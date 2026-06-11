@@ -1,0 +1,59 @@
+{
+  "name": "@edut/mcp-recorder",
+  "version": "0.1.0",
+  "description": "Black-box flight recorder for MCP: wrap any MCP server in one config line and record every tool call into a tamper-evident, replayable, exportable local evidence store.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "audit",
+    "agents",
+    "ai-security",
+    "evidence",
+    "tamper-evident",
+    "proxy"
+  ],
+  "license": "GPL-3.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "mcp-recorder": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "docs/event-schema.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx bench/latency.ts",
+    "demo": "tsx demo/run.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.5.0",
+    "yazl": "^2.5.1"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.10.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "@types/yazl": "^2.4.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

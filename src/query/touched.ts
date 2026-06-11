@@ -1,0 +1,193 @@
+/**
+ * Blast-radius query — "what did this value touch?"
+ *
+ * The store never holds plaintext payloads, only unsalted SHA-256 refs, so a
+ * known probe value (a leaked key, a customer email, ...) can be traced by
+ * hashing it the exact same way and walking the chain for matching refs.
+ *
+ * Match locations, in preference order (one match per event):
+ *   ref         — a RedactedRef leaf whose ref equals sha256(needle)
+ *   result_hash — the event's result_hash equals sha256(needle)
+ *   credential  — an identity credential fingerprint equals sha256(needle)
+ *   name        — tool / method / server.name equals the needle (case-insensitive)
+ *   plain       — a plain string leaf contains the needle (case-sensitive)
+ */
+
+import { sha256Ref } from '../chain/hash.js';
+import type { AnyEvent, RedactedRef } from '../schema/events.js';
+import type { EvidenceStore, QueryMatch, QueryResult } from '../types.js';
+
+type MatchedOn = QueryMatch['matched_on'];
+
+/** Lower = stronger evidence; the strongest single location wins per event. */
+const PRIORITY: Record<MatchedOn, number> = {
+  ref: 0,
+  result_hash: 1,
+  credential: 2,
+  name: 3,
+  plain: 4,
+};
+
+function isRedactedRef(value: unknown): value is RedactedRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { redacted?: unknown }).redacted === true &&
+    typeof (value as { ref?: unknown }).ref === 'string' &&
+    typeof (value as { len?: unknown }).len === 'number'
+  );
+}
+
+const IDENT_RE = /^[A-Za-z_$][\w$]*$/;
+
+/** Append one key to a JSON-path: `.key` or `['weird.key']`. */
+function pathSegment(key: string): string {
+  if (IDENT_RE.test(key)) return '.' + key;
+  return "['" + key.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "']";
+}
+
+interface TreeHits {
+  /** Path of the first RedactedRef leaf whose ref matched. */
+  ref?: string;
+  /** Path of the first plain string leaf containing the needle. */
+  plain?: string;
+}
+
+/** One depth-first pass over the event tree, recording first hits per type. */
+function walkTree(
+  value: unknown,
+  path: string,
+  needle: string,
+  needleHash: string,
+  hits: TreeHits,
+): void {
+  if (hits.ref !== undefined && hits.plain !== undefined) return;
+  if (typeof value === 'string') {
+    if (hits.plain === undefined && needle.length > 0 && value.includes(needle)) {
+      hits.plain = path;
+    }
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  if (isRedactedRef(value)) {
+    // RedactedRefs are atomic leaves: compare the ref, never their fields.
+    if (hits.ref === undefined && value.ref === needleHash) hits.ref = path;
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      walkTree(value[i], `${path}[${i}]`, needle, needleHash, hits);
+      if (hits.ref !== undefined && hits.plain !== undefined) return;
+    }
+    return;
+  }
+  const rec = value as Record<string, unknown>;
+  for (const key of Object.keys(rec)) {
+    walkTree(rec[key], path + pathSegment(key), needle, needleHash, hits);
+    if (hits.ref !== undefined && hits.plain !== undefined) return;
+  }
+}
+
+/** All match locations found in one event, strongest first. */
+function findCandidates(
+  seq: number,
+  event: AnyEvent,
+  needle: string,
+  needleHash: string,
+): QueryMatch[] {
+  const candidates: Array<{ matched_on: MatchedOn; path: string }> = [];
+
+  const hits: TreeHits = {};
+  walkTree(event, '$', needle, needleHash, hits);
+  if (hits.ref !== undefined) candidates.push({ matched_on: 'ref', path: hits.ref });
+
+  if (
+    (event.kind === 'tool_call' || event.kind === 'rpc') &&
+    event.result_hash === needleHash
+  ) {
+    candidates.push({ matched_on: 'result_hash', path: '$.result_hash' });
+  }
+
+  const fingerprints = event.identity.credential_fingerprints;
+  if (fingerprints !== undefined) {
+    for (let i = 0; i < fingerprints.length; i++) {
+      if (fingerprints[i]?.ref === needleHash) {
+        candidates.push({
+          matched_on: 'credential',
+          path: `$.identity.credential_fingerprints[${i}].ref`,
+        });
+        break;
+      }
+    }
+  }
+
+  if (needle.length > 0) {
+    const lower = needle.toLowerCase();
+    const tool = event.kind === 'tool_call' ? event.tool : undefined;
+    const method =
+      event.kind === 'rpc' || event.kind === 'notification' ? event.method : undefined;
+    if (tool !== undefined && tool.toLowerCase() === lower) {
+      candidates.push({ matched_on: 'name', path: '$.tool' });
+    } else if (method !== undefined && method.toLowerCase() === lower) {
+      candidates.push({ matched_on: 'name', path: '$.method' });
+    } else if (event.server.name.toLowerCase() === lower) {
+      candidates.push({ matched_on: 'name', path: '$.server.name' });
+    }
+  }
+
+  if (hits.plain !== undefined) candidates.push({ matched_on: 'plain', path: hits.plain });
+
+  candidates.sort((a, b) => PRIORITY[a.matched_on] - PRIORITY[b.matched_on]);
+  return candidates.map((c) => toMatch(seq, event, c.matched_on, c.path));
+}
+
+function toMatch(seq: number, event: AnyEvent, matchedOn: MatchedOn, path: string): QueryMatch {
+  const name =
+    event.kind === 'tool_call'
+      ? event.tool
+      : event.kind === 'rpc' || event.kind === 'notification'
+        ? event.method
+        : undefined;
+  const match: QueryMatch = {
+    seq,
+    session_id: event.session_id,
+    timestamp: event.timestamp,
+    kind: event.kind,
+    matched_on: matchedOn,
+    path,
+  };
+  if (name !== undefined) match.name = name;
+  return match;
+}
+
+/**
+ * Trace a value through the evidence chain. One QueryMatch per touched event
+ * (the strongest match location wins); sessions are the distinct sessions
+ * touched, newest first.
+ */
+export function queryStore(
+  store: EvidenceStore,
+  needle: string,
+  opts?: { sessionId?: string },
+): QueryResult {
+  const needleHash = sha256Ref(needle);
+  const matches: QueryMatch[] = [];
+  const touchedSessions = new Set<string>();
+
+  const iterateOpts = opts?.sessionId !== undefined ? { sessionId: opts.sessionId } : {};
+  for (const record of store.iterate(iterateOpts)) {
+    const candidates = findCandidates(record.seq, record.event, needle, needleHash);
+    const best = candidates[0];
+    if (best === undefined) continue;
+    matches.push(best);
+    touchedSessions.add(record.event.session_id);
+  }
+
+  const sessions = store
+    .sessions()
+    .filter((s) => touchedSessions.has(s.session_id))
+    .sort((a, b) => b.started_at.localeCompare(a.started_at));
+
+  return { needle_hash: needleHash, matches, sessions };
+}
