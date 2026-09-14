@@ -106,4 +106,30 @@ describe('Signer', () => {
   it('publicKeyPem rejects non-hex input', () => {
     expect(() => publicKeyPem('zz')).toThrow(/64-hex/);
   });
+
+  it('parallel Signer.load calls on an empty dir agree on one identity', async () => {
+    // Several `mcp-recorder record` processes normally share one data dir
+    // and can all hit Signer.load on the very first run — they must not
+    // race into creating (and then signing under) different keys.
+    const N = 8;
+    const signers = await Promise.all(Array.from({ length: N }, () => Signer.load(dir)));
+
+    const pubKeys = new Set(signers.map((s) => s.publicKeyHex));
+    expect(pubKeys.size).toBe(1);
+    for (const s of signers) expect(s.publicKeyHex).toMatch(HEX64);
+
+    const privOnDisk = readFileSync(join(dir, FILES.PRIVATE_KEY), 'utf8').trim().toLowerCase();
+    const pubOnDisk = readFileSync(join(dir, FILES.PUBLIC_KEY), 'utf8').trim().toLowerCase();
+    expect(privOnDisk).toMatch(HEX64);
+    expect(pubOnDisk).toBe([...pubKeys][0]);
+
+    const mode = statSync(join(dir, FILES.PRIVATE_KEY)).mode & 0o777;
+    expect(mode).toBe(0o600);
+
+    // And the winning key actually signs correctly.
+    const chainHash = sha256Hex('race-head');
+    const sig = await signers[0]!.sign(1, chainHash);
+    const ok = await ed.verifyAsync(sig.signature, signedPayload(1, chainHash), sig.public_key);
+    expect(ok).toBe(true);
+  });
 });

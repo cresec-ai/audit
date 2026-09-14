@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { GENESIS_HASH, computeHash, makeRecord, sha256Hex, sha256Ref } from '../src/chain/hash.js';
 import { openStore, isSqliteAvailable } from '../src/store/index.js';
+import { verifyStore } from '../src/verify/verify.js';
 import { ENV, FILES } from '../src/types.js';
 import type { ChainHead, EvidenceStore } from '../src/types.js';
 import type {
@@ -367,6 +368,46 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     ]);
     expect([...store.iterate({ sessionId: 'no-such-session' })]).toEqual([]);
   });
+
+  it('appendEvents seals raw events into a contiguous, verifiable chain', () => {
+    const store = open();
+    const events: AnyEvent[] = [
+      sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'list_issues', { requestId: 1 }),
+      sessionEnd(SESSION_A, '2026-06-11T10:00:02.000Z'),
+    ];
+    const sealed = store.appendEvents(events);
+
+    expect(sealed).toHaveLength(3);
+    let prev = GENESIS_HASH;
+    sealed.forEach((record, idx) => {
+      expect(record.seq).toBe(idx + 1);
+      expect(record.prev_hash).toBe(prev);
+      expect(record.hash).toBe(computeHash(prev, record.event));
+      expect(record.event).toEqual(events[idx]);
+      prev = record.hash;
+    });
+    expect(store.head()).toEqual({ seq: 3, hash: sealed[2]!.hash });
+    expect(store.count()).toBe(3);
+    expect([...store.iterate()]).toEqual(sealed);
+  });
+
+  it('appendEvents keeps the chain linked across multiple calls', () => {
+    const store = open();
+    const first = store.appendEvents([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+    const second = store.appendEvents([
+      toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'list_issues', { requestId: 1 }),
+      sessionEnd(SESSION_A, '2026-06-11T10:00:02.000Z'),
+    ]);
+    expect(first[0]!.seq).toBe(1);
+    expect(second[0]!.seq).toBe(2);
+    expect(second[0]!.prev_hash).toBe(first[0]!.hash);
+    expect(second[1]!.seq).toBe(3);
+    expect(second[1]!.prev_hash).toBe(second[0]!.hash);
+    expect(store.count()).toBe(3);
+    expect(store.append([])).toBeUndefined();
+    expect(store.appendEvents([])).toEqual([]);
+  });
 });
 
 /* --------------------------- sqlite-specific --------------------------- */
@@ -469,6 +510,65 @@ describe('JsonlStore trailing partial line', () => {
     writeFileSync(logPath, lines.join('\n'));
 
     expect(() => openStore({ dataDir: dir, backend: 'jsonl' })).toThrow(/corrupt JSONL line 1/);
+  });
+});
+
+describe('JsonlStore appendEvents across instances (simulates separate processes)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-jsonl-xproc-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('two stores appending alternately produce one contiguous, verifiable chain', async () => {
+    const SESSION_C = '33333333-3333-4333-8333-333333333333';
+    const SESSION_D = '44444444-4444-4444-8444-444444444444';
+    const track = (sessionId: string, tag: string): AnyEvent[] => [
+      sessionStart(sessionId, '2026-06-11T12:00:00.000Z'),
+      toolCall(sessionId, '2026-06-11T12:00:01.000Z', `tool_${tag}`, { requestId: 1 }),
+      sessionEnd(sessionId, '2026-06-11T12:00:02.000Z'),
+    ];
+    const eventsA = track(SESSION_C, 'a');
+    const eventsB = track(SESSION_D, 'b');
+
+    // Two independent JsonlStore instances on the same data dir — each one
+    // stands in for a separate `mcp-recorder record` process, appending one
+    // event at a time so the instances truly interleave on disk.
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    const storeB = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      for (let i = 0; i < eventsA.length; i++) {
+        storeA.appendEvents([eventsA[i]!]);
+        storeB.appendEvents([eventsB[i]!]);
+      }
+    } finally {
+      storeA.close();
+      storeB.close();
+    }
+
+    const verifyOpen = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      expect(verifyOpen.count()).toBe(6);
+      const seqs = [...verifyOpen.iterate()].map((r) => r.seq);
+      expect(seqs).toEqual([1, 2, 3, 4, 5, 6]);
+
+      const result = await verifyStore(verifyOpen);
+      expect(result.problems.filter((p) => p.warning !== true)).toEqual([]);
+      expect(result.checked_events).toBe(6);
+
+      const sessions = verifyOpen.sessions();
+      expect(sessions).toHaveLength(2);
+      for (const s of sessions) {
+        expect(s.event_count).toBe(3);
+        expect(s.ended_at).toBeDefined();
+      }
+    } finally {
+      verifyOpen.close();
+    }
   });
 });
 

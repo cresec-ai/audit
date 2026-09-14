@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Recorder } from '../src/capture/recorder.js';
-import { GENESIS_HASH, computeHash, signedPayload, sha256Hex } from '../src/chain/hash.js';
+import { GENESIS_HASH, computeHash, makeRecord, signedPayload, sha256Hex } from '../src/chain/hash.js';
 import { SCHEMA, type AnyEvent, type ChainRecord, type HeadSignature } from '../src/schema/events.js';
 import type {
   ChainHead,
@@ -37,6 +37,18 @@ class FakeStore implements EvidenceStore {
       this.records.push(r);
       head = { seq: r.seq, hash: r.hash };
     }
+  }
+  appendEvents(events: AnyEvent[]): ChainRecord[] {
+    if (this.failAppend) throw new Error('disk on fire');
+    let head = this.head();
+    const sealed: ChainRecord[] = [];
+    for (const event of events) {
+      const record = makeRecord(head, event);
+      sealed.push(record);
+      head = { seq: record.seq, hash: record.hash };
+    }
+    this.records.push(...sealed);
+    return sealed;
   }
   addSignature(sig: HeadSignature): void {
     this.sigs.push(sig);

@@ -21,6 +21,32 @@ ed.etc.sha512Sync = (...m: Uint8Array[]) => sha512(ed.etc.concatBytes(...m));
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
+/** A real synchronous sleep, without a native dependency. */
+function sleepSync(ms: number): void {
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+/**
+ * Read and validate the private key file, tolerating the brief window where
+ * a concurrent winner of the `wx` create race has created the file but not
+ * yet finished writing its content (open/write/close are separate syscalls
+ * even though writeFileSync looks atomic from the caller's side).
+ */
+function readPrivateKey(path: string): Uint8Array {
+  const deadline = Date.now() + 250;
+  for (;;) {
+    const hex = readFileSync(path, 'utf8').trim().toLowerCase();
+    if (HEX64.test(hex)) return ed.etc.hexToBytes(hex);
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `mcp-recorder: malformed private key file at ${path} (expected 64 hex chars)`,
+      );
+    }
+    sleepSync(5);
+  }
+}
+
 export class Signer implements SignerLike {
   /** 64-hex raw ed25519 public key. */
   readonly publicKeyHex: string;
@@ -34,6 +60,14 @@ export class Signer implements SignerLike {
   /**
    * Load the keypair from `dataDir`, creating it (and the directory) on first
    * use. The private key file is written with mode 0o600.
+   *
+   * Several `mcp-recorder record` processes normally share one data dir (one
+   * wrapper per MCP server) and can race here on a brand-new dir: the private
+   * key is created with the exclusive `wx` flag, so at most one process's
+   * `writeFileSync` wins the file and every other one gets EEXIST — at which
+   * point it just re-reads whichever key won, rather than clobbering it with
+   * its own (which would leave two processes signing under different
+   * identities).
    */
   static async load(dataDir: string): Promise<Signer> {
     mkdirSync(dataDir, { recursive: true });
@@ -42,20 +76,23 @@ export class Signer implements SignerLike {
 
     let priv: Uint8Array;
     if (existsSync(privPath)) {
-      const hex = readFileSync(privPath, 'utf8').trim().toLowerCase();
-      if (!HEX64.test(hex)) {
-        throw new Error(
-          `mcp-recorder: malformed private key file at ${privPath} (expected 64 hex chars)`,
-        );
-      }
-      priv = ed.etc.hexToBytes(hex);
+      priv = readPrivateKey(privPath);
     } else {
-      priv = ed.utils.randomPrivateKey();
-      writeFileSync(privPath, ed.etc.bytesToHex(priv) + '\n', { mode: 0o600 });
+      const candidate = ed.utils.randomPrivateKey();
+      try {
+        writeFileSync(privPath, ed.etc.bytesToHex(candidate) + '\n', { flag: 'wx', mode: 0o600 });
+        priv = candidate;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        // Another process won the race and created the file first — use it.
+        priv = readPrivateKey(privPath);
+      }
     }
 
     const pubHex = ed.etc.bytesToHex(await ed.getPublicKeyAsync(priv));
-    // (Re)write the public key file if missing or stale — it is derived state.
+    // (Re)write the public key file if missing or stale — it is derived
+    // state, and rewriting is idempotent even if another process races us
+    // to it with the SAME key (both derive an identical pubHex from priv).
     if (!existsSync(pubPath) || readFileSync(pubPath, 'utf8').trim().toLowerCase() !== pubHex) {
       writeFileSync(pubPath, pubHex + '\n');
     }

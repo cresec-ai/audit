@@ -3,7 +3,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { GENESIS_HASH, canonicalJson, computeHash, sha256Ref } from '../src/chain/hash.js';
+import { GENESIS_HASH, canonicalJson, computeHash, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Recorder } from '../src/capture/recorder.js';
 import { runStdioProxy } from '../src/proxy/stdio.js';
 import type {
@@ -53,6 +53,17 @@ class FakeStore implements EvidenceStore {
       this.records.push(r);
       head = { seq: r.seq, hash: r.hash };
     }
+  }
+  appendEvents(events: AnyEvent[]): ChainRecord[] {
+    let head = this.head();
+    const sealed: ChainRecord[] = [];
+    for (const event of events) {
+      const record = makeRecord(head, event);
+      sealed.push(record);
+      head = { seq: record.seq, hash: record.hash };
+    }
+    this.records.push(...sealed);
+    return sealed;
   }
   addSignature(sig: HeadSignature): void {
     this.sigs.push(sig);

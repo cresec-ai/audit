@@ -70,6 +70,14 @@ export interface EvidenceStore {
   readonly path: string;
   head(): ChainHead;
   append(records: ChainRecord[]): void;
+  /**
+   * Seal raw events into chain records and append them, all under the
+   * store's own exclusive lock (the head is read INSIDE that lock, so this
+   * is safe to call from multiple processes sharing one data dir — unlike
+   * `append`, which trusts a head read by the caller). Returns the sealed
+   * records in the order they were written.
+   */
+  appendEvents(events: AnyEvent[]): ChainRecord[];
   addSignature(sig: HeadSignature): void;
   latestSignature(): HeadSignature | null;
   signatures(): HeadSignature[];
