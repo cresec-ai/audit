@@ -148,8 +148,11 @@ export class SqliteStore implements EvidenceStore {
     // Several `mcp-recorder record` processes normally share one data dir
     // (one wrapper per MCP server) — without a busy_timeout, a concurrent
     // writer makes better-sqlite3 throw SQLITE_BUSY immediately instead of
-    // waiting for the other transaction to finish.
-    this.db.pragma('busy_timeout = 10000');
+    // waiting for the other transaction to finish. The wait is SYNCHRONOUS
+    // (better-sqlite3 blocks the event loop, and with it the proxy's
+    // forwarding), so it is kept short: write transactions here take
+    // microseconds, and the recorder retries a busy batch asynchronously.
+    this.db.pragma('busy_timeout = 1000');
     this.db.pragma('journal_mode = WAL');
     this.db.exec(DDL);
 

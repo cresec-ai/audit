@@ -468,7 +468,7 @@ describe('JsonlStore trailing partial line', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('ignores a truncated final line with a stderr warning', () => {
+  it('ignores a truncated final line with a stderr warning', async () => {
     const records = twoSessionFixture();
     const store = openStore({ dataDir: dir, backend: 'jsonl' });
     store.append(records);
@@ -492,7 +492,30 @@ describe('JsonlStore trailing partial line', () => {
       );
       reopened.append(more);
       expect(reopened.count()).toBe(7);
+      // The writer trimmed the torn bytes (which never formed a sealed record)
+      // so the new record was not glued onto them.
+      expect(
+        stderrSpy.mock.calls.some((call) => String(call[0]).includes('discarded a torn trailing line')),
+      ).toBe(true);
+      expect(readFileSync(join(dir, FILES.JSONL_LOG), 'utf8')).not.toContain('"trunc');
       reopened.close();
+
+      // ...and it all survives a fresh open + a second append + verification:
+      // before the repair, the glued line was either silently dropped as a
+      // "trailing partial line" (losing seq 7) or, once seq 8 followed it,
+      // became mid-file corruption that made the store unopenable.
+      const again = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(again.count()).toBe(7);
+      expect(again.head()).toEqual({ seq: 7, hash: more[0]!.hash });
+      const sealed = again.appendEvents([
+        toolCall(SESSION_B, '2026-06-11T11:00:10.000Z', 'after_recovery'),
+      ]);
+      expect(sealed[0]!.seq).toBe(8);
+      again.close();
+      const third = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(third.count()).toBe(8);
+      expect((await verifyStore(third)).ok).toBe(true);
+      third.close();
     } finally {
       stderrSpy.mockRestore();
     }

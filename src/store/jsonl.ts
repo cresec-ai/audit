@@ -25,6 +25,7 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -128,13 +129,72 @@ function readLastLine(path: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Crash recovery, run by a writer that holds the lock: when the log does not
+ * end in a newline, a process died mid-write and left a torn final line.
+ * Appending straight after it would glue the first new record onto the
+ * garbage (losing that record, and turning the garbage into mid-file
+ * corruption that makes the next open fail), so the torn bytes are trimmed
+ * back to the last complete line first. Nothing sealed is removed — the
+ * chain never extended over those bytes, and the tolerant loader already
+ * ignores them at read time; this just makes that policy durable. Returns
+ * the number of bytes discarded (0 when the tail was intact).
+ */
+function repairTornTail(path: string): number {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r+');
+  } catch {
+    return 0; // no file yet — nothing to repair
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return 0;
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    if (last[0] === 0x0a) return 0;
+    // Find the last newline: scan a tail window first, then the whole file.
+    let keep = -1;
+    for (const windowSize of [Math.min(size, TAIL_WINDOW_BYTES), size]) {
+      const start = size - windowSize;
+      const buf = Buffer.alloc(windowSize);
+      readSync(fd, buf, 0, windowSize, start);
+      const nl = buf.lastIndexOf(0x0a);
+      if (nl !== -1) {
+        keep = start + nl + 1;
+        break;
+      }
+      if (start === 0) break;
+    }
+    const cut = keep === -1 ? 0 : keep;
+    ftruncateSync(fd, cut);
+    process.stderr.write(
+      `[mcp-recorder] discarded a torn trailing line (${size - cut} bytes) in ${path} left by an interrupted write\n`,
+    );
+    return size - cut;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /* --------------------------- cross-process lock -------------------------- */
 
-const LOCK_BUDGET_MS = 10_000;
+/**
+ * Lock waits are SYNCHRONOUS (they block the event loop, and with it the
+ * proxy's forwarding), so the budget per attempt is short: the critical
+ * section is a tail read plus one appendFileSync, and the recorder retries
+ * a batch that could not get the lock asynchronously.
+ */
+const LOCK_BUDGET_MS = 1_000;
 const LOCK_RETRY_BASE_MS = 5;
 const LOCK_RETRY_MAX_MS = 200;
-/** A lock dir older than this is assumed abandoned by a dead process. */
-const STALE_LOCK_MS = 30_000;
+/**
+ * A lock dir older than this is assumed abandoned by a process that died
+ * inside the critical section. That section takes milliseconds, so 5s is
+ * generous, and it is short enough that a recorder's retry run (~1s of
+ * backoff plus up to 7 lock waits) reaches the reclaim instead of dropping.
+ */
+const STALE_LOCK_MS = 5_000;
 
 /** A real synchronous sleep, without a native dependency. */
 function sleepSync(ms: number): void {
@@ -303,6 +363,7 @@ export class JsonlStore implements EvidenceStore {
   append(records: ChainRecord[]): void {
     if (records.length === 0) return;
     this.withLock(() => {
+      repairTornTail(this.path);
       const diskHead = this.readHeadFromDisk();
       this.catchUpTo(diskHead);
       let head = diskHead;
@@ -325,6 +386,7 @@ export class JsonlStore implements EvidenceStore {
   appendEvents(events: AnyEvent[]): ChainRecord[] {
     if (events.length === 0) return [];
     return this.withLock(() => {
+      repairTornTail(this.path);
       const diskHead = this.readHeadFromDisk();
       this.catchUpTo(diskHead);
       let head = diskHead;
