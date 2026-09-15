@@ -5,12 +5,18 @@
  * HOOK CONTRACT (verified against the current docs — cite these, not memory,
  * if this ever needs re-checking):
  *   https://code.claude.com/docs/en/hooks
+ *   https://code.claude.com/docs/en/hooks#posttoolusefailure-input
  *   https://code.claude.com/docs/en/hooks-guide
  * Claude Code spawns a fresh process per hook event and feeds it exactly one
  * JSON object on stdin. Every event carries `session_id`, `transcript_path`,
- * `cwd`, `hook_event_name`. PreToolUse/PostToolUse add `tool_name`,
- * `tool_input`, `tool_use_id`; PostToolUse also adds `tool_response`
- * (string | object). SessionEnd adds `reason`: one of
+ * `cwd`, `hook_event_name`. PreToolUse/PostToolUse/PostToolUseFailure add
+ * `tool_name`, `tool_input`, `tool_use_id`. PostToolUse fires ONLY for a
+ * tool call that succeeded and adds `tool_response` (string | object); a
+ * call that failed fires PostToolUseFailure INSTEAD, which carries no
+ * `tool_response` but `error` (a string whose format depends on the tool)
+ * and an optional `is_interrupt` boolean (true when the failure reached
+ * Claude Code as an abort — the running tool was cancelled — rather than as
+ * an error the tool reported). SessionEnd adds `reason`: one of
  * 'clear'|'resume'|'logout'|'prompt_input_exit'|'other'. Stop (end of an
  * agent turn, recorded as a 'claude-code/stop' notification) has no
  * `reason` field at all. MCP tools are named `mcp__<server>__<tool>` (see
@@ -47,12 +53,13 @@ import type {
   NotificationEvent,
   SessionEndEvent,
   SessionStartEvent,
+  Sha256Ref,
   ToolCallEvent,
 } from '../schema/events.js';
 import type { RecorderConfig } from '../types.js';
 import { parseToolName } from './names.js';
 import { evaluatePolicy, loadPolicy } from './policy.js';
-import { claimSessionStart, markPending, takePending } from './state.js';
+import { claimSessionStart, markPending, sweepStalePending, takePending } from './state.js';
 
 /** sha256:<hex> of canonical `null` — result_hash for a PreToolUse marker
  *  (no result exists yet). */
@@ -87,6 +94,10 @@ interface HookInput {
   tool_input?: unknown;
   tool_use_id?: unknown;
   tool_response?: unknown;
+  /** PostToolUseFailure only: the error text (a payload string — hashed, never stored). */
+  error?: unknown;
+  /** PostToolUseFailure only: true when the call was aborted rather than erroring. */
+  is_interrupt?: unknown;
   reason?: unknown;
 }
 
@@ -139,6 +150,21 @@ function mapSessionEndReason(hookReason: string | undefined): SessionEndEvent['r
   return hookReason === 'logout' ? 'stdin_closed' : 'child_exit';
 }
 
+/**
+ * Turn boundaries (Stop) and session end are the natural moments to garbage
+ * collect pending markers whose post half never came — see
+ * `sweepStalePending` in src/hook/state.ts for how a marker outlives its
+ * call. Fail-open: the sweep itself ignores every per-file error, and even
+ * an unexpected throw here only ever reaches stderr.
+ */
+function sweepPendingMarkers(dataDir: string): void {
+  try {
+    sweepStalePending(dataDir);
+  } catch (cause) {
+    diagStderr(`pending-marker sweep failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+}
+
 export async function runHook(stdinText: string, opts: HookOpts): Promise<HookResult> {
   try {
     let raw: unknown;
@@ -155,7 +181,8 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
       typeof input.session_id === 'string' && input.session_id.length > 0 ? input.session_id : undefined;
     if (eventName === undefined || sessionId === undefined) return ALLOW;
 
-    const isToolEvent = eventName === 'PreToolUse' || eventName === 'PostToolUse';
+    const isToolEvent =
+      eventName === 'PreToolUse' || eventName === 'PostToolUse' || eventName === 'PostToolUseFailure';
     const isEndEvent = eventName === 'SessionEnd';
     const isStopEvent = eventName === 'Stop';
     if (!isToolEvent && !isEndEvent && !isStopEvent) return ALLOW; // an event this command doesn't handle
@@ -247,6 +274,7 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
           params: setup.redactor.scrub(stopParams),
         };
         setup.recorder.record(turnEnd);
+        sweepPendingMarkers(opts.config.dataDir);
       } else if (isEndEvent) {
         const hookReason = typeof input.reason === 'string' ? input.reason : undefined;
         const stats = setup.stats();
@@ -259,6 +287,7 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
           events_dropped: stats.dropped,
         };
         setup.recorder.record(sessionEnd);
+        sweepPendingMarkers(opts.config.dataDir);
       } else {
         // isToolEvent, with toolName/parsed both guaranteed defined by the
         // early filtering above.
@@ -326,7 +355,15 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
             };
           }
         } else {
-          // PostToolUse
+          // PostToolUse (the call succeeded: `tool_response` is its result)
+          // or PostToolUseFailure (it failed: no `tool_response`, an `error`
+          // string instead). Both are the POST phase of the same call — one
+          // event sharing the PreToolUse event's request_id and closing the
+          // pending marker PreToolUse left behind for duration_ms. Claude
+          // Code fires exactly one of the two per call, so ignoring the
+          // failure half (as cloud dogfood 3 caught) leaves a failed call as
+          // a lone `pre` event with is_error false and a marker nobody takes.
+          const isFailure = eventName === 'PostToolUseFailure';
           let t0: number | undefined;
           try {
             t0 = takePending(opts.config.dataDir, String(requestId));
@@ -335,8 +372,29 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
           }
           const durationMs = t0 !== undefined ? round2(Math.max(0, Date.now() - t0)) : 0;
 
-          const rawResult = input.tool_response;
-          const isError = detectIsError(rawResult);
+          // A failure carries no tool_response by contract; should one ever
+          // appear anyway it is deliberately not read, so a failure's result
+          // is always recorded exactly as an absent response (canonical null).
+          const rawResult = isFailure ? undefined : input.tool_response;
+          const failureType: 'tool_error' | 'interrupted' | undefined = !isFailure
+            ? undefined
+            : input.is_interrupt === true
+              ? 'interrupted'
+              : 'tool_error';
+          const errorType = failureType ?? (detectIsError(rawResult) ? 'tool_error' : undefined);
+
+          // The error text is payload: it reaches the store only as its
+          // sha256 ref, hashed exactly like every redacted leaf
+          // (Redactor.hashString is sha256Ref), so a known error text can be
+          // matched against it by hashing it the same way. A non-string
+          // `error` (never per the docs, but fail-open) is canonicalized
+          // then hashed.
+          let messageRef: Sha256Ref | undefined;
+          if (isFailure && input.error !== undefined) {
+            const errorText = typeof input.error === 'string' ? input.error : canonicalJson(input.error);
+            messageRef = setup.redactor.hashString(errorText);
+          }
+
           const attributes: Attributes = {
             'gen_ai.operation.name': 'execute_tool',
             'gen_ai.tool.name': parsed!.tool,
@@ -344,7 +402,7 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
             'mcp.method.name': 'tools/call',
             'rpc.system': 'hook',
           };
-          if (isError) attributes['error.type'] = 'tool_error';
+          if (errorType !== undefined) attributes['error.type'] = errorType;
 
           const toolCall: ToolCallEvent = {
             ...base('tool_call', attributes, server),
@@ -354,10 +412,15 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
             args: scrubToolArguments(setup.redactor, input.tool_input ?? {}),
             result_hash: sha256Ref(canonicalJson(rawResult ?? null)),
             result: setup.redactor.scrub(rawResult ?? null),
-            is_error: isError,
+            is_error: errorType !== undefined,
             duration_ms: durationMs,
             phase: 'post',
           };
+          if (failureType !== undefined) {
+            const error: NonNullable<ToolCallEvent['error']> = { type: failureType };
+            if (messageRef !== undefined) error.message_ref = messageRef;
+            toolCall.error = error;
+          }
           setup.recorder.record(toolCall);
         }
       }

@@ -213,7 +213,7 @@ Every event carries these fields:
 | `identity` | `IdentityContext` | Who acted. |
 | `server` | `ServerContext` | What was wrapped. |
 | `attributes` | `Attributes` | Flat semconv-named attribute bag. |
-| `source` | `'hook'?` | Additive, optional (schema stays v1). Set to `'hook'` when this event was captured by `mcp-recorder hook` (a Claude Code PreToolUse/PostToolUse/SessionEnd/Stop hook) rather than the stdio/http proxy tap. Undefined on every proxy-captured event. See [Hook-sourced events](#hook-sourced-events-additive) below. |
+| `source` | `'hook'?` | Additive, optional (schema stays v1). Set to `'hook'` when this event was captured by `mcp-recorder hook` (a Claude Code PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop hook) rather than the stdio/http proxy tap. Undefined on every proxy-captured event. See [Hook-sourced events](#hook-sourced-events-additive) below. |
 
 `EventKind` is one of: `session_start`, `initialize`, `tool_call`, `rpc`,
 `notification`, `protocol_error`, `session_end`.
@@ -256,9 +256,9 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
-| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; `mcp-recorder hook` uses `'policy_denied'` for a call its `--policy` denied — see [Hook-sourced events](#hook-sourced-events-additive). |
+| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; `mcp-recorder hook` records the additive values `'policy_denied'` (a `--policy` deny), `'tool_error'` (the call failed: a PostToolUseFailure) and `'interrupted'` (a PostToolUseFailure with `is_interrupt`) under it — see [Hook-sourced events](#hook-sourced-events-additive). |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
-| `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
+| `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse or PostToolUseFailure event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
 
 ### `rpc`
 
@@ -328,7 +328,7 @@ method is just as capped here as in a normal completed event.
 ## Hook-sourced events (additive)
 
 `mcp-recorder hook` (see [docs/hooks.md](hooks.md)) turns Claude Code
-PreToolUse/PostToolUse/SessionEnd/Stop hook invocations into events using
+PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop hook invocations into events using
 the exact same `session_start` / `tool_call` / `session_end` / `notification`
 shapes above — no new event kind was needed. `Stop` (the end of an agent
 turn, which fires many times per session) becomes a `notification` event
@@ -344,11 +344,28 @@ field:
   one `request_id` (Claude Code's own `tool_use_id`), rather than the single
   request+response-correlated event the proxy records. `'pre'` carries
   redacted arguments with `result: null` and `duration_ms: 0`; `'post'`
-  carries the redacted result and the measured `duration_ms`.
-- **`ToolCallEvent.error.type: 'policy_denied'`** — a new value under the
-  already free-form `error.type` string field (no schema change), set when
-  `mcp-recorder hook --policy FILE` denies a PreToolUse call; `error.message_ref`
-  is the hash of the policy rule's `reason`.
+  carries the redacted result and the measured `duration_ms` (for a
+  PostToolUseFailure: `result: null`, `result_hash` of canonical `null`,
+  `is_error: true` and `error` as below — Claude Code fires exactly one of
+  PostToolUse / PostToolUseFailure per call). A hook `'post'` event's
+  `duration_ms` is the gap between the two hook invocations (Claude Code's
+  dispatch plus hook process spawn, about a second per call in cloud
+  dogfood 3), not the MCP server's latency the proxy measures — see
+  [docs/hooks.md](hooks.md#what-gets-recorded).
+- **`ToolCallEvent.error.type: 'policy_denied' | 'tool_error' | 'interrupted'`**
+  — additive values under the already free-form `error.type` string field
+  (no schema change; the same string is also set as the `error.type`
+  attribute). `'policy_denied'`: `mcp-recorder hook --policy FILE` denied
+  the PreToolUse call; `error.message_ref` is the hash of the policy rule's
+  `reason`. `'tool_error'`: the call failed (Claude Code fired
+  PostToolUseFailure instead of PostToolUse); `error.message_ref` is the
+  hash of the hook's `error` string, computed exactly like any redacted
+  value (`Redactor.hashString`, i.e. `sha256Ref`) — the text itself is
+  never stored. `'interrupted'`: the same, but the hook's `is_interrupt`
+  was true (the call was aborted rather than reporting an error). A
+  PostToolUse event whose `tool_response` is shaped `{isError: true}` (the
+  MCP CallToolResult convention) sets `is_error: true` and the
+  `'tool_error'` *attribute* only, with no `error` object.
 
 `SessionEndEvent.reason` is a **frozen closed union**
 (`'child_exit' | 'stdin_closed' | 'signal' | 'error'`) with no member for

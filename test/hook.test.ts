@@ -1,18 +1,19 @@
 /**
- * `mcp-recorder hook` — turns Claude Code PreToolUse/PostToolUse/SessionEnd/
+ * `mcp-recorder hook` — turns Claude Code PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/
  * Stop hook invocations into recorded, redacted evidence-chain events, with
  * an allow/deny policy. Drives the real CLI (spawned fresh per hook event,
  * same as Claude Code does) and inspects the resulting store, exactly like
  * test/cli.test.ts and test/setup.test.ts do for the commands they cover.
  */
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsx } from './helpers/tsx.js';
+import { canonicalJson, sha256Ref } from '../src/chain/hash.js';
 import { openStoreReadOnly } from '../src/store/index.js';
 import type { AnyEvent, NotificationEvent, SessionEndEvent, SessionStartEvent, ToolCallEvent } from '../src/schema/events.js';
 
@@ -139,6 +140,31 @@ function postToolUseInput(opts: {
     tool_input: opts.toolInput,
     tool_use_id: opts.toolUseId,
     tool_response: opts.toolResponse,
+  });
+}
+
+/** PostToolUseFailure carries `error` (string) and `is_interrupt` instead
+ *  of `tool_response` — https://code.claude.com/docs/en/hooks#posttoolusefailure-input */
+function postToolUseFailureInput(opts: {
+  sessionId: string;
+  toolName: string;
+  toolInput: unknown;
+  toolUseId: string;
+  error: string;
+  isInterrupt?: boolean;
+}): string {
+  return JSON.stringify({
+    session_id: opts.sessionId,
+    transcript_path: '/tmp/transcript.jsonl',
+    cwd: '/tmp',
+    permission_mode: 'default',
+    hook_event_name: 'PostToolUseFailure',
+    tool_name: opts.toolName,
+    tool_input: opts.toolInput,
+    tool_use_id: opts.toolUseId,
+    error: opts.error,
+    is_interrupt: opts.isInterrupt ?? false,
+    duration_ms: 4187,
   });
 }
 
@@ -315,6 +341,141 @@ describe('mcp-recorder hook', () => {
 
     const raw = JSON.stringify(postEvent);
     expect(raw).not.toContain(secretResult);
+  });
+
+  it('PostToolUseFailure: records the post half with is_error true and a hashed message_ref, shares request_id, clears the pending marker, and never stores the error text', async () => {
+    const dataDir = tmpDir('mcp-hook-failure-');
+    const sessionId = freshSessionId();
+    const errorText = 'ClickUp API rate limit exceeded: daily MCP quota used up (probe-marker-3f9a1c)';
+    const toolInput = { list_id: '901818701787' };
+
+    const pre = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      preToolUseInput({ sessionId, toolName: 'mcp__ClickUp__clickup_get_list', toolInput, toolUseId: 'toolu_fail_1' }),
+    );
+    expect(pre.code).toBe(0);
+    const marker = join(dataDir, 'hook-pending', 'toolu_fail_1');
+    expect(existsSync(marker)).toBe(true); // PreToolUse left its timestamp for the post half
+
+    await new Promise((r) => setTimeout(r, 15));
+
+    const failure = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      postToolUseFailureInput({
+        sessionId,
+        toolName: 'mcp__ClickUp__clickup_get_list',
+        toolInput,
+        toolUseId: 'toolu_fail_1',
+        error: errorText,
+      }),
+    );
+    expect(failure.code).toBe(0);
+    expect(failure.stdout).toBe(''); // a failure hook can't block anything, and prints nothing
+    expect(existsSync(marker)).toBe(false); // taken, exactly as a PostToolUse would have
+
+    const toolCalls = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(toolCalls).toHaveLength(2);
+    const [preEvent, postEvent] = toolCalls;
+    expect(preEvent!.phase).toBe('pre');
+    expect(preEvent!.is_error).toBe(false);
+    expect(postEvent!.phase).toBe('post');
+    expect(postEvent!.source).toBe('hook');
+    expect(postEvent!.request_id).toBe(preEvent!.request_id);
+    expect(postEvent!.request_id).toBe('toolu_fail_1');
+    expect(postEvent!.tool).toBe('clickup_get_list');
+    expect(postEvent!.server.name).toBe('ClickUp');
+    expect(postEvent!.is_error).toBe(true);
+    expect(postEvent!.error?.type).toBe('tool_error');
+    expect(postEvent!.attributes['error.type']).toBe('tool_error');
+    expect(postEvent!.error?.message_ref).toMatch(/^sha256:[0-9a-f]{64}$/);
+    // Hashed exactly like every other redacted value (Redactor.hashString === sha256Ref).
+    expect(postEvent!.error?.message_ref).toBe(sha256Ref(errorText));
+    expect(postEvent!.result).toBeNull(); // a failure carries no tool_response
+    expect(postEvent!.result_hash).toBe(sha256Ref(canonicalJson(null)));
+    expect(typeof postEvent!.duration_ms).toBe('number');
+    expect(postEvent!.duration_ms).toBeGreaterThanOrEqual(0);
+
+    // The error text never reaches the store: check the raw on-disk bytes,
+    // not just the parsed events.
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expect(rawStore).not.toContain(errorText);
+    expect(rawStore).not.toContain('probe-marker-3f9a1c');
+    expect(rawStore).not.toContain('rate limit');
+    expect(rawStore).not.toContain('901818701787');
+  });
+
+  it('PostToolUseFailure with is_interrupt records error.type "interrupted" (and duration_ms 0 without a pre marker)', async () => {
+    const dataDir = tmpDir('mcp-hook-interrupt-');
+    const errorText = 'The user cancelled the running tool call';
+    const result = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      postToolUseFailureInput({
+        sessionId: freshSessionId(),
+        toolName: 'mcp__github__search_code',
+        toolInput: { q: 'needle-in-args' },
+        toolUseId: 'toolu_interrupt_1',
+        error: errorText,
+        isInterrupt: true,
+      }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
+    const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(toolCall.phase).toBe('post');
+    expect(toolCall.is_error).toBe(true);
+    expect(toolCall.error?.type).toBe('interrupted');
+    expect(toolCall.attributes['error.type']).toBe('interrupted');
+    expect(toolCall.error?.message_ref).toBe(sha256Ref(errorText));
+    expect(toolCall.duration_ms).toBe(0); // no PreToolUse marker to measure from
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expect(rawStore).not.toContain('cancelled');
+    expect(rawStore).not.toContain('needle-in-args');
+  });
+
+  it('SessionEnd and Stop sweep stale pending markers (older than 24 h by mtime) and leave fresh ones alone', async () => {
+    const dataDir = tmpDir('mcp-hook-sweep-');
+    const sessionId = freshSessionId();
+    const pendingDir = join(dataDir, 'hook-pending');
+    mkdirSync(pendingDir, { recursive: true });
+    const staleA = join(pendingDir, 'toolu_stale_a');
+    const staleB = join(pendingDir, 'toolu_stale_b');
+    const fresh = join(pendingDir, 'toolu_fresh');
+    const twentyFiveHoursAgo = (Date.now() - 25 * 60 * 60 * 1000) / 1000; // utimes takes seconds
+    const makeStale = (p: string): void => {
+      writeFileSync(p, String(Date.now()));
+      utimesSync(p, twentyFiveHoursAgo, twentyFiveHoursAgo);
+    };
+    makeStale(staleA);
+    makeStale(staleB);
+    writeFileSync(fresh, String(Date.now()));
+
+    // A tool event never sweeps: only turn boundaries and session end do,
+    // so the tool-call path stays as lean as before.
+    await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      preToolUseInput({ sessionId, toolName: 'mcp__github__get_me', toolInput: {}, toolUseId: 'toolu_sweep_pre' }),
+    );
+    expect(existsSync(staleA)).toBe(true);
+
+    const stop = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      JSON.stringify({ session_id: sessionId, hook_event_name: 'Stop' }),
+    );
+    expect(stop.code).toBe(0);
+    expect(stop.stdout).toBe('');
+    expect(existsSync(staleA)).toBe(false);
+    expect(existsSync(staleB)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(join(pendingDir, 'toolu_sweep_pre'))).toBe(true); // just written, kept
+
+    makeStale(staleB); // SessionEnd sweeps too
+    const end = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      JSON.stringify({ session_id: sessionId, hook_event_name: 'SessionEnd', reason: 'other' }),
+    );
+    expect(end.code).toBe(0);
+    expect(existsSync(staleB)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
   });
 
   it('a non-mcp (built-in) tool is ignored by default, and recorded only with --all-tools', async () => {
@@ -507,7 +668,9 @@ describe('mcp-recorder hook install', () => {
     return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
   }
 
-  it('writes PreToolUse/PostToolUse (mcp__.* matcher) + SessionEnd/Stop entries, creating the file if missing', async () => {
+  const MANAGED_EVENTS = ['PostToolUse', 'PostToolUseFailure', 'PreToolUse', 'SessionEnd', 'Stop'].sort();
+
+  it('writes PreToolUse/PostToolUse/PostToolUseFailure (mcp__.* matcher) + SessionEnd/Stop entries, creating the file if missing', async () => {
     const dir = tmpDir('mcp-hook-install-');
     const settingsPath = join(dir, 'settings.json');
     expect(existsSync(settingsPath)).toBe(false);
@@ -517,7 +680,7 @@ describe('mcp-recorder hook install', () => {
     ]);
     expect(result.code).toBe(0);
     const payload = JSON.parse(result.stdout) as { added: string[]; alreadyInstalled: string[] };
-    expect(payload.added.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(payload.added.sort()).toEqual(MANAGED_EVENTS);
     expect(payload.alreadyInstalled).toEqual([]);
 
     const settings = readSettings(settingsPath) as {
@@ -525,6 +688,8 @@ describe('mcp-recorder hook install', () => {
     };
     expect(settings.hooks.PreToolUse![0]!.matcher).toBe('mcp__.*');
     expect(settings.hooks.PostToolUse![0]!.matcher).toBe('mcp__.*');
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('mcp__.*');
+    expect(settings.hooks.PostToolUseFailure![0]).toEqual(settings.hooks.PostToolUse![0]); // same matcher AND command
     expect(settings.hooks.SessionEnd![0]!.matcher).toBeUndefined();
     expect(settings.hooks.Stop![0]!.matcher).toBeUndefined();
     const command = settings.hooks.PreToolUse![0]!.hooks[0]!.command;
@@ -543,6 +708,7 @@ describe('mcp-recorder hook install', () => {
     };
     expect(settings.hooks.PreToolUse![0]!.matcher).toBe('.*');
     expect(settings.hooks.PostToolUse![0]!.matcher).toBe('.*');
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('.*');
   });
 
   it('--command overrides the generated command verbatim (dogfood form)', async () => {
@@ -564,13 +730,13 @@ describe('mcp-recorder hook install', () => {
 
     const first = await runCli(args);
     const firstPayload = JSON.parse(first.stdout) as { added: string[] };
-    expect(firstPayload.added).toHaveLength(4);
+    expect(firstPayload.added).toHaveLength(5);
     const afterFirst = readFileSync(settingsPath, 'utf8');
 
     const second = await runCli(args);
     const secondPayload = JSON.parse(second.stdout) as { added: string[]; alreadyInstalled: string[] };
     expect(secondPayload.added).toEqual([]);
-    expect(secondPayload.alreadyInstalled.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(secondPayload.alreadyInstalled.sort()).toEqual(MANAGED_EVENTS);
     // No backup was written for a no-op run, and the file is unchanged.
     expect(readFileSync(settingsPath, 'utf8')).toBe(afterFirst);
   });
@@ -619,7 +785,7 @@ describe('mcp-recorder hook install', () => {
     const undo = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--undo', '--json']);
     expect(undo.code).toBe(0);
     const undoPayload = JSON.parse(undo.stdout) as { removed: string[] };
-    expect(undoPayload.removed.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(undoPayload.removed.sort()).toEqual(MANAGED_EVENTS);
 
     settings = readSettings(settingsPath) as typeof settings;
     expect(settings.otherTopLevelKey).toBe('preserved');
@@ -627,8 +793,48 @@ describe('mcp-recorder hook install', () => {
     expect(settings.hooks.PreToolUse).toHaveLength(1); // only the unrelated Bash entry remains
     expect(settings.hooks.PreToolUse[0]!.matcher).toBe('Bash');
     expect(settings.hooks.PostToolUse).toBeUndefined(); // emptied entirely, key dropped
+    expect(settings.hooks.PostToolUseFailure).toBeUndefined();
     expect(settings.hooks.SessionEnd).toBeUndefined();
     expect(settings.hooks.Stop).toBeUndefined();
+  });
+
+  it('PostToolUseFailure: installed with the same matcher and command as PostToolUse, idempotent, and --undo removes exactly it', async () => {
+    const dir = tmpDir('mcp-hook-install-failure-');
+    const settingsPath = join(dir, 'settings.json');
+    // Someone else's PostToolUseFailure hook must survive both install and undo untouched.
+    writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        { hooks: { PostToolUseFailure: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo not-ours' }] }] } },
+        null,
+        2,
+      ),
+    );
+    const command = 'node dist/cli.js hook --data-dir .mcp-recorder';
+    type Hooks = Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>>;
+
+    const install = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--json']);
+    expect(install.code).toBe(0);
+    expect((JSON.parse(install.stdout) as { added: string[] }).added).toContain('PostToolUseFailure');
+    let settings = readSettings(settingsPath) as { hooks: Hooks };
+    expect(settings.hooks.PostToolUseFailure).toHaveLength(2); // theirs, plus ours
+    const ours = settings.hooks.PostToolUseFailure!.find((e) => e.hooks.some((h) => h.command === command));
+    expect(ours).toEqual({ matcher: 'mcp__.*', hooks: [{ type: 'command', command }] });
+    expect(ours).toEqual(settings.hooks.PostToolUse![0]);
+
+    const again = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--json']);
+    const againPayload = JSON.parse(again.stdout) as { added: string[]; alreadyInstalled: string[] };
+    expect(againPayload.added).toEqual([]);
+    expect(againPayload.alreadyInstalled).toContain('PostToolUseFailure');
+    expect((readSettings(settingsPath) as { hooks: Hooks }).hooks.PostToolUseFailure).toHaveLength(2);
+
+    const undo = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--undo', '--json']);
+    expect(undo.code).toBe(0);
+    expect((JSON.parse(undo.stdout) as { removed: string[] }).removed).toContain('PostToolUseFailure');
+    settings = readSettings(settingsPath) as { hooks: Hooks };
+    expect(settings.hooks.PostToolUseFailure).toHaveLength(1); // only theirs remains
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('Bash');
+    expect(settings.hooks.PostToolUse).toBeUndefined();
   });
 
   it('--undo is a no-op (and writes nothing) when nothing of ours is installed', async () => {

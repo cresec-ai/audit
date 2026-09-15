@@ -120,8 +120,8 @@ export interface EventBase {
   /**
    * Additive optional field (schema stays v1). Set to `'hook'` when this
    * event was captured by `mcp-recorder hook` — a Claude Code PreToolUse /
-   * PostToolUse / SessionEnd / Stop hook — rather than the stdio/http proxy
-   * tap. Undefined on every proxy-captured event.
+   * PostToolUse / PostToolUseFailure / SessionEnd / Stop hook — rather than
+   * the stdio/http proxy tap. Undefined on every proxy-captured event.
    */
   source?: 'hook';
 }
@@ -160,6 +160,13 @@ export interface ToolCallEvent extends EventBase {
   /** Redacted result tree. */
   result: Scrubbed;
   is_error: boolean;
+  /**
+   * Error details; the message is stored only as a hash ref. `type` is a
+   * free-form string: `mcp-recorder hook` records 'policy_denied' (a
+   * --policy deny), 'tool_error' (PostToolUseFailure, or a PostToolUse
+   * response shaped `{isError: true}`) and 'interrupted' (PostToolUseFailure
+   * with is_interrupt) under it — additive values, no schema change.
+   */
   error?: { code?: number; type?: string; message_ref?: Sha256Ref };
   /** Wall-clock ms between request and response crossing the proxy. */
   duration_ms: number;
