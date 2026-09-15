@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Recorder } from '../src/capture/recorder.js';
 import { Signer } from '../src/chain/keys.js';
@@ -272,5 +272,290 @@ describe('runHttpProxy', () => {
     const res2 = await post(proxy.url, initializeMsg);
     expect(res2.status).toBe(502);
     await proxy.close();
+  });
+
+  it('correlates concurrent clients that both use JSON-RPC id 1 (no collision)', async () => {
+    // Every MCP client starts its id counter at 1; the target answers the
+    // *first* call (id 1, tool A) after the *second* call (id 1, tool B) has
+    // already been sent, so a process-wide pending map keyed on id alone
+    // would misattribute one response to the other client's tool/args.
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const params = msg.params as { name: string };
+      const delay = params.name === 'A_tool' ? 60 : 10; // A answers last
+      setTimeout(() => {
+        const out = JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { content: [{ type: 'text', text: 'from ' + params.name }] },
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(out);
+      }, delay);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const call = (tool: string) =>
+      post(proxy.url, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: tool, arguments: { who: tool } },
+      }).then((r) => r.json() as Promise<Rpc>);
+
+    const [a, b] = await Promise.all([
+      call('A_tool'),
+      new Promise((r) => setTimeout(r, 5)).then(() => call('B_tool')),
+    ]);
+    // Forwarding is untouched: each client gets its own correct wire reply.
+    const aText = (a.result as { content: [{ text: string }] }).content[0].text;
+    const bText = (b.result as { content: [{ text: string }] }).content[0].text;
+    expect(aText).toBe('from A_tool');
+    expect(bText).toBe('from B_tool');
+
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.some((e) => e.kind === 'protocol_error')).toBe(false);
+    const calls = events.filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(calls).toHaveLength(2);
+    const byTool = new Map(calls.map((c) => [c.tool, c]));
+    // "who" is not allow-listed, so it's redacted — assert the ref matches
+    // that CLIENT's own value, i.e. args were not swapped between clients.
+    const redactor = new Redactor();
+    expect(byTool.get('A_tool')?.args).toEqual(redactor.scrub({ who: 'A_tool' }));
+    expect(byTool.get('B_tool')?.args).toEqual(redactor.scrub({ who: 'B_tool' }));
+    // Duration also confirms no swap: A was delayed 60ms, B only 10ms.
+    expect(byTool.get('A_tool')!.duration_ms).toBeGreaterThan(byTool.get('B_tool')!.duration_ms);
+  });
+
+  it('numeric id 1 and string id "1" do not collide', async () => {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const out = JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { content: [{ type: 'text', text: `id-type:${typeof msg.id}` }] },
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const numeric = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'numeric', arguments: {} },
+    }).then((r) => r.json() as Promise<Rpc>);
+    const stringy = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: '1',
+      method: 'tools/call',
+      params: { name: 'stringy', arguments: {} },
+    }).then((r) => r.json() as Promise<Rpc>);
+
+    expect(typeof numeric.id).toBe('number');
+    expect(typeof stringy.id).toBe('string');
+
+    await proxy.close();
+    const events = loadEvents(dataDir);
+    expect(events.some((e) => e.kind === 'protocol_error')).toBe(false);
+    const calls = events.filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(calls).toHaveLength(2);
+    const num = calls.find((c) => c.tool === 'numeric')!;
+    const str = calls.find((c) => c.tool === 'stringy')!;
+    expect(num.request_id).toBe(1);
+    expect(str.request_id).toBe('1');
+  });
+
+  it('an idle SSE stream survives past a short upstream-headers timeout', async () => {
+    const upstream = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': open\n\n');
+      // then stay silent — headers already sent, this must not be torn down
+    });
+    const upstreamUrl = await listen(upstream);
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const store = openStore({ dataDir });
+    const signer = await Signer.load(dataDir);
+    const recorder = new Recorder({ store, signer });
+    const proxy = await runHttpProxy({
+      targetUrl: upstreamUrl + '/mcp',
+      recorder,
+      redactor: new Redactor(),
+      proxyVersion: '0.0.0-test',
+      upstreamHeadersTimeoutMs: 50, // deliberately tiny; must apply pre-headers only
+    });
+    cleanups.push(() => proxy.close());
+
+    const res = await fetch(proxy.url, { headers: { accept: 'text/event-stream' } });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(Buffer.from(first.value!).toString()).toContain('open');
+
+    // Idle for far longer than the 50ms header timeout: the stream must
+    // still be alive (no error, no premature close) once headers arrived.
+    const raced = await Promise.race([
+      reader.read().then(() => 'more-data' as const),
+      new Promise<'still-open'>((r) => setTimeout(() => r('still-open'), 400)),
+    ]);
+    expect(raced).toBe('still-open');
+    await reader.cancel();
+  });
+
+  it('a long-silent POST (no response yet) survives with no default timeout', async () => {
+    const upstream = createServer((req, res) => {
+      setTimeout(() => {
+        const out = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(out);
+      }, 300); // no bytes at all — not even headers — for 300ms
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    // No upstreamHeadersTimeoutMs configured: default is no cap at all.
+    const proxy = await startProxy(url, dataDir);
+
+    const res = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'slow', arguments: {} },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Rpc;
+    expect(body.result).toEqual({ ok: true });
+    await proxy.close();
+  });
+
+  it('aborts the upstream connection when the client disconnects early', async () => {
+    let opened = 0;
+    let closed = 0;
+    const upstream = createServer((req, res) => {
+      opened++;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': open\n\n');
+      const ping = setInterval(() => {
+        try {
+          res.write(': ping\n\n');
+        } catch {
+          /* ignore */
+        }
+      }, 20);
+      res.on('close', () => {
+        closed++;
+        clearInterval(ping);
+      });
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const ac = new AbortController();
+    const res = await fetch(proxy.url, {
+      headers: { accept: 'text/event-stream' },
+      signal: ac.signal,
+    });
+    const reader = res.body!.getReader();
+    await reader.read();
+    ac.abort();
+
+    await vi.waitFor(() => expect(closed).toBe(opened), { timeout: 2000 });
+    expect(opened).toBe(1);
+    await proxy.close();
+  });
+
+  it('records an unanswered event for a request still pending at close()', async () => {
+    const upstream = createServer((req, res) => {
+      // never respond — simulates a tool call still in flight at shutdown
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    // Attach the rejection handler in the same tick the fetch starts, so
+    // the inevitable socket-close-on-shutdown never counts as unhandled.
+    const pending = post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 42,
+      method: 'tools/call',
+      params: { name: 'never_returns', arguments: { x: 1 } },
+    }).catch(() => undefined);
+    // Let the request body reach the tap before closing.
+    await new Promise((r) => setTimeout(r, 30));
+    await proxy.close();
+    // The client-facing response socket is torn down by close(); swallow.
+    await pending;
+
+    const events = loadEvents(dataDir);
+    const call = events.find(
+      (e) => e.kind === 'tool_call' && (e as ToolCallEvent).tool === 'never_returns',
+    ) as ToolCallEvent | undefined;
+    expect(call).toBeDefined();
+    expect(call!.is_error).toBe(true);
+    expect(call!.result).toBeNull();
+    expect(call!.error?.type).toBe('unanswered');
+    expect(call!.request_id).toBe(42);
+
+    // Recorded strictly before session_end.
+    const callIdx = events.indexOf(call!);
+    const endIdx = events.findIndex((e) => e.kind === 'session_end');
+    expect(endIdx).toBeGreaterThan(callIdx);
+  });
+
+  it('never stores target URL userinfo in ServerContext.command or any event', async () => {
+    const target = await startJsonTarget();
+    const withCreds = target.url.replace('http://', 'http://svcuser:sup3rSecr3t@');
+
+    const dataDir = tmpDataDir();
+    const store = openStore({ dataDir });
+    const signer = await Signer.load(dataDir);
+    const recorder = new Recorder({ store, signer });
+    const proxy = await runHttpProxy({
+      targetUrl: withCreds,
+      recorder,
+      redactor: new Redactor(),
+      proxyVersion: '0.0.0-test',
+    });
+    cleanups.push(() => proxy.close());
+
+    // The credentials must still reach the upstream server (forwarding is
+    // unaffected); the plain target has no auth check here, so this just
+    // proves traffic still flows through the credentialed URL.
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain('svcuser');
+    expect(serialized).not.toContain('sup3rSecr3t');
+    for (const e of events) {
+      expect(e.server.command).not.toContain('svcuser');
+      expect(e.server.command).not.toContain('sup3rSecr3t');
+      expect(e.server.command.startsWith('http://')).toBe(true);
+    }
   });
 });
