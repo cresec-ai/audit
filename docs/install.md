@@ -41,6 +41,19 @@ npm install -g github:cresec-ai/audit#main
 
 If you had an older install, the same command replaces it.
 
+**npm 11 (the npm that ships with Node 24) and the SQLite backend.** npm 11
+refuses to run a dependency's install script on a global install unless you
+allow it, and better-sqlite3 needs its script to fetch the native binding.
+Without it the recorder still works — it falls back to the JSONL store and
+says so once on stderr — but to get SQLite, allow the script:
+
+```sh
+npm install -g --allow-scripts=better-sqlite3 github:cresec-ai/audit#main
+```
+
+(or `npm config set allow-scripts=better-sqlite3 --location=user` once, for
+every future global install). npm 10 runs the script without being asked.
+
 Confirm it worked:
 
 ```sh
@@ -534,6 +547,13 @@ it directly without the wrapper to confirm — `npx -y @modelcontextprotocol/ser
 **Rule out the recorder entirely.** Set `MCP_RECORDER_DISABLE=1` in the
 wrapped command's environment: traffic flows straight through with nothing
 recorded. If the problem persists with this set, it isn't the recorder.
+
+**`mcp-recorder setup` says `Unknown option '--client'`.** The `mcp-recorder`
+on your `PATH` is an older install from before `setup` existed, not the one
+you just installed. `which -a mcp-recorder` lists every copy; remove the
+stale one (or `npm uninstall -g @edut/mcp-recorder` under the Node version
+that owns it), then `hash -r`. `npm ls -g @edut/mcp-recorder` shows where
+the current one lives.
 
 **Read stderr.** The recorder never writes diagnostics to stdout (stdout is
 the MCP wire) — everything it logs is prefixed `[mcp-recorder]` on stderr.
