@@ -42,7 +42,9 @@ access to do this for you.
 Full instructions (manual JSON edits per client, uninstall, troubleshooting)
 are in **[docs/install.md](docs/install.md)** — on Windows, or running from
 inside WSL, see its **[Windows and WSL](docs/install.md#windows-and-wsl)**
-section first.
+section first. What the recorder can and cannot see of Claude's built-in
+connectors, per surface, and what needs Anthropic, is in
+**[docs/connector-coverage.md](docs/connector-coverage.md)**.
 
 ## 60-second quickstart
 
