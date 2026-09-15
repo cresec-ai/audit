@@ -12,7 +12,8 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { inflateRawSync } from 'node:zlib';
 
@@ -26,6 +27,20 @@ import { queryStore } from './query/touched.js';
 import { Redactor } from './redact/redactor.js';
 import { renderTimelineHtml } from './replay/render.js';
 import { serveUi } from './replay/serve.js';
+import { CLIENT_KINDS, isClientKind, resolveClientConfigPath } from './setup/client-config.js';
+import type { ClientKind } from './setup/client-config.js';
+import {
+  detectIndent,
+  readSidecarStrict,
+  removeSidecar,
+  sidecarPath,
+  writeBackup,
+  writeJsonAtomic,
+  writeSidecarAtomic,
+} from './setup/io.js';
+import type { SetupSidecar } from './setup/io.js';
+import { planWrap, structuralUnwrap } from './setup/wrap.js';
+import type { McpServersMap, ServerEntry, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
 import { openStore, openStoreReadOnly } from './store/index.js';
 import type { AnyEvent, ChainRecord } from './schema/events.js';
 import type {
@@ -44,7 +59,7 @@ import { VERSION } from './version.js';
 
 type Flags = Record<string, string | boolean | undefined>;
 
-const SUBCOMMANDS = ['record', 'verify', 'query', 'sessions', 'ui', 'export', 'http'] as const;
+const SUBCOMMANDS = ['record', 'verify', 'query', 'sessions', 'ui', 'export', 'http', 'setup'] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
 const HELP = `@edut/mcp-recorder v${VERSION} — black-box flight recorder for MCP
@@ -71,6 +86,12 @@ Usage:
       signed evidence bundle a stranger can verify with plain Node.js
   mcp-recorder http     --target URL [--port N] [flags]
       transparent streamable-HTTP proxy in front of an HTTP MCP server
+  mcp-recorder setup    --client <claude-desktop|claude-code|cursor> [--config PATH]
+                        [--wrapper local|npx] [--only N,...] [--except N,...]
+                        [--data-dir D] [--dry-run] [--undo] [--json]
+      wrap every stdio MCP server in a client's config behind this recorder,
+      safely (timestamped backup + sidecar) and reversibly (--undo). --config
+      overrides the resolved path and makes --client optional
   mcp-recorder --help | --version
 
 Flags:
@@ -86,7 +107,14 @@ Flags:
   --allow-unsigned
                    verify: downgrade an unsigned chain/tail to a warning
                    instead of a failure (still reported, never silent)
-  --json          machine-readable output (verify / query / sessions)
+  --json          machine-readable output (verify / query / sessions / setup)
+  --client C      setup: claude-desktop | claude-code | cursor
+  --config PATH   setup: config file to edit (overrides --client's default)
+  --wrapper W     setup: local (default, this install) | npx (published form)
+  --only N,...    setup: wrap only these server names
+  --except N,...  setup: wrap every server except these names
+  --dry-run       setup: print what would change; write nothing
+  --undo          setup: restore the servers this tool wrapped
   --help, -h      show this help and exit
   --version, -V   show the version and exit
 
@@ -110,6 +138,13 @@ const FLAG_DEFS = {
   'allow-unsigned': { type: 'boolean' },
   json: { type: 'boolean' },
   'no-open': { type: 'boolean' },
+  client: { type: 'string' },
+  config: { type: 'string' },
+  wrapper: { type: 'string' },
+  only: { type: 'string' },
+  except: { type: 'string' },
+  'dry-run': { type: 'boolean' },
+  undo: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } as const;
@@ -1153,6 +1188,329 @@ async function cmdExport(flags: Flags): Promise<void> {
   }
 }
 
+/* --------------------------------- setup ---------------------------------
+ * `mcp-recorder setup` rewrites a client config's `mcpServers` entries to run
+ * behind this recorder. cli.ts owns every filesystem side effect and exit
+ * code; src/setup/wrap.ts decides *what* the new JSON should look like
+ * (pure functions over parsed JSON) and src/setup/io.ts provides the
+ * backup/sidecar/atomic-write primitives. See src/setup/wrap.ts's WrapPlan
+ * doc comment for the wrapped/skipped/alreadyWrapped shape mirrored below.
+ */
+
+/**
+ * Absolute path to THIS install's dist/cli.js, for `setup --wrapper local`.
+ * `import.meta.url` names wherever this file is actually running from —
+ * `dist/cli.js` once built, or `src/cli.ts` under tsx (as the test suite
+ * runs it) — so resolving through the package root one level up, rather
+ * than trusting the self path verbatim, lands on the same spawnable
+ * `dist/cli.js` either way. That file must exist (a real install always
+ * ships dist/; a dev checkout needs `npm run build` first) since it is what
+ * setup writes into the client's config to be spawned later.
+ */
+function resolveLocalWrapperPath(): string {
+  const selfPath = fileURLToPath(import.meta.url);
+  const packageRoot = resolve(dirname(selfPath), '..');
+  return join(packageRoot, 'dist', 'cli.js');
+}
+
+function parseNameList(v: string | undefined): Set<string> | undefined {
+  if (v === undefined) return undefined;
+  const names = v
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return names.length > 0 ? new Set(names) : undefined;
+}
+
+interface SetupJsonResult {
+  config: string;
+  backup: string | null;
+  wrapped: string[];
+  skipped: SkipEntry[];
+  already_wrapped: string[];
+}
+
+function printSetupHuman(configPath: string, backup: string | null, plan: WrapPlan, dryRun: boolean): void {
+  out(`config: ${configPath}`);
+  if (dryRun) out('(dry run — nothing written)');
+  if (plan.wrapped.length > 0) {
+    out('');
+    out(`wrapped ${plan.wrapped.length} server(s):`);
+    for (const name of plan.wrapped) {
+      const entry = plan.next[name]!;
+      out(`  ${name}: ${entry.command} ${(entry.args ?? []).map((a) => JSON.stringify(a)).join(' ')}`);
+    }
+  } else {
+    out('');
+    out('nothing to wrap');
+  }
+  if (plan.alreadyWrapped.length > 0) {
+    out('');
+    out(`already wrapped, left alone: ${plan.alreadyWrapped.join(', ')}`);
+  }
+  if (plan.skipped.length > 0) {
+    out('');
+    out('skipped:');
+    for (const s of plan.skipped) out(`  ${s.name}: ${s.reason}`);
+  }
+  if (backup !== null) {
+    out('');
+    out(`backup: ${backup}`);
+  }
+  if (!dryRun && plan.wrapped.length > 0) {
+    out('');
+    out('Fully quit and restart your MCP client to pick up this change');
+    out('(Claude Desktop: quit from the menu bar / tray icon — closing the window is not enough).');
+    out('Then check the first recording with:');
+    out('  mcp-recorder sessions');
+    out('  mcp-recorder ui');
+  }
+}
+
+function printSetupResult(
+  configPath: string,
+  backup: string | null,
+  plan: WrapPlan,
+  jsonOut: boolean,
+  dryRun: boolean,
+): void {
+  if (jsonOut) {
+    const payload: SetupJsonResult = {
+      config: configPath,
+      backup,
+      wrapped: plan.wrapped,
+      skipped: plan.skipped,
+      already_wrapped: plan.alreadyWrapped,
+    };
+    out(JSON.stringify(payload, null, 2));
+    return;
+  }
+  printSetupHuman(configPath, backup, plan, dryRun);
+}
+
+interface UndoOutcome {
+  restored: string[];
+  skipped: SkipEntry[];
+  usedSidecar: boolean;
+}
+
+function printUndoResult(
+  configPath: string,
+  backup: string | null,
+  outcome: UndoOutcome,
+  jsonOut: boolean,
+  dryRun: boolean,
+): void {
+  if (jsonOut) {
+    out(
+      JSON.stringify(
+        {
+          config: configPath,
+          backup,
+          restored: outcome.restored,
+          skipped: outcome.skipped,
+          used_sidecar: outcome.usedSidecar,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  out(`config: ${configPath}`);
+  if (dryRun) out('(dry run — nothing written)');
+  out(
+    outcome.usedSidecar
+      ? 'restoring from the sidecar (exact original entries):'
+      : 'no sidecar found — structurally unwrapping recorder entries:',
+  );
+  if (outcome.restored.length > 0) {
+    for (const name of outcome.restored) out(`  ${name}`);
+  } else {
+    out('  nothing to restore');
+  }
+  if (outcome.skipped.length > 0) {
+    out('');
+    out('skipped:');
+    for (const s of outcome.skipped) out(`  ${s.name}: ${s.reason}`);
+  }
+  if (backup !== null) {
+    out('');
+    out(`backup: ${backup}`);
+  }
+}
+
+/**
+ * `setup --undo`: restore the entries this tool wrapped. Prefers the sidecar
+ * (`<config>.mcp-recorder-setup.json`) for an exact, byte-for-byte restore of
+ * what was there before; falls back to structurally stripping a recognizable
+ * wrapper prefix when the sidecar is missing (see structuralUnwrap).
+ */
+function runSetupUndo(
+  configPath: string,
+  root: Record<string, unknown>,
+  servers: McpServersMap,
+  indent: string,
+  dryRun: boolean,
+  jsonOut: boolean,
+): void {
+  let sidecar: SetupSidecar | undefined;
+  try {
+    sidecar = readSidecarStrict(configPath);
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    diag(`error: ${sidecarPath(configPath)} exists but is not valid JSON: ${msg}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const next: McpServersMap = { ...servers };
+  const restored: string[] = [];
+  const skipped: SkipEntry[] = [];
+
+  if (sidecar !== undefined) {
+    for (const [name, original] of Object.entries(sidecar.wrapped)) {
+      if (!(name in next)) {
+        skipped.push({ name, reason: 'not present in current config' });
+        continue;
+      }
+      next[name] = original;
+      restored.push(name);
+    }
+  } else {
+    for (const [name, entry] of Object.entries(servers)) {
+      const original = structuralUnwrap(entry);
+      if (original === undefined) continue;
+      next[name] = original;
+      restored.push(name);
+    }
+  }
+
+  const outcome: UndoOutcome = { restored, skipped, usedSidecar: sidecar !== undefined };
+
+  if (dryRun || restored.length === 0) {
+    printUndoResult(configPath, null, outcome, jsonOut, dryRun);
+    return;
+  }
+
+  const backup = writeBackup(configPath);
+  root.mcpServers = next;
+  writeJsonAtomic(configPath, root, indent);
+  if (sidecar !== undefined) removeSidecar(configPath);
+
+  printUndoResult(configPath, backup, outcome, jsonOut, false);
+}
+
+async function cmdSetup(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+
+  const clientFlag = asStr(flags['client']);
+  if (clientFlag !== undefined && !isClientKind(clientFlag)) {
+    err(`setup: invalid --client '${clientFlag}' (expected ${CLIENT_KINDS.join(', ')})`);
+  }
+  const client = clientFlag as ClientKind | undefined;
+
+  const wrapperFlag = asStr(flags['wrapper']) ?? 'local';
+  if (wrapperFlag !== 'local' && wrapperFlag !== 'npx') {
+    err(`setup: invalid --wrapper '${wrapperFlag}' (expected 'local' or 'npx')`);
+  }
+  const wrapper = wrapperFlag as 'local' | 'npx';
+
+  const dataDir = asStr(flags['data-dir']);
+  const dryRun = flags['dry-run'] === true;
+  const isUndo = flags.undo === true;
+  const jsonOut = flags.json === true;
+  const only = parseNameList(asStr(flags['only']));
+  const except = parseNameList(asStr(flags['except']));
+
+  let resolved: ReturnType<typeof resolveClientConfigPath>;
+  try {
+    resolved = resolveClientConfigPath(client, asStr(flags['config']), process.cwd());
+  } catch (cause) {
+    err(cause instanceof Error ? cause.message : String(cause));
+  }
+  const configPath = resolved.path;
+  if (resolved.note !== undefined) diag(resolved.note);
+
+  if (!existsSync(configPath)) {
+    diag(`error: config file not found at ${configPath}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  let raw: string;
+  let parsed: unknown;
+  try {
+    raw = readFileSync(configPath, 'utf8');
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    diag(`error: ${configPath} is not valid JSON: ${msg}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    diag(`error: ${configPath} does not contain a JSON object`);
+    process.exitCode = 2;
+    return;
+  }
+  const root = parsed as Record<string, unknown>;
+  const serversRaw = root['mcpServers'];
+  const servers: McpServersMap =
+    typeof serversRaw === 'object' && serversRaw !== null && !Array.isArray(serversRaw)
+      ? (serversRaw as McpServersMap)
+      : {};
+  const indent = detectIndent(raw);
+
+  if (isUndo) {
+    runSetupUndo(configPath, root, servers, indent, dryRun, jsonOut);
+    return;
+  }
+
+  const localWrapperPath = resolveLocalWrapperPath();
+  const wrapOpts: WrapOpts = { wrapper, localWrapperPath };
+  if (dataDir !== undefined) wrapOpts.dataDir = dataDir;
+  if (only !== undefined) wrapOpts.only = only;
+  if (except !== undefined) wrapOpts.except = except;
+
+  const plan = planWrap(servers, wrapOpts);
+
+  if (dryRun) {
+    printSetupResult(configPath, null, plan, jsonOut, true);
+    return;
+  }
+
+  if (plan.wrapped.length === 0) {
+    // Idempotent: every candidate was already wrapped (or filtered/skipped)
+    // — report it, but never touch the file (no new backup, no sidecar).
+    printSetupResult(configPath, null, plan, jsonOut, false);
+    return;
+  }
+
+  // Validate any existing sidecar BEFORE writing anything, so a corrupt
+  // sidecar aborts cleanly (exit 2, config untouched) instead of partially
+  // applying the wrap.
+  let existingSidecar: SetupSidecar;
+  try {
+    existingSidecar = readSidecarStrict(configPath) ?? { version: 1, wrapped: {} };
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    diag(`error: ${sidecarPath(configPath)} exists but is not valid JSON: ${msg}`);
+    process.exitCode = 2;
+    return;
+  }
+  for (const name of plan.wrapped) {
+    if (!(name in existingSidecar.wrapped)) existingSidecar.wrapped[name] = plan.originals[name]!;
+  }
+
+  const backup = writeBackup(configPath);
+  root.mcpServers = plan.next;
+  writeJsonAtomic(configPath, root, indent);
+  writeSidecarAtomic(configPath, existingSidecar, indent);
+
+  printSetupResult(configPath, backup, plan, jsonOut, false);
+}
+
 /* -------------------------------- dispatch ------------------------------- */
 
 async function main(): Promise<void> {
@@ -1211,6 +1569,8 @@ async function main(): Promise<void> {
       return cmdExport(flags);
     case 'http':
       return cmdHttp(flags);
+    case 'setup':
+      return cmdSetup(flags);
   }
 }
 
