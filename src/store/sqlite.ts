@@ -41,6 +41,52 @@ export function isSqliteAvailable(): boolean {
   return loadSqlite() !== undefined;
 }
 
+/**
+ * How long the one-time open/schema step keeps retrying SQLITE_BUSY. It
+ * runs once per process, before any traffic flows, so a generous bound is
+ * fine — see the constructor for why `busy_timeout` alone is not enough.
+ */
+export const INIT_BUSY_DEADLINE_MS = 10_000;
+
+/** better-sqlite3 surfaces lock contention as a SqliteError with this code. */
+export function isSqliteBusy(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code.startsWith('SQLITE_BUSY')) return true;
+  return /database is locked/i.test(err.message);
+}
+
+/** A real synchronous sleep, without a native dependency. */
+function sleepSync(ms: number): void {
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+/**
+ * Run `fn`, retrying with a short exponential backoff (5 ms doubling up to
+ * 100 ms) for as long as it fails with SQLITE_BUSY and the deadline has not
+ * passed. Any other error, or a busy error past the deadline, propagates.
+ * `sleep`/`now` are injectable for tests.
+ */
+export function retryWhileBusy<T>(
+  fn: () => T,
+  opts: { deadlineMs: number; sleep?: (ms: number) => void; now?: () => number },
+): T {
+  const sleep = opts.sleep ?? sleepSync;
+  const now = opts.now ?? Date.now;
+  const start = now();
+  let delay = 5;
+  for (;;) {
+    try {
+      return fn();
+    } catch (err) {
+      if (!isSqliteBusy(err) || now() - start >= opts.deadlineMs) throw err;
+      sleep(delay);
+      delay = Math.min(delay * 2, 100);
+    }
+  }
+}
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS records (
   seq        INTEGER PRIMARY KEY,
@@ -158,9 +204,24 @@ export class SqliteStore implements EvidenceStore {
     // machine. This happens once, before any traffic flows, so a generous
     // synchronous wait is fine here — a failure at this point would disable
     // recording for the whole session.
+    //
+    // busy_timeout alone does not cover this race: SQLite deliberately skips
+    // the busy handler and returns SQLITE_BUSY at once when waiting could
+    // deadlock — the classic case being a connection that already holds a
+    // SHARED lock (it just read the header/schema) asking to write while
+    // another connection holds PENDING, which is exactly what two fresh
+    // processes switching to WAL and running CREATE TABLE at the same moment
+    // look like. So the open/schema step is additionally retried from
+    // scratch on SQLITE_BUSY with a short backoff (CI reproduced the bare
+    // "database is locked" at init with the 10 s timeout already in place).
     this.db.pragma('busy_timeout = 10000');
-    this.db.pragma('journal_mode = WAL');
-    this.db.exec(DDL);
+    retryWhileBusy(
+      () => {
+        this.db.pragma('journal_mode = WAL');
+        this.db.exec(DDL);
+      },
+      { deadlineMs: INIT_BUSY_DEADLINE_MS },
+    );
     // Steady state: appends must never stall forwarding, so the wait is
     // short and the recorder retries asynchronously instead.
     this.db.pragma('busy_timeout = 100');
