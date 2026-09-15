@@ -9,10 +9,19 @@
  * almost always what someone running `setup` from inside a project means.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, win32 } from 'node:path';
 import { windowsClientConfigCandidates } from './wsl.js';
+
+// The win32 branch of claudeDesktopConfigPath() below builds Windows paths
+// regardless of the host platform it happens to execute on (tests simulate
+// `platform: 'win32'` from any OS — see test/client-config.test.ts), so it
+// deliberately uses path.win32 rather than the ambient, host-dependent
+// `join`. On a real Windows host the two are identical; this only changes
+// output on a non-Windows host, where it's what makes the simulation
+// meaningful.
+const joinWin32 = win32.join;
 
 export type ClientKind = 'claude-desktop' | 'claude-code' | 'cursor';
 
@@ -22,15 +31,67 @@ export function isClientKind(value: string): value is ClientKind {
   return (CLIENT_KINDS as readonly string[]).includes(value);
 }
 
-function claudeDesktopConfigPath(): string {
-  if (process.platform === 'darwin') {
-    return join(homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+/**
+ * Where Claude Desktop's config lives, per platform. On win32 there are two
+ * install shapes: an ordinary installer, which uses `%APPDATA%\Claude\...`
+ * (the primary, tried first and always preferred when it exists), and an
+ * MSIX / Microsoft Store install, which is sandboxed into a
+ * per-package-identity `LocalCache` under
+ * `%LOCALAPPDATA%\Packages\Claude_<publisher-hash>\LocalCache\Roaming\Claude\...`
+ * — `Claude_` plus an opaque hash that differs per machine, hence the
+ * `Claude_*` glob. `fileExists`/`listDir` are injectable (real `fs` by
+ * default) so this is testable by simulating `platform: 'win32'` on any
+ * host, the same pattern `src/proxy/spawn.ts` uses.
+ */
+export function claudeDesktopConfigPath(
+  fileExists: (p: string) => boolean = existsSync,
+  listDir: (p: string) => string[] = readdirSync,
+  platform: NodeJS.Platform = process.platform,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): ResolvedConfigPath {
+  if (platform === 'darwin') {
+    return { path: join(homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') };
   }
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming');
-    return join(appData, 'Claude', 'claude_desktop_config.json');
+  if (platform === 'win32') {
+    const appData = env.APPDATA ?? joinWin32(homedir(), 'AppData', 'Roaming');
+    const primary = joinWin32(appData, 'Claude', 'claude_desktop_config.json');
+    if (fileExists(primary)) return { path: primary };
+
+    const localAppData = env.LOCALAPPDATA ?? joinWin32(homedir(), 'AppData', 'Local');
+    const packagesDir = joinWin32(localAppData, 'Packages');
+    let entries: string[] = [];
+    try {
+      entries = listDir(packagesDir);
+    } catch {
+      entries = [];
+    }
+    const msixCandidates = entries
+      .filter((name) => name.startsWith('Claude_'))
+      .sort()
+      .map((name) => joinWin32(packagesDir, name, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'));
+    const existingMsix = msixCandidates.filter((p) => fileExists(p));
+
+    if (existingMsix.length === 1) {
+      return {
+        path: existingMsix[0]!,
+        note: `Claude Desktop config found at its Microsoft Store (MSIX) install location ${existingMsix[0]!} (no config at ${primary})`,
+      };
+    }
+    if (existingMsix.length > 1) {
+      throw new Error(
+        'setup: multiple Microsoft Store (MSIX) Claude Desktop config candidates found — pass --config PATH to pick one:\n' +
+          existingMsix.map((p) => `  ${p}`).join('\n'),
+      );
+    }
+    return {
+      path: primary,
+      note:
+        msixCandidates.length > 0
+          ? `also checked for a Microsoft Store (MSIX) install (none found): ${msixCandidates.join(', ')}`
+          : `also checked for a Microsoft Store (MSIX) install under ${packagesDir} (no Claude_* package found)`,
+    };
   }
-  return join(homedir(), '.config', 'Claude', 'claude_desktop_config.json');
+  return { path: join(homedir(), '.config', 'Claude', 'claude_desktop_config.json') };
 }
 
 export interface ResolvedConfigPath {
@@ -75,8 +136,18 @@ function resolveWithWslFallback(
   linuxPath: string,
   wsl: WslContext | undefined,
   fileExists: (p: string) => boolean,
+  /** A note already attached to `linuxPath` by its caller (e.g. the win32
+   * MSIX note from {@link claudeDesktopConfigPath}) — carried through
+   * whenever this function takes its own early-return path, since that path
+   * doesn't otherwise produce a note of its own. The two never coexist:
+   * `wsl.inWsl` is only ever true on Linux, where `claudeDesktopConfigPath`
+   * never takes the win32 branch that produces this note in the first
+   * place. */
+  primaryNote?: string,
 ): ResolvedConfigPath {
-  if (fileExists(linuxPath) || wsl === undefined || !wsl.inWsl) return { path: linuxPath };
+  if (fileExists(linuxPath) || wsl === undefined || !wsl.inWsl) {
+    return primaryNote !== undefined ? { path: linuxPath, note: primaryNote } : { path: linuxPath };
+  }
 
   const windowsCandidates = windowsClientConfigCandidates(client, wsl.homeCandidates());
   const existing = windowsCandidates.filter((p) => fileExists(p));
@@ -124,8 +195,10 @@ export function resolveClientConfigPath(
     );
   }
   switch (client) {
-    case 'claude-desktop':
-      return resolveWithWslFallback(client, claudeDesktopConfigPath(), wsl, fileExists);
+    case 'claude-desktop': {
+      const desktop = claudeDesktopConfigPath(fileExists);
+      return resolveWithWslFallback(client, desktop.path, wsl, fileExists, desktop.note);
+    }
     case 'claude-code': {
       const projectConfig = resolve(cwd, '.mcp.json');
       if (fileExists(projectConfig)) {

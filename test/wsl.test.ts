@@ -223,6 +223,56 @@ describe('windowsClientConfigCandidates', () => {
     const out = windowsClientConfigCandidates('claude-code', ['/mnt/c/Users/joni']);
     expect(out).toEqual([]);
   });
+
+  it('claude-desktop: no readdirFn given defaults to the real fs and never throws when the Packages dir is absent', () => {
+    // Regression guard: on a real (non-Windows) test machine
+    // /mnt/c/Users/joni/AppData/Local/Packages doesn't exist — the default
+    // readdirSync throws ENOENT, which must be swallowed, not propagated.
+    const out = windowsClientConfigCandidates('claude-desktop', ['/mnt/c/Users/joni']);
+    expect(out).toEqual(['/mnt/c/Users/joni/AppData/Roaming/Claude/claude_desktop_config.json']);
+  });
+
+  it('claude-desktop: appends every Claude_* MSIX package match after the ordinary Roaming path', () => {
+    const readdir = (p: string): string[] => {
+      expect(p).toBe('/mnt/c/Users/joni/AppData/Local/Packages');
+      return ['Claude_pzs8sxrjxfjjc', 'SomeOtherVendor_abc123', 'Claude_anotherhash'];
+    };
+    const out = windowsClientConfigCandidates('claude-desktop', ['/mnt/c/Users/joni'], readdir);
+    expect(out).toEqual([
+      '/mnt/c/Users/joni/AppData/Roaming/Claude/claude_desktop_config.json',
+      '/mnt/c/Users/joni/AppData/Local/Packages/Claude_anotherhash/LocalCache/Roaming/Claude/claude_desktop_config.json',
+      '/mnt/c/Users/joni/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude_desktop_config.json',
+    ]);
+  });
+
+  it('claude-desktop: per home directory, both the Roaming path and that home\'s own MSIX matches', () => {
+    const readdir = (p: string): string[] =>
+      p === '/mnt/c/Users/joni/AppData/Local/Packages' ? ['Claude_joniHash'] : [];
+    const out = windowsClientConfigCandidates('claude-desktop', ['/mnt/c/Users/joni', '/mnt/c/Users/bob'], readdir);
+    expect(out).toEqual([
+      '/mnt/c/Users/joni/AppData/Roaming/Claude/claude_desktop_config.json',
+      '/mnt/c/Users/joni/AppData/Local/Packages/Claude_joniHash/LocalCache/Roaming/Claude/claude_desktop_config.json',
+      '/mnt/c/Users/bob/AppData/Roaming/Claude/claude_desktop_config.json',
+    ]);
+  });
+
+  it('claude-desktop: a readdir that throws (missing Packages dir) yields no MSIX candidates, not an error', () => {
+    const readdir = (): string[] => {
+      throw new Error('ENOENT');
+    };
+    const out = windowsClientConfigCandidates('claude-desktop', ['/mnt/c/Users/joni'], readdir);
+    expect(out).toEqual(['/mnt/c/Users/joni/AppData/Roaming/Claude/claude_desktop_config.json']);
+  });
+
+  it('cursor and claude-code ignore the readdirFn parameter entirely', () => {
+    const readdir = (): string[] => {
+      throw new Error('must not be called for cursor/claude-code');
+    };
+    expect(windowsClientConfigCandidates('cursor', ['/mnt/c/Users/joni'], readdir)).toEqual([
+      '/mnt/c/Users/joni/.cursor/mcp.json',
+    ]);
+    expect(windowsClientConfigCandidates('claude-code', ['/mnt/c/Users/joni'], readdir)).toEqual([]);
+  });
 });
 
 /* ------------------------------ isWindowsMountPath ------------------------- */

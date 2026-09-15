@@ -11,6 +11,19 @@
 export type ClientKind = 'claude-desktop' | 'claude-code' | 'cursor';
 export declare const CLIENT_KINDS: readonly ClientKind[];
 export declare function isClientKind(value: string): value is ClientKind;
+/**
+ * Where Claude Desktop's config lives, per platform. On win32 there are two
+ * install shapes: an ordinary installer, which uses `%APPDATA%\Claude\...`
+ * (the primary, tried first and always preferred when it exists), and an
+ * MSIX / Microsoft Store install, which is sandboxed into a
+ * per-package-identity `LocalCache` under
+ * `%LOCALAPPDATA%\Packages\Claude_<publisher-hash>\LocalCache\Roaming\Claude\...`
+ * — `Claude_` plus an opaque hash that differs per machine, hence the
+ * `Claude_*` glob. `fileExists`/`listDir` are injectable (real `fs` by
+ * default) so this is testable by simulating `platform: 'win32'` on any
+ * host, the same pattern `src/proxy/spawn.ts` uses.
+ */
+export declare function claudeDesktopConfigPath(fileExists?: (p: string) => boolean, listDir?: (p: string) => string[], platform?: NodeJS.Platform, env?: Readonly<Record<string, string | undefined>>): ResolvedConfigPath;
 export interface ResolvedConfigPath {
     path: string;
     /** Set when the resolution made a choice worth telling the operator about
