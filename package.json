@@ -27,6 +27,9 @@
   "files": [
     "dist",
     "docs/event-schema.md",
+    "docs/gateway.md",
+    "docs/policy.md",
+    "docs/policy-schema.json",
     "README.md",
     "LICENSE"
   ],
