@@ -66,8 +66,15 @@ export declare function windowsHomeCandidates(deps?: Partial<WindowsHomeDeps>): 
  * candidate home directory. `claude-code` has none: Claude Code running
  * inside WSL is a plain Linux install using `~/.claude.json` there —
  * there's no separate Windows-side config for it to fall back to.
+ *
+ * `claude-desktop` yields, per home, the ordinary installer path
+ * (`AppData/Roaming/Claude/...`) followed by every MSIX / Microsoft Store
+ * package match under `AppData/Local/Packages` (see
+ * {@link msixClaudeDesktopCandidates}), since a Windows install can be
+ * either shape. `readdirFn` is only used for that MSIX lookup and defaults
+ * to the real `fs.readdirSync`.
  */
-export declare function windowsClientConfigCandidates(client: ClientKind, homes: readonly string[]): string[];
+export declare function windowsClientConfigCandidates(client: ClientKind, homes: readonly string[], readdirFn?: (p: string) => string[]): string[];
 /** True for a WSL Windows-drive mount path, e.g. `/mnt/c/Users/me/...`. */
 export declare function isWindowsMountPath(p: string): boolean;
 export type WrapperChoice = 'local' | 'npx' | 'wsl';
