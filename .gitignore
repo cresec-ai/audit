@@ -24,3 +24,4 @@ bundle*.zip
 
 # Claude Code agent worktrees
 .claude/worktrees/
+.mcp-recorder-install.lock/
