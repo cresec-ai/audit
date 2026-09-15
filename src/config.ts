@@ -20,7 +20,7 @@
  * inspection commands create it via whichever store/signer they open.
  */
 
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ENV } from './types.js';
@@ -55,6 +55,15 @@ function pick(
  * holds the ed25519 signing key. */
 export function ensureDataDir(dataDir: string): void {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  // mkdirSync never changes the mode of a directory that already exists (an
+  // earlier inspection command, or the user, may have created it under a
+  // wider umask), and this directory holds the private signing key and the
+  // evidence — tighten it. Best effort: chmod fails on a dir we do not own.
+  try {
+    if ((statSync(dataDir).mode & 0o077) !== 0) chmodSync(dataDir, 0o700);
+  } catch {
+    /* best effort */
+  }
 }
 
 interface CommonFields {

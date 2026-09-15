@@ -18,6 +18,8 @@ class FakeStore implements EvidenceStore {
   sigs: HeadSignature[] = [];
   closed = 0;
   failAppend = false;
+  /** Fail this many appendEvents calls (e.g. lock contention), then succeed. */
+  failTimes = 0;
 
   head(): ChainHead {
     const last = this.records[this.records.length - 1];
@@ -40,6 +42,10 @@ class FakeStore implements EvidenceStore {
   }
   appendEvents(events: AnyEvent[]): ChainRecord[] {
     if (this.failAppend) throw new Error('disk on fire');
+    if (this.failTimes > 0) {
+      this.failTimes--;
+      throw new Error('database is locked');
+    }
     let head = this.head();
     const sealed: ChainRecord[] = [];
     for (const event of events) {
@@ -238,5 +244,21 @@ describe('Recorder', () => {
     expect(signer.calls).toHaveLength(0);
     expect(store.sigs).toHaveLength(0);
     await rec.close();
+  });
+});
+
+describe('Recorder retry on transient store failure', () => {
+  it('retries a batch that fails transiently (lock contention) and drops nothing', async () => {
+    const store = new FakeStore();
+    store.failTimes = 2; // the first two attempts hit "database is locked"
+    const recorder = new Recorder({ store, signer: null });
+    recorder.record(makeEvent(1));
+    recorder.record(makeEvent(2));
+    recorder.record(makeEvent(3));
+    await recorder.flush();
+    expect(store.records.map((r) => r.seq)).toEqual([1, 2, 3]);
+    expect(recorder.stats()).toMatchObject({ written: 3, dropped: 0, storeFailed: false });
+    expect(store.failTimes).toBe(0);
+    await recorder.close();
   });
 });

@@ -22,6 +22,7 @@
 
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { GENESIS_HASH } from '../chain/hash.js';
 import { ENV, FILES } from '../types.js';
 import type { EvidenceStore, OpenStoreOpts } from '../types.js';
 import { SqliteStore, isSqliteAvailable } from './sqlite.js';
@@ -82,7 +83,8 @@ function openFreshStore(dataDir: string): EvidenceStore {
 }
 
 export function openStore(opts: OpenStoreOpts): EvidenceStore {
-  mkdirSync(opts.dataDir, { recursive: true });
+  // 0o700: the data dir holds the private signing key and the evidence.
+  mkdirSync(opts.dataDir, { recursive: true, mode: 0o700 });
   const backend = opts.backend ?? envBackend();
 
   if (backend === 'sqlite') return new SqliteStore(opts.dataDir);
@@ -115,12 +117,38 @@ export function openStore(opts: OpenStoreOpts): EvidenceStore {
  */
 export function openStoreReadOnly(opts: OpenStoreOpts): EvidenceStore {
   const backend = opts.backend ?? envBackend();
-  if (backend === undefined) {
-    const existing = existingBackendFiles(opts.dataDir);
-    if (!existing.sqlite && !existing.jsonl) {
-      // JsonlStore never writes at open — reads nothing, creates nothing.
-      return new JsonlStore(opts.dataDir);
-    }
+  const existing = existingBackendFiles(opts.dataDir);
+  if (backend !== undefined) {
+    const present = backend === 'sqlite' ? existing.sqlite : existing.jsonl;
+    return present ? openStore(opts) : emptyStore(opts.dataDir, backend);
+  }
+  if (!existing.sqlite && !existing.jsonl) {
+    return emptyStore(opts.dataDir, isSqliteAvailable() ? 'sqlite' : 'jsonl');
   }
   return openStore(opts);
+}
+
+/**
+ * An inert, empty store for inspecting a data dir nothing has recorded to.
+ * Creates no files and no directories — "just looking" must leave no trace.
+ */
+function emptyStore(dataDir: string, backend: 'sqlite' | 'jsonl'): EvidenceStore {
+  const path = join(dataDir, backend === 'sqlite' ? FILES.SQLITE_DB : FILES.JSONL_LOG);
+  const readOnly = (): never => {
+    throw new Error('mcp-recorder: store opened read-only');
+  };
+  return {
+    backend,
+    path,
+    head: () => ({ seq: 0, hash: GENESIS_HASH }),
+    append: readOnly,
+    appendEvents: readOnly,
+    addSignature: readOnly,
+    latestSignature: () => null,
+    signatures: () => [],
+    iterate: () => [],
+    count: () => 0,
+    sessions: () => [],
+    close: () => {},
+  };
 }

@@ -155,6 +155,7 @@ function repairTornTail(path: string): number {
     if (last[0] === 0x0a) return 0;
     // Find the last newline: scan a tail window first, then the whole file.
     let keep = -1;
+    let tail: Buffer | undefined;
     for (const windowSize of [Math.min(size, TAIL_WINDOW_BYTES), size]) {
       const start = size - windowSize;
       const buf = Buffer.alloc(windowSize);
@@ -162,9 +163,25 @@ function repairTornTail(path: string): number {
       const nl = buf.lastIndexOf(0x0a);
       if (nl !== -1) {
         keep = start + nl + 1;
+        tail = buf.subarray(nl + 1);
         break;
       }
-      if (start === 0) break;
+      if (start === 0) {
+        tail = buf;
+        break;
+      }
+    }
+    // A complete record that merely lost its newline (the write was cut at
+    // its very last byte) is intact evidence, possibly already covered by a
+    // head signature: finish the line instead of discarding it.
+    if (tail !== undefined && tail.length > 0) {
+      try {
+        JSON.parse(tail.toString('utf8'));
+        appendFileSync(path, '\n');
+        return 0;
+      } catch {
+        /* genuinely torn — fall through and trim it */
+      }
     }
     const cut = keep === -1 ? 0 : keep;
     ftruncateSync(fd, cut);
@@ -185,9 +202,9 @@ function repairTornTail(path: string): number {
  * section is a tail read plus one appendFileSync, and the recorder retries
  * a batch that could not get the lock asynchronously.
  */
-const LOCK_BUDGET_MS = 1_000;
-const LOCK_RETRY_BASE_MS = 5;
-const LOCK_RETRY_MAX_MS = 200;
+const LOCK_BUDGET_MS = 100;
+const LOCK_RETRY_BASE_MS = 2;
+const LOCK_RETRY_MAX_MS = 20;
 /**
  * A lock dir older than this is assumed abandoned by a process that died
  * inside the critical section. That section takes milliseconds, so 5s is
@@ -280,7 +297,7 @@ export class JsonlStore implements EvidenceStore {
   private sigsLoadedSize: number;
 
   constructor(dataDir: string) {
-    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.path = join(dataDir, FILES.JSONL_LOG);
     this.sigsPath = join(dataDir, FILES.JSONL_SIGS);
     this.lockDir = `${this.path}.lock`;

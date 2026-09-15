@@ -66,7 +66,9 @@ const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
 const RUNNER_BARE_FLAGS = new Set(['-y', '--yes', '-q', '--quiet']);
 const RUNNER_VALUE_FLAGS = new Set(['-p', '--package']);
 const MAX_PENDING = 10_000;
-const CLOSE_TIMEOUT_MS = 2_000;
+// Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
+// contended store delays session_end rather than losing it.
+const CLOSE_TIMEOUT_MS = 8_000;
 /** result_hash for a synthesized "unanswered" event: sha256 of canonical `null`. */
 const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
 

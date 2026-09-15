@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readdirSync,
+  statSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -753,5 +754,76 @@ describe('openStoreReadOnly (used by inspection commands)', () => {
     expect(store.backend).toBe('jsonl');
     expect(store.count()).toBe(1);
     store.close();
+  });
+});
+
+describe('data dir hygiene', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-hygiene-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32')('openStore creates the data dir 0700', () => {
+    const dataDir = join(dir, 'fresh');
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.close();
+    expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+  });
+
+  it('openStoreReadOnly on a dir nothing recorded to creates no files and no directory', () => {
+    const dataDir = join(dir, 'never-recorded');
+    const store = openStoreReadOnly({ dataDir });
+    expect(store.count()).toBe(0);
+    expect(store.sessions()).toEqual([]);
+    expect([...store.iterate()]).toEqual([]);
+    expect(store.latestSignature()).toBeNull();
+    expect(() => store.appendEvents([])).toThrow(/read-only/);
+    store.close();
+    expect(existsSync(dataDir)).toBe(false);
+  });
+
+  it('openStoreReadOnly with a forced backend never creates that backend\'s file', () => {
+    for (const backend of ['sqlite', 'jsonl'] as const) {
+      const store = openStoreReadOnly({ dataDir: dir, backend });
+      expect(store.backend).toBe(backend);
+      expect(store.count()).toBe(0);
+      store.close();
+    }
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+    expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(false);
+  });
+
+  it('jsonl: a complete last record that merely lacks its newline is kept, not discarded', async () => {
+    const records = twoSessionFixture();
+    const store = openStore({ dataDir: dir, backend: 'jsonl' });
+    store.append(records);
+    store.close();
+    const logPath = join(dir, FILES.JSONL_LOG);
+    const text = readFileSync(logPath, 'utf8');
+    expect(text.endsWith('\n')).toBe(true);
+    writeFileSync(logPath, text.slice(0, -1)); // the write was cut at the final byte
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const reopened = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(reopened.count()).toBe(records.length);
+      const sealed = reopened.appendEvents([
+        toolCall(SESSION_B, '2026-06-11T11:00:09.000Z', 'after_cut_newline'),
+      ]);
+      expect(sealed[0]!.seq).toBe(records.length + 1);
+      reopened.close();
+      expect(
+        stderrSpy.mock.calls.some((call) => String(call[0]).includes('discarded a torn trailing line')),
+      ).toBe(false);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    const third = openStore({ dataDir: dir, backend: 'jsonl' });
+    expect(third.count()).toBe(records.length + 1);
+    expect((await verifyStore(third, { allowUnsigned: true })).ok).toBe(true);
+    third.close();
   });
 });

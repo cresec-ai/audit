@@ -81,7 +81,7 @@ export class Signer implements SignerLike {
    * identities).
    */
   static async load(dataDir: string): Promise<Signer> {
-    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const privPath = join(dataDir, FILES.PRIVATE_KEY);
     const pubPath = join(dataDir, FILES.PUBLIC_KEY);
 

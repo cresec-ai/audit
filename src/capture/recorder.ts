@@ -29,11 +29,15 @@ export interface RecorderOpts {
 /**
  * Backoff before each retry of a failed batch, after the initial attempt —
  * transient contention (lock wait, a busy database) among several recorder
- * processes sharing one data dir usually clears within a few ms. The sum
- * (935ms) is kept well under stdio.ts's 2s recorder.close() timeout so a
- * session_end still lands on shutdown even after a full retry run.
+ * processes sharing one data dir usually clears within a few ms. The waits
+ * here are asynchronous (they never block forwarding); the stores' own
+ * synchronous waits are kept to ~100ms per attempt for the same reason. The
+ * sum (~5.9s) outlasts the jsonl store's 5s stale-lock reclaim, so a lock
+ * abandoned by a crashed peer costs a delay, not a dropped batch, and it is
+ * covered by stdio.ts's recorder.close() timeout so a session_end still
+ * lands on shutdown even after a full retry run.
  */
-const RETRY_DELAYS_MS = [10, 25, 50, 100, 250, 500];
+const RETRY_DELAYS_MS = [10, 25, 50, 100, 250, 500, 1000, 2000, 2000];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

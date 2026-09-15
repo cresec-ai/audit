@@ -142,7 +142,7 @@ export class SqliteStore implements EvidenceStore {
     if (Ctor === undefined) {
       throw new Error('mcp-recorder: better-sqlite3 is not available in this environment');
     }
-    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.path = join(dataDir, FILES.SQLITE_DB);
     this.db = new Ctor(this.path);
     // Several `mcp-recorder record` processes normally share one data dir
@@ -150,9 +150,10 @@ export class SqliteStore implements EvidenceStore {
     // writer makes better-sqlite3 throw SQLITE_BUSY immediately instead of
     // waiting for the other transaction to finish. The wait is SYNCHRONOUS
     // (better-sqlite3 blocks the event loop, and with it the proxy's
-    // forwarding), so it is kept short: write transactions here take
-    // microseconds, and the recorder retries a busy batch asynchronously.
-    this.db.pragma('busy_timeout = 1000');
+    // forwarding), so it is kept very short: write transactions here take
+    // microseconds, and the recorder retries a busy batch asynchronously
+    // with ~6s of non-blocking backoff (src/capture/recorder.ts).
+    this.db.pragma('busy_timeout = 100');
     this.db.pragma('journal_mode = WAL');
     this.db.exec(DDL);
 
