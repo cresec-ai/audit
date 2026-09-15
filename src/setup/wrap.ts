@@ -191,6 +191,96 @@ export function buildWrappedEntry(name: string, original: ServerEntry, opts: Wra
   return { ...original, command, args };
 }
 
+/* --------------------------------- bridge --------------------------------- */
+
+export interface BridgeSpec {
+  name: string;
+  url: string;
+}
+
+const BRIDGE_NAME_RE = /^[A-Za-z0-9_.-]+$/;
+
+/**
+ * Parse `--bridge NAME=URL[,NAME=URL...]` values into `{name, url}` specs.
+ * `values` is every raw `--bridge` occurrence (cli.ts collects a repeatable
+ * flag into an array); each one may itself be a comma-separated list, so
+ * both `--bridge a=X --bridge b=Y` and `--bridge a=X,b=Y` work. Throws a
+ * usage-shaped `Error` (cli.ts turns any thrown error from `setup` into exit
+ * code 2) on a malformed spec — a bad name or a URL that doesn't parse as
+ * http(s) — naming the offending piece so the message is actionable.
+ */
+export function parseBridgeSpecs(values: readonly string[]): BridgeSpec[] {
+  const specs: BridgeSpec[] = [];
+  for (const value of values) {
+    for (const part of value.split(',')) {
+      const raw = part.trim();
+      if (raw.length === 0) continue;
+
+      const eq = raw.indexOf('=');
+      if (eq <= 0) {
+        throw new Error(`setup: invalid --bridge '${raw}' (expected NAME=URL)`);
+      }
+      const name = raw.slice(0, eq);
+      const urlStr = raw.slice(eq + 1);
+
+      if (!BRIDGE_NAME_RE.test(name)) {
+        throw new Error(
+          `setup: invalid --bridge name '${name}' (letters, digits, '_', '.', '-' only)`,
+        );
+      }
+
+      let parsed: URL;
+      try {
+        parsed = new URL(urlStr);
+      } catch {
+        throw new Error(`setup: invalid --bridge URL '${urlStr}' for '${name}' (not a valid URL)`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(
+          `setup: invalid --bridge URL '${urlStr}' for '${name}' (must be http:// or https://)`,
+        );
+      }
+
+      specs.push({ name, url: urlStr });
+    }
+  }
+  return specs;
+}
+
+/**
+ * The unwrapped stdio entry that bridges a *remote* MCP server — an OAuth
+ * "connector" Claude Desktop would otherwise reach directly from Anthropic's
+ * own infrastructure, never touching this machine — into a local process
+ * the recorder can wrap like any other. `mcp-remote`
+ * (https://www.npmjs.com/package/mcp-remote) speaks the remote server's
+ * HTTP/SSE transport on one side and plain stdio on the other; `npx -y`
+ * fetches it at run time, so it's never a dependency of this package (same
+ * as `--wrapper npx` already does for the recorder itself). This entry is
+ * what the sidecar stores as the "original" for a bridged server — `--undo`
+ * restores exactly this, not a further-unwrapped remote connector, since
+ * this recorder cannot make Claude Desktop reach a remote MCP server any
+ * other way.
+ */
+export function bridgeEntry(url: string): ServerEntry {
+  return { command: 'npx', args: ['-y', 'mcp-remote', url] };
+}
+
+/**
+ * True when `entry` is exactly the bridge entry {@link bridgeEntry} would
+ * build for `url` — same keys, same values — so a second `setup --bridge`
+ * run for a name that's already bridged is idempotent instead of erroring.
+ * Any other entry under that name (a real server, or a bridge to a
+ * different URL, or one the operator customized) is NOT identical, and the
+ * caller must refuse to silently replace it.
+ */
+export function isSameBridgeEntry(entry: ServerEntry, url: string): boolean {
+  const wanted = bridgeEntry(url);
+  const keysA = Object.keys(entry).sort();
+  const keysB = Object.keys(wanted).sort();
+  if (keysA.length !== keysB.length || keysA.some((k, i) => k !== keysB[i])) return false;
+  return keysA.every((k) => JSON.stringify(entry[k]) === JSON.stringify(wanted[k]));
+}
+
 /** Decide, for every entry in `servers`, whether it gets wrapped, skipped, or
  * is already wrapped — and build the replacement map. Order of entries in
  * `next` follows `servers`' own key order. */

@@ -27,7 +27,10 @@ import { ENV } from './types.js';
 import type { RecorderConfig } from './types.js';
 
 export interface ResolveConfigOpts {
-  flags: Record<string, string | boolean | undefined>;
+  // string[] covers a repeatable CLI flag (e.g. setup's --bridge); nothing
+  // here reads such a flag, so it's simply treated like any other
+  // non-string value below (asString/pick fall through to undefined).
+  flags: Record<string, string | boolean | string[] | undefined>;
   env: NodeJS.ProcessEnv;
 }
 
@@ -37,12 +40,12 @@ export interface LenientConfigResult {
   warnings: string[];
 }
 
-function asString(v: string | boolean | undefined): string | undefined {
+function asString(v: string | boolean | string[] | undefined): string | undefined {
   return typeof v === 'string' && v !== '' ? v : undefined;
 }
 
 function pick(
-  flag: string | boolean | undefined,
+  flag: string | boolean | string[] | undefined,
   envValue: string | undefined,
 ): string | undefined {
   const f = asString(flag);

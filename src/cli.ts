@@ -52,8 +52,15 @@ import {
 import type { SetupSidecar } from './setup/io.js';
 import { chooseWrapper, detectWsl, isWindowsMountPath, windowsHomeCandidates } from './setup/wsl.js';
 import type { WrapperChoice } from './setup/wsl.js';
-import { planWrap, structuralUnwrap } from './setup/wrap.js';
-import type { McpServersMap, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
+import {
+  bridgeEntry,
+  isAlreadyWrapped,
+  isSameBridgeEntry,
+  parseBridgeSpecs,
+  planWrap,
+  structuralUnwrap,
+} from './setup/wrap.js';
+import type { BridgeSpec, McpServersMap, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
 import { openStore, openStoreReadOnly } from './store/index.js';
 import type { AnyEvent, ChainRecord } from './schema/events.js';
 import type {
@@ -70,7 +77,7 @@ import { verifyRecords, verifyStore } from './verify/verify.js';
 import type { VerifyOpts } from './verify/verify.js';
 import { VERSION } from './version.js';
 
-type Flags = Record<string, string | boolean | undefined>;
+type Flags = Record<string, string | boolean | string[] | undefined>;
 
 const SUBCOMMANDS = [
   'record',
@@ -129,15 +136,21 @@ Usage:
       transparent streamable-HTTP proxy in front of an HTTP MCP server
   mcp-recorder setup    --client <claude-desktop|claude-code|cursor> [--config PATH]
                         [--wrapper local|npx|wsl] [--only N,...] [--except N,...]
-                        [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]
+                        [--bridge NAME=URL,...] [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]
       wrap every stdio MCP server in a client's config behind this recorder,
       safely (timestamped backup + sidecar) and reversibly (--undo). --config
-      overrides the resolved path and makes --client optional. --policy FILE
-      bakes '--policy <absolute path>' into every wrapped entry (gateway
-      mode). Inside WSL, when the resolved config belongs to a Windows-side
-      client, --wrapper wsl is auto-selected (spawns the wrapped server via
-      wsl.exe so a Windows client can actually launch it) unless --wrapper
-      is given
+      overrides the resolved path and makes --client optional. For
+      claude-desktop this also finds a Microsoft Store (MSIX) install when
+      the ordinary %APPDATA%\\Claude\\... config doesn't exist. --policy FILE
+      validates the policy and bakes '--policy <absolute path>' into every
+      wrapped entry (gateway mode). Inside WSL, when the resolved config
+      belongs to a Windows-side client, --wrapper wsl is auto-selected
+      (spawns the wrapped server via wsl.exe so a Windows client can actually
+      launch it) unless --wrapper is given.
+      --bridge NAME=URL turns a remote MCP connector (one Claude Desktop
+      would otherwise reach from Anthropic's own servers, never touching
+      this machine) into a local entry via 'npx -y mcp-remote URL', then
+      wraps that like any other stdio server
   mcp-recorder --help | --version
 
 Flags:
@@ -166,6 +179,9 @@ Flags:
                    wsl (wsl.exe, auto-selected for a Windows-side config in WSL)
   --only N,...    setup: wrap only these server names
   --except N,...  setup: wrap every server except these names
+  --bridge NAME=URL[,...]
+                   setup: bridge a remote MCP connector as a local NAME
+                   entry (via npx -y mcp-remote URL), repeatable
   --dry-run       setup: print what would change; write nothing
   --undo          setup: restore the servers this tool wrapped
   --help, -h      show this help and exit
@@ -198,6 +214,7 @@ const FLAG_DEFS = {
   wrapper: { type: 'string' },
   only: { type: 'string' },
   except: { type: 'string' },
+  bridge: { type: 'string', multiple: true },
   'dry-run': { type: 'boolean' },
   undo: { type: 'boolean' },
   policy: { type: 'string' },
@@ -242,11 +259,17 @@ function out(msg: string): void {
   process.stdout.write(msg + '\n');
 }
 
-function asStr(v: string | boolean | undefined): string | undefined {
+function asStr(v: string | boolean | string[] | undefined): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
-function parsePort(v: string | boolean | undefined): number | undefined {
+/** `--bridge` collects into a string[] (`multiple: true`); every other flag
+ * this returns undefined for, same as `asStr` does for a non-string. */
+function asStrArr(v: string | boolean | string[] | undefined): string[] {
+  return Array.isArray(v) ? v : [];
+}
+
+function parsePort(v: string | boolean | string[] | undefined): number | undefined {
   const s = asStr(v);
   if (s === undefined) return undefined;
   const n = Number(s);
@@ -1509,8 +1532,13 @@ interface SetupJsonResult {
   skipped: SkipEntry[];
   already_wrapped: string[];
   /** Same notices the human output prints (e.g. which env var names a
-   * `--wrapper wsl` entry forwards via WSLENV). */
+   * `--wrapper wsl` entry forwards via WSLENV, or a bridged server's
+   * one-time OAuth pre-authorization tip). */
   notes: string[];
+  /** Server names materialized this run via `--bridge NAME=URL` (an
+   * unwrapped `npx -y mcp-remote URL` entry, then wrapped like any other
+   * stdio server — see {@link bridgeEntry}). */
+  bridged: string[];
 }
 
 function printSetupHuman(configPath: string, backup: string | null, plan: WrapPlan, dryRun: boolean): void {
@@ -1560,6 +1588,7 @@ function printSetupResult(
   plan: WrapPlan,
   jsonOut: boolean,
   dryRun: boolean,
+  bridged: readonly string[] = [],
 ): void {
   if (jsonOut) {
     const payload: SetupJsonResult = {
@@ -1569,6 +1598,7 @@ function printSetupResult(
       skipped: plan.skipped,
       already_wrapped: plan.alreadyWrapped,
       notes: plan.notes,
+      bridged: [...bridged],
     };
     out(JSON.stringify(payload, null, 2));
     return;
@@ -1740,6 +1770,13 @@ async function cmdSetup(flags: Flags): Promise<void> {
     }
   }
 
+  let bridgeSpecs: BridgeSpec[];
+  try {
+    bridgeSpecs = parseBridgeSpecs(asStrArr(flags['bridge']));
+  } catch (cause) {
+    err(cause instanceof Error ? cause.message : String(cause));
+  }
+
   // Cheap (env vars + one /proc/version read, no process spawned) — safe to
   // always compute, unlike windowsHomeCandidates() below which may shell
   // out to cmd.exe and is only invoked lazily, when actually needed.
@@ -1819,17 +1856,51 @@ async function cmdSetup(flags: Flags): Promise<void> {
   if (wslInfo.distro !== undefined) wrapOpts.wslDistro = wslInfo.distro;
   if (policyPath !== undefined) wrapOpts.policyPath = policyPath;
 
+  // --bridge NAME=URL[,...]: materialize each remote MCP connector as a
+  // LOCAL, unwrapped `npx -y mcp-remote URL` entry in `servers` BEFORE
+  // planWrap runs, so the normal wrap logic below wraps it like any other
+  // stdio server — the sidecar then records this unwrapped mcp-remote entry
+  // as the "original", and `--undo` restores exactly that (it removes the
+  // recorder, not the bridge; delete the entry by hand to remove the
+  // bridge too). A name that already exists and isn't this exact bridge
+  // entry — nor already wrapped (a previous `--bridge` run, or by pure
+  // coincidence a different server this tool already wrapped) — is a
+  // conflict: never silently replaced.
+  const bridgedNames: string[] = [];
+  for (const spec of bridgeSpecs) {
+    const existing = servers[spec.name];
+    const isConflict =
+      existing !== undefined &&
+      !isSameBridgeEntry(existing, spec.url) &&
+      !isAlreadyWrapped(existing, localWrapperPath);
+    if (isConflict) {
+      err(
+        `setup: --bridge ${spec.name}=${spec.url}: a server named '${spec.name}' already exists in ` +
+          `${configPath} and is not the same bridge entry — remove or rename it first, ` +
+          'this tool never silently replaces an existing entry',
+      );
+    }
+    if (existing === undefined) servers[spec.name] = bridgeEntry(spec.url);
+    bridgedNames.push(spec.name);
+  }
+
   const plan = planWrap(servers, wrapOpts);
+  for (const spec of bridgeSpecs) {
+    plan.notes.push(
+      `first launch of ${spec.name} opens an OAuth flow in your browser; to pre-authorize from a ` +
+        `terminal run: npx -y mcp-remote ${spec.url} (tokens are cached under ~/.mcp-auth)`,
+    );
+  }
 
   if (dryRun) {
-    printSetupResult(configPath, null, plan, jsonOut, true);
+    printSetupResult(configPath, null, plan, jsonOut, true, bridgedNames);
     return;
   }
 
   if (plan.wrapped.length === 0) {
     // Idempotent: every candidate was already wrapped (or filtered/skipped)
     // — report it, but never touch the file (no new backup, no sidecar).
-    printSetupResult(configPath, null, plan, jsonOut, false);
+    printSetupResult(configPath, null, plan, jsonOut, false, bridgedNames);
     return;
   }
 
@@ -1854,7 +1925,7 @@ async function cmdSetup(flags: Flags): Promise<void> {
   writeJsonAtomic(configPath, root, indent, eol);
   writeSidecarAtomic(configPath, existingSidecar, indent);
 
-  printSetupResult(configPath, backup, plan, jsonOut, false);
+  printSetupResult(configPath, backup, plan, jsonOut, false, bridgedNames);
 }
 
 /* -------------------------------- dispatch ------------------------------- */

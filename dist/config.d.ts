@@ -21,7 +21,7 @@
  */
 import type { RecorderConfig } from './types.js';
 export interface ResolveConfigOpts {
-    flags: Record<string, string | boolean | undefined>;
+    flags: Record<string, string | boolean | string[] | undefined>;
     env: NodeJS.ProcessEnv;
 }
 export interface LenientConfigResult {

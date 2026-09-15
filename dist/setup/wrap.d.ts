@@ -79,6 +79,44 @@ export declare function mergeWslEnv(existing: string | undefined, keys: readonly
  * keys are carried over untouched (`wrapper: 'wsl'` extends `env.WSLENV`,
  * see {@link buildWslWrappedEntry}); otherwise only `command`/`args` change. */
 export declare function buildWrappedEntry(name: string, original: ServerEntry, opts: WrapOpts): ServerEntry;
+export interface BridgeSpec {
+    name: string;
+    url: string;
+}
+/**
+ * Parse `--bridge NAME=URL[,NAME=URL...]` values into `{name, url}` specs.
+ * `values` is every raw `--bridge` occurrence (cli.ts collects a repeatable
+ * flag into an array); each one may itself be a comma-separated list, so
+ * both `--bridge a=X --bridge b=Y` and `--bridge a=X,b=Y` work. Throws a
+ * usage-shaped `Error` (cli.ts turns any thrown error from `setup` into exit
+ * code 2) on a malformed spec — a bad name or a URL that doesn't parse as
+ * http(s) — naming the offending piece so the message is actionable.
+ */
+export declare function parseBridgeSpecs(values: readonly string[]): BridgeSpec[];
+/**
+ * The unwrapped stdio entry that bridges a *remote* MCP server — an OAuth
+ * "connector" Claude Desktop would otherwise reach directly from Anthropic's
+ * own infrastructure, never touching this machine — into a local process
+ * the recorder can wrap like any other. `mcp-remote`
+ * (https://www.npmjs.com/package/mcp-remote) speaks the remote server's
+ * HTTP/SSE transport on one side and plain stdio on the other; `npx -y`
+ * fetches it at run time, so it's never a dependency of this package (same
+ * as `--wrapper npx` already does for the recorder itself). This entry is
+ * what the sidecar stores as the "original" for a bridged server — `--undo`
+ * restores exactly this, not a further-unwrapped remote connector, since
+ * this recorder cannot make Claude Desktop reach a remote MCP server any
+ * other way.
+ */
+export declare function bridgeEntry(url: string): ServerEntry;
+/**
+ * True when `entry` is exactly the bridge entry {@link bridgeEntry} would
+ * build for `url` — same keys, same values — so a second `setup --bridge`
+ * run for a name that's already bridged is idempotent instead of erroring.
+ * Any other entry under that name (a real server, or a bridge to a
+ * different URL, or one the operator customized) is NOT identical, and the
+ * caller must refuse to silently replace it.
+ */
+export declare function isSameBridgeEntry(entry: ServerEntry, url: string): boolean;
 /** Decide, for every entry in `servers`, whether it gets wrapped, skipped, or
  * is already wrapped — and build the replacement map. Order of entries in
  * `next` follows `servers`' own key order. */

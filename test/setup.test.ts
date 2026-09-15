@@ -8,9 +8,12 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { spawnTsx } from './helpers/tsx.js';
 import {
+  bridgeEntry,
   buildWrappedEntry,
   isAlreadyWrapped,
+  isSameBridgeEntry,
   mergeWslEnv,
+  parseBridgeSpecs,
   structuralUnwrap,
 } from '../src/setup/wrap.js';
 import type { ServerEntry as WrapServerEntry } from '../src/setup/wrap.js';
@@ -467,7 +470,7 @@ describe('mcp-recorder setup', () => {
     expect(res.stderr).toContain(configPath);
   }, 30_000);
 
-  it('--json prints the {config, backup, wrapped, skipped, already_wrapped} shape', async () => {
+  it('--json prints the {config, backup, wrapped, skipped, already_wrapped, bridged} shape', async () => {
     const dir = tmpDir('mcp-rec-setup-jsonshape-');
     const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
 
@@ -475,13 +478,14 @@ describe('mcp-recorder setup', () => {
     expect(res.code).toBe(0);
     const result = JSON.parse(res.stdout) as Record<string, unknown>;
     expect(Object.keys(result).sort()).toEqual(
-      ['already_wrapped', 'backup', 'config', 'notes', 'skipped', 'wrapped'].sort(),
+      ['already_wrapped', 'backup', 'bridged', 'config', 'notes', 'skipped', 'wrapped'].sort(),
     );
     expect(result.config).toBe(configPath);
     expect(typeof result.backup).toBe('string');
     expect(Array.isArray(result.wrapped)).toBe(true);
     expect(Array.isArray(result.skipped)).toBe(true);
     expect(Array.isArray(result.already_wrapped)).toBe(true);
+    expect(result.bridged).toEqual([]);
   }, 30_000);
 
   describe('--wrapper local end-to-end', () => {
@@ -1064,5 +1068,262 @@ describe('mcp-recorder setup --policy (via the CLI)', () => {
     const res = await runCli(['setup', '--config', configPath, '--policy', policyPath]);
     expect(res.code).toBe(2);
     expect(res.stderr).toContain('no `mcp` section');
+  }, 30_000);
+});
+
+/* ------------------ --bridge: remote MCP connectors via mcp-remote ------- */
+
+describe('parseBridgeSpecs', () => {
+  it('parses a single NAME=URL', () => {
+    expect(parseBridgeSpecs(['clickup=https://mcp.clickup.com/mcp'])).toEqual([
+      { name: 'clickup', url: 'https://mcp.clickup.com/mcp' },
+    ]);
+  });
+
+  it('a repeatable flag (one element per --bridge) and comma-separated values within one element both work', () => {
+    expect(
+      parseBridgeSpecs(['a=https://a.example/mcp', 'b=https://b.example/mcp,c=https://c.example/mcp']),
+    ).toEqual([
+      { name: 'a', url: 'https://a.example/mcp' },
+      { name: 'b', url: 'https://b.example/mcp' },
+      { name: 'c', url: 'https://c.example/mcp' },
+    ]);
+  });
+
+  it('accepts a name made only of letters, digits, "_", ".", "-"', () => {
+    expect(parseBridgeSpecs(['my-server_v2.1=https://x.example/mcp'])).toEqual([
+      { name: 'my-server_v2.1', url: 'https://x.example/mcp' },
+    ]);
+  });
+
+  it('rejects a name with a character outside that set', () => {
+    expect(() => parseBridgeSpecs(['cl ickup=https://mcp.clickup.com/mcp'])).toThrow(/--bridge/);
+    expect(() => parseBridgeSpecs(['click@up=https://mcp.clickup.com/mcp'])).toThrow(/name/i);
+  });
+
+  it('rejects a spec with no "="', () => {
+    expect(() => parseBridgeSpecs(['clickup'])).toThrow(/NAME=URL/);
+  });
+
+  it('rejects a URL that does not parse at all', () => {
+    expect(() => parseBridgeSpecs(['clickup=not a url'])).toThrow(/URL/);
+  });
+
+  it('rejects a non-http(s) URL scheme', () => {
+    expect(() => parseBridgeSpecs(['clickup=ftp://mcp.clickup.com/mcp'])).toThrow(/http/);
+  });
+
+  it('accepts plain http:// as well as https://', () => {
+    expect(parseBridgeSpecs(['local=http://localhost:1234/mcp'])).toEqual([
+      { name: 'local', url: 'http://localhost:1234/mcp' },
+    ]);
+  });
+
+  it('ignores empty pieces (a trailing comma, blank --bridge)', () => {
+    expect(parseBridgeSpecs(['a=https://a.example/mcp,'])).toEqual([{ name: 'a', url: 'https://a.example/mcp' }]);
+    expect(parseBridgeSpecs([''])).toEqual([]);
+  });
+});
+
+describe('bridgeEntry / isSameBridgeEntry', () => {
+  const URL = 'https://mcp.clickup.com/mcp';
+
+  it('bridgeEntry builds the "npx -y mcp-remote URL" unwrapped form', () => {
+    expect(bridgeEntry(URL)).toEqual({ command: 'npx', args: ['-y', 'mcp-remote', URL] });
+  });
+
+  it('isSameBridgeEntry is true only for an exact match', () => {
+    expect(isSameBridgeEntry(bridgeEntry(URL), URL)).toBe(true);
+    expect(isSameBridgeEntry({ command: 'npx', args: ['-y', 'mcp-remote', URL] }, URL)).toBe(true);
+  });
+
+  it('isSameBridgeEntry is false for a different URL, command, argv, or extra keys', () => {
+    expect(isSameBridgeEntry({ command: 'npx', args: ['-y', 'mcp-remote', 'https://other.example/mcp'] }, URL)).toBe(
+      false,
+    );
+    expect(isSameBridgeEntry({ command: 'node', args: ['./server.js'] }, URL)).toBe(false);
+    expect(isSameBridgeEntry({ command: 'npx', args: ['-y', 'mcp-remote'] }, URL)).toBe(false);
+    expect(isSameBridgeEntry({ ...bridgeEntry(URL), env: { FOO: 'bar' } }, URL)).toBe(false);
+  });
+});
+
+describe('mcp-recorder setup --bridge (via the CLI)', () => {
+  const CLICKUP_URL = 'https://mcp.clickup.com/mcp';
+
+  it('--bridge with a malformed name exits 2, config untouched', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-badname-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+    const before = readFileSync(configPath, 'utf8');
+
+    const res = await runCli(['setup', '--config', configPath, '--bridge', `cl ickup=${CLICKUP_URL}`]);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toMatch(/--bridge/);
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+  }, 30_000);
+
+  it('--bridge with an invalid URL exits 2, config untouched', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-badurl-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+    const before = readFileSync(configPath, 'utf8');
+
+    const res = await runCli(['setup', '--config', configPath, '--bridge', 'clickup=not-a-url']);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toMatch(/--bridge/);
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+  }, 30_000);
+
+  it('--dry-run prints the wrapped mcp-remote argv, and --json reports it under "bridged"', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-dryrun-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+
+    const human = await runCli([
+      'setup',
+      '--config',
+      configPath,
+      '--wrapper',
+      'npx',
+      '--bridge',
+      `clickup=${CLICKUP_URL}`,
+      '--dry-run',
+    ]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain('clickup:');
+    expect(human.stdout).toContain('"mcp-remote"');
+    expect(human.stdout).toContain(`"${CLICKUP_URL}"`);
+    expect(human.stdout).toMatch(/OAuth/);
+    expect(human.stdout).toContain('npx -y mcp-remote');
+
+    const json = await runCli([
+      'setup',
+      '--config',
+      configPath,
+      '--wrapper',
+      'npx',
+      '--bridge',
+      `clickup=${CLICKUP_URL}`,
+      '--dry-run',
+      '--json',
+    ]);
+    expect(json.code).toBe(0);
+    const result = JSON.parse(json.stdout) as { wrapped: string[]; bridged: string[]; notes: string[] };
+    expect(result.wrapped).toEqual(['clickup']);
+    expect(result.bridged).toEqual(['clickup']);
+    expect(result.notes.some((n) => n.includes('clickup') && n.includes('OAuth'))).toBe(true);
+
+    // --dry-run never writes, either time.
+    const onDisk = JSON.parse(readFileSync(configPath, 'utf8')) as { mcpServers: Record<string, unknown> };
+    expect(onDisk.mcpServers).toEqual({});
+  }, 30_000);
+
+  it('a real write wraps the bridge entry; --undo restores the unwrapped "npx -y mcp-remote URL" entry', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-write-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+
+    const wrap = await runCli([
+      'setup',
+      '--config',
+      configPath,
+      '--wrapper',
+      'npx',
+      '--bridge',
+      `clickup=${CLICKUP_URL}`,
+      '--json',
+    ]);
+    expect(wrap.code).toBe(0);
+    const wrapResult = JSON.parse(wrap.stdout) as { wrapped: string[]; bridged: string[] };
+    expect(wrapResult.wrapped).toEqual(['clickup']);
+    expect(wrapResult.bridged).toEqual(['clickup']);
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      mcpServers: Record<string, WrapServerEntry>;
+    };
+    expect(written.mcpServers.clickup).toEqual({
+      command: 'npx',
+      args: [
+        '-y',
+        '@edut/mcp-recorder',
+        'record',
+        '--name',
+        'clickup',
+        '--',
+        'npx',
+        '-y',
+        'mcp-remote',
+        CLICKUP_URL,
+      ],
+    });
+
+    // sidecar stores the unwrapped mcp-remote entry as the "original"
+    const sidecar = JSON.parse(readFileSync(sidecarFor(configPath), 'utf8')) as {
+      wrapped: Record<string, WrapServerEntry>;
+    };
+    expect(sidecar.wrapped.clickup).toEqual(bridgeEntry(CLICKUP_URL));
+
+    const undo = await runCli(['setup', '--config', configPath, '--undo', '--json']);
+    expect(undo.code).toBe(0);
+    const undoResult = JSON.parse(undo.stdout) as { restored: string[]; used_sidecar: boolean };
+    expect(undoResult.restored).toEqual(['clickup']);
+    expect(undoResult.used_sidecar).toBe(true);
+
+    const restored = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      mcpServers: Record<string, WrapServerEntry>;
+    };
+    expect(restored.mcpServers.clickup).toEqual(bridgeEntry(CLICKUP_URL));
+  }, 30_000);
+
+  it('an existing different entry under the bridge name is never silently replaced (exit 2)', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-conflict-');
+    const configPath = writeConfig(dir, 'config.json', {
+      mcpServers: { clickup: { command: 'node', args: ['./my-clickup-server.js'] } },
+    });
+    const before = readFileSync(configPath, 'utf8');
+
+    const res = await runCli(['setup', '--config', configPath, '--bridge', `clickup=${CLICKUP_URL}`]);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('clickup');
+    expect(res.stderr.toLowerCase()).toContain('already exists');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+  }, 30_000);
+
+  it('re-running --bridge on an already-bridged-and-wrapped name is idempotent, not a conflict', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-idempotent-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+
+    const first = await runCli(['setup', '--config', configPath, '--bridge', `clickup=${CLICKUP_URL}`, '--json']);
+    expect(first.code).toBe(0);
+
+    const second = await runCli(['setup', '--config', configPath, '--bridge', `clickup=${CLICKUP_URL}`, '--json']);
+    expect(second.code).toBe(0);
+    const result = JSON.parse(second.stdout) as { wrapped: string[]; already_wrapped: string[]; bridged: string[] };
+    expect(result.wrapped).toEqual([]);
+    expect(result.already_wrapped).toEqual(['clickup']);
+    expect(result.bridged).toEqual(['clickup']);
+  }, 30_000);
+
+  it('--wrapper wsl --bridge produces the wsl.exe form, with the mcp-remote argv after "--"', async () => {
+    const dir = tmpDir('mcp-rec-setup-bridge-wsl-');
+    const configPath = writeConfig(dir, 'config.json', { mcpServers: {} });
+
+    const res = await runCli([
+      'setup',
+      '--config',
+      configPath,
+      '--wrapper',
+      'wsl',
+      '--data-dir',
+      '/home/me/.mcp-recorder',
+      '--bridge',
+      `clickup=${CLICKUP_URL}`,
+      '--dry-run',
+    ]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain('wsl.exe');
+    expect(res.stdout).toContain('"-e"');
+    expect(res.stdout).toContain('"record"');
+    expect(res.stdout).toContain('"clickup"');
+    expect(res.stdout).toContain('"--"');
+    expect(res.stdout).toContain('"npx"');
+    expect(res.stdout).toContain('"mcp-remote"');
+    expect(res.stdout).toContain(`"${CLICKUP_URL}"`);
   }, 30_000);
 });

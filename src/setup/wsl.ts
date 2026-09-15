@@ -218,15 +218,53 @@ export function windowsHomeCandidates(deps: Partial<WindowsHomeDeps> = {}): stri
 /* --------------------------- config candidates ---------------------------- */
 
 /**
+ * A home directory's Windows-side MSIX (Microsoft Store) Claude Desktop
+ * config candidates: every `Claude_*` package directory under
+ * `<home>/AppData/Local/Packages`, each turned into its
+ * `LocalCache/Roaming/Claude/claude_desktop_config.json`. `readdirFn` reads
+ * the Packages directory (wrapped in try/catch — a missing/unreadable
+ * directory is just "no MSIX install", not an error) and defaults to the
+ * real `fs.readdirSync`, injectable so tests never touch the real
+ * filesystem.
+ */
+function msixClaudeDesktopCandidates(home: string, readdirFn: (p: string) => string[]): string[] {
+  const packagesDir = join(home, 'AppData', 'Local', 'Packages');
+  let entries: string[] = [];
+  try {
+    entries = readdirFn(packagesDir);
+  } catch {
+    entries = [];
+  }
+  return entries
+    .filter((name) => name.startsWith('Claude_'))
+    .sort()
+    .map((name) => join(packagesDir, name, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'));
+}
+
+/**
  * The Windows-side config path(s) a given client would use, for each
  * candidate home directory. `claude-code` has none: Claude Code running
  * inside WSL is a plain Linux install using `~/.claude.json` there —
  * there's no separate Windows-side config for it to fall back to.
+ *
+ * `claude-desktop` yields, per home, the ordinary installer path
+ * (`AppData/Roaming/Claude/...`) followed by every MSIX / Microsoft Store
+ * package match under `AppData/Local/Packages` (see
+ * {@link msixClaudeDesktopCandidates}), since a Windows install can be
+ * either shape. `readdirFn` is only used for that MSIX lookup and defaults
+ * to the real `fs.readdirSync`.
  */
-export function windowsClientConfigCandidates(client: ClientKind, homes: readonly string[]): string[] {
+export function windowsClientConfigCandidates(
+  client: ClientKind,
+  homes: readonly string[],
+  readdirFn: (p: string) => string[] = nodeReaddirSync,
+): string[] {
   switch (client) {
     case 'claude-desktop':
-      return homes.map((home) => join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'));
+      return homes.flatMap((home) => [
+        join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'),
+        ...msixClaudeDesktopCandidates(home, readdirFn),
+      ]);
     case 'cursor':
       return homes.map((home) => join(home, '.cursor', 'mcp.json'));
     case 'claude-code':

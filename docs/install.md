@@ -41,6 +41,19 @@ npm install -g github:cresec-ai/audit#main
 
 If you had an older install, the same command replaces it.
 
+**npm 11 (the npm that ships with Node 24) and the SQLite backend.** npm 11
+refuses to run a dependency's install script on a global install unless you
+allow it, and better-sqlite3 needs its script to fetch the native binding.
+Without it the recorder still works — it falls back to the JSONL store and
+says so once on stderr — but to get SQLite, allow the script:
+
+```sh
+npm install -g --allow-scripts=better-sqlite3 github:cresec-ai/audit#main
+```
+
+(or `npm config set allow-scripts=better-sqlite3 --location=user` once, for
+every future global install). npm 10 runs the script without being asked.
+
 Confirm it worked:
 
 ```sh
@@ -78,18 +91,28 @@ mcp-recorder setup --client claude-desktop
 
 ```
 mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] [--wrapper local|npx|wsl]
-                   [--only NAME[,NAME...]] [--except NAME[,NAME...]] [--data-dir D] [--dry-run] [--undo] [--json]
+                   [--only NAME[,NAME...]] [--except NAME[,NAME...]] [--bridge NAME=URL[,NAME=URL...]]
+                   [--data-dir D] [--dry-run] [--undo] [--json]
 ```
 
 - `--client` picks the config file automatically:
   - `claude-desktop`: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%\Claude\claude_desktop_config.json` (Windows), or `~/.config/Claude/claude_desktop_config.json` (Linux)
+    — and on Windows, when that `%APPDATA%` path doesn't exist, a **Microsoft
+    Store (MSIX)** install instead: `%LOCALAPPDATA%\Packages\Claude_<hash>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+    (the `Claude_<hash>` package folder name varies per machine; `setup`
+    finds it automatically, or errors asking for `--config` if more than one
+    matches)
   - `claude-code`: `~/.claude.json`, or a project's `.mcp.json`
   - `cursor`: `~/.cursor/mcp.json`
   - `--config PATH` overrides the resolved path.
   - Running inside **WSL**: if the Linux-side path above doesn't exist,
     `setup` automatically looks for it on the **Windows** side instead (e.g.
-    `/mnt/c/Users/<you>/AppData/Roaming/Claude/claude_desktop_config.json`)
+    `/mnt/c/Users/<you>/AppData/Roaming/Claude/claude_desktop_config.json`,
+    MSIX included)
     — see [Windows and WSL](#windows-and-wsl) below.
+  - `--bridge NAME=URL` turns a *remote* MCP connector into a local, wrappable
+    entry — see [Connectors: what the recorder can and cannot
+    see](#connectors-what-the-recorder-can-and-cannot-see) below.
 - `--wrapper local` (the default) points at this Node binary and this
   install's `dist/cli.js` by absolute path. `--wrapper npx` writes the
   `npx -y @edut/mcp-recorder` form (once the package is on npm). `--wrapper
@@ -101,6 +124,9 @@ mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] 
 - `--only NAME,...` / `--except NAME,...` limit which server entries get
   wrapped; entries that are already `url`/`http` (not stdio) are always
   skipped, and an already-wrapped entry is never wrapped twice.
+- `--bridge NAME=URL[,NAME=URL...]` (repeatable) adds `NAME` as a local
+  `npx -y mcp-remote URL` entry before wrapping — see [Connectors: what the
+  recorder can and cannot see](#connectors-what-the-recorder-can-and-cannot-see).
 - Every run writes a timestamped `.bak` of the config plus a sidecar record,
   so `mcp-recorder setup --client <same> --undo` restores the originals
   exactly.
@@ -400,6 +426,65 @@ install using `~/.claude.json` (or a project's `.mcp.json`) on the Linux
 side, same as any other Linux setup. There's no separate Windows-side config
 for it to fall back to.
 
+## Connectors: what the recorder can and cannot see
+
+`claude_desktop_config.json` isn't the only way Claude Desktop reaches an MCP
+server. Whether `setup` can wrap one depends entirely on how it's added:
+
+| Kind | Where it runs | Recordable? |
+| --- | --- | --- |
+| Local MCP servers in `claude_desktop_config.json` | Your machine, stdio | **Yes** — `setup` wraps it |
+| Desktop Extensions (`.mcpb`) | Your machine, stdio | Local, but not yet wrapped by `setup` (planned) |
+| Remote connectors (Settings → Connectors) | **Anthropic's infrastructure**, not your machine | **No** — see below |
+
+A **remote connector** — one you add from Claude Desktop's Settings →
+Connectors, such as ClickUp at `https://mcp.clickup.com/mcp` — is an OAuth
+flow to a remote MCP endpoint that Claude's own backend calls, not a local
+process your machine ever runs: the OAuth callback for these is
+`https://claude.ai/api/mcp/auth_callback`, and none of it is a `command`/`args`
+entry in `claude_desktop_config.json` for `setup` to find. There is nothing
+local for the recorder to sit in front of.
+
+The way to record such a server today is `--bridge`: it reaches the *same*
+remote MCP endpoint, but from your machine, through the
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, so it
+becomes a local stdio entry `setup` can wrap like any other. First-party
+Anthropic-hosted connectors — Google Drive, Gmail, Calendar — have no public
+MCP endpoint of their own to bridge to; only third-party remote MCP servers
+(ClickUp and similar) can be bridged this way.
+
+### Bridge a remote MCP server
+
+```sh
+mcp-recorder setup --client claude-desktop --bridge clickup=https://mcp.clickup.com/mcp --dry-run
+mcp-recorder setup --client claude-desktop --bridge clickup=https://mcp.clickup.com/mcp
+```
+
+This adds `clickup` to your config as `npx -y mcp-remote https://mcp.clickup.com/mcp`,
+then wraps *that* with the recorder — so the sidecar's "original" for
+`--undo` is the unwrapped `mcp-remote` entry, not the remote connector itself
+(`--undo` removes the recorder, not the bridge; delete the `clickup` entry by
+hand if you want the bridge gone too).
+
+The first time Claude Desktop launches a bridged server, `mcp-remote` opens
+an OAuth flow in your browser, the same authorization you'd get adding it as
+a connector. To pre-authorize from a terminal instead of waiting for that
+first launch:
+
+```sh
+npx -y mcp-remote https://mcp.clickup.com/mcp
+```
+
+Tokens land under `~/.mcp-auth` and are reused by the wrapped server.
+
+**In WSL:** the browser OAuth step opens on Windows even when the recorder
+and `mcp-remote` run inside WSL — WSL2 forwards `localhost`, so the callback
+mcp-remote listens for still reaches it.
+
+**Caveat:** once bridged, that server is only available in **Claude
+Desktop**, wired through this specific config — not on claude.ai or mobile,
+which still reach the connector directly through Anthropic's infrastructure.
+
 ## Install with Claude
 
 You can hand the install off to Claude itself — Claude Desktop or Claude
@@ -534,6 +619,13 @@ it directly without the wrapper to confirm — `npx -y @modelcontextprotocol/ser
 **Rule out the recorder entirely.** Set `MCP_RECORDER_DISABLE=1` in the
 wrapped command's environment: traffic flows straight through with nothing
 recorded. If the problem persists with this set, it isn't the recorder.
+
+**`mcp-recorder setup` says `Unknown option '--client'`.** The `mcp-recorder`
+on your `PATH` is an older install from before `setup` existed, not the one
+you just installed. `which -a mcp-recorder` lists every copy; remove the
+stale one (or `npm uninstall -g @edut/mcp-recorder` under the Node version
+that owns it), then `hash -r`. `npm ls -g @edut/mcp-recorder` shows where
+the current one lives.
 
 **Read stderr.** The recorder never writes diagnostics to stdout (stdout is
 the MCP wire) — everything it logs is prefixed `[mcp-recorder]` on stderr.
