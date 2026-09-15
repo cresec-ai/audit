@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { spawnTsx } from './helpers/tsx.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ECHO_SERVER = fileURLToPath(new URL('./fixtures/echo-server.cjs', import.meta.url));
@@ -64,7 +65,7 @@ function waitExit(child: ChildProcess): Promise<number | null> {
 }
 
 function spawnCli(args: string[]): ChildProcess {
-  const child = spawn('npx', ['tsx', 'src/cli.ts', ...args], {
+  const child = spawnTsx(['src/cli.ts', ...args], {
     cwd: ROOT,
     env: { ...process.env, MCP_RECORDER_DISABLE: undefined },
     stdio: ['pipe', 'pipe', 'pipe'],

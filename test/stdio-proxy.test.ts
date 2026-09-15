@@ -382,22 +382,28 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     expect(end?.spawn_error).toBe('ENOENT');
   });
 
-  it('a child killed by a signal exits 128+<signal number> and records child_signal', async () => {
-    const store = new FakeStore();
-    const recorder = new Recorder({ store, signer: null });
-    const code = await runStdioProxy({
-      command: [process.execPath, '-e', "process.kill(process.pid, 'SIGKILL')"],
-      recorder,
-      redactor: fakeRedactor,
-      proxyVersion: '0.1.0-test',
-      stdin: new PassThrough(),
-      stdout: new PassThrough(),
-      stderr: new PassThrough(),
-    });
-    expect(code).toBe(128 + 9); // SIGKILL = 9 on POSIX
-    const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
-    expect(end?.child_signal).toBe('SIGKILL');
-  });
+  // Windows has no POSIX signal semantics: exit codes are not 128+<signum>
+  // and there is no equivalent guarantee that the process is reported as
+  // signal-killed rather than merely exited.
+  it.skipIf(process.platform === 'win32')(
+    'a child killed by a signal exits 128+<signal number> and records child_signal',
+    async () => {
+      const store = new FakeStore();
+      const recorder = new Recorder({ store, signer: null });
+      const code = await runStdioProxy({
+        command: [process.execPath, '-e', "process.kill(process.pid, 'SIGKILL')"],
+        recorder,
+        redactor: fakeRedactor,
+        proxyVersion: '0.1.0-test',
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+      });
+      expect(code).toBe(128 + 9); // SIGKILL = 9 on POSIX
+      const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
+      expect(end?.child_signal).toBe('SIGKILL');
+    },
+  );
 
   it('EPIPE on the proxy stdout does not crash the proxy, and a session_end is still written', async () => {
     const store = new FakeStore();

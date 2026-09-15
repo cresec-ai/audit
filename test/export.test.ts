@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { inflateRawSync } from 'node:zlib';
 import yazl from 'yazl';
+import { spawnTsxSync } from './helpers/tsx.js';
 import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Signer, publicKeyPem } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
@@ -180,7 +181,7 @@ async function zipBundleDir(bundleDir: string, zipPath: string): Promise<void> {
 }
 
 function runCliVerifyBundle(bundlePath: string): { status: number | null; stdout: string } {
-  const result = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', bundlePath], {
+  const result = spawnTsxSync(['src/cli.ts', 'verify', '--bundle', bundlePath], {
     cwd: ROOT,
     encoding: 'utf8',
   });
@@ -455,7 +456,7 @@ describe('exportBundle', () => {
     const zipPath = join(dir, 'evidence.zip');
     await exportBundle({ store, zipPath, toolVersion: '0.1.0-test', signer });
 
-    const ok = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', zipPath], {
+    const ok = spawnTsxSync(['src/cli.ts', 'verify', '--bundle', zipPath], {
       cwd: ROOT,
       encoding: 'utf8',
     });
@@ -488,7 +489,7 @@ describe('exportBundle', () => {
       zf.end();
     });
 
-    const bad = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', tamperedZip], {
+    const bad = spawnTsxSync(['src/cli.ts', 'verify', '--bundle', tamperedZip], {
       cwd: ROOT,
       encoding: 'utf8',
     });
@@ -612,7 +613,7 @@ describe('exportBundle', () => {
       zf.end();
     });
 
-    const cli = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', zipPath], {
+    const cli = spawnTsxSync(['src/cli.ts', 'verify', '--bundle', zipPath], {
       cwd: ROOT,
       encoding: 'utf8',
     });

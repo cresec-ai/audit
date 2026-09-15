@@ -6,13 +6,13 @@
  * stale head, jsonl's advisory lock, the key-file creation race) that an
  * in-process test cannot reproduce.
  */
-import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsx } from './helpers/tsx.js';
 
 import { openStore } from '../src/store/index.js';
 import { verifyStore } from '../src/verify/verify.js';
@@ -55,10 +55,8 @@ function runRecordProcess(
   calls: number,
 ): Promise<ProcResult> {
   return new Promise((resolve) => {
-    const child: ChildProcess = spawn(
-      'npx',
+    const child: ChildProcess = spawnTsx(
       [
-        'tsx',
         'src/cli.ts',
         'record',
         '--data-dir',

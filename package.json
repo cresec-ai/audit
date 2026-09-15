@@ -15,7 +15,7 @@
   "license": "GPL-3.0",
   "type": "module",
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20"
   },
   "bin": {
     "mcp-recorder": "dist/cli.js"

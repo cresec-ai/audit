@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { createPublicKey, verify as nodeVerify } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import * as ed from '@noble/ed25519';
+import { spawnTsx } from './helpers/tsx.js';
 import { Signer, publicKeyPem, publicKeyHexFromPem } from '../src/chain/keys.js';
 import { signedPayload, sha256Hex } from '../src/chain/hash.js';
 import { FILES } from '../src/types.js';
@@ -15,8 +15,6 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const HEX128 = /^[0-9a-f]{128}$/;
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-/** Local tsx binary (a devDependency): avoids depending on a global PATH `npx`. */
-const TSX_BIN = join(TEST_DIR, '..', 'node_modules', '.bin', 'tsx');
 const LOAD_SIGNER_FIXTURE = join(TEST_DIR, 'fixtures', 'load-signer.ts');
 
 interface ChildResult {
@@ -43,7 +41,7 @@ interface SpawnedSigner {
  * their Signer.load calls as tightly as the OS will schedule them.
  */
 function spawnSigner(dataDir: string): SpawnedSigner {
-  const child = spawn(TSX_BIN, [LOAD_SIGNER_FIXTURE, dataDir], {
+  const child = spawnTsx([LOAD_SIGNER_FIXTURE, dataDir], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';

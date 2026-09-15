@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsx } from './helpers/tsx.js';
 import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Signer, publicKeyPem } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
@@ -43,7 +44,7 @@ function tmpDir(prefix: string): string {
 }
 
 function spawnCli(args: string[], env: Record<string, string | undefined> = {}): ChildProcess {
-  const child = spawn('npx', ['tsx', 'src/cli.ts', ...args], {
+  const child = spawnTsx(['src/cli.ts', ...args], {
     cwd: ROOT,
     env: { ...process.env, MCP_RECORDER_DISABLE: undefined, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -56,25 +57,34 @@ function spawnCli(args: string[], env: Record<string, string | undefined> = {}):
 
 /**
  * Like spawnCli, but detached into its own process group so cleanup can kill
- * the WHOLE npx -> sh -> node(tsx) -> node(loader) tree it creates. A signal
- * to just the top pid (what spawnCli's cleanup does) does not reliably reach
- * a long-running server like `ui` down that chain — only a full process-group
- * kill does. Use this for any test that starts `ui` without `--out`.
+ * the WHOLE tsx -> node(loader) tree it creates. A signal to just the top pid
+ * (what spawnCli's cleanup does) does not reliably reach a long-running
+ * server like `ui` down that chain — only a full process-group kill does.
+ * Use this for any test that starts `ui` without `--out`.
+ *
+ * Windows has no POSIX process groups (`detached`/`process.kill(-pid, ...)`
+ * are a no-op/error there), so on win32 this just falls back to killing the
+ * one child directly — tsx spawns `ui`'s HTTP server in-process (no further
+ * child tree here, unlike the npx/sh chain this used to go through), so that
+ * single kill is enough.
  */
 function spawnCliDetached(args: string[], env: Record<string, string | undefined> = {}): ChildProcess {
-  const child = spawn('npx', ['tsx', 'src/cli.ts', ...args], {
+  const child = spawnTsx(['src/cli.ts', ...args], {
     cwd: ROOT,
     env: { ...process.env, MCP_RECORDER_DISABLE: undefined, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
+    detached: process.platform !== 'win32',
   });
   cleanups.push(() => {
-    if (child.pid !== undefined) {
-      try {
+    if (child.pid === undefined) return;
+    try {
+      if (process.platform === 'win32') {
+        child.kill('SIGKILL');
+      } else {
         process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        /* whole tree already gone */
       }
+    } catch {
+      /* whole tree already gone */
     }
   });
   return child;
@@ -922,57 +932,77 @@ describe('ui: best-effort browser open', () => {
     return { binDir, marker };
   }
 
-  it('spawns the platform opener for the served URL by default (a display is present)', async () => {
-    const dataDir = tmpDir('mcp-rec-ui-open-');
-    const { binDir, marker } = makeFakeOpener();
-    const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
-      PATH: `${binDir}:${process.env.PATH ?? ''}`,
-      DISPLAY: ':99',
-    });
-    const stderrText = collect(child.stderr);
-    await waitForMatch(stderrText, /replay UI at http/);
-    await waitMs(1000);
-    expect(existsSync(marker)).toBe(true);
-  }, 30_000);
+  // Every test below fakes out the *Linux* opener (`xdg-open`, a `#!/bin/sh`
+  // script granted the exec bit) — on win32 the CLI reaches for a different
+  // opener entirely (see cli.ts's platform switch) and PATH itself uses a
+  // different separator (`;` not `:`), so this whole fixture doesn't apply.
+  it.skipIf(process.platform === 'win32')(
+    'spawns the platform opener for the served URL by default (a display is present)',
+    async () => {
+      const dataDir = tmpDir('mcp-rec-ui-open-');
+      const { binDir, marker } = makeFakeOpener();
+      const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        DISPLAY: ':99',
+      });
+      const stderrText = collect(child.stderr);
+      await waitForMatch(stderrText, /replay UI at http/);
+      await waitMs(1000);
+      expect(existsSync(marker)).toBe(true);
+    },
+    30_000,
+  );
 
-  it('--no-open never spawns the opener, even with a display present', async () => {
-    const dataDir = tmpDir('mcp-rec-ui-noopen-');
-    const { binDir, marker } = makeFakeOpener();
-    const child = spawnCliDetached(['ui', '--data-dir', dataDir, '--no-open'], {
-      PATH: `${binDir}:${process.env.PATH ?? ''}`,
-      DISPLAY: ':99',
-    });
-    const stderrText = collect(child.stderr);
-    await waitForMatch(stderrText, /replay UI at http/);
-    await waitMs(1000);
-    expect(existsSync(marker)).toBe(false);
-  }, 30_000);
+  it.skipIf(process.platform === 'win32')(
+    '--no-open never spawns the opener, even with a display present',
+    async () => {
+      const dataDir = tmpDir('mcp-rec-ui-noopen-');
+      const { binDir, marker } = makeFakeOpener();
+      const child = spawnCliDetached(['ui', '--data-dir', dataDir, '--no-open'], {
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        DISPLAY: ':99',
+      });
+      const stderrText = collect(child.stderr);
+      await waitForMatch(stderrText, /replay UI at http/);
+      await waitMs(1000);
+      expect(existsSync(marker)).toBe(false);
+    },
+    30_000,
+  );
 
-  it('--out never spawns the opener (there is no server to open)', async () => {
-    const dataDir = tmpDir('mcp-rec-ui-outnoopen-');
-    const { binDir, marker } = makeFakeOpener();
-    const res = await runCli(['ui', '--data-dir', dataDir, '--out', join(dataDir, 'replay.html')], {
-      PATH: `${binDir}:${process.env.PATH ?? ''}`,
-      DISPLAY: ':99',
-    });
-    expect(res.code).toBe(0);
-    expect(existsSync(marker)).toBe(false);
-  }, 30_000);
+  it.skipIf(process.platform === 'win32')(
+    '--out never spawns the opener (there is no server to open)',
+    async () => {
+      const dataDir = tmpDir('mcp-rec-ui-outnoopen-');
+      const { binDir, marker } = makeFakeOpener();
+      const res = await runCli(['ui', '--data-dir', dataDir, '--out', join(dataDir, 'replay.html')], {
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        DISPLAY: ':99',
+      });
+      expect(res.code).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    30_000,
+  );
 
-  it('does not hang on a headless host (no DISPLAY) and never spawns an opener', async () => {
-    const dataDir = tmpDir('mcp-rec-ui-headless-');
-    const { binDir, marker } = makeFakeOpener();
-    const started = Date.now();
-    const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
-      PATH: `${binDir}:${process.env.PATH ?? ''}`,
-      DISPLAY: undefined,
-      WAYLAND_DISPLAY: undefined,
-    });
-    const stderrText = collect(child.stderr);
-    await waitForMatch(stderrText, /replay UI at http/);
-    // The server came up promptly — nothing blocked on a (nonexistent) opener.
-    expect(Date.now() - started).toBeLessThan(10_000);
-    await waitMs(1000);
-    expect(existsSync(marker)).toBe(false);
-  }, 30_000);
+  it.skipIf(process.platform === 'win32')(
+    'does not hang on a headless host (no DISPLAY) and never spawns an opener',
+    async () => {
+      const dataDir = tmpDir('mcp-rec-ui-headless-');
+      const { binDir, marker } = makeFakeOpener();
+      const started = Date.now();
+      const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        DISPLAY: undefined,
+        WAYLAND_DISPLAY: undefined,
+      });
+      const stderrText = collect(child.stderr);
+      await waitForMatch(stderrText, /replay UI at http/);
+      // The server came up promptly — nothing blocked on a (nonexistent) opener.
+      expect(Date.now() - started).toBeLessThan(10_000);
+      await waitMs(1000);
+      expect(existsSync(marker)).toBe(false);
+    },
+    30_000,
+  );
 });
