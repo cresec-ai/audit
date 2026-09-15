@@ -286,7 +286,11 @@ export async function verifyRecords(
       problems.push({
         type: 'no_valid_signature',
         seq: head.seq,
-        detail: `${checked} event(s) recorded, but no valid head signature attests any of this chain`,
+        detail:
+          `the store carries no valid signature: ${checked} event(s) recorded, but no head ` +
+          'signature attests any of this chain (e.g. the recorder ran with a corrupt or ' +
+          'missing identity.key). Pass --allow-unsigned to treat this as a warning instead ' +
+          'of a failure if that is acceptable for your use case.',
         ...warnOpt,
       });
       if (tailHasSessionEnd) {

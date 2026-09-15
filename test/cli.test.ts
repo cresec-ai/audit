@@ -242,8 +242,15 @@ function fixtureSessionStart(sessionId: string, timestamp: string): SessionStart
   };
 }
 
-/** Seed a jsonl store with one session_start event per given (deterministic) session id. */
-function seedSessions(dataDir: string, sessionIds: string[]): void {
+/**
+ * Seed a jsonl store with one session_start event per given (deterministic)
+ * session id. Also creates a real signing key first, same as an honest
+ * `record` run would — `export` (Signer.loadExisting) now refuses to run
+ * against a data dir with no identity.key, so any fixture `export` is
+ * expected to succeed against needs one already in place.
+ */
+async function seedSessions(dataDir: string, sessionIds: string[]): Promise<void> {
+  await Signer.load(dataDir);
   const store = openStore({ dataDir, backend: 'jsonl' });
   try {
     let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
@@ -603,6 +610,65 @@ describe('mcp-recorder CLI', () => {
     expect(lenient.stdout).toContain('PASS (unsigned tail)');
   }, 60_000);
 
+  it('a store with no identity.pub and no --public-key is an unpinned PASS, loudly labeled as such', async () => {
+    const dataDir = tmpDir('mcp-rec-unpinned-');
+    const signer = await Signer.load(dataDir);
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2)]));
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+    store.close();
+    rmSync(join(dataDir, 'identity.pub')); // e.g. a store copied without it, or the file deleted
+
+    const human = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(human.code).toBe(0); // the chain really is intact — this is a PASS, just an unpinned one
+    expect(human.stdout).toContain('WARNING');
+    expect(human.stdout).toContain('no public key to pin against');
+    expect(human.stdout).toContain('PASS (unpinned)');
+    expect(human.stdout).not.toMatch(/^PASS —/m); // never an indistinguishable plain PASS
+
+    const json = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl', '--json']);
+    expect(json.code).toBe(0);
+    const payload = JSON.parse(json.stdout) as { ok: boolean; pinned_public_key: unknown; unpinned?: boolean };
+    expect(payload.ok).toBe(true);
+    expect(payload.pinned_public_key).toBeNull();
+    expect(payload.unpinned).toBe(true);
+  }, 60_000);
+
+  it('export refuses to mint a new signing key: a store copied without identity.key exits 2 and creates no key files, verify still passes after', async () => {
+    const hostDir = tmpDir('mcp-rec-export-host-');
+    const signer = await Signer.load(hostDir);
+    const store = openStore({ dataDir: hostDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2)]));
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+    store.close();
+
+    // Simulate "copied the evidence dir to another machine": only the store
+    // files come along, not the private key.
+    const copyDir = tmpDir('mcp-rec-export-copy-');
+    writeFileSync(join(copyDir, 'evidence.jsonl'), readFileSync(join(hostDir, 'evidence.jsonl')));
+    writeFileSync(join(copyDir, 'signatures.jsonl'), readFileSync(join(hostDir, 'signatures.jsonl')));
+
+    const exported = await runCli([
+      'export', '--data-dir', copyDir, '--store', 'jsonl', '--dir', join(copyDir, 'bundle'),
+    ]);
+    expect(exported.code).toBe(2);
+    expect(exported.stderr).toContain('no signing key in');
+    expect(exported.stderr).toContain('export must run on the recording host');
+    expect(existsSync(join(copyDir, 'identity.key'))).toBe(false);
+    expect(existsSync(join(copyDir, 'identity.pub'))).toBe(false);
+    expect(existsSync(join(copyDir, 'bundle'))).toBe(false);
+
+    // The chain itself was never touched — verify (pinned to the honest
+    // signer's key, since identity.pub wasn't copied either) still passes.
+    const verify = await runCli([
+      'verify', '--data-dir', copyDir, '--store', 'jsonl', '--public-key', signer.publicKeyHex,
+    ]);
+    expect(verify.code).toBe(0);
+    expect(verify.stdout).toContain('PASS');
+  }, 60_000);
+
   it('verify --bundle --public-key pins to an externally supplied key', async () => {
     const dataDir = tmpDir('mcp-rec-bundle-pin-');
     const signer = await Signer.load(dataDir);
@@ -626,6 +692,40 @@ describe('mcp-recorder CLI', () => {
     expect(wrong.code).toBe(1);
     expect(wrong.stdout).toContain('FAIL');
   }, 60_000);
+
+  it("ui's integrity banner agrees with verify: FAILED banner for a chain verify rejects (foreign-key re-signed), not a green PASS", async () => {
+    const dataDir = tmpDir('mcp-rec-ui-banner-');
+    await Signer.load(dataDir); // creates dataDir's own identity.pub
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2), notif(3)]));
+    store.close();
+
+    // Attacker: re-sign the (otherwise honest) chain with a foreign key —
+    // identity.key/.pub in dataDir untouched, so verify's default pin rejects it.
+    const attackerDir = tmpDir('mcp-rec-ui-banner-attacker-');
+    const attacker = await Signer.load(attackerDir);
+    const lines = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8').trim().split('\n');
+    const last = JSON.parse(lines[lines.length - 1]!) as ChainRecord;
+    writeFileSync(
+      join(dataDir, 'signatures.jsonl'),
+      JSON.stringify(await attacker.sign(last.seq, last.hash)) + '\n',
+    );
+
+    const verify = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(verify.code).toBe(1);
+    expect(verify.stdout).toContain('FAIL');
+
+    const htmlPath = join(dataDir, 'replay.html');
+    const ui = await runCli(['ui', '--data-dir', dataDir, '--store', 'jsonl', '--out', htmlPath]);
+    expect(ui.code).toBe(0);
+    const html = readFileSync(htmlPath, 'utf8');
+    // Before the fix, ui called verifyStore(store) with no pin at all, so the
+    // foreign-but-cryptographically-valid signature verified and the banner
+    // showed green even though `verify` itself FAILs this exact chain.
+    expect(html).toContain('banner bad');
+    expect(html).not.toContain('banner ok');
+    expect(html).toContain('signature_invalid');
+  }, 60_000);
 });
 
 describe('--session prefix resolution (export / query / ui)', () => {
@@ -635,14 +735,14 @@ describe('--session prefix resolution (export / query / ui)', () => {
   const SESSION_SHARED_B = 'aaaaaaab-2222-4222-8222-222222222222';
   const SESSION_UNIQUE = 'ffffffff-3333-4333-8333-333333333333';
 
-  function seededDataDir(): string {
+  async function seededDataDir(): Promise<string> {
     const dataDir = tmpDir('mcp-rec-session-prefix-');
-    seedSessions(dataDir, [SESSION_SHARED_A, SESSION_SHARED_B, SESSION_UNIQUE]);
+    await seedSessions(dataDir, [SESSION_SHARED_A, SESSION_SHARED_B, SESSION_UNIQUE]);
     return dataDir;
   }
 
   it('a unique id prefix (the 8 chars `sessions` prints) resolves for export / query / ui', async () => {
-    const dataDir = seededDataDir();
+    const dataDir = await seededDataDir();
 
     const bundleDir = join(dataDir, 'bundle');
     const exported = await runCli([
@@ -685,13 +785,13 @@ describe('--session prefix resolution (export / query / ui)', () => {
   }, 60_000);
 
   it('an exact full session id still works (unchanged behavior)', async () => {
-    const dataDir = seededDataDir();
+    const dataDir = await seededDataDir();
     const query = await runCli(['query', 'anything', '--data-dir', dataDir, '--session', SESSION_UNIQUE]);
     expect(query.code).toBe(0);
   }, 60_000);
 
   it('an ambiguous --session prefix exits 2 and lists the candidates', async () => {
-    const dataDir = seededDataDir();
+    const dataDir = await seededDataDir();
 
     const exported = await runCli([
       'export',
@@ -725,7 +825,7 @@ describe('--session prefix resolution (export / query / ui)', () => {
   }, 60_000);
 
   it('a --session with no match exits 2 with a clear message (query: not a silent 0 matches)', async () => {
-    const dataDir = seededDataDir();
+    const dataDir = await seededDataDir();
 
     const query = await runCli(['query', 'x', '--data-dir', dataDir, '--session', 'deadbeef']);
     expect(query.code).toBe(2);
@@ -771,6 +871,43 @@ describe('inspection commands: EPIPE handling', () => {
     expect(stderrOut).not.toMatch(/Emitted 'error' event/i);
     expect(stderrOut).not.toMatch(/at WriteStream/);
     expect(code).toBe(0);
+  }, 60_000);
+
+  it('a FAILing verify piped through a reader that closes early still exits 1, not 0', async () => {
+    const dataDir = tmpDir('mcp-rec-epipe-failcode-');
+    seedManyMatchingEvents(dataDir, 'epipe-failcode-needle', 4000);
+    // Tamper every record (leaving their stored hash untouched) so verify's
+    // problems table has one hash_mismatch row per record — big enough that
+    // the CLI is still mid-write when the reader below closes early, exactly
+    // the condition under which guardStdoutEpipe's exit(0) used to mask a
+    // real FAIL's exit code (cmdVerify used to set process.exitCode AFTER
+    // printing, so the EPIPE handler never saw it).
+    const evidencePath = join(dataDir, 'evidence.jsonl');
+    const tampered =
+      readFileSync(evidencePath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const record = JSON.parse(line) as ChainRecord;
+          (record.event as ToolCallEvent).tool = 'doctored';
+          return JSON.stringify(record);
+        })
+        .join('\n') + '\n';
+    writeFileSync(evidencePath, tampered);
+
+    const sanity = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(sanity.code).toBe(1);
+    expect(sanity.stdout).toContain('FAIL');
+
+    const child = spawnCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    await new Promise<void>((resolveData) => {
+      child.stdout!.once('data', () => {
+        child.stdout!.destroy();
+        resolveData();
+      });
+    });
+    const code = await waitExit(child);
+    expect(code).toBe(1); // NOT 0 — a reader going away must not turn a FAIL into apparent success
   }, 60_000);
 });
 

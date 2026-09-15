@@ -150,6 +150,7 @@ a1b2c3d4  2026-09-15T09:14:02.113Z  2026-09-15T09:14:21.885Z  filesystem  17    
 <span class="c"># 3. prove the record is intact</span>
 <span class="p">$</span> mcp-recorder verify
 verify store ~/.mcp-recorder/evidence.db (sqlite)
+pinned signer: ed25519 c397380b4a18ee5a&hellip; (~/.mcp-recorder/identity.pub)
 <span class="g">PASS</span> &mdash; chain intact: 17 event(s), head seq 17
 signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.887Z
 
@@ -168,6 +169,7 @@ verify anywhere with: node verify.cjs (inside the bundle)
 
 <span class="p">$</span> mcp-recorder verify --bundle evidence.zip
 verify bundle /Users/me/projects/evidence.zip
+pinned signer: ed25519 c397380b4a18ee5a&hellip; (bundle's own manifest.json &mdash; self-pinned; pass --public-key with a key obtained out of band for independent assurance)
 <span class="g">PASS</span> &mdash; chain intact: 17 event(s), head seq 17
 signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.887Z</pre>
   </div>

@@ -15,7 +15,7 @@ import { spawnSync } from 'node:child_process';
 import { inflateRawSync } from 'node:zlib';
 import yazl from 'yazl';
 import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
-import { Signer } from '../src/chain/keys.js';
+import { Signer, publicKeyPem } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
 import { exportBundle, BUNDLE_FILES } from '../src/export/bundle.js';
 import { verifyRecords } from '../src/verify/verify.js';
@@ -161,6 +161,30 @@ function readZipEntry(zipPath: string, name: string): Buffer {
     return method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed);
   }
   throw new Error(`entry ${name} not found in ${zipPath}`);
+}
+
+/** Zip up every file currently in a bundle directory (post-tamper contents included). */
+async function zipBundleDir(bundleDir: string, zipPath: string): Promise<void> {
+  const zf = new yazl.ZipFile();
+  for (const name of Object.values(BUNDLE_FILES)) {
+    zf.addBuffer(readFileSync(join(bundleDir, name)), name);
+  }
+  await new Promise<void>((resolve, reject) => {
+    const out = createWriteStream(zipPath);
+    out.on('close', () => resolve());
+    out.on('error', reject);
+    zf.outputStream.on('error', reject);
+    zf.outputStream.pipe(out);
+    zf.end();
+  });
+}
+
+function runCliVerifyBundle(bundlePath: string): { status: number | null; stdout: string } {
+  const result = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', bundlePath], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  });
+  return { status: result.status, stdout: result.stdout };
 }
 
 /* -------------------------------- suite -------------------------------- */
@@ -471,5 +495,128 @@ describe('exportBundle', () => {
     expect(bad.status).toBe(1);
     expect(bad.stdout).toContain('FAIL');
     expect(bad.stdout).toMatch(/hash_mismatch\s+5\b/); // pinpoints the doctored record at seq 5
+  }, 30_000);
+
+  /* --------- review-fix R1: forged-tail, PEM-swap, and duplicate-ZIP-entry bundles --------- */
+
+  it('P0: a forged tail chained onto the real signed head (no key needed) FAILS verify --bundle, dir and zip', async () => {
+    const bundleDir = join(dir, 'bundle-forged-tail');
+    await exportBundle({ store, dirPath: bundleDir, toolVersion: '0.1.0-test', signer });
+
+    // Attacker: append records that chain correctly onto the genuine signed
+    // head — self-consistent, no key required — same shape as any honest
+    // tail. Nothing else in the bundle is touched.
+    const eventsPath = join(bundleDir, BUNDLE_FILES.EVENTS);
+    const genuineLines = readFileSync(eventsPath, 'utf8').split('\n').filter((l) => l.trim() !== '');
+    const lastGenuine = JSON.parse(genuineLines[genuineLines.length - 1]!) as ChainRecord;
+    let head: ChainHead = { seq: lastGenuine.seq, hash: lastGenuine.hash };
+    const forged: ChainRecord[] = [];
+    for (let i = 0; i < 3; i++) {
+      const r = makeRecord(head, toolCall(SESSION_A, 900 + i, 'FORGED_exfiltrate'));
+      forged.push(r);
+      head = { seq: r.seq, hash: r.hash };
+    }
+    writeFileSync(
+      eventsPath,
+      [...genuineLines, ...forged.map((r) => JSON.stringify(r))].join('\n') + '\n',
+    );
+
+    // The in-package verifier must reject it (this is the bug: it used to
+    // report only a downgradable "unsigned tail" warning and PASS).
+    const cliDir = runCliVerifyBundle(bundleDir);
+    expect(cliDir.status).toBe(1);
+    expect(cliDir.stdout).toContain('FAIL');
+    expect(cliDir.stdout).toContain('bundle_manifest_mismatch');
+
+    // The standalone verifier shipped in the bundle must agree.
+    const cjsDir = runVerifyCjs(bundleDir);
+    expect(cjsDir.status).toBe(1);
+    expect(cjsDir.stdout).toContain('FAIL');
+
+    // Same forged tail, packaged as a .zip.
+    const zipPath = join(dir, 'forged-tail.zip');
+    await zipBundleDir(bundleDir, zipPath);
+    const cliZip = runCliVerifyBundle(zipPath);
+    expect(cliZip.status).toBe(1);
+    expect(cliZip.stdout).toContain('FAIL');
+    expect(cliZip.stdout).toContain('bundle_manifest_mismatch');
+  }, 30_000);
+
+  it('P1: a forgery re-signed with an attacker key that ships the real public_key.pem FAILS verify --bundle, dir and zip', async () => {
+    // A fully self-consistent bundle signed end-to-end by an ATTACKER key —
+    // internally it verifies perfectly against its own manifest.
+    const attacker = await Signer.load(join(dir, 'attacker'));
+    const attackerDir = join(dir, 'bundle-attacker');
+    const attackerStore = openStore({ dataDir: join(dir, 'attacker-data'), backend: 'jsonl' });
+    attackerStore.append(seal([toolCall(SESSION_A, 0, 'FORGED_exfiltrate')]));
+    await exportBundle({
+      store: attackerStore,
+      dirPath: attackerDir,
+      toolVersion: '0.1.0-test',
+      signer: attacker,
+    });
+    attackerStore.close();
+
+    // ...but public_key.pem still ships the OPERATOR's genuine key (e.g. the
+    // attacker only had write access to events.jsonl/manifest.json, or
+    // forgot to swap it). manifest.public_key_pem is left pointing at the
+    // attacker's own PEM, matching manifest.signature — only the shipped
+    // public_key.pem FILE is the operator's.
+    writeFileSync(join(attackerDir, BUNDLE_FILES.PUBLIC_KEY), publicKeyPem(signer.publicKeyHex));
+
+    const cliDir = runCliVerifyBundle(attackerDir);
+    expect(cliDir.status).toBe(1);
+    expect(cliDir.stdout).toContain('FAIL');
+    expect(cliDir.stdout).toContain('public_key.pem does not match the manifest signing key');
+
+    const cjsDir = runVerifyCjs(attackerDir);
+    expect(cjsDir.status).toBe(1);
+    expect(cjsDir.stdout).toContain('FAIL');
+
+    const zipPath = join(dir, 'attacker.zip');
+    await zipBundleDir(attackerDir, zipPath);
+    const cliZip = runCliVerifyBundle(zipPath);
+    expect(cliZip.status).toBe(1);
+    expect(cliZip.stdout).toContain('FAIL');
+    expect(cliZip.stdout).toContain('public_key.pem does not match the manifest signing key');
+  }, 30_000);
+
+  it('P1/P2: a .zip with a duplicate events.jsonl entry (genuine then forged) is rejected, not silently resolved to either copy', async () => {
+    const bundleDir = join(dir, 'bundle-dup');
+    await exportBundle({ store, dirPath: bundleDir, toolVersion: '0.1.0-test', signer });
+
+    const genuineEvents = readFileSync(join(bundleDir, BUNDLE_FILES.EVENTS));
+    const forgedEvents = Buffer.from(
+      genuineEvents.toString('utf8').replace('list_issues', 'FORGED_exfiltrate'),
+      'utf8',
+    );
+
+    // A real unzip/extractAllTo writes whichever duplicate-named entry comes
+    // LAST — verify --bundle must not silently trust the FIRST instead (which
+    // would let a bundle verify against a genuine copy while extracting a
+    // forged one to disk).
+    const zipPath = join(dir, 'dup-entry.zip');
+    const zf = new yazl.ZipFile();
+    zf.addBuffer(genuineEvents, BUNDLE_FILES.EVENTS); // genuine, first
+    for (const name of Object.values(BUNDLE_FILES)) {
+      if (name === BUNDLE_FILES.EVENTS) continue;
+      zf.addBuffer(readFileSync(join(bundleDir, name)), name);
+    }
+    zf.addBuffer(forgedEvents, BUNDLE_FILES.EVENTS); // forged, second — duplicate name
+    await new Promise<void>((resolve, reject) => {
+      const out = createWriteStream(zipPath);
+      out.on('close', () => resolve());
+      out.on('error', reject);
+      zf.outputStream.on('error', reject);
+      zf.outputStream.pipe(out);
+      zf.end();
+    });
+
+    const cli = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', zipPath], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
+    expect(cli.status).toBe(2); // usage/malformed-input error, not a verify verdict either way
+    expect(cli.stderr).toContain('malformed ZIP: duplicate entry events.jsonl');
   }, 30_000);
 });

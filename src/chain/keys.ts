@@ -115,6 +115,30 @@ export class Signer implements SignerLike {
     return new Signer(priv, pubHex);
   }
 
+  /**
+   * Load the keypair from `dataDir` WITHOUT ever minting a new one — unlike
+   * `load`, which happily creates a fresh identity on a data dir that has
+   * none. Used by `export`: it must sign with the SAME key that produced the
+   * chain being exported. A store copied to a fresh machine (or a data dir
+   * with `identity.key` deleted) has no such key, and silently minting one
+   * there (as `load` would) means export "succeeds" signing with an identity
+   * that never touched the evidence — and the next `verify`, pinned to the
+   * now-rewritten `identity.pub`, then fails a chain that used to pass.
+   * Throws instead, and creates nothing.
+   */
+  static async loadExisting(dataDir: string): Promise<Signer> {
+    const privPath = join(dataDir, FILES.PRIVATE_KEY);
+    if (!existsSync(privPath)) {
+      throw new Error(
+        `no signing key in ${dataDir}: export must run on the recording host ` +
+          '(or copy identity.key along with the store)',
+      );
+    }
+    const priv = readPrivateKey(privPath);
+    const pubHex = ed.etc.bytesToHex(ed.getPublicKey(priv));
+    return new Signer(priv, pubHex);
+  }
+
   /** Sign the chain head; the exact bytes are signedPayload(seq, chainHash). */
   async sign(seq: number, chainHash: string): Promise<HeadSignature> {
     const payload = signedPayload(seq, chainHash);

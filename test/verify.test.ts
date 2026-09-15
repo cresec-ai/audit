@@ -184,6 +184,12 @@ describe.each(backends)('verifyStore (%s)', (backend) => {
     expect(result.problems).toHaveLength(1);
     expect(result.problems[0]).toMatchObject({ type: 'no_valid_signature', seq: 6 });
     expect(result.problems[0]!.warning).not.toBe(true);
+    // Same scenario a corrupt/missing identity.key at record time would
+    // produce (setupProxyRecording falls back to signer=null, so nothing
+    // ever gets signed) — the detail must say plainly what's wrong and how
+    // to proceed, not just "no valid head signature".
+    expect(result.problems[0]!.detail).toContain('no valid signature');
+    expect(result.problems[0]!.detail).toContain('--allow-unsigned');
   });
 
   it('--allow-unsigned downgrades a never-signed chain to a warning (ok: true)', async () => {

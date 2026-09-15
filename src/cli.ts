@@ -34,6 +34,7 @@ import type {
   RecorderConfig,
   RecorderLike,
   SignerLike,
+  VerifyProblem,
   VerifyResult,
 } from './types.js';
 import { FILES } from './types.js';
@@ -62,8 +63,10 @@ Usage:
   mcp-recorder sessions [--data-dir D] [--json]
       list recorded sessions
   mcp-recorder ui       [--data-dir D] [--session ID] [--port N] [--out FILE] [--no-open]
+                        [--public-key K] [--allow-unsigned]
       replay timeline (local web UI, opened in your browser unless --no-open
-      or --out is given; or --out FILE for a static page)
+      or --out is given; or --out FILE for a static page). The integrity
+      banner uses the same pin as 'verify' (identity.pub by default)
   mcp-recorder export   [--data-dir D] [--session ID] [--out FILE.zip] [--dir DIR]
       signed evidence bundle a stranger can verify with plain Node.js
   mcp-recorder http     --target URL [--port N] [flags]
@@ -249,7 +252,12 @@ function resolveSessionId(store: EvidenceStore, raw: string | undefined): string
  */
 function guardStdoutEpipe(): void {
   process.stdout.on('error', (cause: NodeJS.ErrnoException) => {
-    if (cause.code === 'EPIPE') process.exit(0);
+    // Exit with whatever code the command had already decided on (e.g.
+    // cmdVerify sets process.exitCode = 1 for a FAILing chain BEFORE it
+    // prints) rather than hardcoding 0 — otherwise `verify | head -1` on a
+    // failing store would report success just because the reader went away
+    // mid-write.
+    if (cause.code === 'EPIPE') process.exit(process.exitCode ?? 0);
     throw cause;
   });
 }
@@ -450,15 +458,32 @@ interface PinnedKey {
 
 function printVerifyHuman(result: VerifyResult, source: string, pinned?: PinnedKey): void {
   out(`verify ${source}`);
+  // pinned is undefined ONLY for the store-mode branch that found neither
+  // --public-key nor <data-dir>/identity.pub — bundle mode always pins to
+  // something (the manifest's own key, at minimum). That's a silent downgrade
+  // from "this PASS proves who signed it" to "this PASS accepts a signature
+  // from ANY key" — deleting identity.pub (or copying a store without it)
+  // must not look identical to a normal pinned PASS, so this is a loud
+  // warning, never a quiet omission.
+  const unpinned = pinned === undefined;
   if (pinned !== undefined) {
     out(`pinned signer: ed25519 ${pinned.hex.slice(0, 16)}… (${pinned.source})`);
+  } else {
+    out(
+      'WARNING: no public key to pin against — neither <data-dir>/identity.pub nor ' +
+        '--public-key is available, so a signature from ANY key is accepted. This does ' +
+        'NOT prove who signed the chain. Pass --public-key with a key obtained out of ' +
+        'band for real assurance.',
+    );
   }
   // A warning-only chain (an unsigned tail we chose to tolerate) still says
   // PASS, but distinctly — it's a weaker guarantee than a fully-signed chain.
   const hasWarning = result.problems.some((p) => p.warning === true);
   if (result.ok) {
+    const labels = [...(unpinned ? ['unpinned'] : []), ...(hasWarning ? ['unsigned tail'] : [])];
+    const label = labels.length > 0 ? `PASS (${labels.join(', ')})` : 'PASS';
     out(
-      `${hasWarning ? 'PASS (unsigned tail)' : 'PASS'} — chain intact: ${result.checked_events} event(s), head seq ${result.head.seq}`,
+      `${label} — chain intact: ${result.checked_events} event(s), head seq ${result.head.seq}`,
     );
   } else {
     out(`FAIL — evidence does NOT verify: ${result.checked_events} event(s) checked`);
@@ -511,6 +536,9 @@ const ZIP_CENTRAL_DIR_SIGNATURE = 0x02014b50;
 const ZIP_LOCAL_HEADER_SIGNATURE = 0x04034b50;
 const ZIP_EOCD_SIZE = 22;
 const ZIP_MAX_COMMENT = 0xffff;
+/** Decompression cap per entry — a bundle's events.jsonl is never near this
+ * size; this just bounds a hostile/corrupt DEFLATE stream's blow-up. */
+const ZIP_MAX_ENTRY_BYTES = 256 * 1024 * 1024;
 
 /** Scan backward from EOF for the End Of Central Directory record. */
 function findZipEndOfCentralDirectory(buf: Buffer): number {
@@ -540,7 +568,7 @@ function inflateZipEntry(buf: Buffer, localHeaderOffset: number, method: number,
   if (method === 0) return Buffer.from(compressed);
   if (method === 8) {
     try {
-      return inflateRawSync(compressed);
+      return inflateRawSync(compressed, { maxOutputLength: ZIP_MAX_ENTRY_BYTES });
     } catch (cause) {
       err(`malformed ZIP: cannot inflate ${name}: ${(cause as Error).message}`);
     }
@@ -548,7 +576,18 @@ function inflateZipEntry(buf: Buffer, localHeaderOffset: number, method: number,
   err(`unsupported ZIP compression method ${method} for ${name} (only stored/deflate are supported)`);
 }
 
-/** Extract the bytes of each `wanted` entry from a .zip buffer, by name. */
+/**
+ * Extract the bytes of each `wanted` entry from a .zip buffer, by name.
+ *
+ * The central directory is walked in FULL (no early exit once every wanted
+ * name has been seen once): a wanted name appearing more than once is a
+ * malformed/hostile ZIP, not an ambiguity to resolve silently. Real
+ * extractors (`unzip`, Node's own `AdmZip`-style `extractAllTo`) write
+ * whichever duplicate-named entry comes LAST; picking any one entry here
+ * without checking for a duplicate would let a bundle whose FIRST
+ * events.jsonl is genuine and SECOND is forged verify against the genuine
+ * copy while extracting the forged one to disk.
+ */
 function readZipEntries(buf: Buffer, wanted: readonly string[]): Map<string, Buffer> {
   const eocd = findZipEndOfCentralDirectory(buf);
   if (eocd === -1) err('not a valid ZIP file (no end-of-central-directory record found)');
@@ -558,10 +597,10 @@ function readZipEntries(buf: Buffer, wanted: readonly string[]): Map<string, Buf
     err('ZIP64 bundles are not supported by verify --bundle');
   }
 
-  const remaining = new Set(wanted);
+  const wantedSet = new Set(wanted);
   const found = new Map<string, Buffer>();
   let pos = centralDirOffset;
-  for (let i = 0; i < totalEntries && remaining.size > 0; i++) {
+  for (let i = 0; i < totalEntries; i++) {
     if (pos + 46 > buf.length || buf.readUInt32LE(pos) !== ZIP_CENTRAL_DIR_SIGNATURE) {
       err('malformed ZIP central directory');
     }
@@ -574,9 +613,9 @@ function readZipEntries(buf: Buffer, wanted: readonly string[]): Map<string, Buf
     const name = buf.toString('utf8', pos + 46, pos + 46 + nameLen);
     pos += 46 + nameLen + extraLen + commentLen;
 
-    if (!remaining.has(name)) continue;
+    if (!wantedSet.has(name)) continue;
+    if (found.has(name)) err(`malformed ZIP: duplicate entry ${name}`);
     found.set(name, inflateZipEntry(buf, localHeaderOffset, method, compressedSize, name));
-    remaining.delete(name);
   }
   return found;
 }
@@ -598,17 +637,127 @@ function parseEventsJsonl(text: string): ChainRecord[] {
     .map((line) => JSON.parse(line) as ChainRecord);
 }
 
+/**
+ * A bundle is a sealed, self-declared range: manifest.json's range/
+ * event_count/head_hash/signature must exactly match what events.jsonl (and
+ * public_key.pem) actually contain, or a forged tail chained onto a genuine
+ * signed head — self-consistent, no key needed — would otherwise slip past
+ * verifyRecords as a mere "unsigned tail" warning (that check only walks the
+ * chain it's given; it has no notion of the manifest's own claims). Every
+ * mismatch here is an unconditional failure, never downgradable by
+ * --allow-unsigned: a bundle is an exported, sealed artifact, not an
+ * in-flight recording. This mirrors verify.cjs's checks 1-4 exactly — keep
+ * the two in sync.
+ */
+function checkBundleManifestConsistency(
+  manifest: BundleManifest,
+  records: ChainRecord[],
+  publicKeyPemText: string,
+): VerifyProblem[] {
+  const problems: VerifyProblem[] = [];
+  const push = (seq: number, detail: string): void => {
+    problems.push({ type: 'bundle_manifest_mismatch', seq, detail });
+  };
+
+  const first = records[0];
+  const last = records[records.length - 1];
+  if (records.length !== manifest.event_count) {
+    push(
+      last?.seq ?? 0,
+      `events.jsonl has ${records.length} record(s) but manifest.event_count declares ${manifest.event_count}`,
+    );
+  }
+  if (first !== undefined && first.seq !== manifest.range.from_seq) {
+    push(
+      first.seq,
+      `first record seq ${first.seq} does not match manifest.range.from_seq ${manifest.range.from_seq}`,
+    );
+  }
+  if (last !== undefined && last.seq !== manifest.range.to_seq) {
+    push(
+      last.seq,
+      `last record seq ${last.seq} does not match manifest.range.to_seq ${manifest.range.to_seq}`,
+    );
+  }
+  if (last !== undefined && last.hash !== manifest.head_hash) {
+    push(
+      last.seq,
+      `last record hash ${last.hash} does not match manifest.head_hash ${manifest.head_hash} — events were appended or removed after export`,
+    );
+  }
+  if (manifest.signature.seq !== manifest.range.to_seq) {
+    push(
+      manifest.signature.seq,
+      `manifest.signature.seq ${manifest.signature.seq} does not match manifest.range.to_seq ${manifest.range.to_seq}`,
+    );
+  }
+  if (manifest.signature.chain_hash !== manifest.head_hash) {
+    push(
+      manifest.signature.seq,
+      `manifest.signature.chain_hash ${manifest.signature.chain_hash} does not match manifest.head_hash ${manifest.head_hash}`,
+    );
+  }
+
+  // The shipped public_key.pem must be the SAME key manifest.signature names
+  // — mirrors verify.cjs step 4. A forgery re-signed with an attacker key
+  // that ships the operator's genuine PEM (or vice versa) is caught here even
+  // though the chain/signature math above is internally self-consistent.
+  let pemHex: string | undefined;
+  try {
+    pemHex = publicKeyHexFromPem(publicKeyPemText);
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    problems.push({
+      type: 'signature_invalid',
+      seq: manifest.signature.seq,
+      detail: `public_key.pem is not a valid ed25519 public key: ${msg}`,
+    });
+  }
+  if (pemHex !== undefined && pemHex !== manifest.signature.public_key.toLowerCase()) {
+    problems.push({
+      type: 'signature_invalid',
+      seq: manifest.signature.seq,
+      detail: 'public_key.pem does not match the manifest signing key',
+    });
+  }
+  if (manifest.public_key_pem !== publicKeyPemText) {
+    push(
+      manifest.signature.seq,
+      'public_key.pem on disk differs from the PEM embedded in manifest.json (manifest.public_key_pem)',
+    );
+  }
+
+  return problems;
+}
+
 async function verifyManifestAgainst(
   manifest: BundleManifest,
   records: ChainRecord[],
+  publicKeyPemText: string,
   pinOpts: BundlePinOpts,
 ): Promise<{ result: VerifyResult; pinnedPublicKeyHex: string }> {
   const pinnedPublicKeyHex = pinOpts.expectedPublicKeyHex ?? manifest.signature.public_key;
-  const result = await verifyRecords(records, [manifest.signature], {
+  const chainResult = await verifyRecords(records, [manifest.signature], {
     baseHash: manifest.base_hash,
     expectedPublicKeyHex: pinnedPublicKeyHex,
     ...(pinOpts.allowUnsigned !== undefined ? { allowUnsigned: pinOpts.allowUnsigned } : {}),
   });
+
+  // Bundle mode: an unsigned tail is never a mere warning — a bundle is a
+  // sealed artifact, never in-flight. Unconditional, same as the
+  // manifest-consistency checks below: neither is gated on --allow-unsigned.
+  // In practice the consistency checks already reject any tail that could
+  // produce this, but strip the warning flag here too as defense in depth.
+  const chainProblems = chainResult.problems.map((p) =>
+    p.type === 'unsigned_tail' ? ({ type: p.type, seq: p.seq, detail: p.detail } satisfies VerifyProblem) : p,
+  );
+  const manifestProblems = checkBundleManifestConsistency(manifest, records, publicKeyPemText);
+  const problems = [...chainProblems, ...manifestProblems];
+  const result: VerifyResult = {
+    ...chainResult,
+    problems,
+    ok: problems.every((p) => p.warning === true),
+  };
   return { result, pinnedPublicKeyHex };
 }
 
@@ -617,7 +766,13 @@ async function verifyBundleFromDir(dir: string, pinOpts: BundlePinOpts): Promise
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as BundleManifest;
   assertBundleId(manifest, manifestPath);
   const records = parseEventsJsonl(readFileSync(join(dir, BUNDLE_FILES.EVENTS), 'utf8'));
-  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(manifest, records, pinOpts);
+  const publicKeyPemText = readFileSync(join(dir, BUNDLE_FILES.PUBLIC_KEY), 'utf8');
+  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(
+    manifest,
+    records,
+    publicKeyPemText,
+    pinOpts,
+  );
   return { result, source: `bundle ${dir}`, pinnedPublicKeyHex };
 }
 
@@ -637,7 +792,13 @@ async function verifyBundleFromZip(
   const manifest = JSON.parse(entries.get(BUNDLE_FILES.MANIFEST)!.toString('utf8')) as BundleManifest;
   assertBundleId(manifest, `${zipPath} (${BUNDLE_FILES.MANIFEST})`);
   const records = parseEventsJsonl(entries.get(BUNDLE_FILES.EVENTS)!.toString('utf8'));
-  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(manifest, records, pinOpts);
+  const publicKeyPemText = entries.get(BUNDLE_FILES.PUBLIC_KEY)!.toString('utf8');
+  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(
+    manifest,
+    records,
+    publicKeyPemText,
+    pinOpts,
+  );
   return { result, source: `bundle ${zipPath}`, pinnedPublicKeyHex };
 }
 
@@ -672,6 +833,39 @@ async function verifyBundleDir(
   err(`--bundle ${resolved} is neither a file nor a directory`);
 }
 
+/**
+ * Resolve `verify`'s store-mode pin (explicit --public-key, else this data
+ * dir's own identity.pub, else none) and run verifyStore against it. Shared
+ * by cmdVerify and cmdUi's integrity banner so the two always agree — before
+ * this was factored out, `ui` called verifyStore(store) with no pin and no
+ * --allow-unsigned at all, so it could show green for a chain `verify`
+ * itself rejects.
+ */
+async function resolveStoreVerify(
+  store: EvidenceStore,
+  config: RecorderConfig,
+  opts: { explicitPublicKeyHex: string | undefined; allowUnsigned: boolean },
+): Promise<{ result: VerifyResult; pinned: PinnedKey | undefined }> {
+  let expectedPublicKeyHex = opts.explicitPublicKeyHex;
+  let pinSource = '--public-key';
+  if (expectedPublicKeyHex === undefined) {
+    // Default pin: this data dir's own identity.pub, so a chain rewritten
+    // and re-signed with a fresh, unrelated key is rejected instead of
+    // silently accepted — see README "Security model".
+    const pubPath = join(config.dataDir, FILES.PUBLIC_KEY);
+    if (existsSync(pubPath)) {
+      expectedPublicKeyHex = readFileSync(pubPath, 'utf8').trim().toLowerCase();
+      pinSource = pubPath;
+    }
+  }
+  const verifyOpts: VerifyOpts = { allowUnsigned: opts.allowUnsigned };
+  if (expectedPublicKeyHex !== undefined) verifyOpts.expectedPublicKeyHex = expectedPublicKeyHex;
+  const result = await verifyStore(store, verifyOpts);
+  const pinned =
+    expectedPublicKeyHex !== undefined ? { hex: expectedPublicKeyHex, source: pinSource } : undefined;
+  return { result, pinned };
+}
+
 async function cmdVerify(flags: Flags): Promise<void> {
   const allowUnsigned = flags['allow-unsigned'] === true;
   const publicKeyFlag = asStr(flags['public-key']);
@@ -703,38 +897,31 @@ async function cmdVerify(flags: Flags): Promise<void> {
     const config = resolveConfig({ flags, env: process.env });
     const store = openConfiguredStore(config, { readOnly: true });
     try {
-      let expectedPublicKeyHex = explicitPublicKeyHex;
-      let pinSource = '--public-key';
-      if (expectedPublicKeyHex === undefined) {
-        // Default pin: this data dir's own identity.pub, so a chain rewritten
-        // and re-signed with a fresh, unrelated key is rejected instead of
-        // silently accepted — see README "Security model".
-        const pubPath = join(config.dataDir, FILES.PUBLIC_KEY);
-        if (existsSync(pubPath)) {
-          expectedPublicKeyHex = readFileSync(pubPath, 'utf8').trim().toLowerCase();
-          pinSource = pubPath;
-        }
-      }
-      const verifyOpts: VerifyOpts = { allowUnsigned };
-      if (expectedPublicKeyHex !== undefined) verifyOpts.expectedPublicKeyHex = expectedPublicKeyHex;
-      result = await verifyStore(store, verifyOpts);
+      const resolved = await resolveStoreVerify(store, config, { explicitPublicKeyHex, allowUnsigned });
+      result = resolved.result;
+      pinned = resolved.pinned;
       source = `store ${store.path} (${store.backend})`;
-      if (expectedPublicKeyHex !== undefined) pinned = { hex: expectedPublicKeyHex, source: pinSource };
     } finally {
       store.close();
     }
   }
 
+  // Set the exit code BEFORE printing: printVerifyHuman/JSON.stringify below
+  // can fail partway through with EPIPE (e.g. `verify | head -1`), and
+  // guardStdoutEpipe's handler exits with process.exitCode — an exit code
+  // set only after a successful print would never take effect on that path,
+  // silently turning a FAIL into an apparent success.
+  if (!result.ok) process.exitCode = 1;
+
   if (flags.json === true) {
     const payload =
       pinned !== undefined
         ? { ...result, pinned_public_key: pinned.hex, pinned_public_key_source: pinned.source }
-        : result;
+        : { ...result, pinned_public_key: null, unpinned: true };
     out(JSON.stringify(payload, null, 2));
   } else {
     printVerifyHuman(result, source, pinned);
   }
-  if (!result.ok) process.exitCode = 1;
 }
 
 async function cmdQuery(flags: Flags, positionals: string[]): Promise<void> {
@@ -811,7 +998,17 @@ async function cmdUi(flags: Flags): Promise<void> {
   try {
     const sessionId = resolveSessionId(store, asStr(flags.session));
     const outFile = asStr(flags.out);
-    const verify = await verifyStore(store);
+    // Route through the SAME pin resolution `verify` uses (identity.pub by
+    // default, or --public-key / --allow-unsigned if given) so the integrity
+    // banner never shows green for a chain `mcp-recorder verify` rejects.
+    const publicKeyFlag = asStr(flags['public-key']);
+    const explicitPublicKeyHex =
+      publicKeyFlag !== undefined ? resolvePublicKeyArg(publicKeyFlag) : undefined;
+    const allowUnsigned = flags['allow-unsigned'] === true;
+    const { result: verify } = await resolveStoreVerify(store, config, {
+      explicitPublicKeyHex,
+      allowUnsigned,
+    });
     if (outFile !== undefined) {
       const html = renderTimelineHtml(store, {
         ...(sessionId !== undefined ? { sessionId } : {}),
@@ -862,7 +1059,12 @@ async function cmdExport(flags: Flags): Promise<void> {
         ? `./mcp-recorder-bundle-${exportTimestamp(new Date())}.zip`
         : undefined);
     const sessionId = resolveSessionId(store, asStr(flags.session));
-    const signer = await Signer.load(config.dataDir);
+    // loadExisting, NOT load: export must sign with the key that actually
+    // produced the chain. Minting a fresh one here (as record's Signer.load
+    // does) would sign evidence with an identity that never touched it, and
+    // silently repoint identity.pub out from under the next `verify` — see
+    // Signer.loadExisting's doc comment.
+    const signer = await Signer.loadExisting(config.dataDir);
 
     const manifest = await exportBundle({
       store,

@@ -171,7 +171,14 @@ export type VerifyProblemType =
   /** The unsigned suffix (see 'unsigned_tail') contains a session_end event.
    *  The recorder signs on every flush, including the session_end flush, so
    *  this is a stronger signal than a plain crash mid-session. */
-  | 'unsigned_session_end';
+  | 'unsigned_session_end'
+  /** Bundle mode only (`verify --bundle`): manifest.json's declared range /
+   *  event_count / head_hash / signature don't match what events.jsonl and
+   *  public_key.pem actually contain. A bundle is a sealed, self-declared
+   *  artifact — any mismatch here means the bundle was hand-edited after
+   *  export (e.g. records appended past the signed head) and is an
+   *  unconditional failure, never a warning. */
+  | 'bundle_manifest_mismatch';
 
 export interface VerifyProblem {
   type: VerifyProblemType;
