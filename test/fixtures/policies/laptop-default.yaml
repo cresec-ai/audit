@@ -1,0 +1,42 @@
+# The worked example from the design document: MCP rules with a multi-glob
+# tool list, an args regex and a byte cap, plus an egress section.
+version: 1
+name: laptop-default
+
+mcp:
+  default: allow
+  rules:
+    - id: no-exfil
+      match:
+        server: "*"
+        tool: [http_post, "send_*"]
+        args:
+          url: "^https?://"
+        max_args_bytes: 65536
+      action: deny
+      reason: "no outbound HTTP"
+    - id: hold-writes
+      match:
+        tool: "write_*"
+      action: hold
+      reason: "writes need a human"
+  hold:
+    timeout_ms: 60000
+    on_timeout: deny
+  boundary:
+    secrets: redact
+    injection: flag
+    max_scan_bytes: 1048576
+    on_oversize: flag
+
+egress:
+  default: deny
+  rules:
+    - id: github-read
+      match:
+        host: "api.github.com"
+        methods: [GET, HEAD]
+        path: "/**"
+        max_body_bytes: 1048576
+      action: allow
+      reason: "read-only GitHub API"

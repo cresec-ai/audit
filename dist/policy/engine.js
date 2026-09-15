@@ -1,0 +1,168 @@
+/**
+ * Policy evaluation: the local TypeScript twin of the emitted Rego.
+ *
+ * Rules are checked in order and the first match wins; when nothing matches
+ * the section's default applies. Every predicate here has a line-for-line
+ * counterpart in `rego.ts`, and the OPA comparison test proves they agree:
+ *
+ * - server / tool / host / path: `globMatch` with the section's delimiter.
+ * - args: each dot-path is resolved like `object.get(input.args, [...], null)`
+ *   — numeric segments address ARRAY INDEXES only, other segments address
+ *   OBJECT KEYS only; a missing path, a null, or a non-scalar value means the
+ *   rule does not match. Scalars are coerced with `String()` (Rego:
+ *   `sprintf("%v", [v])`), truncated to `REGEX_VALUE_CAP` UTF-16 units
+ *   before matching (Rego does not truncate: RE2 is linear-time, so only
+ *   values beyond the cap can ever differ, and that is documented).
+ * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
+ *
+ * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
+ * deny with `reason: "policy evaluation error: ..."` (enforcement is
+ * fail-closed, unlike recording).
+ */
+import { globMatch } from './glob.js';
+import { DEFAULTS, REGEX_VALUE_CAP } from './types.js';
+/** Max compiled arg regexes retained (LRU). */
+export const REGEX_CACHE_SIZE = 512;
+const regexCache = new Map();
+function compiledRegex(pattern) {
+    const hit = regexCache.get(pattern);
+    if (hit !== undefined) {
+        regexCache.delete(pattern);
+        regexCache.set(pattern, hit);
+        return hit;
+    }
+    const re = new RegExp(pattern);
+    if (regexCache.size >= REGEX_CACHE_SIZE) {
+        const oldest = regexCache.keys().next();
+        if (!oldest.done)
+            regexCache.delete(oldest.value);
+    }
+    regexCache.set(pattern, re);
+    return re;
+}
+const ARRAY_INDEX = /^(0|[1-9][0-9]*)$/;
+/** Split a dot-path into Rego-style segments: canonical integers become numbers. */
+export function dotPathSegments(dotPath) {
+    return dotPath.split('.').map((seg) => (ARRAY_INDEX.test(seg) ? Number(seg) : seg));
+}
+/**
+ * Resolve a dot-path like `object.get(root, segments, undefined)`: numeric
+ * segments index arrays only, string segments read own keys of plain
+ * objects only. Returns undefined when the path does not exist.
+ */
+export function getPath(root, dotPath) {
+    let cur = root;
+    for (const seg of dotPathSegments(dotPath)) {
+        if (typeof seg === 'number') {
+            if (!Array.isArray(cur) || seg >= cur.length)
+                return undefined;
+            cur = cur[seg];
+        }
+        else {
+            if (typeof cur !== 'object' || cur === null || Array.isArray(cur))
+                return undefined;
+            if (!Object.prototype.hasOwnProperty.call(cur, seg))
+                return undefined;
+            cur = cur[seg];
+        }
+    }
+    return cur;
+}
+/** String form used for regex matching, or undefined when the value is not a scalar. */
+export function coerceScalar(value) {
+    switch (typeof value) {
+        case 'string':
+            return value.length > REGEX_VALUE_CAP ? value.slice(0, REGEX_VALUE_CAP) : value;
+        case 'number':
+        case 'boolean':
+            return String(value);
+        default:
+            return undefined;
+    }
+}
+function argsMatch(args, input) {
+    for (const [dotPath, pattern] of Object.entries(args)) {
+        const s = coerceScalar(getPath(input, dotPath));
+        if (s === undefined)
+            return false;
+        if (!compiledRegex(pattern).test(s))
+            return false;
+    }
+    return true;
+}
+function mcpRuleMatches(rule, input) {
+    const m = rule.match;
+    if (!globMatch(m.server, '/', input.server))
+        return false;
+    if (!m.tool.some((g) => globMatch(g, '/', input.tool)))
+        return false;
+    if (m.args !== undefined && !argsMatch(m.args, input.args))
+        return false;
+    if (m.max_args_bytes !== undefined && !(input.argsBytes <= m.max_args_bytes))
+        return false;
+    return true;
+}
+function egressRuleMatches(rule, input) {
+    const m = rule.match;
+    if (!m.host.some((g) => globMatch(g, '.', input.host)))
+        return false;
+    if (m.methods !== undefined && !m.methods.includes(input.method))
+        return false;
+    if (!m.path.some((g) => globMatch(g, '/', input.path)))
+        return false;
+    if (m.max_body_bytes !== undefined && !(input.bodyBytes <= m.max_body_bytes))
+        return false;
+    return true;
+}
+function decide(rules, defaultAction, matches) {
+    for (let i = 0; i < rules.length; i++) {
+        const rule = rules[i];
+        if (matches(rule)) {
+            const d = { action: rule.action, ruleId: rule.id, ruleIndex: i, matched: true };
+            if (rule.reason !== undefined)
+                d.reason = rule.reason;
+            return d;
+        }
+    }
+    return { action: defaultAction, matched: false };
+}
+function evaluationError(err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}` };
+}
+/**
+ * Decide a `tools/call`. A policy without an `mcp` section yields the
+ * documented default (`allow`, unmatched). Never throws.
+ */
+export function evaluateMcp(policy, input) {
+    try {
+        const mcp = policy.mcp;
+        if (mcp === undefined)
+            return { action: DEFAULTS.mcp.default, matched: false };
+        return decide(mcp.rules, mcp.default, (rule) => mcpRuleMatches(rule, input));
+    }
+    catch (err) {
+        return evaluationError(err);
+    }
+}
+/**
+ * Decide an HTTP egress request (not enforced by mcp-recorder; kept 1:1 with
+ * the Rego so both can be tested). A policy without `egress` yields the
+ * documented default (`deny`, unmatched). Never throws.
+ */
+export function evaluateEgress(policy, input) {
+    try {
+        const egress = policy.egress;
+        if (egress === undefined)
+            return { action: DEFAULTS.egress.default, matched: false };
+        return decide(egress.rules, egress.default, (rule) => egressRuleMatches(rule, input));
+    }
+    catch (err) {
+        return evaluationError(err);
+    }
+}
+/** The rule id that produced a decision, or "default". */
+export function ruleLabel(decision) {
+    return decision.ruleId ?? 'default';
+}
+//# sourceMappingURL=engine.js.map

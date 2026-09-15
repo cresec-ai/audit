@@ -215,7 +215,8 @@ Every event carries these fields:
 | `attributes` | `Attributes` | Flat semconv-named attribute bag. |
 
 `EventKind` is one of: `session_start`, `initialize`, `tool_call`, `rpc`,
-`notification`, `protocol_error`, `session_end`.
+`notification`, `protocol_error`, `session_end`, and — additive, recorded only in
+[gateway mode](#gateway-mode-fields-additive) — `policy_decision`.
 
 ## Event kinds
 
@@ -228,6 +229,7 @@ Proxy process started; carries the redaction policy in force.
 | `proxy_version` | `string` | Version of `@edut/mcp-recorder`. |
 | `cwd` | `string` | Working directory of the proxy process. |
 | `redaction_mode` | `'allowlist' \| 'off'` | Redaction policy in force for the session. |
+| `policy` | `{ hash: Sha256Ref; name?: string }?` | Additive (v1). Present only in gateway mode: `hash` is the SHA-256 of the exact bytes of the `policy.yaml` in force, `name` its `name` field (capped, `structuralString` kind `identifier`). See [Gateway mode fields](#gateway-mode-fields-additive). |
 
 ### `initialize`
 
@@ -255,8 +257,9 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
-| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. |
+| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. A call the gateway refused carries `error.type: 'policy_denied'`. |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
+| `gateway` | `GatewayOutcome?` | Additive (v1). Present on every `tool_call` recorded in gateway mode — see [Gateway mode fields](#gateway-mode-fields-additive). |
 
 ### `rpc`
 
@@ -321,6 +324,59 @@ capped (`structuralString`, see [Privacy posture](#privacy-posture)) at the poin
 request was first seen, so an unanswered call with an oversized/malformed name or
 method is just as capped here as in a normal completed event.
 
+## Gateway mode fields (additive)
+
+[Gateway mode](gateway.md) (`record --policy policy.yaml`) enforces a
+[`policy.yaml`](policy.md) on `tools/call` traffic. Everything it records is
+**additive under v1**: one new event kind and two optional fields. Records
+written in record mode never carry any of them, and old records verify
+exactly as before (canonical JSON drops nothing that was never there).
+
+### `GatewayOutcome` (the `tool_call.gateway` field)
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `decision` | `'allow' \| 'deny' \| 'hold'` | What the policy decided for the request. |
+| `rule_id` | `string?` | The rule that matched (capped, `structuralString` kind `identifier`); absent when the section's `default` applied. |
+| `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled'?` | Holds only: how the hold was resolved. |
+| `approval_id` | `string?` | Holds only: the UUID the operator saw in `mcp-recorder holds`. |
+| `boundary` | `BoundaryReport?` | Present when the result went through the tool-result boundary filter (every `allow`ed and `approved` call whose server answered). |
+
+### `BoundaryReport`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scanned` | `boolean` | `false` when the result exceeded `boundary.max_scan_bytes` or the filter hit an internal error. |
+| `action` | `'none' \| 'redact' \| 'block' \| 'flag'` | What was applied to the result the client received. |
+| `secrets_found` | `number` | Secret-shaped spans found (`alwaysPatterns`, the same regexes behind `secret_refs`). |
+| `injection_found` | `number` | Prompt-injection marker spans found. |
+| `secret_refs` | `Sha256Ref[]?` | Hashes of the secret tokens found (de-duplicated, capped at 8) — the model may never have seen the values, `query` still finds the call. |
+| `delivered_result_hash` | `Sha256Ref?` | Present only when the filter modified the result: `sha256:<hex>` of the canonical JSON of the result **the client actually received**. `result_hash`/`result` keep their frozen meaning — the complete raw result the server returned, pre-redaction and pre-filter. |
+| `error` | `string?` | Internal-error class when `scanned` is `false` for a reason other than size. |
+
+### `policy_decision`
+
+An enforcement action taken by the gateway: one per **deny**, and one per
+**hold outcome**. Allowed calls do not produce this event (their `tool_call`
+carries `gateway.decision: 'allow'`), so the kind is a complete list of
+everything the gateway ever refused or paused.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `decision` | `'deny' \| 'hold'` | The action the policy selected. |
+| `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled' \| 'session_end'?` | Holds only. `session_end` means the proxy shut down while the call was still held. |
+| `tool` | `string` | Tool name (`gen_ai.tool.name`). Capped exactly like `tool_call.tool`. |
+| `request_id` | `string \| number` | JSON-RPC request id of the call. |
+| `rule_id` | `string?` | Matching rule id (capped identifier); absent when `mcp.default` applied. |
+| `policy_hash` | `Sha256Ref` | SHA-256 of the exact bytes of the policy file in force. |
+| `args_hash` | `Sha256Ref` | `sha256:<hex>` of the canonical JSON of the raw `params.arguments` — never the arguments themselves. |
+| `approval_id` | `string?` | Holds only. |
+| `waited_ms` | `number?` | Holds only: how long the call was parked. |
+| `approver` | `string?` | Holds only: the OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one. |
+
+Attributes on a `policy_decision`: `gen_ai.tool.name`, `gen_ai.tool.call.id`,
+`cresec.policy.decision`, and `cresec.policy.rule_id` when a rule matched.
+
 ---
 
 ## OpenTelemetry semantic-convention mapping
@@ -337,7 +393,9 @@ typed event fields to their semconv equivalents.
 | `rpc.system` | constant | `jsonrpc` — MCP is JSON-RPC 2.0. |
 | `rpc.jsonrpc.request_id` | `RpcEvent.request_id`, `InitializeEvent.request_id` | Correlated request id. |
 | `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. Same capped value as `method` (see above). |
-| `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. |
+| `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. `policy_denied` marks a call the gateway refused. |
+| `cresec.policy.decision` | `PolicyDecisionEvent.decision`, `ToolCallEvent.gateway.decision` | `allow` / `hold` / `deny`. Not an OTel semconv name; namespaced under `cresec.` to say so. |
+| `cresec.policy.rule_id` | `PolicyDecisionEvent.rule_id`, `ToolCallEvent.gateway.rule_id` | The matching `policy.yaml` rule id, when one matched. |
 
 ---
 

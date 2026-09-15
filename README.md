@@ -167,14 +167,18 @@ mcp-recorder [record] [options] -- <server command...>
 
 | Command | What it does |
 | --- | --- |
-| `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. |
+| `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] [--policy FILE] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. `--policy FILE` switches on **gateway mode**: `tools/call` requests are allowed / held / denied per the policy and tool results pass through the boundary filter — see [Gateway mode](#gateway-mode-opt-in-enforcement). |
+| `mcp-recorder policy validate FILE [--json]` | Validate a `policy.yaml` against the v1 schema (exit 0 valid, 1 invalid, 2 unreadable). See [docs/policy.md](docs/policy.md). |
+| `mcp-recorder policy compile FILE [--target rego] [--out DIR]` | Compile a `policy.yaml` to an OPA bundle (`cresec.mcp` / `cresec.egress` Rego modules) for the Cresec control plane; without `--out` the MCP module is printed. |
+| `mcp-recorder holds [--data-dir D] [--all] [--json]` | List tool calls currently held for approval by a gateway (`--all` includes decided ones). |
+| `mcp-recorder approve <id> [--data-dir D]` / `mcp-recorder deny <id> [--data-dir D]` | Decide a held tool call. `<id>` accepts a unique prefix, the same short id `holds` prints. |
 | `mcp-recorder verify [--data-dir D] [--store sqlite\|jsonl] [--bundle PATH] [--public-key K] [--allow-unsigned] [--json]` | Re-walk the hash chain and check head signatures — for the local store, or for an exported bundle with `--bundle` (accepts either form `export` produces: a `.zip` or a bundle directory). `--public-key` pins to a key obtained out of band instead of the default (`<data-dir>/identity.pub`, or the bundle's own manifest key); `--allow-unsigned` downgrades an unsigned chain/tail from a failure to a warning (store mode only — a bundle's own manifest range/signature must always match exactly, see "Security model"). |
 | `mcp-recorder query <needle> [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--json]` | Blast radius: hash the needle and find every event and session that touched that value. `--session` accepts a unique id prefix, the same short id `sessions` prints. |
 | `mcp-recorder sessions [--data-dir D] [--store sqlite\|jsonl] [--json]` | List recorded sessions: server, identity, event/tool-call/error counts. |
 | `mcp-recorder ui [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--port P] [--out FILE] [--no-open] [--public-key K] [--allow-unsigned]` | Serve the HTML replay timeline (or write it to a file with `--out`). Opens your default browser to the served URL unless `--no-open` is set, `--out` is used, or the host looks headless. The integrity banner is resolved the same way as `verify` (same default `identity.pub` pin, same `--public-key`/`--allow-unsigned`), so it never shows green for a chain `verify` would reject. |
 | `mcp-recorder export [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. `--session` accepts a unique id prefix, the same short id `sessions` prints. Requires an existing `identity.key` in the data dir — it signs with the key that actually produced the chain, never minting a fresh one, so exit 2 on a data dir with no key (e.g. a store copied without it). |
 | `mcp-recorder http --target URL [--port P]` | Recording proxy for HTTP-transport MCP servers. |
-| `mcp-recorder setup --client claude-desktop\|claude-code\|cursor [--config PATH] [--wrapper local\|npx\|wsl] [--only N,...] [--except N,...] [--data-dir D] [--dry-run] [--undo] [--json]` | Wrap every stdio MCP server in a client's config behind the recorder — safely (a timestamped backup + a sidecar recording the originals) and reversibly (`--undo`). `--config` overrides the resolved path (and makes `--client` optional). `--wrapper local` (default) points at this install's own `dist/cli.js`; `--wrapper npx` writes the published-package form; `--wrapper wsl` writes a `wsl.exe`-launched form for a Windows client whose server should run inside WSL, auto-selected when `setup` runs inside WSL against a Windows-side config (see [docs/install.md#windows-and-wsl](docs/install.md#windows-and-wsl)). `--dry-run` previews without writing. See [docs/install.md](docs/install.md) for the full walkthrough. |
+| `mcp-recorder setup --client claude-desktop\|claude-code\|cursor [--config PATH] [--wrapper local\|npx\|wsl] [--only N,...] [--except N,...] [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]` | Wrap every stdio MCP server in a client's config behind the recorder — safely (a timestamped backup + a sidecar recording the originals) and reversibly (`--undo`). `--config` overrides the resolved path (and makes `--client` optional). `--policy FILE` bakes `--policy <absolute path>` into every wrapped entry so those servers run in gateway mode. `--wrapper local` (default) points at this install's own `dist/cli.js`; `--wrapper npx` writes the published-package form; `--wrapper wsl` writes a `wsl.exe`-launched form for a Windows client whose server should run inside WSL, auto-selected when `setup` runs inside WSL against a Windows-side config (see [docs/install.md#windows-and-wsl](docs/install.md#windows-and-wsl)). `--dry-run` previews without writing. See [docs/install.md](docs/install.md) for the full walkthrough. |
 
 `--help`/`-h` and `--version`/`-V` work on every invocation.
 
@@ -185,7 +189,8 @@ mcp-recorder [record] [options] -- <server command...>
 | `MCP_RECORDER_DATA_DIR` | Override the data directory (default `~/.mcp-recorder`). |
 | `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: whichever evidence file already exists in the data dir wins; on a fresh data dir, sqlite when available, else jsonl). |
 | `MCP_RECORDER_REDACT` | `allowlist` (default) or `off`. Secret-shaped values are hashed in every mode. |
-| `MCP_RECORDER_DISABLE` | `1` → pure passthrough, no recording. |
+| `MCP_RECORDER_DISABLE` | `1` → pure passthrough, no recording — and no gateway enforcement either (it is the kill switch). |
+| `MCP_RECORDER_POLICY` | Path to a `policy.yaml`; same effect as `record --policy` when the flag is absent. |
 
 ---
 
@@ -198,6 +203,32 @@ npm run demo
 A scripted prompt-injection exfiltration — an agent is tricked into reading a credential and sending it out through an innocent-looking tool — recorded, reconstructed on the replay timeline, blast-radius-queried, and cryptographically verified, in under a minute. It is the fastest way to see what the recorder is for.
 
 Want to see the same story with a real model instead of the scripted agent? [docs/red-team.md](docs/red-team.md) walks through running it live in Claude Desktop.
+
+---
+
+## Gateway mode (opt-in enforcement)
+
+Record mode never interferes with traffic. Pass `--policy policy.yaml` and the same proxy becomes a **gateway**: every `tools/call` is evaluated against ordered per-tool rules (first match wins) and is **allowed** byte-for-byte, **denied** with a tool error the model can read, or **held** until a human runs `mcp-recorder approve <id>` (or a timeout decides). Tool results pass through a **boundary filter** on the way back: secret-shaped values are redacted with `[redacted:sha256:…]` (their hashes stay queryable), and prompt-injection markers are flagged or blocked. Every decision is sealed into the same evidence chain (`policy_decision` events, `tool_call.gateway`, `session_start.policy`).
+
+```yaml
+version: 1
+mcp:
+  default: allow
+  rules:
+    - { id: no-exfil,   match: { tool: [http_post, "send_*"] }, action: deny, reason: no outbound HTTP }
+    - { id: dangerous,  match: { tool: ["delete_*", "rm*"] },   action: hold }
+    - { id: no-secrets, match: { tool: read_file, args: { path: "(^|/)(\\.env|id_rsa)$" } }, action: deny }
+  boundary: { secrets: redact, injection: flag }
+```
+
+```sh
+mcp-recorder policy validate policy.yaml
+mcp-recorder setup --client claude-desktop --policy /abs/path/policy.yaml
+mcp-recorder holds && mcp-recorder approve <id>
+mcp-recorder policy compile policy.yaml --out ./bundle     # Rego for the Cresec control plane (OPA)
+```
+
+Ten-minute walkthrough for a laptop and for CI: [docs/gateway.md](docs/gateway.md). Full schema, matching semantics and the Rego output: [docs/policy.md](docs/policy.md). Gateway mode is stdio-only in this release, and enforcement fails closed (an unevaluable policy denies) while recording stays fail-open.
 
 ---
 
@@ -225,7 +256,7 @@ Events follow the frozen schema `edut.mcp-recorder.event.v1`, with field names a
 
 - **No payload storage.** Strings are hashed at the edge — leaf values, object keys, and the wrapped command's argv alike; original values never land in the store. A tool call's `arguments` are hashed unconditionally, regardless of key.
 - **No cloud.** Local-first, no telemetry, no phone-home. Evidence leaves your machine only when you run `export`.
-- **No enforcement.** The recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a flight recorder, not a firewall.
+- **No enforcement unless you ask for it.** In record mode the recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a flight recorder, not a firewall. Enforcement exists only in [gateway mode](#gateway-mode-opt-in-enforcement), only with an explicit `--policy`, and only over `tools/call` requests and their results — every other message is still forwarded untouched.
 
 ## Development
 

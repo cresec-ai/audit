@@ -1,0 +1,23 @@
+# MCP-only policy, deny by default, no explicit ids (auto "rule[<i>]"),
+# server-scoped rules, array-index dot-paths and numeric coercion.
+version: 1
+mcp:
+  default: deny
+  rules:
+    - match:
+        server: "corp-*"
+        tool: read_note
+      action: allow
+    - match:
+        tool: [list_notes, "search/**"]
+        args:
+          "filters.0.field": "^(title|body)$"
+          "limit": "^[0-9]{1,2}$"
+          "dry_run": "^true$"
+      action: allow
+      reason: "narrow search only"
+    - match:
+        tool: "*"
+        max_args_bytes: 1024
+      action: hold
+      reason: "small unknown calls are held for review"

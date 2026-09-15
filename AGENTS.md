@@ -45,6 +45,17 @@ setup hook calls the same script:
 - No readable payload strings ever reach the store, the replay page, or a
   bundle; tool arguments are hashed unconditionally.
 - Never skip or weaken a test to get green.
+- Gateway mode (`record --policy`) is the ONLY place the proxy may block,
+  delay or rewrite traffic, and only for `tools/call` requests and their
+  results. Without `--policy` the byte-for-byte, fail-open behaviour above is
+  untouched. Inside gateway mode, recording stays fail-open (a store failure
+  never becomes a deny) while enforcement fails closed (an unevaluable policy
+  or an unwritable hold is a deny). Hold files under `<data-dir>/holds/` and
+  `policy_decision` events carry hashed arguments only — the no-readable-
+  payloads rule applies to them exactly as to the store. `policy.yaml` v1 is
+  documented in `docs/policy.md` and its JSON Schema in
+  `docs/policy-schema.json`; the TypeScript engine and the emitted Rego must
+  stay semantically identical (the OPA parity test enforces it).
 
 ## The repository records itself
 
