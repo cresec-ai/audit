@@ -404,12 +404,16 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     });
 
     // Simulates the MCP client closing its read end mid-session: the first
-    // write (the initialize response) succeeds, every write after that
-    // fails with EPIPE (the server's follow-up notification, in this case).
+    // write to the proxy's stdout succeeds, every write after that fails
+    // with EPIPE. Every chunk is also buffered so the test can wait for the
+    // actual initialize REPLY to land (a positive signal), instead of
+    // guessing a fixed delay.
     let writes = 0;
+    const written: Buffer[] = [];
     const stdout = new Writable({
-      write(_chunk, _enc, cb) {
+      write(chunk, _enc, cb) {
         writes++;
+        written.push(Buffer.from(chunk as Buffer));
         if (writes > 1) {
           const err = new Error('write EPIPE') as NodeJS.ErrnoException;
           err.code = 'EPIPE';
@@ -419,6 +423,18 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
         cb();
       },
     });
+    const hasReply = (id: number) => () =>
+      Buffer.concat(written)
+        .toString('utf8')
+        .split('\n')
+        .some((l) => {
+          try {
+            const m = JSON.parse(l) as { id?: unknown; result?: unknown };
+            return m.id === id && 'result' in m;
+          } catch {
+            return false;
+          }
+        });
 
     const done = runStdioProxy({
       command: [process.execPath, ECHO_SERVER],
@@ -431,14 +447,37 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     });
 
     stdin.write(JSON.stringify(CLIENT_SCRIPT[0]) + '\n'); // initialize
-    await new Promise((r) => setTimeout(r, 300));
-    stdin.end(); // echo-server exits once stdin ends
+    // Wait for the actual reply to land on the proxy's stdout (the first
+    // write always succeeds) rather than sleeping a fixed amount.
+    await waitFor(hasReply(1), 'initialize reply on proxy stdout');
 
+    // The handshake's reply and its immediate follow-up notification are
+    // written back to back by echo-server and may or may not already have
+    // coalesced into that single first write — force a second, temporally
+    // distinct server->client message so a write attempt strictly AFTER
+    // the first one is guaranteed, and EPIPE is guaranteed to fire.
+    stdin.write(JSON.stringify(CLIENT_SCRIPT[2]) + '\n'); // tools/list
+
+    // Deliberately never end the client-facing stdin ourselves. The only
+    // thing that can end the child's real stdin in this test is the
+    // proxy's own EPIPE handler (src/proxy/stdio.ts's
+    // `proxyStdout.on('error', ...)`, the branch that ends `child.stdin`
+    // once the client is gone) — that's what lets echo-server exit on its
+    // own. If that branch never ran, `done` would hang (and this test
+    // would time out) instead of passing vacuously.
     const exitCode = await done; // must resolve, not hang or throw
     expect(exitCode).toBe(0);
+    expect(writes).toBeGreaterThan(1); // the forced second write actually happened
 
     const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
     expect(end).toBeDefined();
+    // 'child_exit' (never 'stdin_closed', since this test's own stdin was
+    // never ended) is the proof that the shutdown was driven by the EPIPE
+    // handler ending child.stdin, i.e. that the EPIPE branch actually ran —
+    // not merely that the process happened to exit 0.
+    expect(end!.reason).toBe('child_exit');
+
+    stdin.destroy();
   });
 
   it('keeps numeric and string JSON-RPC ids distinct in the pending-request map', async () => {

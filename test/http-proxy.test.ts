@@ -393,12 +393,21 @@ describe('runHttpProxy', () => {
     const store = openStore({ dataDir });
     const signer = await Signer.load(dataDir);
     const recorder = new Recorder({ store, signer });
+    // Budgeted in the hundreds of ms, not tens: a busy test runner can
+    // easily burn 50ms of scheduling delay before this same-process
+    // upstream's handler even gets to call writeHead/write, which would
+    // trip a too-tight header-wait timeout before headers ever arrive and
+    // fail the test for a reason that has nothing to do with the behavior
+    // under test. The point under test is that this timeout is cleared the
+    // instant headers arrive and never applies again afterwards, so the
+    // idle period below is picked to clearly (4x) exceed it.
+    const headersTimeoutMs = 300;
     const proxy = await runHttpProxy({
       targetUrl: upstreamUrl + '/mcp',
       recorder,
       redactor: new Redactor(),
       proxyVersion: '0.0.0-test',
-      upstreamHeadersTimeoutMs: 50, // deliberately tiny; must apply pre-headers only
+      upstreamHeadersTimeoutMs: headersTimeoutMs,
     });
     cleanups.push(() => proxy.close());
 
@@ -408,11 +417,12 @@ describe('runHttpProxy', () => {
     const first = await reader.read();
     expect(Buffer.from(first.value!).toString()).toContain('open');
 
-    // Idle for far longer than the 50ms header timeout: the stream must
-    // still be alive (no error, no premature close) once headers arrived.
+    // Idle for several times the header timeout: the stream must still be
+    // alive (no error, no premature close) once headers arrived.
+    const idleMs = headersTimeoutMs * 4;
     const raced = await Promise.race([
       reader.read().then(() => 'more-data' as const),
-      new Promise<'still-open'>((r) => setTimeout(() => r('still-open'), 400)),
+      new Promise<'still-open'>((r) => setTimeout(() => r('still-open'), idleMs)),
     ]);
     expect(raced).toBe('still-open');
     await reader.cancel();
@@ -485,8 +495,26 @@ describe('runHttpProxy', () => {
   });
 
   it('records an unanswered event for a request still pending at close()', async () => {
-    const upstream = createServer((req, res) => {
-      // never respond — simulates a tool call still in flight at shutdown
+    // A positive signal that the request has fully reached the upstream,
+    // in place of a fixed sleep: the proxy's tap parses the request body
+    // (registering the pending entry) in the SAME 'end' event tick as it
+    // pipes the body onward to upReq — see the request-body handling in
+    // src/proxy/http.ts, where the tap's own `req.on('end', ...)` listener
+    // is attached before `req.pipe(upReq)`, so it always runs first. That
+    // means the pending entry is registered strictly before `upReq.end()`
+    // is even called, which itself happens strictly before this upstream
+    // stub can physically observe the end of the request body below — so
+    // waiting for THIS promise guarantees the proxy has already registered
+    // the pending entry, on any runner speed.
+    let requestReceived: () => void;
+    const received = new Promise<void>((resolve) => {
+      requestReceived = resolve;
+    });
+    const upstream = createServer((req) => {
+      // Never respond — simulates a tool call still in flight at shutdown.
+      // Consume (don't just ignore) the body so 'end' actually fires.
+      req.resume();
+      req.on('end', () => requestReceived());
     });
     const url = (await listen(upstream)) + '/mcp';
     cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
@@ -502,8 +530,7 @@ describe('runHttpProxy', () => {
       method: 'tools/call',
       params: { name: 'never_returns', arguments: { x: 1 } },
     }).catch(() => undefined);
-    // Let the request body reach the tap before closing.
-    await new Promise((r) => setTimeout(r, 30));
+    await received;
     await proxy.close();
     // The client-facing response socket is torn down by close(); swallow.
     await pending;
