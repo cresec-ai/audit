@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter as pathDelimiter, dirname, join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -613,6 +616,155 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     const end = events.find((e): e is SessionEndEvent => e.kind === 'session_end');
     expect(events.indexOf(call!)).toBeLessThan(events.indexOf(end!));
   });
+
+  it('appends the running Node binary\'s directory to the wrapped server\'s PATH (all platforms)', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    // A minimal env with no PATH at all: the only way dirname(process.execPath)
+    // can end up on the child's PATH here is src/proxy/spawn.ts's
+    // withNodeDirOnPath being applied by the proxy before spawning — this is
+    // what lets a wrapped "npx" resolve when the recorder itself was started
+    // by an absolute path to Node with a thin/empty PATH (nvm, WSL bridges,
+    // some client launchers).
+    const env: NodeJS.ProcessEnv = {};
+
+    const done = runStdioProxy({
+      // No MCP framing needed here; just have the child print its own PATH
+      // verbatim so the proxy's plain byte-forwarding can be checked
+      // directly against what the child actually received.
+      command: [process.execPath, '-e', 'process.stdout.write(process.env.PATH || "")'],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+      env,
+    });
+    stdin.end();
+    const exitCode = await done;
+    expect(exitCode).toBe(0);
+
+    const childPath = out.raw();
+    const nodeDir = dirname(process.execPath);
+    expect(childPath.split(pathDelimiter)).toContain(nodeDir);
+  });
+
+  it("does not duplicate the Node binary's directory when it is already on PATH", async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const nodeDir = dirname(process.execPath);
+    const env: NodeJS.ProcessEnv = { PATH: `/usr/bin${pathDelimiter}${nodeDir}` };
+
+    const done = runStdioProxy({
+      command: [process.execPath, '-e', 'process.stdout.write(process.env.PATH || "")'],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+      env,
+    });
+    stdin.end();
+    const exitCode = await done;
+    expect(exitCode).toBe(0);
+
+    const segments = out.raw().split(pathDelimiter);
+    expect(segments.filter((seg) => seg === nodeDir)).toHaveLength(1);
+  });
+});
+
+/* --- W1: native win32 spawning. planSpawn/resolveCommand's own escaping and
+ * PATH/PATHEXT resolution logic is covered platform-independently in
+ * test/spawn.test.ts; this is the one true end-to-end check that a real
+ * .cmd shim (the shape npx/npm/uvx are actually installed as on Windows)
+ * spawns and speaks MCP through the full proxy. It can only run on win32
+ * itself (child_process refuses a plain node_modules-style .cmd file on
+ * POSIX), so it's skipped everywhere else rather than faked. */
+describe('win32: spawning a .cmd shim through the proxy', () => {
+  it.runIf(process.platform === 'win32')(
+    'spawns a generated .cmd shim wrapping node+echo-server, round-trips initialize, and records the session',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-cmdshim-'));
+      const shimPath = join(dir, 'echo-shim.cmd');
+      try {
+        // The same shape npm installs real shims in (npx.cmd, npm.cmd, ...):
+        // a batch file that execs node with a fixed script, forwarding argv.
+        writeFileSync(shimPath, `@node "${ECHO_SERVER}" %*\r\n`);
+
+        const store = new FakeStore();
+        const recorder = new Recorder({ store, signer: null });
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        const out = collectLines(stdout);
+        stderr.on('data', () => {
+          /* drain */
+        });
+
+        const done = runStdioProxy({
+          command: [shimPath],
+          recorder,
+          redactor: fakeRedactor,
+          proxyVersion: '0.1.0-test',
+          stdin,
+          stdout,
+          stderr,
+        });
+
+        const responded = (id: number) => () =>
+          out.lines().some((l) => {
+            try {
+              const m = JSON.parse(l) as { id?: unknown };
+              return m.id === id;
+            } catch {
+              return false;
+            }
+          });
+
+        stdin.write(JSON.stringify(CLIENT_SCRIPT[0]) + '\n'); // initialize
+        await waitFor(responded(1), 'initialize response');
+        stdin.write(JSON.stringify(CLIENT_SCRIPT[2]) + '\n'); // tools/list
+        await waitFor(responded(2), 'tools/list response');
+        stdin.end();
+
+        const exitCode = await done;
+        expect(exitCode).toBe(0);
+
+        const events = store.events();
+        const init = events.find((e): e is InitializeEvent => e.kind === 'initialize');
+        expect(init).toBeDefined();
+        expect(init!.server_name).toBe('echo-server');
+        expect(init!.server_version).toBe('1.0.0');
+
+        const rpc = events.find((e): e is RpcEvent => e.kind === 'rpc' && e.method === 'tools/list');
+        expect(rpc).toBeDefined();
+        expect(rpc!.is_error).toBe(false);
+
+        const end = events.find((e): e is SessionEndEvent => e.kind === 'session_end');
+        expect(end?.child_exit_code).toBe(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 /* --- P2: credential-fingerprint cap reservation. Env-derived fingerprints
