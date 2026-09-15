@@ -37,6 +37,59 @@ const UNSERIALIZABLE = '[unserializable]';
 /** Literal stored (hashed) when JSON.stringify of a subtree throws. */
 const CIRCULAR = '[circular]';
 
+/* -------------------------------------------------------------------- */
+/* structuralString() — capping verbatim protocol strings (P0)           */
+/* -------------------------------------------------------------------- */
+
+/**
+ * Kinds of verbatim protocol string `structuralString` caps. `tool`/`method`
+ * and the identifier-shaped fields learned off the wire (clientInfo/
+ * serverInfo `name`) share the `identifier` shape; `clientInfo`/`serverInfo`
+ * `version` gets its own, looser-on-punctuation `version` shape; MCP's
+ * negotiated `protocolVersion` is a strict `YYYY-MM-DD` date string.
+ */
+export type StructuralStringKind = 'identifier' | 'version' | 'protocol_version';
+
+/** Cap on a `structuralString` value that may survive un-hashed. */
+export const STRUCTURAL_STRING_MAX_LEN = 128;
+
+/** Conservative shape each `StructuralStringKind` must match to survive un-hashed. */
+const STRUCTURAL_STRING_SHAPES: Record<StructuralStringKind, RegExp> = {
+  identifier: /^[A-Za-z0-9_.:/-]+$/,
+  version: /^[A-Za-z0-9_.+-]+$/,
+  protocol_version: /^\d{4}-\d{2}-\d{2}$/,
+};
+
+/**
+ * `stdio.ts`/`http.ts` copy a handful of protocol strings straight off the
+ * wire into every event, VERBATIM, with no length or character cap: the
+ * `tools/call` tool name (`gen_ai.tool.name`), the JSON-RPC `method`
+ * (`mcp.method.name`), the `initialize` handshake's `clientInfo`/
+ * `serverInfo` `name`/`version`, and the negotiated `protocolVersion` — plus
+ * the identity/server context remembered from that handshake and reused on
+ * every later event, and the synthetic `unanswered` events sealed at
+ * shutdown (which just replay an already-captured `tool`/`method`). None of
+ * these fields are part of a `scrub()`-walked JSON tree (the event schema
+ * keeps them as plain top-level strings, e.g. `ToolCallEvent.tool`), so
+ * `scrub()`'s length/vocabulary gates never applied to them: a misbehaving
+ * or malicious peer could stuff kilobytes of arbitrary text — including
+ * payload it wants to smuggle past redaction — into every event through any
+ * one of them.
+ *
+ * `structuralString` closes that: the value is kept AS-IS only when it is at
+ * most `STRUCTURAL_STRING_MAX_LEN` (128) characters AND matches `kind`'s
+ * conservative shape; otherwise it is replaced by its `sha256:<hex>`
+ * reference — computed the exact same way as `Redactor.hashString` (both are
+ * `sha256Ref(value)`), so a blast-radius `query` for the original value still
+ * finds it. The event schema is frozen: the field stays a plain `string`
+ * either way, never a `RedactedRef` object.
+ */
+export function structuralString(value: string, kind: StructuralStringKind): string {
+  if (value.length > STRUCTURAL_STRING_MAX_LEN) return sha256Ref(value);
+  if (!STRUCTURAL_STRING_SHAPES[kind].test(value)) return sha256Ref(value);
+  return value;
+}
+
 /**
  * Charset a string must satisfy to pass under a CUSTOM (non-default) allowed
  * key that has no dedicated structural-vocabulary rule below. Kept only for

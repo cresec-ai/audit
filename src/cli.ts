@@ -465,7 +465,23 @@ interface PinnedKey {
   source: string;
 }
 
-function printVerifyHuman(result: VerifyResult, source: string, pinned?: PinnedKey): void {
+/**
+ * `manifest.json` fields NOT covered by the head signature (which covers
+ * only `signature.seq` + `signature.chain_hash`) — printed for context, but
+ * clearly labeled unsigned so they are never mistaken for verified evidence.
+ */
+interface UnsignedBundleMetadata {
+  session_id?: string;
+  created_at: string;
+  tool_version: string;
+}
+
+function printVerifyHuman(
+  result: VerifyResult,
+  source: string,
+  pinned?: PinnedKey,
+  unsignedMetadata?: UnsignedBundleMetadata,
+): void {
   out(`verify ${source}`);
   // pinned is undefined ONLY for the store-mode branch that found neither
   // --public-key nor <data-dir>/identity.pub — bundle mode always pins to
@@ -501,6 +517,15 @@ function printVerifyHuman(result: VerifyResult, source: string, pinned?: PinnedK
   if (sig !== undefined) {
     out(`signed head: seq ${sig.seq} by ed25519 ${sig.public_key.slice(0, 16)}… at ${sig.signed_at}`);
   }
+  if (unsignedMetadata !== undefined) {
+    out('');
+    out('UNSIGNED metadata (not covered by the signature - informational only):');
+    if (unsignedMetadata.session_id !== undefined) {
+      out(`  session_id  : ${unsignedMetadata.session_id}`);
+    }
+    out(`  created_at  : ${unsignedMetadata.created_at}`);
+    out(`  tool_version: ${unsignedMetadata.tool_version}`);
+  }
   if (result.problems.length > 0) {
     out('');
     out(
@@ -529,6 +554,8 @@ interface BundleVerification {
   result: VerifyResult;
   source: string;
   pinnedPublicKeyHex: string;
+  /** manifest.json fields not covered by the signature — see printVerifyHuman. */
+  unsignedMetadata: UnsignedBundleMetadata;
 }
 
 /* ----------------------------- minimal ZIP reader ----------------------------
@@ -644,6 +671,16 @@ function assertBundleId(manifest: BundleManifest, where: string): void {
   if (manifest.bundle !== 'edut.mcp-recorder.bundle.v1') {
     err(`unrecognized bundle id in ${where}: ${String(manifest.bundle)}`);
   }
+}
+
+/** Extract the manifest fields the head signature does not cover (see UnsignedBundleMetadata). */
+function unsignedMetadataOf(manifest: BundleManifest): UnsignedBundleMetadata {
+  const out: UnsignedBundleMetadata = {
+    created_at: manifest.created_at,
+    tool_version: manifest.tool_version,
+  };
+  if (manifest.session_id !== undefined) out.session_id = manifest.session_id;
+  return out;
 }
 
 function parseEventsJsonl(text: string): ChainRecord[] {
@@ -789,7 +826,12 @@ async function verifyBundleFromDir(dir: string, pinOpts: BundlePinOpts): Promise
     publicKeyPemText,
     pinOpts,
   );
-  return { result, source: `bundle ${dir}`, pinnedPublicKeyHex };
+  return {
+    result,
+    source: `bundle ${dir}`,
+    pinnedPublicKeyHex,
+    unsignedMetadata: unsignedMetadataOf(manifest),
+  };
 }
 
 async function verifyBundleFromZip(
@@ -815,7 +857,12 @@ async function verifyBundleFromZip(
     publicKeyPemText,
     pinOpts,
   );
-  return { result, source: `bundle ${zipPath}`, pinnedPublicKeyHex };
+  return {
+    result,
+    source: `bundle ${zipPath}`,
+    pinnedPublicKeyHex,
+    unsignedMetadata: unsignedMetadataOf(manifest),
+  };
 }
 
 /**
@@ -892,6 +939,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
   let result: VerifyResult;
   let source: string;
   let pinned: PinnedKey | undefined;
+  let unsignedMetadata: UnsignedBundleMetadata | undefined;
 
   const bundle = asStr(flags.bundle);
   if (bundle !== undefined) {
@@ -901,6 +949,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
     });
     result = bundleResult.result;
     source = bundleResult.source;
+    unsignedMetadata = bundleResult.unsignedMetadata;
     pinned = {
       hex: bundleResult.pinnedPublicKeyHex,
       source:
@@ -936,7 +985,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
         : { ...result, pinned_public_key: null, unpinned: true };
     out(JSON.stringify(payload, null, 2));
   } else {
-    printVerifyHuman(result, source, pinned);
+    printVerifyHuman(result, source, pinned, unsignedMetadata);
   }
 }
 

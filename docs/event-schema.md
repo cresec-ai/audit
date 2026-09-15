@@ -53,6 +53,42 @@ used as a key. A literal `__proto__` key is preserved as a genuine own property 
 scrubbed tree is built without going through a normal object's prototype setter), never
 silently dropped.
 
+**Verbatim protocol strings copied off the wire are capped too (P0).** A handful of
+fields are stamped onto events directly from the MCP handshake / JSON-RPC envelope
+rather than through a `scrub()`-walked tree — they stay plain top-level strings by
+schema, so `scrub()`'s length/vocabulary gates never applied to them:
+`ToolCallEvent.tool` (and the `gen_ai.tool.name` attribute), `RpcEvent`/
+`NotificationEvent.method` (and the `mcp.method.name` attribute), and the
+`initialize` handshake's `protocol_version`/`client_name`/`client_version`/
+`server_name`/`server_version` — plus the `client_name`/`client_version` remembered on
+`IdentityContext` and the `name`/`version` learned onto `ServerContext`, both reused on
+every event recorded after the handshake. A misbehaving or malicious peer could
+otherwise stuff kilobytes of arbitrary text — including payload it wants to smuggle
+past redaction — into every event through any one of these. `structuralString()`
+(`src/redact/redactor.ts`) closes this: a value survives AS-IS only when it is at most
+128 characters **and** matches a conservative shape for its kind —
+
+| Kind | Applies to | Shape |
+| --- | --- | --- |
+| `identifier` | tool name, JSON-RPC method, clientInfo/serverInfo `name` | `^[A-Za-z0-9_.:/-]+$` |
+| `version` | clientInfo/serverInfo `version` | `^[A-Za-z0-9_.+-]+$` |
+| `protocol_version` | negotiated `protocolVersion` | `^\d{4}-\d{2}-\d{2}$` |
+
+— otherwise the value is replaced by its `sha256:<hex>` reference, computed the exact
+same way as any other redacted value (`sha256Ref`/`Redactor.hashString`), so a
+blast-radius `query` for the original value still finds it. The field itself stays a
+plain `string` either way — never a `RedactedRef` object — so this is not a schema
+change. Each value is capped ONCE, at the point it is first read off the wire (a
+request's own `method`/`params.name`, or the `initialize` handshake's
+`clientInfo`/`serverInfo`); every later use of that same value — the identity/server
+context stamped on every subsequent event, and the synthetic `unanswered` events sealed
+at shutdown (see [`session_end`](#session_end) below) — reuses the already-capped value,
+so nothing downstream needs its own cap.
+
+Note the asymmetry on `ServerContext.name`: it is `--name` (operator-supplied, never
+capped) else the serverInfo name **learned from the handshake** (capped) else a locally
+derived basename of the wrapped command (not peer-controlled, not capped either).
+
 ---
 
 ## Common types
@@ -96,8 +132,8 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `fingerprint` | `Sha256Ref` | Stable identity hash for the acting agent/credential pair: sha256 over (os_user, hostname, label, initial server name) — the context known at proxy startup, before the MCP `initialize` handshake. `client_name`/`client_version` are learned later from that handshake and are **not** part of the fingerprint. |
 | `os_user` | `string?` | OS user running the proxy. |
 | `hostname` | `string?` | Host the proxy ran on. |
-| `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. |
-| `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. |
+| `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `label` | `string?` | Operator-supplied label (`--identity`). |
 | `credential_fingerprints` | `CredentialFingerprint[]?` | Hashes of secret-looking env values passed to the wrapped server. |
 
@@ -105,8 +141,8 @@ Identity context stamped on **every** event ("identity-stamp everything").
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `name` | `string` | Logical server name (`--name` flag, else derived from command/initialize). |
-| `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. |
+| `name` | `string` | Logical server name (`--name` flag, else derived from command/initialize). The initialize-learned component is capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an operator-supplied `--name` is not. |
+| `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
 
@@ -200,11 +236,11 @@ The MCP initialize handshake (request + response correlated).
 | Field | Type | Description |
 | --- | --- | --- |
 | `request_id` | `string \| number` | JSON-RPC request id. |
-| `protocol_version` | `string?` | Negotiated MCP protocol version. |
-| `client_name` | `string?` | From clientInfo. |
-| `client_version` | `string?` | From clientInfo. |
-| `server_name` | `string?` | From serverInfo. |
-| `server_version` | `string?` | From serverInfo. |
+| `protocol_version` | `string?` | Negotiated MCP protocol version. Capped (`structuralString`, kind `protocol_version`) — see [above](#privacy-posture). |
+| `client_name` | `string?` | From clientInfo. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `client_version` | `string?` | From clientInfo. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
+| `server_name` | `string?` | From serverInfo. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `server_version` | `string?` | From serverInfo. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
 
 ### `tool_call`
@@ -213,7 +249,7 @@ A completed `tools/call` (request + response correlated). The flagship event.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `tool` | `string` | Tool name (`gen_ai.tool.name`). |
+| `tool` | `string` | Tool name (`gen_ai.tool.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped name is stored as its `sha256:<hex>` reference instead. |
 | `request_id` | `string \| number` | JSON-RPC request id (`gen_ai.tool.call.id`). |
 | `args` | `Scrubbed` | Redacted argument tree. **Every string leaf is hashed, unconditionally, regardless of key or position or redaction mode** — see [Privacy posture](#privacy-posture). |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
@@ -228,7 +264,7 @@ Any other correlated JSON-RPC request/response (`tools/list`, `resources/read`, 
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `method` | `string` | JSON-RPC method (`mcp.method.name`). |
+| `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `request_id` | `string \| number` | JSON-RPC request id. |
 | `params` | `Scrubbed` | Redacted params tree. |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the complete raw result, pre-redaction. |
@@ -242,7 +278,7 @@ One-way JSON-RPC notification in either direction.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `method` | `string` | JSON-RPC method (`mcp.method.name`). |
+| `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `direction` | `'client_to_server' \| 'server_to_client'` | Which way it flowed. |
 | `params` | `Scrubbed` | Redacted params tree. |
 
@@ -279,7 +315,11 @@ becomes a `tool_call` event, everything else (including an unanswered
 `error: { type: 'unanswered' }`, `result_hash` is the hash of canonical `null`
 (a `tool_call` also sets `result: null`), and `duration_ms` is measured from
 the request crossing the proxy to session shutdown. `error.type` is an
-existing free-form string field, so this needed no schema change.
+existing free-form string field, so this needed no schema change. The synthetic
+event's `tool`/`method` is whatever was captured for the pending request — already
+capped (`structuralString`, see [Privacy posture](#privacy-posture)) at the point the
+request was first seen, so an unanswered call with an oversized/malformed name or
+method is just as capped here as in a normal completed event.
 
 ---
 
@@ -292,11 +332,11 @@ typed event fields to their semconv equivalents.
 | Semconv attribute | Recorder source | Notes |
 | --- | --- | --- |
 | `gen_ai.operation.name` | event `kind = 'tool_call'` | `execute_tool` for tool-call events. |
-| `gen_ai.tool.name` | `ToolCallEvent.tool` | The MCP tool invoked. |
+| `gen_ai.tool.name` | `ToolCallEvent.tool` | The MCP tool invoked. Same capped value as `tool` (see above). |
 | `gen_ai.tool.call.id` | `ToolCallEvent.request_id` | The JSON-RPC request id of the call. |
 | `rpc.system` | constant | `jsonrpc` — MCP is JSON-RPC 2.0. |
 | `rpc.jsonrpc.request_id` | `RpcEvent.request_id`, `InitializeEvent.request_id` | Correlated request id. |
-| `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. |
+| `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. Same capped value as `method` (see above). |
 | `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. |
 
 ---

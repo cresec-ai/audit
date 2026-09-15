@@ -11,11 +11,14 @@ import { sha256Ref } from '../src/chain/hash.js';
 import { Signer } from '../src/chain/keys.js';
 import { runHttpProxy } from '../src/proxy/http.js';
 import { Redactor } from '../src/redact/redactor.js';
+import { queryStore } from '../src/query/touched.js';
 import { openStore } from '../src/store/index.js';
 import { verifyStore } from '../src/verify/verify.js';
 import type {
   AnyEvent,
   InitializeEvent,
+  NotificationEvent,
+  RpcEvent,
   ToolCallEvent,
 } from '../src/schema/events.js';
 
@@ -674,5 +677,219 @@ describe('runHttpProxy', () => {
     );
     expect(hitApiKey).toBe(true);
     expect(hitToken).toBe(true);
+  });
+});
+
+/* --- P0: capping verbatim protocol strings (tool name, method, clientInfo/
+ * serverInfo, protocolVersion). A misbehaving or malicious peer used to be
+ * able to stuff kilobytes of arbitrary text into every event through these
+ * fields, uncapped by length or character shape — structuralString() now
+ * caps each one at the edge. */
+describe('structuralString capping of protocol strings (P0)', () => {
+  const HUGE_NAME = 'x'.repeat(5000);
+  const NAME_WITH_SPACES = 'not a valid tool name';
+  const NAME_WITH_NEWLINE = 'bad\nname';
+  const HUGE_METHOD = 'y'.repeat(5000);
+  const MALFORMED_PROTOCOL_VERSION = 'not-a-date';
+  const HUGE_SERVER_NAME = 'srv-' + 'z'.repeat(5000);
+  const MALFORMED_SERVER_VERSION = 'bad version';
+
+  /** Replies `{ok:true}` to everything, regardless of method/params — unlike
+   *  startJsonTarget, it never echoes params/method back into the result, so
+   *  a capped tool/method name's sha256 ref cannot show up anywhere in the
+   *  tree except the `tool`/`method` field itself (keeps the query-match
+   *  assertions below precise about WHERE the match was found). */
+  async function startPlainAckTarget(): Promise<{ url: string }> {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const out = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { ok: true } });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(out) });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    return { url };
+  }
+
+  /** Same shape as startJsonTarget, but `initialize` replies with an
+   *  oversized/malformed serverInfo instead of a normal one. */
+  async function startHugeServerInfoTarget(): Promise<{ url: string }> {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      let result: unknown;
+      if (msg.method === 'initialize') {
+        result = {
+          protocolVersion: '2025-03-26',
+          serverInfo: { name: HUGE_SERVER_NAME, version: MALFORMED_SERVER_VERSION },
+          capabilities: {},
+        };
+      } else if (msg.method === 'tools/call') {
+        result = { content: [{ type: 'text', text: JSON.stringify(msg.params) }] };
+      } else {
+        result = { ok: true };
+      }
+      const out = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(out) });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    return { url };
+  }
+
+  it('an oversized / space-containing / newline-containing tools/call name is capped to a sha256 ref in tool_call.tool and the gen_ai.tool.name attribute, and a blast-radius query for the original name finds it', async () => {
+    const target = await startPlainAckTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const names = [HUGE_NAME, NAME_WITH_SPACES, NAME_WITH_NEWLINE];
+    for (const [i, name] of names.entries()) {
+      const res = await post(proxy.url, {
+        jsonrpc: '2.0',
+        id: 200 + i,
+        method: 'tools/call',
+        params: { name, arguments: {} },
+      });
+      expect(res.status).toBe(200);
+    }
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    const calls = events.filter((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(calls).toHaveLength(3);
+
+    const store = openStore({ dataDir });
+    try {
+      calls.forEach((call, i) => {
+        const name = names[i]!;
+        const expectedRef = sha256Ref(name);
+        expect(call.tool).toBe(expectedRef);
+        expect(call.attributes['gen_ai.tool.name']).toBe(expectedRef);
+        expect(call.tool).not.toContain(name);
+
+        const result = queryStore(store, name);
+        expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.tool')).toBe(true);
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a normal, short tool name passes through unchanged', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const res = await post(proxy.url, toolCallMsg); // params.name === 'echo'
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call?.tool).toBe('echo');
+    expect(call?.attributes['gen_ai.tool.name']).toBe('echo');
+  });
+
+  it('an oversized JSON-RPC method is capped to a sha256 ref in rpc.method / notification.method and the mcp.method.name attribute, and query finds the original method', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const rpcRes = await post(proxy.url, { jsonrpc: '2.0', id: 1, method: HUGE_METHOD });
+    expect(rpcRes.status).toBe(200);
+    // A notification carrying the same oversized method (no id).
+    const noteRes = await post(proxy.url, { jsonrpc: '2.0', method: HUGE_METHOD });
+    expect(noteRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedRef = sha256Ref(HUGE_METHOD);
+    const events = loadEvents(dataDir);
+    const rpc = events.find((e): e is RpcEvent => e.kind === 'rpc');
+    expect(rpc).toBeDefined();
+    expect(rpc!.method).toBe(expectedRef);
+    expect(rpc!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const note = events.find(
+      (e): e is NotificationEvent => e.kind === 'notification' && e.direction === 'client_to_server',
+    );
+    expect(note).toBeDefined();
+    expect(note!.method).toBe(expectedRef);
+    expect(note!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const store = openStore({ dataDir });
+    try {
+      const result = queryStore(store, HUGE_METHOD);
+      expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.method')).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an oversized clientInfo name/version and a malformed protocolVersion are capped on the initialize event, and the capped client_name is what later events carry as identity context', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const initRes = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: MALFORMED_PROTOCOL_VERSION,
+        clientInfo: { name: HUGE_NAME, version: NAME_WITH_SPACES },
+        capabilities: {},
+      },
+    });
+    expect(initRes.status).toBe(200);
+    const callRes = await post(proxy.url, toolCallMsg);
+    expect(callRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedNameRef = sha256Ref(HUGE_NAME);
+    const expectedVersionRef = sha256Ref(NAME_WITH_SPACES);
+    const expectedProtoRef = sha256Ref(MALFORMED_PROTOCOL_VERSION);
+
+    const events = loadEvents(dataDir);
+    const init = events.find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.client_name).toBe(expectedNameRef);
+    expect(init!.client_version).toBe(expectedVersionRef);
+    expect(init!.protocol_version).toBe(expectedProtoRef);
+    expect(init!.client_name).not.toContain(HUGE_NAME.slice(0, 50));
+
+    // The remembered clientName/clientVersion feed identity context on every
+    // LATER event too, not just the initialize event itself.
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call!.identity.client_name).toBe(expectedNameRef);
+    expect(call!.identity.client_version).toBe(expectedVersionRef);
+  });
+
+  it('an oversized/malformed serverInfo learned from the handshake is capped on the initialize event, and later events carry the capped server name/version', async () => {
+    const target = await startHugeServerInfoTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const initRes = await post(proxy.url, initializeMsg);
+    expect(initRes.status).toBe(200);
+    const callRes = await post(proxy.url, toolCallMsg);
+    expect(callRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedNameRef = sha256Ref(HUGE_SERVER_NAME);
+    const expectedVersionRef = sha256Ref(MALFORMED_SERVER_VERSION);
+
+    const events = loadEvents(dataDir);
+    const init = events.find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.server_name).toBe(expectedNameRef);
+    expect(init!.server_version).toBe(expectedVersionRef);
+
+    // server.name / server.version stamped on events AFTER the handshake
+    // carry the capped, learned value too.
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call!.server.name).toBe(expectedNameRef);
+    expect(call!.server.version).toBe(expectedVersionRef);
   });
 });

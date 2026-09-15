@@ -393,9 +393,6 @@ if (!signatureOk) {
 console.log('PASS: evidence bundle verified');
 console.log('  events     : ' + lines.length + ' (seq ' + manifest.range.from_seq +
   '..' + manifest.range.to_seq + ')');
-if (manifest.session_id !== undefined) {
-  console.log('  session    : ' + manifest.session_id);
-}
 console.log('  base hash  : ' + manifest.base_hash);
 console.log('  head hash  : ' + manifest.head_hash);
 console.log('  signed by  : ed25519 ' + sig.public_key + ' at ' + sig.signed_at);
@@ -410,5 +407,17 @@ if (pinnedHex !== null) {
   console.log('               --public-key <hex|path> using a key you obtained out of band');
   console.log('               (e.g. from the operator directly) for real assurance.');
 }
+/* manifest.session_id / created_at / tool_version are NOT covered by the head
+ * signature above (it covers only sig.seq + sig.chain_hash, checked in step
+ * 3) — they are the exporting tool's own unverified say-so, so they are
+ * printed separately and clearly labeled rather than folded into the PASS
+ * block above, where a reader could mistake them for verified facts. */
+console.log('');
+console.log('UNSIGNED metadata (not covered by the signature - informational only):');
+if (manifest.session_id !== undefined) {
+  console.log('  session_id   : ' + manifest.session_id);
+}
+console.log('  created_at   : ' + manifest.created_at);
+console.log('  tool_version : ' + manifest.tool_version);
 process.exit(0);
 `;

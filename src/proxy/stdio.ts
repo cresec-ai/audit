@@ -30,7 +30,7 @@ import type {
   ToolCallEvent,
 } from '../schema/events.js';
 import { SCHEMA } from '../schema/events.js';
-import { scrubArgv, scrubToolArguments } from '../redact/redactor.js';
+import { scrubArgv, scrubToolArguments, structuralString } from '../redact/redactor.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
 import { LineScanner, type ScannedLine } from './framing.js';
 
@@ -406,11 +406,24 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       const clientInfo = isPlainObject(reqParams.clientInfo) ? reqParams.clientInfo : {};
       const res = isPlainObject(rawResult) ? rawResult : {};
       const serverInfo = isPlainObject(res.serverInfo) ? res.serverInfo : {};
-      // Remember for subsequent events' identity/server context.
-      if (typeof clientInfo.name === 'string') clientName = clientInfo.name;
-      if (typeof clientInfo.version === 'string') clientVersion = clientInfo.version;
-      if (typeof serverInfo.name === 'string') learnedServerName = serverInfo.name;
-      if (typeof serverInfo.version === 'string') learnedServerVersion = serverInfo.version;
+      // Remember for subsequent events' identity/server context. Capped here
+      // (P0): these are copied verbatim off the wire and reused on every
+      // later event, so an oversized/malformed value is capped once, at the
+      // point it's learned — every downstream use (this event's own
+      // client_name/server_name below, plus identity/server context on every
+      // later event) inherits the capped value for free.
+      if (typeof clientInfo.name === 'string') {
+        clientName = structuralString(clientInfo.name, 'identifier');
+      }
+      if (typeof clientInfo.version === 'string') {
+        clientVersion = structuralString(clientInfo.version, 'version');
+      }
+      if (typeof serverInfo.name === 'string') {
+        learnedServerName = structuralString(serverInfo.name, 'identifier');
+      }
+      if (typeof serverInfo.version === 'string') {
+        learnedServerVersion = structuralString(serverInfo.version, 'version');
+      }
 
       const ev: InitializeEvent = {
         ...base('initialize', {
@@ -423,7 +436,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         duration_ms: durationMs,
       };
       const protoVersion = reqParams.protocolVersion ?? res.protocolVersion;
-      if (typeof protoVersion === 'string') ev.protocol_version = protoVersion;
+      if (typeof protoVersion === 'string') {
+        ev.protocol_version = structuralString(protoVersion, 'protocol_version');
+      }
       if (clientName !== undefined) ev.client_name = clientName;
       if (clientVersion !== undefined) ev.client_version = clientVersion;
       if (learnedServerName !== undefined) ev.server_name = learnedServerName;
@@ -489,30 +504,36 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const hasId = id !== undefined && id !== null;
 
     if (hasMethod && hasId) {
-      // Request: register pending under the direction it was sent on.
+      // Request: register pending under the direction it was sent on. The
+      // method/tool name is capped HERE (P0), once, at capture time: every
+      // downstream event built from this entry (the eventual response event
+      // AND the synthetic 'unanswered' event sealed at shutdown, see
+      // emitUnanswered below) reads `entry.method`/`entry.toolName`, so
+      // capping the source field once covers both for free.
       const keyPrefix = direction === 'client_to_server' ? 'c2s:' : 's2c:';
       const reqId = id as string | number;
       const params = msg.params;
       const entry: PendingEntry = {
-        method: msg.method as string,
+        method: structuralString(msg.method as string, 'identifier'),
         params,
         t0: performance.now(),
         id: reqId,
       };
       if (isPlainObject(params) && typeof params.name === 'string') {
-        entry.toolName = params.name;
+        entry.toolName = structuralString(params.name, 'identifier');
       }
       registerPending(pendingKey(keyPrefix, reqId), entry);
       return;
     }
     if (hasMethod) {
+      const method = structuralString(msg.method as string, 'identifier');
       const ev: NotificationEvent = {
         ...base('notification', {
-          'mcp.method.name': msg.method as string,
+          'mcp.method.name': method,
           'rpc.system': 'jsonrpc',
         }),
         kind: 'notification',
-        method: msg.method as string,
+        method,
         direction,
         params: redactor.scrub(msg.params ?? null),
       };

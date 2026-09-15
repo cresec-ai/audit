@@ -6,10 +6,12 @@ import { describe, expect, it } from 'vitest';
 import { GENESIS_HASH, canonicalJson, computeHash, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Recorder } from '../src/capture/recorder.js';
 import { runStdioProxy } from '../src/proxy/stdio.js';
+import { queryStore } from '../src/query/touched.js';
 import type {
   AnyEvent,
   ChainRecord,
   HeadSignature,
+  InitializeEvent,
   NotificationEvent,
   ProtocolErrorEvent,
   RpcEvent,
@@ -660,5 +662,286 @@ describe('credential-fingerprint cap reservation (P2)', () => {
     const argvHash = sha256Ref(argvSecret);
     expect(fps.some((f) => f.ref === argvHash)).toBe(true);
     expect(fps.length).toBeLessThanOrEqual(64);
+  });
+});
+
+/* --- P0: capping verbatim protocol strings (tool name, method, clientInfo/
+ * serverInfo, protocolVersion). A misbehaving or malicious peer used to be
+ * able to stuff kilobytes of arbitrary text into every event through these
+ * fields, uncapped by length or character shape — structuralString() now
+ * caps each one at the edge. */
+describe('structuralString capping of protocol strings (P0)', () => {
+  const HUGE_NAME = 'x'.repeat(5000);
+  const NAME_WITH_SPACES = 'not a valid tool name';
+  const NAME_WITH_NEWLINE = 'bad\nname';
+  const HUGE_METHOD = 'y'.repeat(5000);
+  const MALFORMED_PROTOCOL_VERSION = 'not-a-date';
+
+  /** node -e script: replies to ONE initialize request with an oversized,
+   *  malformed serverInfo (name/version), no dependency on echo-server.cjs. */
+  const HUGE_SERVER_INFO_SCRIPT =
+    "let buf = ''; process.stdin.setEncoding('utf8'); " +
+    "process.stdin.on('data', (c) => { buf += c; }); " +
+    "process.stdin.on('end', () => { " +
+    'const msg = JSON.parse(buf); ' +
+    "process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { " +
+    "protocolVersion: '2024-11-05', " +
+    "serverInfo: { name: 'srv-'.concat('z'.repeat(5000)), version: 'bad version' }, " +
+    'capabilities: {} } })); ' +
+    'process.exitCode = 0; ' +
+    '});';
+
+  it('an oversized / space-containing / newline-containing tools/call name is capped to a sha256 ref in tool_call.tool and the gen_ai.tool.name attribute, and a blast-radius query for the original name finds it', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    const names = [HUGE_NAME, NAME_WITH_SPACES, NAME_WITH_NEWLINE];
+    names.forEach((name, i) => {
+      stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 100 + i,
+          method: 'tools/call',
+          params: { name, arguments: {} },
+        }) + '\n',
+      );
+    });
+    await waitFor(() => out.lines().length >= names.length, 'all tool_call responses');
+    stdin.end();
+    await done;
+
+    const calls = store.events().filter((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(calls).toHaveLength(3);
+    calls.forEach((call, i) => {
+      const name = names[i]!;
+      const expectedRef = sha256Ref(name);
+      expect(call.tool).toBe(expectedRef);
+      expect(call.attributes['gen_ai.tool.name']).toBe(expectedRef);
+      expect(call.tool).not.toContain(name);
+
+      // A blast-radius query for the ORIGINAL (uncapped) name still finds
+      // the event, via the tool field's sha256 ref.
+      const result = queryStore(store, name);
+      expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.tool')).toBe(true);
+    });
+  });
+
+  it('a normal, short tool name passes through unchanged', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: {} },
+      }) + '\n',
+    );
+    await waitFor(() => out.lines().length >= 1, 'tool_call response');
+    stdin.end();
+    await done;
+
+    const call = store.events().find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call?.tool).toBe('echo');
+    expect(call?.attributes['gen_ai.tool.name']).toBe('echo');
+  });
+
+  it('an oversized JSON-RPC method is capped to a sha256 ref in rpc.method / notification.method and the mcp.method.name attribute, and query finds the original method', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    // A request with a huge method: echo-server replies -32601 (method not
+    // found), but the proxy must still cap and record it as an `rpc` event.
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: HUGE_METHOD }) + '\n');
+    await waitFor(() => out.lines().length >= 1, 'rpc error response');
+    // A notification (no id) carrying the same oversized method.
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', method: HUGE_METHOD }) + '\n');
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.end();
+    await done;
+
+    const expectedRef = sha256Ref(HUGE_METHOD);
+    const rpc = store.events().find((e): e is RpcEvent => e.kind === 'rpc');
+    expect(rpc).toBeDefined();
+    expect(rpc!.method).toBe(expectedRef);
+    expect(rpc!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const note = store
+      .events()
+      .find((e): e is NotificationEvent => e.kind === 'notification' && e.direction === 'client_to_server');
+    expect(note).toBeDefined();
+    expect(note!.method).toBe(expectedRef);
+    expect(note!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const result = queryStore(store, HUGE_METHOD);
+    expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.method')).toBe(true);
+  });
+
+  it('an oversized clientInfo name/version and a malformed protocolVersion are capped on the initialize event, and the capped client_name is what later events carry as identity context', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: MALFORMED_PROTOCOL_VERSION,
+          clientInfo: { name: HUGE_NAME, version: NAME_WITH_SPACES },
+          capabilities: {},
+        },
+      }) + '\n',
+    );
+    await waitFor(() => out.lines().length >= 1, 'initialize response');
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: {} },
+      }) + '\n',
+    );
+    await waitFor(() => out.lines().length >= 2, 'tool_call response');
+    stdin.end();
+    await done;
+
+    const expectedNameRef = sha256Ref(HUGE_NAME);
+    const expectedVersionRef = sha256Ref(NAME_WITH_SPACES);
+    const expectedProtoRef = sha256Ref(MALFORMED_PROTOCOL_VERSION);
+
+    const init = store.events().find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.client_name).toBe(expectedNameRef);
+    expect(init!.client_version).toBe(expectedVersionRef);
+    expect(init!.protocol_version).toBe(expectedProtoRef);
+    expect(init!.client_name).not.toContain(HUGE_NAME.slice(0, 50));
+
+    // The remembered clientName/clientVersion feed identity context on every
+    // LATER event too, not just the initialize event itself.
+    const call = store.events().find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call!.identity.client_name).toBe(expectedNameRef);
+    expect(call!.identity.client_version).toBe(expectedVersionRef);
+  });
+
+  it('an oversized/malformed serverInfo learned from the handshake is capped on the initialize event, and later events carry the capped server name/version', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, '-e', HUGE_SERVER_INFO_SCRIPT],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    // HUGE_SERVER_INFO_SCRIPT only replies once ITS stdin ends (it has no
+    // \n-framing of its own — see the script above), so end stdin right
+    // after writing the request rather than waiting for a response first.
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2024-11-05', clientInfo: { name: 'vitest', version: '1.0.0' }, capabilities: {} },
+      }) + '\n',
+    );
+    stdin.end();
+    await waitFor(() => out.lines().length >= 1, 'initialize response');
+    await done;
+
+    const hugeServerName = 'srv-'.concat('z'.repeat(5000));
+    const expectedNameRef = sha256Ref(hugeServerName);
+    const expectedVersionRef = sha256Ref('bad version');
+
+    const init = store.events().find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.server_name).toBe(expectedNameRef);
+    expect(init!.server_version).toBe(expectedVersionRef);
+
+    // server.name / server.version stamped on the SessionStartEvent (which
+    // predates the handshake) stay the pre-handshake fallback, but every
+    // event recorded AFTER the handshake carries the capped, learned value.
+    expect(init!.server.name).toBe(expectedNameRef);
+    expect(init!.server.version).toBe(expectedVersionRef);
   });
 });

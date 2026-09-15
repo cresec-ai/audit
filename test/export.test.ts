@@ -619,4 +619,64 @@ describe('exportBundle', () => {
     expect(cli.status).toBe(2); // usage/malformed-input error, not a verify verdict either way
     expect(cli.stderr).toContain('malformed ZIP: duplicate entry events.jsonl');
   }, 30_000);
+
+  /* --------- unsigned manifest metadata: session_id/created_at/tool_version --------- */
+
+  it('created_at/tool_version are unsigned: editing them still PASSES, and both verifiers label them as such', async () => {
+    const bundleDir = join(dir, 'bundle-unsigned-metadata');
+    await exportBundle({ store, dirPath: bundleDir, toolVersion: '0.1.0-test', signer });
+
+    // Only the head signature (seq + chain_hash) is covered by the signature —
+    // created_at and tool_version are the exporting tool's own say-so.
+    // Doctoring them must NOT break verification.
+    const manifestPath = join(bundleDir, BUNDLE_FILES.MANIFEST);
+    const onDisk = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    onDisk.created_at = '2099-01-01T00:00:00.000Z';
+    onDisk.tool_version = '99.99.99-doctored';
+    writeFileSync(manifestPath, JSON.stringify(onDisk, null, 2) + '\n');
+
+    const UNSIGNED_LABEL = 'UNSIGNED metadata (not covered by the signature - informational only)';
+
+    // (a) node verify.cjs still PASSES, and shows the doctored fields under
+    // the clearly-labeled unsigned section.
+    const cjs = runVerifyCjs(bundleDir);
+    expect(cjs.status).toBe(0);
+    expect(cjs.stdout).toContain('PASS');
+    expect(cjs.stdout).toContain(UNSIGNED_LABEL);
+    expect(cjs.stdout).toContain('2099-01-01T00:00:00.000Z');
+    expect(cjs.stdout).toContain('99.99.99-doctored');
+
+    // (b) `mcp-recorder verify --bundle` agrees: still PASSES, same label,
+    // same (unverified) values surfaced for the operator to see.
+    const cli = runCliVerifyBundle(bundleDir);
+    expect(cli.status).toBe(0);
+    expect(cli.stdout).toContain('PASS');
+    expect(cli.stdout).toContain(UNSIGNED_LABEL);
+    expect(cli.stdout).toContain('2099-01-01T00:00:00.000Z');
+    expect(cli.stdout).toContain('99.99.99-doctored');
+  });
+
+  it('a genuine bundle also shows the unsigned-metadata label (not just a tampered one)', async () => {
+    const bundleDir = join(dir, 'bundle-unsigned-metadata-genuine');
+    const manifest = await exportBundle({
+      store,
+      dirPath: bundleDir,
+      toolVersion: '0.1.0-test',
+      signer,
+    });
+
+    const UNSIGNED_LABEL = 'UNSIGNED metadata (not covered by the signature - informational only)';
+
+    const cjs = runVerifyCjs(bundleDir);
+    expect(cjs.status).toBe(0);
+    expect(cjs.stdout).toContain(UNSIGNED_LABEL);
+    expect(cjs.stdout).toContain(manifest.created_at);
+    expect(cjs.stdout).toContain(manifest.tool_version);
+
+    const cli = runCliVerifyBundle(bundleDir);
+    expect(cli.status).toBe(0);
+    expect(cli.stdout).toContain(UNSIGNED_LABEL);
+    expect(cli.stdout).toContain(manifest.created_at);
+    expect(cli.stdout).toContain(manifest.tool_version);
+  });
 });

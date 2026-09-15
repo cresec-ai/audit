@@ -4,9 +4,11 @@ import type { RedactedRef, Scrubbed } from '../src/schema/events.js';
 import {
   DEFAULT_POLICY,
   Redactor,
+  STRUCTURAL_STRING_MAX_LEN,
   looksSecret,
   scrubArgv,
   scrubToolArguments,
+  structuralString,
 } from '../src/redact/redactor.js';
 
 /* ------------------------------ fixtures ------------------------------ */
@@ -682,5 +684,75 @@ describe('scrubArgv: NAME=value elements and encoded userinfo', () => {
     expect(refs).toContain(redactor.hashString('p@ss:w0rd'));
     expect(refs).toContain(redactor.hashString('p%40ss%3Aw0rd'));
     expect(refs).toContain(redactor.hashString('alice:p@ss:w0rd'));
+  });
+});
+
+/* --- P0: structuralString() caps verbatim protocol strings (tool/method
+ * names, clientInfo/serverInfo name+version, protocolVersion) that the
+ * proxies stamp on events with no length/vocabulary cap otherwise — see
+ * src/proxy/stdio.ts and src/proxy/http.ts for the call sites. */
+describe('structuralString (P0: capping verbatim protocol strings)', () => {
+  it('keeps a normal identifier (tool/method name) unchanged', () => {
+    expect(structuralString('list_issues', 'identifier')).toBe('list_issues');
+    expect(structuralString('tools/call', 'identifier')).toBe('tools/call');
+    expect(structuralString('notifications/initialized', 'identifier')).toBe(
+      'notifications/initialized',
+    );
+    expect(structuralString('my-tool_v2.final', 'identifier')).toBe('my-tool_v2.final');
+  });
+
+  it('keeps a normal version string unchanged', () => {
+    expect(structuralString('9.9.9', 'version')).toBe('9.9.9');
+    expect(structuralString('1.2.3-beta+build.4', 'version')).toBe('1.2.3-beta+build.4');
+  });
+
+  it('keeps a well-formed protocolVersion unchanged', () => {
+    expect(structuralString('2024-11-05', 'protocol_version')).toBe('2024-11-05');
+  });
+
+  it('hashes an oversized identifier (> 128 chars) to its sha256 ref', () => {
+    const huge = 'x'.repeat(5000);
+    expect(structuralString(huge, 'identifier')).toBe(sha256Ref(huge));
+    // Right at the boundary: exactly MAX_LEN survives, one over does not.
+    const atMax = 'a'.repeat(STRUCTURAL_STRING_MAX_LEN);
+    expect(structuralString(atMax, 'identifier')).toBe(atMax);
+    const overMax = 'a'.repeat(STRUCTURAL_STRING_MAX_LEN + 1);
+    expect(structuralString(overMax, 'identifier')).toBe(sha256Ref(overMax));
+  });
+
+  it('hashes an identifier containing spaces to its sha256 ref', () => {
+    const withSpaces = 'not a valid tool name';
+    expect(structuralString(withSpaces, 'identifier')).toBe(sha256Ref(withSpaces));
+  });
+
+  it('hashes an identifier containing a newline to its sha256 ref', () => {
+    const withNewline = 'bad\nname';
+    expect(structuralString(withNewline, 'identifier')).toBe(sha256Ref(withNewline));
+  });
+
+  it('hashes a malformed version string to its sha256 ref', () => {
+    const badVersion = 'not a version! 🎉';
+    expect(structuralString(badVersion, 'version')).toBe(sha256Ref(badVersion));
+  });
+
+  it('hashes a malformed protocolVersion (wrong shape) to its sha256 ref', () => {
+    for (const bad of ['not-a-date', '2024/11/05', '2024-11-05T00:00:00Z', '', '2024-1-5']) {
+      expect(structuralString(bad, 'protocol_version')).toBe(sha256Ref(bad));
+    }
+  });
+
+  it('the hashed fallback is computed the exact same way as Redactor.hashString, so query can still find the original value', () => {
+    const redactor = new Redactor();
+    const huge = 'y'.repeat(1000);
+    expect(structuralString(huge, 'identifier')).toBe(redactor.hashString(huge));
+  });
+
+  it('the field stays a plain string either way, never a RedactedRef object (frozen schema)', () => {
+    const huge = 'z'.repeat(1000);
+    const kept = structuralString('short_id', 'identifier');
+    const hashed = structuralString(huge, 'identifier');
+    expect(typeof kept).toBe('string');
+    expect(typeof hashed).toBe('string');
+    expect(hashed).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 });

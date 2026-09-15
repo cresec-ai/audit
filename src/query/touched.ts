@@ -144,6 +144,21 @@ function findCandidates(
     }
   }
 
+  // `tool` / `method` stay plain strings by schema (never a RedactedRef), but
+  // an over-long or oddly-shaped one is capped at the edge to its own
+  // `sha256:<hex>` (structuralString, P0) — the generic RedactedRef walk
+  // above never sees this since it isn't an object leaf. Check the raw field
+  // against needleHash directly so a blast-radius query for the original
+  // (oversized/malformed) name still finds the event that carried it.
+  if (event.kind === 'tool_call' && event.tool === needleHash) {
+    candidates.push({ matched_on: 'ref', path: '$.tool' });
+  } else if (
+    (event.kind === 'rpc' || event.kind === 'notification') &&
+    event.method === needleHash
+  ) {
+    candidates.push({ matched_on: 'ref', path: '$.method' });
+  }
+
   if (needle.length > 0) {
     const lower = needle.toLowerCase();
     const tool = event.kind === 'tool_call' ? event.tool : undefined;
