@@ -29,6 +29,22 @@ function loadConfig(): Record<string, Entry> {
   return parsed.mcpServers;
 }
 
+describe('platform hooks call the shared bootstrap', () => {
+  it('Copilot setup steps, Cursor environment and Codex config reference scripts/bootstrap.sh or the wrapper', () => {
+    const copilot = readFileSync(join(ROOT, '.github', 'workflows', 'copilot-setup-steps.yml'), 'utf8');
+    expect(copilot).toMatch(/^\s*copilot-setup-steps:/m);
+    expect(copilot).toContain('sh scripts/bootstrap.sh');
+    const cursorEnv = JSON.parse(readFileSync(join(ROOT, '.cursor', 'environment.json'), 'utf8')) as { install: string };
+    expect(cursorEnv.install).toBe('sh scripts/bootstrap.sh');
+    const cursorMcp = JSON.parse(readFileSync(join(ROOT, '.cursor', 'mcp.json'), 'utf8')) as { mcpServers: Record<string, Entry> };
+    expect(cursorMcp.mcpServers['corp-notes']!.args[0]).toBe('scripts/dogfood-wrap.sh');
+    const codex = readFileSync(join(ROOT, '.codex', 'config.toml'), 'utf8');
+    expect(codex).toContain('[mcp_servers.corp_notes]');
+    expect(codex).toContain('scripts/dogfood-wrap.sh');
+    expect(readFileSync(join(ROOT, 'AGENTS.md'), 'utf8')).toContain('sh scripts/bootstrap.sh');
+  });
+});
+
 describe('.mcp.json dogfood config', () => {
   it('runs every server through the dogfood wrapper with a matching --name and a wrapped command', () => {
     for (const [name, entry] of Object.entries(loadConfig())) {

@@ -1,0 +1,28 @@
+# GitHub Copilot's coding agent runs this job before it starts working on an
+# issue or PR, so the agent gets the same environment as a contributor. GitHub
+# only honours it on the default branch, and the job must be named
+# `copilot-setup-steps`. MCP servers for the coding agent are configured in the
+# repository's Settings > Copilot > MCP servers (see docs/install.md).
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies (shared bootstrap)
+        run: sh scripts/bootstrap.sh

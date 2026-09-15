@@ -1,0 +1,14 @@
+# OpenAI Codex CLI: the repository's MCP servers, recorded by mcp-recorder.
+# Codex reads a project .codex/config.toml only for trusted projects
+# (`[projects."/abs/path"] trust_level = "trusted"` in ~/.codex/config.toml).
+# The first start installs dependencies, hence the generous startup timeout.
+
+[mcp_servers.corp_notes]
+command = "sh"
+args = ["scripts/dogfood-wrap.sh", "--name", "corp-notes", "--", "npx", "tsx", "demo/server.ts"]
+startup_timeout_sec = 120
+
+[mcp_servers.repo_filesystem]
+command = "sh"
+args = ["scripts/dogfood-wrap.sh", "--name", "repo-filesystem", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+startup_timeout_sec = 120

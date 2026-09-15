@@ -391,3 +391,52 @@ Claude Desktop and Cursor both keep per-server log files; check those first.
 **Windows.** Not supported yet — the proxy spawns the wrapped command
 without a shell, which breaks `npx`/`.cmd` shims on Windows. Use WSL, or
 wait for native Windows support.
+
+## Cloud coding agents
+
+Each platform installs dependencies through its own hook, and all of them call
+the same `scripts/bootstrap.sh`. Where a platform lets a repository declare
+MCP servers, the recorder wraps them the same way as `.mcp.json` does.
+
+| Platform | Environment setup | MCP servers |
+| --- | --- | --- |
+| Claude Code on the web | `.claude/hooks/session-start.sh` (SessionStart hook), loaded automatically | `.mcp.json`, loaded automatically |
+| GitHub Copilot coding agent | `.github/workflows/copilot-setup-steps.yml` on the default branch (job `copilot-setup-steps`) | Repository Settings → Copilot → MCP servers (JSON below) |
+| Cursor cloud agents | `.cursor/environment.json` (`install` runs at build time) | Dashboard only (cursor.com/agents → MCP), stdio form below; `.cursor/mcp.json` serves local Cursor |
+| OpenAI Codex cloud | Environment settings → Setup script: `sh scripts/bootstrap.sh` | Not supported for stdio servers today |
+| OpenAI Codex CLI | `sh scripts/bootstrap.sh` (see `AGENTS.md`) | `.codex/config.toml` (trusted projects only) |
+
+Copilot coding agent MCP configuration (repository settings):
+
+```json
+{
+  "mcpServers": {
+    "corp-notes": {
+      "type": "local",
+      "command": "sh",
+      "args": ["scripts/dogfood-wrap.sh", "--name", "corp-notes", "--", "npx", "tsx", "demo/server.ts"],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Cursor cloud agent MCP server (dashboard form, stdio):
+
+```json
+{
+  "mcpServers": {
+    "corp-notes": {
+      "type": "stdio",
+      "command": "sh",
+      "args": ["scripts/dogfood-wrap.sh", "--name", "corp-notes", "--", "npx", "tsx", "demo/server.ts"]
+    }
+  }
+}
+```
+
+Two caveats apply everywhere: the platform's own connectors (for example
+GitHub or ClickUp offered by the platform) do not pass through anything a
+repository can configure, so they are not recorded; and a cloud container is
+ephemeral, so export a bundle (`mcp-recorder export`) before the session ends
+if the evidence must outlive it.

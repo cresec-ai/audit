@@ -1,0 +1,6 @@
+{
+  "$schema": "https://www.cursor.com/schemas/environment.schema.json",
+  "install": "sh scripts/bootstrap.sh",
+  "start": "",
+  "terminals": []
+}
