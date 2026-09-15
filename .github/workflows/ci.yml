@@ -32,6 +32,8 @@ jobs:
         run: npm run lint
       - name: Build
         run: npm run build
+      - name: dist/ is committed and current
+        run: git diff --exit-code --stat -- dist
       - name: Test
         run: npm test
 
@@ -52,6 +54,8 @@ jobs:
         run: npm run lint
       - name: Build
         run: npm run build
+      - name: dist/ is committed and current
+        run: git diff --exit-code --stat -- dist
       - name: Test
         run: npm test
 

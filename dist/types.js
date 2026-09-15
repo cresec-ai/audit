@@ -1,0 +1,41 @@
+/**
+ * FROZEN MODULE CONTRACTS
+ * =======================
+ * Public interfaces every module implements against. Implementation files own
+ * their internals, but the exported shapes below must not drift — the CLI and
+ * the other modules are written against them.
+ *
+ * Module map (file ownership):
+ *   src/chain/hash.ts      — canonicalJson, sha256Hex, GENESIS_HASH, computeHash, makeRecord, signedPayload
+ *   src/chain/keys.ts      — Signer (ed25519 keypair management + head signing)
+ *   src/store/sqlite.ts    — SqliteStore implements EvidenceStore
+ *   src/store/jsonl.ts     — JsonlStore implements EvidenceStore
+ *   src/store/index.ts     — openStore() factory with sqlite→jsonl fallback
+ *   src/redact/redactor.ts — Redactor implements RedactorLike
+ *   src/capture/recorder.ts— Recorder (async fail-open queue) implements RecorderLike
+ *   src/proxy/framing.ts   — LineScanner (incremental newline-delimited JSON tap)
+ *   src/proxy/stdio.ts     — runStdioProxy()
+ *   src/proxy/http.ts      — runHttpProxy()
+ *   src/verify/verify.ts   — verifyStore(), verifyRecords()
+ *   src/query/touched.ts   — queryStore()
+ *   src/replay/render.ts   — renderTimelineHtml()
+ *   src/replay/serve.ts    — serveUi()
+ *   src/export/bundle.ts   — exportBundle()
+ *   src/config.ts          — resolveConfig(), data-dir/env handling
+ *   src/cli.ts             — subcommand dispatch
+ */
+export const ENV = {
+    DATA_DIR: 'MCP_RECORDER_DATA_DIR',
+    STORE: 'MCP_RECORDER_STORE',
+    REDACT: 'MCP_RECORDER_REDACT',
+    DISABLE: 'MCP_RECORDER_DISABLE',
+};
+/** File names inside the data dir. */
+export const FILES = {
+    SQLITE_DB: 'evidence.db',
+    JSONL_LOG: 'evidence.jsonl',
+    JSONL_SIGS: 'signatures.jsonl',
+    PRIVATE_KEY: 'identity.key',
+    PUBLIC_KEY: 'identity.pub',
+};
+//# sourceMappingURL=types.js.map

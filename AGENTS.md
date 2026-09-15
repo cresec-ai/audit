@@ -8,7 +8,7 @@ tamper-evident local evidence store. Read `README.md` for the promises and
 ## Setup
 
 Run `sh scripts/bootstrap.sh` once in a fresh checkout. It installs
-dependencies (which also builds `dist/`), is idempotent, and is safe to run
+dependencies (which also rebuilds `dist/`), is idempotent, and is safe to run
 while other processes run it (it takes a lock). Every agent platform's own
 setup hook calls the same script:
 
@@ -26,6 +26,13 @@ setup hook calls the same script:
 - `npm run bench` — latency gate (p50 added latency must stay under 5 ms).
 
 ## Rules that must hold
+
+- `dist/` is committed. It exists so `npm install -g github:cresec-ai/audit#main`
+  works without a build (npm runs a git package's `prepare` without its
+  devDependencies on a global install). After changing anything under `src/`,
+  run `npm run build` and commit the `dist/` changes with it — CI fails on a
+  stale `dist/`. `tsconfig.json` pins `newLine: lf` so the output is identical
+  on every platform.
 
 - The event schema `edut.mcp-recorder.event.v1` is frozen: additive optional
   fields only, documented in `docs/event-schema.md`.

@@ -32,13 +32,16 @@ get the same thing right now.
 
 ### B. From git (today)
 
-Install straight from the repository. `npm install` runs the package's
-`prepare` script automatically, which builds `dist/` for you — no manual
-build step needed.
+Install straight from the repository. The built `dist/` is committed, so
+this needs no build step and no TypeScript toolchain on your machine (npm
+runs a git package's `prepare` step without its devDependencies on a global
+install, which is exactly why `dist/` ships in the repo):
 
 ```sh
 npm install -g github:cresec-ai/audit#main
 ```
+
+If you had an older install, the same command replaces it.
 
 Confirm it worked:
 
@@ -54,8 +57,9 @@ and invoke it from a local clone instead:
 ```sh
 git clone https://github.com/cresec-ai/audit.git
 cd audit
-npm ci   # runs `prepare` -> builds dist/
+npm ci                 # dev dependencies; `prepare` rebuilds dist/ from src/
 node dist/cli.js --version
+npm install -g .       # optional: put `mcp-recorder` on your PATH from this clone
 ```
 
 ## Wrap your servers
