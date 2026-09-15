@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import type { IncomingMessage, Server } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
