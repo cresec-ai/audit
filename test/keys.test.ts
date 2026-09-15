@@ -95,7 +95,8 @@ describe('Signer', () => {
     expect(readFileSync(join(nested, FILES.PUBLIC_KEY), 'utf8').trim()).toBe(signer.publicKeyHex);
   });
 
-  it('private key file is mode 0600', async () => {
+  // File modes are a POSIX concept; Windows reports 0o666 for every file.
+  it.skipIf(process.platform === 'win32')('private key file is mode 0600', async () => {
     await Signer.load(dir);
     const mode = statSync(join(dir, FILES.PRIVATE_KEY)).mode & 0o777;
     expect(mode).toBe(0o600);

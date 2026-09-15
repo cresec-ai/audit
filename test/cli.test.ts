@@ -480,9 +480,14 @@ describe('mcp-recorder CLI', () => {
   }, 60_000);
 
   it('an unwritable --data-dir still spawns the server and exits with its code (fail-open)', async () => {
+    // A path *underneath a regular file* can't be created on any platform
+    // (ENOTDIR on POSIX, ENOENT on Windows) — unlike /dev/null/..., which a
+    // Windows runner happily turns into D:\dev\null\... and creates.
+    const blocker = join(tmpDir('mcp-rec-unwritable-'), 'not-a-directory');
+    writeFileSync(blocker, '');
     const child = spawnCli([
       '--data-dir',
-      '/dev/null/mcp-recorder-not-a-real-dir',
+      join(blocker, 'mcp-recorder-not-a-real-dir'),
       '--',
       'node',
       '-e',

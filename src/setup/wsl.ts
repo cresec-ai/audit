@@ -15,7 +15,13 @@
 
 import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import { existsSync as nodeExistsSync, readdirSync as nodeReaddirSync } from 'node:fs';
-import { join } from 'node:path';
+import { posix } from 'node:path';
+
+// Every path built here is a WSL (Linux) path — `/mnt/c/...` — regardless of
+// the platform this code happens to execute on (the unit tests also run on
+// windows-latest), so path.posix is used deliberately, never the
+// platform-dependent `path.join`.
+const { join } = posix;
 import type { ClientKind } from './client-config.js';
 
 /* ------------------------------ detectWsl -------------------------------- */
