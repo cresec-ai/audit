@@ -29,7 +29,14 @@ export { Signer, publicKeyPem, publicKeyHexFromPem } from './chain/keys.js';
 export { openStore, SqliteStore, JsonlStore, isSqliteAvailable } from './store/index.js';
 
 /* redaction */
-export { Redactor, DEFAULT_POLICY, looksSecret } from './redact/redactor.js';
+export {
+  Redactor,
+  DEFAULT_POLICY,
+  looksSecret,
+  scrubArgv,
+  scrubToolArguments,
+} from './redact/redactor.js';
+export type { ScrubbedArgv } from './redact/redactor.js';
 
 /* capture */
 export { Recorder } from './capture/recorder.js';

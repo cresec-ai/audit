@@ -30,7 +30,7 @@ import type {
   ToolCallEvent,
 } from '../schema/events.js';
 import { SCHEMA } from '../schema/events.js';
-import { scrubArgv } from '../redact/redactor.js';
+import { scrubArgv, scrubToolArguments } from '../redact/redactor.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
 import { LineScanner, type ScannedLine } from './framing.js';
 
@@ -432,7 +432,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         kind: 'tool_call',
         tool,
         request_id: id,
-        args: redactor.scrub(reqParams.arguments ?? {}),
+        args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
         result_hash: resultHash,
         result: redactor.scrub(rawResult ?? null),
         is_error: isError,
@@ -625,7 +625,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
             kind: 'tool_call',
             tool,
             request_id: entry.id,
-            args: redactor.scrub(reqParams.arguments ?? {}),
+            args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
             result_hash: NULL_RESULT_HASH,
             result: null,
             is_error: true,

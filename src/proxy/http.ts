@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 
 import { canonicalJson, sha256Hex, sha256Ref } from '../chain/hash.js';
+import { scrubToolArguments } from '../redact/redactor.js';
 import type {
   AnyEvent,
   Attributes,
@@ -420,7 +421,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
         kind: 'tool_call',
         tool,
         request_id: id,
-        args: redactor.scrub(reqParams.arguments ?? {}),
+        args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
         result_hash: resultHash,
         result: redactor.scrub(rawResult ?? null),
         is_error: isError,
@@ -592,7 +593,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           kind: 'tool_call',
           tool,
           request_id: entry.id,
-          args: redactor.scrub(reqParams.arguments ?? {}),
+          args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
           result_hash: nullHash,
           result: null,
           is_error: true,
