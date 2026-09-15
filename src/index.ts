@@ -23,7 +23,7 @@ export {
 } from './chain/hash.js';
 
 /* keys + signing */
-export { Signer, publicKeyPem } from './chain/keys.js';
+export { Signer, publicKeyPem, publicKeyHexFromPem } from './chain/keys.js';
 
 /* evidence stores */
 export { openStore, SqliteStore, JsonlStore, isSqliteAvailable } from './store/index.js';

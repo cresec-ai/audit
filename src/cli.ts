@@ -10,12 +10,12 @@
  * failed / nothing to export, 2 usage or unexpected error.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { Recorder } from './capture/recorder.js';
-import { Signer } from './chain/keys.js';
+import { Signer, publicKeyHexFromPem } from './chain/keys.js';
 import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
 import { exportBundle } from './export/bundle.js';
 import { runHttpProxy } from './proxy/http.js';
@@ -34,7 +34,9 @@ import type {
   SignerLike,
   VerifyResult,
 } from './types.js';
+import { FILES } from './types.js';
 import { verifyRecords, verifyStore } from './verify/verify.js';
+import type { VerifyOpts } from './verify/verify.js';
 import { VERSION } from './version.js';
 
 type Flags = Record<string, string | boolean | undefined>;
@@ -47,8 +49,12 @@ const HELP = `@edut/mcp-recorder v${VERSION} — black-box flight recorder for M
 Usage:
   mcp-recorder [record] [flags] -- <server command...>
       transparent stdio proxy: forwards bytes unchanged, records redacted events
-  mcp-recorder verify   [--data-dir D] [--bundle PATH] [--json]
+  mcp-recorder verify   [--data-dir D] [--bundle PATH] [--public-key K] [--allow-unsigned] [--json]
       verify the hash chain + head signatures (exit 1 on failure)
+      by default pins to <data-dir>/identity.pub (store mode) or the
+      bundle's own manifest key (bundle mode); --public-key overrides
+      either with a key obtained out of band (64-hex, or a path to a
+      hex or PEM file)
   mcp-recorder query    <needle> [--data-dir D] [--session ID] [--json]
       blast radius: trace a value through the evidence chain
   mcp-recorder sessions [--data-dir D] [--json]
@@ -67,6 +73,11 @@ Flags:
   --redact M     redaction mode: allowlist | off      (env MCP_RECORDER_REDACT)
   --name NAME    logical server name stamped on events
   --identity L   operator identity label stamped on events
+  --public-key K pin verify to this ed25519 key instead of the default
+                 (64-hex, or a path to a file holding hex or a PEM)
+  --allow-unsigned
+                 verify: downgrade an unsigned chain/tail to a warning
+                 instead of a failure (still reported, never silent)
   --json         machine-readable output (verify / query / sessions)
 
 Environment:
@@ -85,6 +96,8 @@ const FLAG_DEFS = {
   dir: { type: 'string' },
   bundle: { type: 'string' },
   target: { type: 'string' },
+  'public-key': { type: 'string' },
+  'allow-unsigned': { type: 'boolean' },
   json: { type: 'boolean' },
   'no-open': { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
@@ -137,6 +150,38 @@ function parsePort(v: string | boolean | undefined): number | undefined {
   const n = Number(s);
   if (!Number.isInteger(n) || n < 0 || n > 65535) err(`invalid --port '${s}'`);
   return n;
+}
+
+const HEX64 = /^[0-9a-f]{64}$/i;
+
+/**
+ * Resolve `verify --public-key <value>` to a 64-hex raw ed25519 public key.
+ * `value` is either the hex itself, or a path to a file holding either the
+ * hex or an SPKI PEM (the same file identity.pub or public_key.pem already
+ * are) — this is how a third party pins a key they obtained out of band,
+ * rather than trusting whatever key ships alongside the data being checked.
+ */
+function resolvePublicKeyArg(value: string): string {
+  const trimmed = value.trim();
+  if (HEX64.test(trimmed)) return trimmed.toLowerCase();
+  let content: string;
+  try {
+    content = readFileSync(resolve(trimmed), 'utf8');
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    return err(`--public-key '${value}' is neither 64-hex nor a readable file: ${msg}`);
+  }
+  const text = content.trim();
+  if (HEX64.test(text)) return text.toLowerCase();
+  if (text.includes('BEGIN PUBLIC KEY')) {
+    try {
+      return publicKeyHexFromPem(text);
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      return err(`--public-key file '${value}' is not a valid ed25519 public key PEM: ${msg}`);
+    }
+  }
+  return err(`--public-key file '${value}' is neither 64-hex nor a PEM public key`);
 }
 
 function formatTable(headers: string[], rows: string[][]): string {
@@ -314,10 +359,25 @@ async function cmdHttp(flags: Flags): Promise<void> {
   process.exit(0);
 }
 
-function printVerifyHuman(result: VerifyResult, source: string): void {
+/** Which key `verify` pinned signatures to, and where it came from. */
+interface PinnedKey {
+  hex: string;
+  /** Human-readable provenance, e.g. a file path or '--public-key'. */
+  source: string;
+}
+
+function printVerifyHuman(result: VerifyResult, source: string, pinned?: PinnedKey): void {
   out(`verify ${source}`);
+  if (pinned !== undefined) {
+    out(`pinned signer: ed25519 ${pinned.hex.slice(0, 16)}… (${pinned.source})`);
+  }
+  // A warning-only chain (an unsigned tail we chose to tolerate) still says
+  // PASS, but distinctly — it's a weaker guarantee than a fully-signed chain.
+  const hasWarning = result.problems.some((p) => p.warning === true);
   if (result.ok) {
-    out(`PASS — chain intact: ${result.checked_events} event(s), head seq ${result.head.seq}`);
+    out(
+      `${hasWarning ? 'PASS (unsigned tail)' : 'PASS'} — chain intact: ${result.checked_events} event(s), head seq ${result.head.seq}`,
+    );
   } else {
     out(`FAIL — evidence does NOT verify: ${result.checked_events} event(s) checked`);
   }
@@ -340,7 +400,17 @@ function printVerifyHuman(result: VerifyResult, source: string): void {
   }
 }
 
-async function verifyBundleDir(dirPath: string): Promise<{ result: VerifyResult; source: string }> {
+/**
+ * `pinOpts.expectedPublicKeyHex`, when passed, overrides the tautological
+ * default of pinning to the bundle's own manifest key — that only proves the
+ * bundle is internally self-consistent, not that it came from anyone in
+ * particular. A third party who obtained the real key out of band should
+ * pass it via --public-key instead.
+ */
+async function verifyBundleDir(
+  dirPath: string,
+  pinOpts: Pick<VerifyOpts, 'expectedPublicKeyHex' | 'allowUnsigned'> = {},
+): Promise<{ result: VerifyResult; source: string; pinnedPublicKeyHex: string }> {
   const dir = resolve(dirPath);
   const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as BundleManifest;
   if (manifest.bundle !== 'edut.mcp-recorder.bundle.v1') {
@@ -350,33 +420,75 @@ async function verifyBundleDir(dirPath: string): Promise<{ result: VerifyResult;
     .split('\n')
     .filter((line) => line.trim() !== '')
     .map((line) => JSON.parse(line) as ChainRecord);
+  const pinnedPublicKeyHex = pinOpts.expectedPublicKeyHex ?? manifest.signature.public_key;
   const result = await verifyRecords(records, [manifest.signature], {
     baseHash: manifest.base_hash,
-    expectedPublicKeyHex: manifest.signature.public_key,
+    expectedPublicKeyHex: pinnedPublicKeyHex,
+    ...(pinOpts.allowUnsigned !== undefined ? { allowUnsigned: pinOpts.allowUnsigned } : {}),
   });
-  return { result, source: `bundle ${dir}` };
+  return { result, source: `bundle ${dir}`, pinnedPublicKeyHex };
 }
 
 async function cmdVerify(flags: Flags): Promise<void> {
+  const allowUnsigned = flags['allow-unsigned'] === true;
+  const publicKeyFlag = asStr(flags['public-key']);
+  const explicitPublicKeyHex =
+    publicKeyFlag !== undefined ? resolvePublicKeyArg(publicKeyFlag) : undefined;
+
   let result: VerifyResult;
   let source: string;
+  let pinned: PinnedKey | undefined;
+
   const bundle = asStr(flags.bundle);
   if (bundle !== undefined) {
-    ({ result, source } = await verifyBundleDir(bundle));
+    const bundleResult = await verifyBundleDir(bundle, {
+      ...(explicitPublicKeyHex !== undefined ? { expectedPublicKeyHex: explicitPublicKeyHex } : {}),
+      allowUnsigned,
+    });
+    result = bundleResult.result;
+    source = bundleResult.source;
+    pinned = {
+      hex: bundleResult.pinnedPublicKeyHex,
+      source:
+        explicitPublicKeyHex !== undefined
+          ? '--public-key'
+          : "bundle's own manifest.json — self-pinned; pass --public-key with a key " +
+            'obtained out of band for independent assurance',
+    };
   } else {
     const config = resolveConfig({ flags, env: process.env });
     const store = openConfiguredStore(config);
     try {
-      result = await verifyStore(store);
+      let expectedPublicKeyHex = explicitPublicKeyHex;
+      let pinSource = '--public-key';
+      if (expectedPublicKeyHex === undefined) {
+        // Default pin: this data dir's own identity.pub, so a chain rewritten
+        // and re-signed with a fresh, unrelated key is rejected instead of
+        // silently accepted — see README "Security model".
+        const pubPath = join(config.dataDir, FILES.PUBLIC_KEY);
+        if (existsSync(pubPath)) {
+          expectedPublicKeyHex = readFileSync(pubPath, 'utf8').trim().toLowerCase();
+          pinSource = pubPath;
+        }
+      }
+      const verifyOpts: VerifyOpts = { allowUnsigned };
+      if (expectedPublicKeyHex !== undefined) verifyOpts.expectedPublicKeyHex = expectedPublicKeyHex;
+      result = await verifyStore(store, verifyOpts);
       source = `store ${store.path} (${store.backend})`;
+      if (expectedPublicKeyHex !== undefined) pinned = { hex: expectedPublicKeyHex, source: pinSource };
     } finally {
       store.close();
     }
   }
+
   if (flags.json === true) {
-    out(JSON.stringify(result, null, 2));
+    const payload =
+      pinned !== undefined
+        ? { ...result, pinned_public_key: pinned.hex, pinned_public_key_source: pinned.source }
+        : result;
+    out(JSON.stringify(payload, null, 2));
   } else {
-    printVerifyHuman(result, source);
+    printVerifyHuman(result, source, pinned);
   }
   if (!result.ok) process.exitCode = 1;
 }

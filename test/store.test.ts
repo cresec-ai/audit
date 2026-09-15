@@ -514,7 +514,7 @@ describe('JsonlStore trailing partial line', () => {
       again.close();
       const third = openStore({ dataDir: dir, backend: 'jsonl' });
       expect(third.count()).toBe(8);
-      expect((await verifyStore(third)).ok).toBe(true);
+      expect((await verifyStore(third, { allowUnsigned: true })).ok).toBe(true);
       third.close();
     } finally {
       stderrSpy.mockRestore();
@@ -579,7 +579,7 @@ describe('JsonlStore appendEvents across instances (simulates separate processes
       const seqs = [...verifyOpen.iterate()].map((r) => r.seq);
       expect(seqs).toEqual([1, 2, 3, 4, 5, 6]);
 
-      const result = await verifyStore(verifyOpen);
+      const result = await verifyStore(verifyOpen, { allowUnsigned: true });
       expect(result.problems.filter((p) => p.warning !== true)).toEqual([]);
       expect(result.checked_events).toBe(6);
 

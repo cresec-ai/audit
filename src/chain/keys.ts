@@ -5,9 +5,20 @@
  * FILES.PUBLIC_KEY). The private key never leaves the machine; the public key
  * is embedded in every HeadSignature and exported (as SPKI PEM) in evidence
  * bundles so a stranger can verify with nothing but node:crypto / openssl.
+ *
+ * Node >= 18.17 note: this module deliberately uses ONLY the SYNC @noble/
+ * ed25519 API (getPublicKey / sign, both wired to sha512Sync below) and
+ * node:crypto's randomBytes for key generation. The v2 ASYNC entry points
+ * (getPublicKeyAsync / signAsync / utils.randomPrivateKey) go through
+ * globalThis.crypto.subtle / globalThis.crypto.getRandomValues, which Node
+ * only defines as a default global from v19 on — on bare Node 18.17 (the
+ * package's declared minimum) globalThis.crypto is undefined unless the
+ * process was started with --experimental-global-webcrypto, so those calls
+ * throw and `record`/`export` fail. Keep this file on the sync API.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomBytes as nodeRandomBytes, createPublicKey } from 'node:crypto';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import * as ed from '@noble/ed25519';
@@ -78,7 +89,10 @@ export class Signer implements SignerLike {
     if (existsSync(privPath)) {
       priv = readPrivateKey(privPath);
     } else {
-      const candidate = ed.utils.randomPrivateKey();
+      // node:crypto.randomBytes, not ed.utils.randomPrivateKey() — the noble
+      // helper reads globalThis.crypto.getRandomValues, absent by default on
+      // Node 18 (see the module doc comment above).
+      const candidate = new Uint8Array(nodeRandomBytes(32));
       try {
         writeFileSync(privPath, ed.etc.bytesToHex(candidate) + '\n', { flag: 'wx', mode: 0o600 });
         priv = candidate;
@@ -89,7 +103,9 @@ export class Signer implements SignerLike {
       }
     }
 
-    const pubHex = ed.etc.bytesToHex(await ed.getPublicKeyAsync(priv));
+    // Sync getPublicKey (sha512Sync is wired above) — not getPublicKeyAsync,
+    // which needs globalThis.crypto.subtle.
+    const pubHex = ed.etc.bytesToHex(ed.getPublicKey(priv));
     // (Re)write the public key file if missing or stale — it is derived
     // state, and rewriting is idempotent even if another process races us
     // to it with the SAME key (both derive an identical pubHex from priv).
@@ -102,7 +118,9 @@ export class Signer implements SignerLike {
   /** Sign the chain head; the exact bytes are signedPayload(seq, chainHash). */
   async sign(seq: number, chainHash: string): Promise<HeadSignature> {
     const payload = signedPayload(seq, chainHash);
-    const signature = await ed.signAsync(payload, this.#privateKey);
+    // Sync ed.sign (sha512Sync is wired above) — not signAsync, which needs
+    // globalThis.crypto.subtle and would throw on bare Node 18.
+    const signature = ed.sign(payload, this.#privateKey);
     return {
       seq,
       chain_hash: chainHash,
@@ -135,4 +153,22 @@ export function publicKeyPem(publicKeyHex: string): string {
   const lines: string[] = [];
   for (let i = 0; i < b64.length; i += 64) lines.push(b64.slice(i, i + 64));
   return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----\n`;
+}
+
+/**
+ * Inverse of publicKeyPem: extract the 64-hex raw ed25519 public key from an
+ * SPKI PEM block, via node:crypto (parses/re-derives, doesn't just strip the
+ * fixed prefix — rejects a PEM that isn't actually an ed25519 public key).
+ * Used by `verify --public-key <PEM path>` so a third party can pin a key
+ * they obtained out of band, in either raw-hex or PEM form.
+ */
+export function publicKeyHexFromPem(pem: string): string {
+  const key = createPublicKey(pem);
+  if (key.asymmetricKeyType !== 'ed25519') {
+    throw new Error(
+      `mcp-recorder: expected an ed25519 public key PEM, got ${String(key.asymmetricKeyType)}`,
+    );
+  }
+  const der = key.export({ format: 'der', type: 'spki' });
+  return der.subarray(der.length - 32).toString('hex');
 }

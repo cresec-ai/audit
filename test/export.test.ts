@@ -103,8 +103,11 @@ function tenRecords(): ChainRecord[] {
   ]);
 }
 
-function runVerifyCjs(bundleDir: string): { status: number | null; stdout: string } {
-  const result = spawnSync(process.execPath, [BUNDLE_FILES.VERIFY], {
+function runVerifyCjs(
+  bundleDir: string,
+  args: string[] = [],
+): { status: number | null; stdout: string } {
+  const result = spawnSync(process.execPath, [BUNDLE_FILES.VERIFY, ...args], {
     cwd: bundleDir,
     encoding: 'utf8',
   });
@@ -225,6 +228,60 @@ describe('exportBundle', () => {
     const verdict = runVerifyCjs(bundleDir);
     expect(verdict.status).toBe(1);
     expect(verdict.stdout).toContain('FAIL');
+  });
+
+  it('a bundle with its signature deleted makes verify.cjs exit 1 with FAIL', async () => {
+    const bundleDir = join(dir, 'bundle-unsigned');
+    const manifest = await exportBundle({
+      store,
+      dirPath: bundleDir,
+      toolVersion: '0.1.0-test',
+      signer,
+    });
+
+    const manifestPath = join(bundleDir, BUNDLE_FILES.MANIFEST);
+    const onDisk = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    expect(onDisk.signature).toEqual(manifest.signature); // sanity: it really was there
+    delete onDisk.signature;
+    writeFileSync(manifestPath, JSON.stringify(onDisk, null, 2) + '\n');
+
+    const verdict = runVerifyCjs(bundleDir);
+    expect(verdict.status).toBe(1);
+    expect(verdict.stdout).toContain('FAIL');
+    expect(verdict.stdout).toContain('manifest.signature');
+  });
+
+  it('verify.cjs --public-key pins to an externally-obtained key: accepts the real one, rejects any other', async () => {
+    const bundleDir = join(dir, 'bundle-pinned');
+    await exportBundle({ store, dirPath: bundleDir, toolVersion: '0.1.0-test', signer });
+
+    // The correct key, passed as raw hex.
+    const okHex = runVerifyCjs(bundleDir, ['--public-key', signer.publicKeyHex]);
+    expect(okHex.status).toBe(0);
+    expect(okHex.stdout).toContain('PASS');
+    expect(okHex.stdout).toContain('independently verified');
+
+    // The correct key, passed as a path to the bundled PEM (also valid input).
+    const okPem = runVerifyCjs(bundleDir, [
+      '--public-key',
+      join(bundleDir, BUNDLE_FILES.PUBLIC_KEY),
+    ]);
+    expect(okPem.status).toBe(0);
+    expect(okPem.stdout).toContain('PASS');
+
+    // An unrelated (but well-formed) key is rejected, even though the bundle
+    // is internally self-consistent and self-pinned verification would pass.
+    const otherSigner = await Signer.load(join(dir, 'other-signer'));
+    const bad = runVerifyCjs(bundleDir, ['--public-key', otherSigner.publicKeyHex]);
+    expect(bad.status).toBe(1);
+    expect(bad.stdout).toContain('FAIL');
+    expect(bad.stdout).toContain('unexpected key');
+
+    // Without --public-key at all, the bundle still verifies (self-pinned)
+    // but says so isn't independently checked.
+    const unpinned = runVerifyCjs(bundleDir);
+    expect(unpinned.status).toBe(0);
+    expect(unpinned.stdout).toContain('NOT independently verified');
   });
 
   it('session-scoped export covers the contiguous range incl. interleaved records', async () => {

@@ -1,11 +1,17 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
+import { Signer, publicKeyPem } from '../src/chain/keys.js';
+import { openStore } from '../src/store/index.js';
+import { SCHEMA } from '../src/schema/events.js';
+import type { AnyEvent, ChainRecord } from '../src/schema/events.js';
+import type { ChainHead } from '../src/types.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ECHO_SERVER = fileURLToPath(new URL('./fixtures/echo-server.cjs', import.meta.url));
@@ -335,4 +341,146 @@ describe('mcp-recorder CLI', () => {
     expect(res.code).toBe(127);
     expect(res.stderr).toContain('failed to run');
   }, 30_000);
+
+  /* -------------------- verify: key pinning + unsigned-tail rules -------------------- */
+
+  function notif(i: number): AnyEvent {
+    return {
+      schema: SCHEMA,
+      event_id: `e${i}`,
+      session_id: 's1',
+      timestamp: new Date(1700000000000 + i).toISOString(),
+      kind: 'notification',
+      identity: { fingerprint: sha256Ref('cli-verify-test-identity') },
+      server: { name: 'cli-verify-test-server', command: 'node x', transport: 'stdio' },
+      attributes: {},
+      method: `m${i}`,
+      direction: 'client_to_server',
+      params: null,
+    } as AnyEvent;
+  }
+
+  function sealAll(events: AnyEvent[]): ChainRecord[] {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const out: ChainRecord[] = [];
+    for (const event of events) {
+      const record = makeRecord(head, event);
+      out.push(record);
+      head = { seq: record.seq, hash: record.hash };
+    }
+    return out;
+  }
+
+  it('verify pins identity.pub by default: a chain rewritten and re-signed with a foreign key FAILS', async () => {
+    const dataDir = tmpDir('mcp-rec-pin-');
+    const signer = await Signer.load(dataDir);
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2), notif(3)]));
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+    store.close();
+
+    // Sanity: the honestly-signed chain verifies, and says what it pinned to.
+    // --store jsonl throughout: this test builds a jsonl-backed store
+    // directly and must point the CLI at the same backend (verify/export
+    // otherwise default to trying sqlite first).
+    const honest = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(honest.code).toBe(0);
+    expect(honest.stdout).toContain('PASS');
+    expect(honest.stdout).toContain('pinned signer');
+    expect(honest.stdout).toContain('identity.pub');
+
+    // Attacker: rewrite the chain from scratch and re-sign with their OWN
+    // key — identity.key in dataDir is never touched.
+    const attackerDir = tmpDir('mcp-rec-pin-attacker-');
+    const attacker = await Signer.load(attackerDir);
+    const forged = sealAll([notif(1), notif(99)]);
+    const forgedHead = { seq: forged[forged.length - 1]!.seq, hash: forged[forged.length - 1]!.hash };
+    const forgedSig = await attacker.sign(forgedHead.seq, forgedHead.hash);
+    writeFileSync(join(dataDir, 'evidence.jsonl'), forged.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    writeFileSync(join(dataDir, 'signatures.jsonl'), JSON.stringify(forgedSig) + '\n');
+
+    const forgedResult = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(forgedResult.code).toBe(1);
+    expect(forgedResult.stdout).toContain('FAIL');
+    expect(forgedResult.stdout).toContain('signature_invalid');
+    expect(forgedResult.stdout).toContain('no_valid_signature');
+  }, 60_000);
+
+  it('--public-key overrides the default identity.pub pin', async () => {
+    const dataDir = tmpDir('mcp-rec-pubkey-');
+    const signer = await Signer.load(dataDir);
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2)]));
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+    store.close();
+
+    const wrongKey = 'ab'.repeat(32);
+    const wrong = await runCli([
+      'verify', '--data-dir', dataDir, '--store', 'jsonl', '--public-key', wrongKey,
+    ]);
+    expect(wrong.code).toBe(1);
+    expect(wrong.stdout).toContain('FAIL');
+    expect(wrong.stdout).toContain('--public-key');
+
+    const right = await runCli([
+      'verify', '--data-dir', dataDir, '--store', 'jsonl', '--public-key', signer.publicKeyHex,
+    ]);
+    expect(right.code).toBe(0);
+    expect(right.stdout).toContain('PASS');
+    expect(right.stdout).toContain('--public-key');
+
+    // A PEM file path is also accepted.
+    const pemPath = join(dataDir, 'external-key.pem');
+    writeFileSync(pemPath, publicKeyPem(signer.publicKeyHex));
+    const viaPem = await runCli([
+      'verify', '--data-dir', dataDir, '--store', 'jsonl', '--public-key', pemPath,
+    ]);
+    expect(viaPem.code).toBe(0);
+    expect(viaPem.stdout).toContain('PASS');
+  }, 60_000);
+
+  it('an unsigned chain FAILS by default and PASSES (unsigned tail) with --allow-unsigned', async () => {
+    const dataDir = tmpDir('mcp-rec-unsigned-');
+    await Signer.load(dataDir); // creates identity.pub; nothing below ever signs the chain
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2), notif(3)]));
+    store.close();
+
+    const strict = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(strict.code).toBe(1);
+    expect(strict.stdout).toContain('FAIL');
+    expect(strict.stdout).toContain('no_valid_signature');
+
+    const lenient = await runCli([
+      'verify', '--data-dir', dataDir, '--store', 'jsonl', '--allow-unsigned',
+    ]);
+    expect(lenient.code).toBe(0);
+    expect(lenient.stdout).toContain('PASS (unsigned tail)');
+  }, 60_000);
+
+  it('verify --bundle --public-key pins to an externally supplied key', async () => {
+    const dataDir = tmpDir('mcp-rec-bundle-pin-');
+    const signer = await Signer.load(dataDir);
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.append(sealAll([notif(1), notif(2)]));
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+    store.close();
+
+    const bundleDir = tmpDir('mcp-rec-bundle-pin-out-');
+    const exported = await runCli([
+      'export', '--data-dir', dataDir, '--store', 'jsonl', '--dir', bundleDir,
+    ]);
+    expect(exported.code).toBe(0);
+
+    const right = await runCli(['verify', '--bundle', bundleDir, '--public-key', signer.publicKeyHex]);
+    expect(right.code).toBe(0);
+    expect(right.stdout).toContain('PASS');
+
+    const wrong = await runCli(['verify', '--bundle', bundleDir, '--public-key', 'ab'.repeat(32)]);
+    expect(wrong.code).toBe(1);
+    expect(wrong.stdout).toContain('FAIL');
+  }, 60_000);
 });

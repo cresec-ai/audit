@@ -163,7 +163,15 @@ export type VerifyProblemType =
   | 'signature_chain_mismatch'
   | 'truncated_after_signature'
   | 'unsigned_tail'
-  | 'malformed_record';
+  | 'malformed_record'
+  /** Chain has events but not one valid (crypto-verified, correctly-linked,
+   *  correctly-keyed) signature attests any of it. Not a warning by default
+   *  — a chain nobody can be shown to have signed proves nothing. */
+  | 'no_valid_signature'
+  /** The unsigned suffix (see 'unsigned_tail') contains a session_end event.
+   *  The recorder signs on every flush, including the session_end flush, so
+   *  this is a stronger signal than a plain crash mid-session. */
+  | 'unsigned_session_end';
 
 export interface VerifyProblem {
   type: VerifyProblemType;

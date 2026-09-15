@@ -42,6 +42,15 @@ export interface VerifyOpts {
   baseHash?: string;
   /** When set, signatures by any other key are reported signature_invalid. */
   expectedPublicKeyHex?: string;
+  /**
+   * Downgrade 'no_valid_signature' and 'unsigned_session_end' from failures
+   * to warnings (ok stays true). Off by default: a chain with events but no
+   * signature anyone can attribute to a key proves nothing, and a session_end
+   * in the unsigned tail means a signature that should exist (the recorder
+   * signs on every flush, including session_end) is missing outright, not
+   * merely pending the next flush.
+   */
+  allowUnsigned?: boolean;
 }
 
 /** Structural validation of one ChainRecord; returns field names in error. */
@@ -89,6 +98,8 @@ export async function verifyRecords(
 
   /** Recomputed chain hash per seq — what each signature is checked against. */
   const recomputedBySeq = new Map<number, string>();
+  /** seqs of well-formed session_end records, ascending — for the tail check below. */
+  const sessionEndSeqs: number[] = [];
   let prev: ChainRecord | undefined;
   let checked = 0;
 
@@ -105,6 +116,7 @@ export async function verifyRecords(
       continue; // structurally unusable — skip the chain checks for this one
     }
     checked++;
+    if (record.event.kind === 'session_end') sessionEndSeqs.push(record.seq);
 
     if (prev === undefined) {
       if (record.prev_hash !== baseHash) {
@@ -165,6 +177,11 @@ export async function verifyRecords(
 
   // ------------------------------ signatures ------------------------------
   let verified: HeadSignature | undefined;
+  // A genuine signature that names a seq/hash the chain doesn't (currently)
+  // have is its own unconditional failure (truncation or a rewritten tail
+  // behind a real signature) — don't also report the weaker
+  // no_valid_signature/unsigned_session_end verdicts for the same cause.
+  let sawChainMismatchOrTruncation = false;
 
   for (const sig of signatures) {
     const shapeIssue = malformedSignature(sig);
@@ -180,10 +197,11 @@ export async function verifyRecords(
       opts.expectedPublicKeyHex !== undefined &&
       sig.public_key !== opts.expectedPublicKeyHex.toLowerCase()
     ) {
+      const expected = opts.expectedPublicKeyHex.toLowerCase();
       problems.push({
         type: 'signature_invalid',
         seq: sig.seq,
-        detail: `signed by unexpected key ${sig.public_key} (expected ${opts.expectedPublicKeyHex.toLowerCase()})`,
+        detail: `signed by unexpected key ${sig.public_key.slice(0, 16)}…, expected ${expected.slice(0, 16)}… — this signature was not made by the pinned key`,
       });
       continue;
     }
@@ -215,6 +233,7 @@ export async function verifyRecords(
         seq: sig.seq,
         detail: `a valid signature attests seq ${sig.seq}, but the chain ends at seq ${head.seq} — records were deleted from the tail`,
       });
+      sawChainMismatchOrTruncation = true;
       continue;
     }
     const recomputed = recomputedBySeq.get(sig.seq);
@@ -224,6 +243,7 @@ export async function verifyRecords(
         seq: sig.seq,
         detail: `a valid signature attests seq ${sig.seq}, but no record with that seq exists in the chain`,
       });
+      sawChainMismatchOrTruncation = true;
       continue;
     }
     if (recomputed !== sig.chain_hash) {
@@ -232,6 +252,7 @@ export async function verifyRecords(
         seq: sig.seq,
         detail: `a valid signature attests hash ${sig.chain_hash} at seq ${sig.seq}, but the chain recomputes to ${recomputed}`,
       });
+      sawChainMismatchOrTruncation = true;
       continue;
     }
 
@@ -240,18 +261,65 @@ export async function verifyRecords(
   }
 
   // Tail newer than the newest fully-valid signature (or never signed at
-  // all): not a tamper verdict — flushes can outrun head signing — but the
-  // unsigned suffix carries weaker guarantees, so surface it as a warning.
-  if (head.seq > 0 && (verified === undefined || verified.seq < head.seq)) {
-    problems.push({
-      type: 'unsigned_tail',
-      seq: head.seq,
-      detail:
-        verified === undefined
-          ? `no valid head signature; all ${checked} event(s) are unsigned`
-          : `events after seq ${verified.seq} (through ${head.seq}) are newer than the newest valid signature`,
-      warning: true,
-    });
+  // all). Three cases, from weakest to strongest signal:
+  //   - a signed prefix with a plain unsigned tail (no session_end in it):
+  //     not a tamper verdict — flushes can outrun head signing on a crash —
+  //     stays a warning (ok can still be true).
+  //   - NO valid signature attests any part of the chain: a chain nobody can
+  //     be shown to have signed proves nothing. Hard failure by default.
+  //   - the unsigned tail contains a session_end event: the recorder signs
+  //     on every flush INCLUDING the session_end flush (concurrent recorder
+  //     processes interleave sessions in one chain, so this is "ANY
+  //     session_end in the tail", not just the latest session's). A missing
+  //     signature here is not a pending flush, it's a signature that should
+  //     exist and doesn't. Hard failure by default.
+  // Both hard failures downgrade to warnings with --allow-unsigned
+  // (opts.allowUnsigned). Skipped entirely when a genuine signature already
+  // named a truncation/rewrite the chain can't account for — that's its own
+  // unconditional, non-downgradable failure above.
+  if (head.seq > 0 && !sawChainMismatchOrTruncation) {
+    const tailStartSeq = (verified?.seq ?? 0) + 1;
+    const tailHasSessionEnd = sessionEndSeqs.some((seq) => seq >= tailStartSeq);
+    const warnOpt = opts.allowUnsigned === true ? { warning: true as const } : {};
+
+    if (verified === undefined) {
+      problems.push({
+        type: 'no_valid_signature',
+        seq: head.seq,
+        detail: `${checked} event(s) recorded, but no valid head signature attests any of this chain`,
+        ...warnOpt,
+      });
+      if (tailHasSessionEnd) {
+        problems.push({
+          type: 'unsigned_session_end',
+          seq: head.seq,
+          detail:
+            'the chain includes a session_end event with no valid signature covering it — ' +
+            'the recorder signs on every flush, including session_end, so this signature is ' +
+            'missing outright, not merely pending',
+          ...warnOpt,
+        });
+      }
+    } else if (verified.seq < head.seq) {
+      if (tailHasSessionEnd) {
+        problems.push({
+          type: 'unsigned_session_end',
+          seq: head.seq,
+          detail:
+            `events after seq ${verified.seq} (through ${head.seq}) are unsigned and include a ` +
+            'session_end event — the recorder signs on every flush, including session_end, so ' +
+            'this signature is missing outright, not merely pending',
+          ...warnOpt,
+        });
+      } else {
+        problems.push({
+          type: 'unsigned_tail',
+          seq: head.seq,
+          detail: `events after seq ${verified.seq} (through ${head.seq}) are newer than the newest valid signature`,
+          warning: true,
+        });
+      }
+    }
   }
 
   const result: VerifyResult = {
