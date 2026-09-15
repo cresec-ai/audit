@@ -24,7 +24,6 @@ export interface ScannedLine {
 const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024; // 32 MiB
 
 const NL = 0x0a;
-const CR = 0x0d;
 
 export class LineScanner {
   private readonly maxLineBytes: number;

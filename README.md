@@ -225,6 +225,10 @@ Events follow the frozen schema `edut.mcp-recorder.event.v1`, with field names a
 - **No cloud.** Local-first, no telemetry, no phone-home. Evidence leaves your machine only when you run `export`.
 - **No enforcement.** The recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a flight recorder, not a firewall.
 
+## Development
+
+`npm install`, then `npm run typecheck && npm run lint && npm test` before sending a PR. `npm run lint:fix` applies the auto-fixable subset.
+
 ## License
 
 GPL-3.0. The recorder sits in your trust path, so you should be able to read every line of it — and so should everyone downstream of any fork.

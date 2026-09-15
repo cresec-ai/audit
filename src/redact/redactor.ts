@@ -96,7 +96,7 @@ export function structuralString(value: string, kind: StructuralStringKind): str
  * backward compatibility with callers who extend `allowKeys` via policy
  * overrides; none of the shipped default keys use this fallback.
  */
-const STRUCTURAL_CHARSET = /^[\w .,@()\/:+#-]*$/;
+const STRUCTURAL_CHARSET = /^[\w .,@()/:+#-]*$/;
 
 /** MCP content-block `type` values (text/image/audio/resource/...). */
 const CONTENT_TYPES = new Set(['text', 'image', 'audio', 'resource', 'resource_link']);
@@ -146,11 +146,11 @@ const ALWAYS_PATTERNS: RegExp[] = [
   // Slack tokens
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
   // Bearer auth headers
-  /\bBearer\s+[A-Za-z0-9._~+\/=-]{16,}/i,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i,
   // Long hex blobs (>= 32 hex chars: digests, session ids, raw keys)
   /\b[0-9a-fA-F]{32,}\b/,
   // Long base64 blobs (>= 40 chars)
-  /\b[A-Za-z0-9+\/]{40,}={0,2}\b/,
+  /\b[A-Za-z0-9+/]{40,}={0,2}\b/,
   // password-ish assignments ("password=...", "api_key: ...")
   /\b(password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+/i,
 ];

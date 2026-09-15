@@ -40,7 +40,7 @@ import {
 } from './setup/io.js';
 import type { SetupSidecar } from './setup/io.js';
 import { planWrap, structuralUnwrap } from './setup/wrap.js';
-import type { McpServersMap, ServerEntry, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
+import type { McpServersMap, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
 import { openStore, openStoreReadOnly } from './store/index.js';
 import type { AnyEvent, ChainRecord } from './schema/events.js';
 import type {
