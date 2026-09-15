@@ -81,6 +81,37 @@ FROM records r
 GROUP BY r.session_id
 ORDER BY first_seq
 `;
+/** Synchronous open-time wait: generous, because it happens once before any traffic flows. */
+export const OPEN_BUSY_TIMEOUT_MS = 10_000;
+function isBusyError(err) {
+    const code = err?.code;
+    return typeof code === 'string' && (code.startsWith('SQLITE_BUSY') || code === 'SQLITE_LOCKED');
+}
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+/** Block the thread for `ms` (open-time only — never on the forwarding path). */
+function sleepSync(ms) {
+    Atomics.wait(sleepCell, 0, 0, ms);
+}
+/**
+ * Run `fn`, retrying on SQLITE_BUSY/SQLITE_LOCKED with a short, jittered
+ * synchronous backoff until `timeoutMs` has elapsed; the last error is
+ * rethrown once the deadline passes.
+ */
+function retryWhileBusy(fn, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let delay = 5;
+    for (;;) {
+        try {
+            return fn();
+        }
+        catch (err) {
+            if (!isBusyError(err) || Date.now() >= deadline)
+                throw err;
+            sleepSync(Math.min(delay, Math.max(1, deadline - Date.now())) + Math.random() * delay);
+            delay = Math.min(delay * 2, 100);
+        }
+    }
+}
 export class SqliteStore {
     backend = 'sqlite';
     path;
@@ -90,7 +121,7 @@ export class SqliteStore {
     insertSigStmt;
     appendTx;
     appendEventsTx;
-    constructor(dataDir) {
+    constructor(dataDir, opts = {}) {
         const Ctor = loadSqlite();
         if (Ctor === undefined) {
             throw new Error('mcp-recorder: better-sqlite3 is not available in this environment');
@@ -111,9 +142,34 @@ export class SqliteStore {
         // machine. This happens once, before any traffic flows, so a generous
         // synchronous wait is fine here — a failure at this point would disable
         // recording for the whole session.
-        this.db.pragma('busy_timeout = 10000');
-        this.db.pragma('journal_mode = WAL');
-        this.db.exec(DDL);
+        this.db.pragma(`busy_timeout = ${OPEN_BUSY_TIMEOUT_MS}`);
+        // busy_timeout alone does NOT cover the WAL switch. Setting journal_mode
+        // = WAL rewrites the file header inside a read transaction that SQLite
+        // then upgrades to a write transaction — and SQLite deliberately skips
+        // the busy handler on a SHARED -> RESERVED upgrade (it could deadlock two
+        // upgraders), returning SQLITE_BUSY immediately instead. So two recorders
+        // opening a fresh data dir at the same moment can have one fail with
+        // "database is locked" straight away, however long the timeout — seen on
+        // the Windows CI runner, where file locking is slow enough to hit the
+        // window reliably. Retry the switch (and the schema, for symmetry) with a
+        // synchronous sleep until the same deadline instead of giving up.
+        const openDeadline = opts.openTimeoutMs ?? OPEN_BUSY_TIMEOUT_MS;
+        try {
+            retryWhileBusy(() => this.db.pragma('journal_mode = WAL'), openDeadline);
+            retryWhileBusy(() => this.db.exec(DDL), openDeadline);
+        }
+        catch (err) {
+            // Don't leak the handle on a failed open: the caller falls back or
+            // disables recording, and an open handle would keep the file locked
+            // (which on Windows also blocks deleting the data dir).
+            try {
+                this.db.close();
+            }
+            catch {
+                /* best effort */
+            }
+            throw err;
+        }
         // Steady state: appends must never stall forwarding, so the wait is
         // short and the recorder retries asynchronously instead.
         this.db.pragma('busy_timeout = 100');
