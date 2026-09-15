@@ -39,6 +39,11 @@ export interface WrapOpts {
    * whichever one wsl.exe treats as default. Omitted entirely (no `-d`
    * pair) when unknown. */
   wslDistro?: string;
+  /** `setup --policy FILE`: ABSOLUTE path (cli.ts resolves it) baked into
+   * every wrapped entry as `--policy <path>` right after `--data-dir`, so
+   * those servers run in gateway mode (record --policy). Absolute because
+   * MCP clients launch servers from their own working directory. */
+  policyPath?: string;
 }
 
 export interface SkipEntry {
@@ -141,9 +146,11 @@ function buildWslWrappedEntry(name: string, original: ServerEntry, originalArgv:
     name,
     '--data-dir',
     dataDir,
-    '--',
-    ...originalArgv,
   );
+  // Same treatment as --data-dir: the path is used verbatim (wsl.exe -e
+  // launches the recorder inside the distro, where a Linux path is right).
+  if (opts.policyPath !== undefined) args.push('--policy', opts.policyPath);
+  args.push('--', ...originalArgv);
 
   const entry: ServerEntry = { ...original, command: 'wsl.exe', args };
 
@@ -175,6 +182,7 @@ export function buildWrappedEntry(name: string, original: ServerEntry, opts: Wra
   if (opts.wrapper === 'npx') recorderArgs.push('-y', '@edut/mcp-recorder');
   recorderArgs.push('record', '--name', name);
   if (opts.dataDir !== undefined) recorderArgs.push('--data-dir', opts.dataDir);
+  if (opts.policyPath !== undefined) recorderArgs.push('--policy', opts.policyPath);
   recorderArgs.push('--', ...originalArgv);
 
   const command = opts.wrapper === 'npx' ? 'npx' : process.execPath;

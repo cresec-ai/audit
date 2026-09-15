@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://cresec.ai/schemas/agent-policy.v1.json
+#
+# The laptop policy from docs/gateway.md: deny outbound HTTP tools, hold
+# destructive tools for a human, keep credential files off limits, redact
+# secret-shaped values out of tool results and flag prompt-injection markers.
+#
+#   mcp-recorder policy validate docs/examples/policy.laptop.yaml
+#   mcp-recorder setup --client claude-desktop --policy /abs/path/policy.laptop.yaml
+version: 1
+name: laptop
+
+mcp:
+  default: allow
+  rules:
+    - id: no-exfil
+      match: { tool: [http_post, "send_*", "fetch*"] }
+      action: deny
+      reason: outbound HTTP from agents is not allowed on this machine
+    - id: destructive-needs-a-human
+      match: { tool: ["delete_*", "rm*", "drop_*"] }
+      action: hold
+    - id: no-credential-files
+      match:
+        tool: read_file
+        args: { path: "(^|/)(\\.env|secrets\\.env|id_rsa|\\.npmrc)$" }
+      action: deny
+      reason: credential files are off limits
+  hold:
+    timeout_ms: 90000
+    on_timeout: deny
+  boundary:
+    secrets: redact
+    injection: flag

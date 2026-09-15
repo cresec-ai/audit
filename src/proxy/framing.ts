@@ -19,6 +19,14 @@ export interface ScannedLine {
   bytesLen: number;
   /** sha256 hex of the raw line bytes (no trailing newline). */
   lineHashHex: string;
+  /**
+   * The exact bytes of the line as they crossed the wire — including any
+   * trailing `\r` and the terminating `\n` (absent only for a trailing
+   * unterminated line flushed by `end()`). Present only when the line was
+   * not oversized (an oversized line's content is not buffered). Additive:
+   * used by gateway mode to forward an untouched line byte-for-byte.
+   */
+  raw?: Buffer;
 }
 
 const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -51,7 +59,7 @@ export class LineScanner {
         break;
       }
       this.append(chunk.subarray(start, nl));
-      const line = this.finishLine();
+      const line = this.finishLine(true);
       if (line !== null) out.push(line);
       start = nl + 1;
     }
@@ -61,8 +69,18 @@ export class LineScanner {
   /** Flush a trailing unterminated line, if any. */
   end(): ScannedLine[] {
     if (this.bytesLen === 0 && !this.oversized) return [];
-    const line = this.finishLine();
+    const line = this.finishLine(false);
     return line === null ? [] : [line];
+  }
+
+  /** True while bytes of an incomplete line are buffered (or being counted, when oversized). */
+  hasPartialLine(): boolean {
+    return this.bytesLen > 0 || this.oversized;
+  }
+
+  /** True when the current incomplete line has already exceeded the cap (its content is not buffered). */
+  partialLineOversized(): boolean {
+    return this.oversized;
   }
 
   private append(bytes: Buffer): void {
@@ -80,8 +98,11 @@ export class LineScanner {
     }
   }
 
-  /** Emit the buffered line and reset state. Returns null for empty lines. */
-  private finishLine(): ScannedLine | null {
+  /**
+   * Emit the buffered line and reset state. Returns null for empty lines.
+   * `terminated` says whether a `\n` ended the line (so `raw` includes it).
+   */
+  private finishLine(terminated: boolean): ScannedLine | null {
     const { parts, bytesLen, hash, oversized } = this;
     this.parts = [];
     this.bytesLen = 0;
@@ -94,9 +115,13 @@ export class LineScanner {
     if (oversized) {
       return { text: null, oversized: true, bytesLen, lineHashHex };
     }
-    let text = Buffer.concat(parts, bytesLen).toString('utf8');
+    // One allocation: the line bytes plus room for the terminating '\n'
+    // (`raw`); `text` is decoded from the same buffer's line-only view.
+    const raw = terminated ? Buffer.concat(parts, bytesLen + 1) : Buffer.concat(parts, bytesLen);
+    if (terminated) raw[bytesLen] = NL;
+    let text = raw.toString('utf8', 0, bytesLen);
     if (text.endsWith('\r')) text = text.slice(0, -1);
     if (text.length === 0) return null; // bare "\r\n" — also empty
-    return { text, oversized: false, bytesLen, lineHashHex };
+    return { text, oversized: false, bytesLen, lineHashHex, raw };
   }
 }

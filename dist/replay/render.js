@@ -158,10 +158,102 @@ function renderInitialize(seq, e) {
         : ''} <span class="dim">· ${num(e.duration_ms)} ms</span></div>
 </article>`;
 }
+/* ------------------------- gateway mode (additive) ------------------------ */
+/** CSS class for a gateway decision badge; anything off-schema falls back to the hold style. */
+function gatewayBadgeClass(decision) {
+    return decision === 'allow' ? 'gw-allow' : decision === 'deny' ? 'gw-deny' : 'gw-hold';
+}
+/**
+ * "redacted 2 secrets · flagged 1 injection marker" — a one-line summary of
+ * what the boundary filter did to a tool result. Every count goes through
+ * num() (a tampered store may put markup where a number belongs).
+ */
+function boundarySummary(boundary) {
+    if (boundary === undefined)
+        return '';
+    if (!boundary.scanned) {
+        const why = boundary.error !== undefined ? `error ${escapeHtml(boundary.error)}` : 'oversize';
+        return `not scanned (${why})` + (boundary.action === 'block' ? ' · blocked' : '');
+    }
+    const bits = [];
+    const verb = boundary.action === 'redact'
+        ? 'redacted'
+        : boundary.action === 'block'
+            ? 'blocked'
+            : boundary.action === 'flag'
+                ? 'flagged'
+                : 'found';
+    const secrets = Number(boundary.secrets_found);
+    const injections = Number(boundary.injection_found);
+    if (secrets > 0)
+        bits.push(`${verb} ${num(boundary.secrets_found)} secret${secrets === 1 ? '' : 's'}`);
+    if (injections > 0) {
+        bits.push(`${verb} ${num(boundary.injection_found)} injection marker${injections === 1 ? '' : 's'}`);
+    }
+    if (bits.length === 0)
+        return 'scanned clean';
+    return bits.join(' · ');
+}
+/**
+ * Badge(s) on a tool_call card recorded in gateway mode: the decision
+ * (gw-allow / gw-hold / gw-deny), the hold outcome when there is one, and
+ * the boundary-filter summary. secret_refs are exposed as data-secret-refs
+ * so the client-side blast-radius search finds a value the filter scrubbed
+ * before the model ever saw it.
+ */
+function gatewayBadges(gw) {
+    if (gw === undefined)
+        return '';
+    const cls = gatewayBadgeClass(gw.decision);
+    const label = gw.outcome !== undefined ? `${escapeHtml(String(gw.decision))} · ${escapeHtml(String(gw.outcome))}` : escapeHtml(String(gw.decision));
+    const title = [];
+    if (gw.rule_id !== undefined)
+        title.push(`rule ${gw.rule_id}`);
+    if (gw.approval_id !== undefined)
+        title.push(`hold ${gw.approval_id}`);
+    if (gw.waited_ms !== undefined)
+        title.push(`waited ${String(gw.waited_ms)} ms`);
+    const titleAttr = title.length > 0 ? ` title="${escapeHtml(title.join(' · '))}"` : '';
+    let html = `<span class="badge gw ${cls}"${titleAttr}>gateway ${label}</span>`;
+    const b = gw.boundary;
+    if (b !== undefined) {
+        const refs = Array.isArray(b.secret_refs) && b.secret_refs.length > 0
+            ? ` data-secret-refs="${escapeHtml(b.secret_refs.map(String).join(' '))}"`
+            : '';
+        const delivered = b.delivered_result_hash !== undefined
+            ? ` title="delivered result ${escapeHtml(String(b.delivered_result_hash))}"`
+            : '';
+        html += ` <span class="badge boundary${b.action === 'block' ? ' gw-deny' : ''}"${refs}${delivered}>${boundarySummary(b)}</span>`;
+    }
+    return html;
+}
+function renderPolicyDecision(seq, e) {
+    const cls = gatewayBadgeClass(e.decision);
+    const bits = [`request ${escapeHtml(String(e.request_id))}`];
+    bits.push(e.rule_id !== undefined ? `rule ${escapeHtml(e.rule_id)}` : 'policy default');
+    if (e.outcome !== undefined)
+        bits.push(`outcome ${escapeHtml(String(e.outcome))}`);
+    if (e.waited_ms !== undefined)
+        bits.push(`waited ${num(e.waited_ms)} ms`);
+    if (e.approval_id !== undefined)
+        bits.push(`hold <code>${escapeHtml(String(e.approval_id))}</code>`);
+    if (e.approver !== undefined)
+        bits.push(`by ${escapeHtml(String(e.approver))}`);
+    const argsHash = typeof e.args_hash === 'string'
+        ? ` · args <code class="rh" data-ref="${escapeHtml(e.args_hash)}" title="${escapeHtml(e.args_hash)}">${escapeHtml(shortRef(e.args_hash))}</code>`
+        : '';
+    return `<article class="event row policy ${cls}" data-seq="${num(seq)}">
+  <span class="kind tag-policy">POLICY</span> <span class="tool">${escapeHtml(e.tool)}</span>
+  <span class="badge gw ${cls}">${escapeHtml(String(e.decision))}</span>
+  <span class="dim">· ${bits.join(' · ')}${argsHash} · policy <code title="${escapeHtml(String(e.policy_hash))}">${escapeHtml(shortRef(String(e.policy_hash)))}</code></span>
+  ${timeTag(e.timestamp)}
+</article>`;
+}
 function renderToolCall(seq, e) {
     const hasGenAi = Object.keys(e.attributes).some((k) => k.startsWith('gen_ai.'));
     const genAiBadge = hasGenAi ? '<span class="badge genai">gen_ai</span>' : '';
     const errorBadge = e.is_error ? '<span class="badge err">error</span>' : '';
+    const gwBadges = gatewayBadges(e.gateway);
     let errorInfo = '';
     if (e.error !== undefined) {
         const bits = [];
@@ -178,7 +270,7 @@ function renderToolCall(seq, e) {
   <div class="card-head act-head">
     <span class="kind tag-act">ACT</span>
     <span class="tool">${escapeHtml(e.tool)}</span>
-    ${genAiBadge}${errorBadge}
+    ${genAiBadge}${errorBadge}${gwBadges}
     <span class="dur">${num(e.duration_ms)} ms</span>
     ${timeTag(e.timestamp)}
   </div>
@@ -241,6 +333,8 @@ function renderEvent(record) {
             return renderProtocolError(record.seq, e);
         case 'session_end':
             return renderSessionEnd(record.seq, e);
+        case 'policy_decision':
+            return renderPolicyDecision(record.seq, e);
         default:
             // Future kinds: render an inert row rather than dropping evidence.
             return `<article class="event row" data-seq="${num(record.seq)}"><span class="kind">${escapeHtml(e.kind)}</span> ${timeTag(e.timestamp)}</article>`;
@@ -357,6 +451,13 @@ header .meta code { color: var(--fg); }
 .badge { font-size: .72em; font-weight: 700; padding: .05rem .4rem; border-radius: 999px; }
 .badge.genai { background: rgba(90,176,247,.15); color: var(--accent); border: 1px solid var(--accent); }
 .badge.err { background: rgba(224,108,117,.15); color: var(--bad); border: 1px solid var(--bad); }
+.badge.gw-allow { background: rgba(79,195,128,.15); color: var(--ok); border: 1px solid var(--ok); }
+.badge.gw-hold { background: rgba(224,169,63,.15); color: var(--warn); border: 1px solid var(--warn); }
+.badge.gw-deny { background: rgba(224,108,117,.15); color: var(--bad); border: 1px solid var(--bad); }
+.badge.boundary { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); }
+.tag-policy { background: rgba(224,169,63,.2); color: var(--warn); }
+.event.row.policy.gw-deny { background: rgba(224,108,117,.08); border-color: var(--bad); }
+.event.row.policy.gw-hold { background: rgba(224,169,63,.08); border-color: var(--warn); }
 .dur { color: var(--dim); font-size: .85em; }
 .sub { color: var(--dim); font-size: .85em; margin-top: .4rem; }
 pre.tree { margin: .35rem 0 0; padding: .5rem .65rem; background: var(--bg);

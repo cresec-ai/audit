@@ -14,6 +14,10 @@ black-box flight recorder for MCP. It tells one story end to end:
 ```bash
 npm run demo          # the 5-step incident story
 npm run demo -- --ui  # ...then open the interactive HTML replay
+npm run demo -- --policy docs/examples/policy.demo.yaml
+                      # the same story behind the gateway: http_post is denied,
+                      # the canary is redacted before the model sees it, and the
+                      # blast-radius query still finds it (docs/gateway.md)
 ```
 
 It runs in well under a minute and exits nonzero if any step fails (or if the

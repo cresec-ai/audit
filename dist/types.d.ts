@@ -218,6 +218,8 @@ export declare const ENV: {
     readonly STORE: "MCP_RECORDER_STORE";
     readonly REDACT: "MCP_RECORDER_REDACT";
     readonly DISABLE: "MCP_RECORDER_DISABLE";
+    /** Additive (gateway mode): policy.yaml path honoured by `record` when `--policy` is absent. */
+    readonly POLICY: "MCP_RECORDER_POLICY";
 };
 /** File names inside the data dir. */
 export declare const FILES: {

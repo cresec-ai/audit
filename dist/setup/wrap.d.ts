@@ -33,6 +33,11 @@ export interface WrapOpts {
      * whichever one wsl.exe treats as default. Omitted entirely (no `-d`
      * pair) when unknown. */
     wslDistro?: string;
+    /** `setup --policy FILE`: ABSOLUTE path (cli.ts resolves it) baked into
+     * every wrapped entry as `--policy <path>` right after `--data-dir`, so
+     * those servers run in gateway mode (record --policy). Absolute because
+     * MCP clients launch servers from their own working directory. */
+    policyPath?: string;
 }
 export interface SkipEntry {
     name: string;

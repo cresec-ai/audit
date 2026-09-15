@@ -11,8 +11,9 @@
  * - duplicate rule ids within a section;
  * - `args` values are strings, keys are well-formed dot-paths;
  * - regexes compile in JS AND stay inside the RE2-portable subset (no
- *   lookaround, no backreferences, no RE2-only or JS-only escapes) so the
- *   local engine and OPA agree on every input;
+ *   lookaround, no backreferences, no inline flag / modifier groups, no
+ *   RE2-only or JS-only escapes) so the local engine and OPA agree on every
+ *   input, whatever the running Node version's V8 happens to accept;
  * - globs are not blank and do not use `[ ] { } \`, which OPA's glob library
  *   interprets and ours does not.
  *
@@ -52,9 +53,17 @@ const NON_PORTABLE_ESCAPES = new Set(['A', 'z', 'Z', 'p', 'P', 'Q', 'E', 'C', 'G
 /**
  * Why `pattern` is outside the RE2-portable subset (or fails to compile), or
  * undefined when it is acceptable. Rejected: lookaround `(?=` `(?!` `(?<=`
- * `(?<!`, backreferences `\1`..`\9`, escapes that only one engine knows
+ * `(?<!`, every other `(?` group that is not a plain non-capturing `(?:`
+ * or a named group `(?<name>` — inline flags `(?i)` `(?s)` `(?m)` `(?U)`,
+ * modifier groups `(?i:...)` `(?-i:...)`, `(?P<name>`, comments `(?#` —
+ * backreferences `\1`..`\9`, escapes that only one engine knows
  * (`\A \z \Z \p \P \Q \E \C \G \u \U \c`), `\x{...}` and POSIX classes
  * `[:alpha:]`.
+ *
+ * The `(?` check is explicit and runs BEFORE `new RegExp`: RE2 accepts inline
+ * flags, Node 20's V8 rejects them all, and Node 24's V8 accepts the
+ * `(?i:...)` modifier form — the policy must mean the same thing everywhere,
+ * so none of them is allowed regardless of what the local engine says.
  */
 export function checkRe2Subset(pattern: string): string | undefined {
   let inClass = false;
@@ -84,9 +93,8 @@ export function checkRe2Subset(pattern: string): string | undefined {
       continue;
     }
     if (ch === '(' && pattern[i + 1] === '?') {
-      const rest = pattern.slice(i + 2, i + 4);
-      if (rest.startsWith('=') || rest.startsWith('!')) return `lookahead "(?${rest[0]}" is not supported (RE2 subset)`;
-      if (rest === '<=' || rest === '<!') return `lookbehind "(?${rest}" is not supported (RE2 subset)`;
+      const why = checkGroupPrefix(pattern, i + 2);
+      if (why !== undefined) return why;
     }
   }
   try {
@@ -95,6 +103,23 @@ export function checkRe2Subset(pattern: string): string | undefined {
     return `invalid regular expression: ${err instanceof Error ? err.message : String(err)}`;
   }
   return undefined;
+}
+
+/**
+ * Why the `(?` group whose body starts at `at` is not acceptable, or
+ * undefined for `(?:` and `(?<name>`. Named groups are spelled the same in
+ * JavaScript and RE2 (Go regexp since 1.22), so they stay allowed; anything
+ * else after `(?` is either lookaround or an inline flag / modifier group.
+ */
+function checkGroupPrefix(pattern: string, at: number): string | undefined {
+  const head = pattern.slice(at, at + 2);
+  const first = head[0];
+  if (first === ':') return undefined;
+  if (first === '=' || first === '!') return `lookahead "(?${first}" is not supported (RE2 subset)`;
+  if (head === '<=' || head === '<!') return `lookbehind "(?${head}" is not supported (RE2 subset)`;
+  if (first === '<') return undefined; // (?<name>...): validated by new RegExp below
+  const shown = first === undefined ? '(?' : `(?${first}`;
+  return `group "${shown}" is not supported (RE2 subset): only "(?:" non-capturing groups are allowed (no inline flags or modifier groups such as (?i), (?s), (?m), (?U), (?i:...), (?-i:...))`;
 }
 
 /** `a.b.0.c`: non-empty segments separated by single dots. */

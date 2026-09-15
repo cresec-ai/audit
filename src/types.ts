@@ -267,6 +267,8 @@ export const ENV = {
   STORE: 'MCP_RECORDER_STORE',
   REDACT: 'MCP_RECORDER_REDACT',
   DISABLE: 'MCP_RECORDER_DISABLE',
+  /** Additive (gateway mode): policy.yaml path honoured by `record` when `--policy` is absent. */
+  POLICY: 'MCP_RECORDER_POLICY',
 } as const;
 
 /** File names inside the data dir. */

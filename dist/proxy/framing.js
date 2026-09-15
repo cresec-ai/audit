@@ -35,7 +35,7 @@ export class LineScanner {
                 break;
             }
             this.append(chunk.subarray(start, nl));
-            const line = this.finishLine();
+            const line = this.finishLine(true);
             if (line !== null)
                 out.push(line);
             start = nl + 1;
@@ -46,8 +46,16 @@ export class LineScanner {
     end() {
         if (this.bytesLen === 0 && !this.oversized)
             return [];
-        const line = this.finishLine();
+        const line = this.finishLine(false);
         return line === null ? [] : [line];
+    }
+    /** True while bytes of an incomplete line are buffered (or being counted, when oversized). */
+    hasPartialLine() {
+        return this.bytesLen > 0 || this.oversized;
+    }
+    /** True when the current incomplete line has already exceeded the cap (its content is not buffered). */
+    partialLineOversized() {
+        return this.oversized;
     }
     append(bytes) {
         if (bytes.length === 0)
@@ -66,8 +74,11 @@ export class LineScanner {
             }
         }
     }
-    /** Emit the buffered line and reset state. Returns null for empty lines. */
-    finishLine() {
+    /**
+     * Emit the buffered line and reset state. Returns null for empty lines.
+     * `terminated` says whether a `\n` ended the line (so `raw` includes it).
+     */
+    finishLine(terminated) {
         const { parts, bytesLen, hash, oversized } = this;
         this.parts = [];
         this.bytesLen = 0;
@@ -79,12 +90,17 @@ export class LineScanner {
         if (oversized) {
             return { text: null, oversized: true, bytesLen, lineHashHex };
         }
-        let text = Buffer.concat(parts, bytesLen).toString('utf8');
+        // One allocation: the line bytes plus room for the terminating '\n'
+        // (`raw`); `text` is decoded from the same buffer's line-only view.
+        const raw = terminated ? Buffer.concat(parts, bytesLen + 1) : Buffer.concat(parts, bytesLen);
+        if (terminated)
+            raw[bytesLen] = NL;
+        let text = raw.toString('utf8', 0, bytesLen);
         if (text.endsWith('\r'))
             text = text.slice(0, -1);
         if (text.length === 0)
             return null; // bare "\r\n" — also empty
-        return { text, oversized: false, bytesLen, lineHashHex };
+        return { text, oversized: false, bytesLen, lineHashHex, raw };
     }
 }
 //# sourceMappingURL=framing.js.map

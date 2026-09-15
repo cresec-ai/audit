@@ -339,9 +339,25 @@ describe('mcp-recorder CLI', () => {
   it('--help exits 0 and lists every subcommand', async () => {
     const res = await runCli(['--help']);
     expect(res.code).toBe(0);
-    for (const sub of ['record', 'verify', 'query', 'sessions', 'ui', 'export', 'http']) {
+    for (const sub of [
+      'record',
+      'verify',
+      'query',
+      'sessions',
+      'ui',
+      'export',
+      'http',
+      'setup',
+      'policy validate',
+      'policy compile',
+      'holds',
+      'approve',
+      'deny',
+    ]) {
       expect(res.stdout).toContain(sub);
     }
+    expect(res.stdout).toContain('--policy FILE');
+    expect(res.stdout).toContain('MCP_RECORDER_POLICY');
   }, 30_000);
 
   it('--version prints 0.1.0', async () => {

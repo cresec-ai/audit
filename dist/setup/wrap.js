@@ -72,7 +72,12 @@ function buildWslWrappedEntry(name, original, originalArgv, opts) {
     const args = [];
     if (opts.wslDistro !== undefined)
         args.push('-d', opts.wslDistro);
-    args.push('-e', process.execPath, opts.localWrapperPath, 'record', '--name', name, '--data-dir', dataDir, '--', ...originalArgv);
+    args.push('-e', process.execPath, opts.localWrapperPath, 'record', '--name', name, '--data-dir', dataDir);
+    // Same treatment as --data-dir: the path is used verbatim (wsl.exe -e
+    // launches the recorder inside the distro, where a Linux path is right).
+    if (opts.policyPath !== undefined)
+        args.push('--policy', opts.policyPath);
+    args.push('--', ...originalArgv);
     const entry = { ...original, command: 'wsl.exe', args };
     // Windows env vars only cross the WSL boundary when their names are
     // listed in WSLENV (colon-separated) — being present in `env` alone does
@@ -101,6 +106,8 @@ export function buildWrappedEntry(name, original, opts) {
     recorderArgs.push('record', '--name', name);
     if (opts.dataDir !== undefined)
         recorderArgs.push('--data-dir', opts.dataDir);
+    if (opts.policyPath !== undefined)
+        recorderArgs.push('--policy', opts.policyPath);
     recorderArgs.push('--', ...originalArgv);
     const command = opts.wrapper === 'npx' ? 'npx' : process.execPath;
     const args = opts.wrapper === 'npx' ? recorderArgs : [opts.localWrapperPath, ...recorderArgs];

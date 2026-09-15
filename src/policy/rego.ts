@@ -1,9 +1,13 @@
 /**
- * Compile a normalized policy into an OPA bundle directory (nhi style):
+ * Compile a normalized policy into an OPA bundle directory laid out like the
+ * Cresec control plane (sibling packages to `cresec.broker`, one `decision`
+ * object rule each; distinct basenames because the Helm ConfigMap flattens
+ * by basename):
  *
- *   .manifest                    {"revision": "<policy sha256 hex>", "roots": ["cresec/gateway"]}
- *   cresec/gateway/mcp.rego      package cresec.gateway.mcp     (always)
- *   cresec/gateway/egress.rego   package cresec.gateway.egress  (only when `egress` is present)
+ *   .manifest                {"revision": "<policy sha256 hex>", "roots": ["cresec/mcp", "cresec/egress"]}
+ *   cresec/mcp/tool.rego     package cresec.mcp     (always)
+ *   cresec/egress/http.rego  package cresec.egress  (only when `egress` is present; then and only then
+ *                                                    "cresec/egress" is listed in the manifest roots)
  *
  * Output is deterministic (same policy + options => identical bytes), uses
  * tabs like `opa fmt`, `import rego.v1`, and emits every string literal via
@@ -22,6 +26,18 @@
  * minimum, so "first match wins" is expressed by index, exactly like the TS
  * engine. `rules[i].reason` is always present ("" when unset) so `decision`
  * is never undefined.
+ *
+ * The `decision` object is a superset of the broker's, so a consumer that
+ * only knows `allow` / `deny_reason` (and fails closed on a missing `allow`)
+ * can evaluate `data.cresec.mcp.decision` or `data.cresec.egress.decision`
+ * unchanged:
+ *
+ *   {"allow": <action == "allow">, "action": "allow"|"hold"|"deny", "rule_id": "...",
+ *    "reason": "...", "matched": bool, "deny_reason": "..."}
+ *
+ * `deny_reason` is "" when the action is allow; otherwise "rule <id>: <reason>"
+ * ("rule <id>" when the rule has no reason) for a matched rule and
+ * "default <action>" when no rule matched and the section default applies.
  */
 
 import { dotPathSegments } from './engine.js';
@@ -40,9 +56,17 @@ export interface RegoBundle {
 }
 
 export const MANIFEST_PATH = '.manifest';
-export const MCP_REGO_PATH = 'cresec/gateway/mcp.rego';
-export const EGRESS_REGO_PATH = 'cresec/gateway/egress.rego';
-export const BUNDLE_ROOTS: readonly string[] = ['cresec/gateway'];
+export const MCP_REGO_PATH = 'cresec/mcp/tool.rego';
+export const EGRESS_REGO_PATH = 'cresec/egress/http.rego';
+/** Manifest root of the MCP module (always present). */
+export const MCP_ROOT = 'cresec/mcp';
+/** Manifest root of the egress module (listed only when `cresec/egress/http.rego` is emitted). */
+export const EGRESS_ROOT = 'cresec/egress';
+
+/** The `.manifest` roots for a policy: `["cresec/mcp"]`, plus `"cresec/egress"` when it has an egress section. */
+export function bundleRoots(policy: Policy): string[] {
+  return policy.egress === undefined ? [MCP_ROOT] : [MCP_ROOT, EGRESS_ROOT];
+}
 
 /** Canonical write order for bundle files. */
 export const BUNDLE_FILE_ORDER: readonly string[] = [MANIFEST_PATH, MCP_REGO_PATH, EGRESS_REGO_PATH];
@@ -111,6 +135,57 @@ function egressRuleBody(rule: EgressRule): string[] {
   return lines;
 }
 
+/** The documented decision shape (comment in every module header). */
+export const DECISION_SHAPE =
+  '{"allow": bool, "action": "allow"|"hold"|"deny", "rule_id": "...", "reason": "...", "matched": bool, "deny_reason": "..."}';
+
+/**
+ * The module tail shared by both packages: `deny_reason(rule)` and the two
+ * `decision` heads (matched rule / section default). Identical in every
+ * module so the broker-style consumer sees one shape; formatted exactly like
+ * `opa fmt` (tabs, one blank line between rules).
+ */
+const DECISION_RULES: readonly string[] = [
+  '# "rule <id>: <reason>" ("rule <id>" without a reason) when the action is not allow, "" otherwise.',
+  'deny_reason(rule) := "" if rule.action == "allow"',
+  '',
+  'deny_reason(rule) := sprintf("rule %s", [rule.id]) if {',
+  '\trule.action != "allow"',
+  '\trule.reason == ""',
+  '}',
+  '',
+  'deny_reason(rule) := sprintf("rule %s: %s", [rule.id, rule.reason]) if {',
+  '\trule.action != "allow"',
+  '\trule.reason != ""',
+  '}',
+  '',
+  'decision := {',
+  '\t"allow": rule.action == "allow",',
+  '\t"action": rule.action,',
+  '\t"rule_id": rule.id,',
+  '\t"reason": rule.reason,',
+  '\t"matched": true,',
+  '\t"deny_reason": deny_reason(rule),',
+  '} if {',
+  '\tcount(rule_matches) > 0',
+  '\trule := rules[first_match]',
+  '}',
+  '',
+  'decision := {',
+  '\t"allow": default_action == "allow",',
+  '\t"action": default_action,',
+  '\t"rule_id": "",',
+  '\t"reason": "",',
+  '\t"matched": false,',
+  '\t"deny_reason": default_deny_reason,',
+  '} if count(rule_matches) == 0',
+  '',
+  '# "default <action>" when no rule matched and the section default is not allow, "" otherwise.',
+  'default_deny_reason := "" if default_action == "allow"',
+  '',
+  'default_deny_reason := sprintf("default %s", [default_action]) if default_action != "allow"',
+];
+
 interface ModuleSpec<R extends { id: string; action: string; reason?: string }> {
   pkg: string;
   inputShape: string;
@@ -129,7 +204,7 @@ function renderModule<R extends { id: string; action: string; reason?: string }>
   out.push(`package ${spec.pkg}`, '', 'import rego.v1', '');
   out.push(`# Generated by mcp-recorder ${opts.toolVersion} from policy ${q(name)} (sha256:${revision}). Do not edit.`);
   out.push(`# Input:    ${spec.inputShape}`);
-  out.push('# Decision: {"action": "allow"|"hold"|"deny", "rule_id": "...", "reason": "...", "matched": bool}');
+  out.push(`# Decision: ${DECISION_SHAPE}`);
   out.push('');
   out.push(`default_action := ${q(spec.defaultAction)}`, '');
   if (spec.rules.length === 0) {
@@ -149,19 +224,15 @@ function renderModule<R extends { id: string; action: string; reason?: string }>
     });
   }
   out.push('first_match := min(rule_matches) if count(rule_matches) > 0', '');
-  out.push(
-    'decision := {"action": rules[first_match].action, "rule_id": rules[first_match].id, "reason": rules[first_match].reason, "matched": true} if count(rule_matches) > 0',
-    '',
-  );
-  out.push('decision := {"action": default_action, "rule_id": "", "reason": "", "matched": false} if count(rule_matches) == 0');
+  out.push(...DECISION_RULES);
   return out.join('\n') + '\n';
 }
 
-/** Render `cresec/gateway/mcp.rego`. A policy without `mcp` compiles to the documented default (allow, no rules). */
+/** Render `cresec/mcp/tool.rego`. A policy without `mcp` compiles to the documented default (allow, no rules). */
 export function renderMcpModule(policy: Policy, opts: CompileOptions): string {
   return renderModule<McpRule>(
     {
-      pkg: 'cresec.gateway.mcp',
+      pkg: 'cresec.mcp',
       inputShape: '{"server": "...", "tool": "...", "args": {...}, "args_bytes": 123}',
       defaultAction: policy.mcp?.default ?? 'allow',
       rules: policy.mcp?.rules ?? [],
@@ -171,13 +242,13 @@ export function renderMcpModule(policy: Policy, opts: CompileOptions): string {
   );
 }
 
-/** Render `cresec/gateway/egress.rego`; throws when the policy has no `egress` section. */
+/** Render `cresec/egress/http.rego`; throws when the policy has no `egress` section. */
 export function renderEgressModule(policy: Policy, opts: CompileOptions): string {
   const egress = policy.egress;
   if (egress === undefined) throw new TypeError('policy has no egress section');
   return renderModule<EgressRule>(
     {
-      pkg: 'cresec.gateway.egress',
+      pkg: 'cresec.egress',
       inputShape: '{"host": "...", "method": "GET", "path": "/...", "body_bytes": 123}',
       defaultAction: egress.default,
       rules: egress.rules,
@@ -191,7 +262,7 @@ export function renderEgressModule(policy: Policy, opts: CompileOptions): string
 export function compileToRego(policy: Policy, opts: CompileOptions): RegoBundle {
   const revision = policyRevision(opts.policyHash);
   const files: Record<string, string> = {};
-  files[MANIFEST_PATH] = JSON.stringify({ revision, roots: [...BUNDLE_ROOTS] }) + '\n';
+  files[MANIFEST_PATH] = JSON.stringify({ revision, roots: bundleRoots(policy) }) + '\n';
   files[MCP_REGO_PATH] = renderMcpModule(policy, opts);
   if (policy.egress !== undefined) files[EGRESS_REGO_PATH] = renderEgressModule(policy, opts);
   return { files };

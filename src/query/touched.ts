@@ -144,13 +144,29 @@ function findCandidates(
     }
   }
 
+  // Gateway mode (additive): a secret the boundary filter redacted out of a
+  // tool result before the model saw it is recorded only as its hash in
+  // `gateway.boundary.secret_refs` — plain strings, not a RedactedRef leaf,
+  // so the walk above does not see them. A needle that was redacted at the
+  // boundary must still trace to the call it was scrubbed from.
+  if (event.kind === 'tool_call' && event.gateway?.boundary?.secret_refs !== undefined) {
+    const refs = event.gateway.boundary.secret_refs;
+    if (Array.isArray(refs)) {
+      const idx = refs.indexOf(needleHash);
+      if (idx !== -1) {
+        candidates.push({ matched_on: 'ref', path: `$.gateway.boundary.secret_refs[${idx}]` });
+      }
+    }
+  }
+
   // `tool` / `method` stay plain strings by schema (never a RedactedRef), but
   // an over-long or oddly-shaped one is capped at the edge to its own
   // `sha256:<hex>` (structuralString, P0) — the generic RedactedRef walk
   // above never sees this since it isn't an object leaf. Check the raw field
   // against needleHash directly so a blast-radius query for the original
   // (oversized/malformed) name still finds the event that carried it.
-  if (event.kind === 'tool_call' && event.tool === needleHash) {
+  // policy_decision carries `tool` capped exactly like tool_call (gateway mode).
+  if ((event.kind === 'tool_call' || event.kind === 'policy_decision') && event.tool === needleHash) {
     candidates.push({ matched_on: 'ref', path: '$.tool' });
   } else if (
     (event.kind === 'rpc' || event.kind === 'notification') &&
@@ -161,7 +177,8 @@ function findCandidates(
 
   if (needle.length > 0) {
     const lower = needle.toLowerCase();
-    const tool = event.kind === 'tool_call' ? event.tool : undefined;
+    const tool =
+      event.kind === 'tool_call' || event.kind === 'policy_decision' ? event.tool : undefined;
     const method =
       event.kind === 'rpc' || event.kind === 'notification' ? event.method : undefined;
     if (tool !== undefined && tool.toLowerCase() === lower) {
@@ -180,8 +197,10 @@ function findCandidates(
 }
 
 function toMatch(seq: number, event: AnyEvent, matchedOn: MatchedOn, path: string): QueryMatch {
+  // policy_decision (gateway mode) names the tool the decision was about,
+  // exactly like tool_call — so `query` output reads the same for both.
   const name =
-    event.kind === 'tool_call'
+    event.kind === 'tool_call' || event.kind === 'policy_decision'
       ? event.tool
       : event.kind === 'rpc' || event.kind === 'notification'
         ? event.method

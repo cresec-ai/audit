@@ -16,6 +16,14 @@ export interface ScannedLine {
     bytesLen: number;
     /** sha256 hex of the raw line bytes (no trailing newline). */
     lineHashHex: string;
+    /**
+     * The exact bytes of the line as they crossed the wire — including any
+     * trailing `\r` and the terminating `\n` (absent only for a trailing
+     * unterminated line flushed by `end()`). Present only when the line was
+     * not oversized (an oversized line's content is not buffered). Additive:
+     * used by gateway mode to forward an untouched line byte-for-byte.
+     */
+    raw?: Buffer;
 }
 export declare class LineScanner {
     private readonly maxLineBytes;
@@ -34,7 +42,14 @@ export declare class LineScanner {
     push(chunk: Buffer): ScannedLine[];
     /** Flush a trailing unterminated line, if any. */
     end(): ScannedLine[];
+    /** True while bytes of an incomplete line are buffered (or being counted, when oversized). */
+    hasPartialLine(): boolean;
+    /** True when the current incomplete line has already exceeded the cap (its content is not buffered). */
+    partialLineOversized(): boolean;
     private append;
-    /** Emit the buffered line and reset state. Returns null for empty lines. */
+    /**
+     * Emit the buffered line and reset state. Returns null for empty lines.
+     * `terminated` says whether a `\n` ended the line (so `raw` includes it).
+     */
     private finishLine;
 }

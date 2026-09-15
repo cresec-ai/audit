@@ -337,8 +337,8 @@ exactly as before (canonical JSON drops nothing that was never there).
 | Field | Type | Description |
 | --- | --- | --- |
 | `decision` | `'allow' \| 'deny' \| 'hold'` | What the policy decided for the request. |
-| `rule_id` | `string?` | The rule that matched (capped, `structuralString` kind `identifier`); absent when the section's `default` applied. |
-| `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled'?` | Holds only: how the hold was resolved. |
+| `rule_id` | `string?` | The rule that matched; absent when the section's `default` applied. An explicit id already matches the `structuralString` identifier shape and is kept as-is, and so is an auto-assigned `rule[<index>]`; only an off-shape id would be stored as its `sha256:<hex>` reference. |
+| `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled' \| 'session_end'?` | Holds only: how the hold was resolved (`session_end` = the proxy shut down while the call was still held). |
 | `approval_id` | `string?` | Holds only: the UUID the operator saw in `mcp-recorder holds`. |
 | `boundary` | `BoundaryReport?` | Present when the result went through the tool-result boundary filter (every `allow`ed and `approved` call whose server answered). |
 
@@ -375,7 +375,12 @@ everything the gateway ever refused or paused.
 | `approver` | `string?` | Holds only: the OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one. |
 
 Attributes on a `policy_decision`: `gen_ai.tool.name`, `gen_ai.tool.call.id`,
-`cresec.policy.decision`, and `cresec.policy.rule_id` when a rule matched.
+`mcp.method.name`, `rpc.system`, `cresec.policy.decision`, and
+`cresec.policy.rule_id` when a rule matched. A `tool_call` recorded in gateway
+mode carries the same two `cresec.policy.*` attributes next to its usual ones.
+A call the gateway refused has `duration_ms: 0` (it never reached the server);
+`waited_ms` carries the hold time, and for a hold that was approved
+`duration_ms` measures from the moment the request was forwarded.
 
 ---
 

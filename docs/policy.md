@@ -180,9 +180,11 @@ anchored (they must match the whole subject).
 **Regexes** (`match.args`) must stay inside the RE2 subset so that the local
 JavaScript engine and OPA's RE2 agree: lookaround (`(?=`, `(?!`, `(?<=`,
 `(?<!`) and backreferences (`\1`…`\9`) are rejected by `policy validate`.
-Inline flag groups (`(?i)`, `(?s)`, `(?m)`, `(?i:...)`) are rejected as well:
-RE2 accepts them but JavaScript does not, and both engines must agree. Use
-character classes (`[Aa]`) for case-insensitive matching. Regexes are
+Inline flag and modifier groups (`(?i)`, `(?s)`, `(?m)`, `(?U)`, `(?i:...)`,
+`(?-i:...)`) are rejected as well: RE2 accepts them, JavaScript engines differ
+by version (Node 24 accepts `(?i:...)`, Node 20 does not), and both sides must
+agree — only `(?:...)` non-capturing and `(?<name>...)` named groups are
+allowed. Use character classes (`[Aa]`) for case-insensitive matching. Regexes are
 unanchored (write `^`/`$` yourself) and matching is a *search*, not a
 full-string match.
 
@@ -270,20 +272,34 @@ Errors carry a JSON-pointer path:
 ```
 policy.yaml: invalid
   /mcp/rules/1/match/tool: required property missing
-  /mcp/rules/2/match/args/path: regex uses lookaround, which RE2 (OPA) does not support
+  /mcp/rules/2/match/args/path: lookahead "(?=" is not supported (RE2 subset)
   /mcp/hold/timeout_ms: must be <= 3600000
 ```
 
 `.yaml`, `.yml` and `.json` files are accepted. Duplicate YAML keys are an
 error. The validator is the shipped JSON Schema plus a few semantic checks
-the schema language can't express (unique ids, the RE2 subset, ranges).
+the schema language can't express (unique ids, the RE2 subset, ranges). A
+file that exists but does not parse is reported as invalid (exit 1, one error
+at pointer `/`); exit 2 is reserved for a file that cannot be read at all.
+
+`--json` prints `{ "path", "valid": true, "name"?, "hash", "source",
+"mcp_rules", "egress_rules" }` for a valid file and
+`{ "path", "valid": false, "errors": [{ "path", "message", "keyword" }] }`
+otherwise, so a CI step can fail on `valid` and show the pointers.
 
 ## Compiling to Rego
 
 ```sh
 mcp-recorder policy compile policy.yaml                 # prints cresec/mcp/tool.rego
 mcp-recorder policy compile policy.yaml --out ./bundle  # writes an OPA bundle directory
+# wrote 3 file(s) to /abs/path/bundle
+#   .manifest
+#   cresec/mcp/tool.rego
+#   cresec/egress/http.rego
 ```
+
+An invalid policy exits 1 with the same error listing as `validate` and
+writes nothing.
 
 The bundle follows the Cresec control plane's layout — sibling packages to
 the existing `cresec.broker`, one `decision` object rule each:
@@ -296,9 +312,18 @@ bundle/
     └── egress/http.rego     package cresec.egress   (only if `egress` is present)
 ```
 
+`cresec/mcp/tool.rego` is always emitted (a policy without `mcp` compiles to
+`default allow`, no rules); `cresec/egress/http.rego` — and the
+`"cresec/egress"` entry in `roots` — only when the policy has an `egress`
+section. The two files deliberately have distinct basenames.
+
 Input and decision shapes. The decision is a superset of the broker's
 (`allow` + `deny_reason`), so a consumer that only understands those two keys
-still fails closed on `hold`:
+still fails closed on `hold`. `allow` is `action == "allow"`; `deny_reason` is
+`""` for an allow, `rule <id>: <reason>` for a matched deny/hold rule
+(`rule <id>` when the rule has no `reason`), and `default deny` /
+`default hold` when no rule matched and the section `default` applied
+(`matched: false`, empty `rule_id`):
 
 ```jsonc
 // package cresec.mcp — input

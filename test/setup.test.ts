@@ -873,3 +873,196 @@ describe('mcp-recorder setup — wsl wrapper & BOM handling (via the CLI)', () =
     expect(JSON.parse(rewritten)).toEqual(JSON.parse(original));
   }, 30_000);
 });
+
+/* ------------------------------ --policy ----------------------------------
+ * `setup --policy FILE` bakes `--policy <absolute path>` into every wrapped
+ * entry (gateway mode). Pure-function coverage of src/setup/wrap.ts first,
+ * then the CLI path (validation, dry-run, write, undo).
+ */
+
+describe('buildWrappedEntry / structuralUnwrap — policyPath (setup --policy)', () => {
+  const LOCAL_WRAPPER = '/install/dist/cli.js';
+  const original: WrapServerEntry = { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] };
+
+  it('local: "--policy <path>" lands right after --data-dir, before the "--" separator', () => {
+    const entry = buildWrappedEntry('filesystem', original, {
+      wrapper: 'local',
+      localWrapperPath: LOCAL_WRAPPER,
+      dataDir: '/data',
+      policyPath: '/abs/policy.yaml',
+    });
+    expect(entry.command).toBe(process.execPath);
+    expect(entry.args).toEqual([
+      LOCAL_WRAPPER,
+      'record',
+      '--name',
+      'filesystem',
+      '--data-dir',
+      '/data',
+      '--policy',
+      '/abs/policy.yaml',
+      '--',
+      'npx',
+      '-y',
+      '@modelcontextprotocol/server-filesystem',
+      '/tmp',
+    ]);
+  });
+
+  it('npx: same position in the published-package form (no --data-dir given)', () => {
+    const entry = buildWrappedEntry('filesystem', original, {
+      wrapper: 'npx',
+      localWrapperPath: LOCAL_WRAPPER,
+      policyPath: '/abs/policy.yaml',
+    });
+    expect(entry).toEqual({
+      command: 'npx',
+      args: ['-y', '@edut/mcp-recorder', 'record', '--name', 'filesystem', '--policy', '/abs/policy.yaml', '--', 'npx', '-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+    });
+  });
+
+  it('wsl: "--policy <path>" follows the always-present --data-dir, verbatim like it', () => {
+    const entry = buildWrappedEntry('filesystem', original, {
+      wrapper: 'wsl',
+      localWrapperPath: LOCAL_WRAPPER,
+      wslDistro: 'Ubuntu',
+      dataDir: '/home/me/.mcp-recorder',
+      policyPath: '/home/me/.mcp-recorder/policy.yaml',
+    });
+    expect(entry.command).toBe('wsl.exe');
+    expect(entry.args).toEqual([
+      '-d',
+      'Ubuntu',
+      '-e',
+      process.execPath,
+      LOCAL_WRAPPER,
+      'record',
+      '--name',
+      'filesystem',
+      '--data-dir',
+      '/home/me/.mcp-recorder',
+      '--policy',
+      '/home/me/.mcp-recorder/policy.yaml',
+      '--',
+      'npx',
+      '-y',
+      '@modelcontextprotocol/server-filesystem',
+      '/tmp',
+    ]);
+  });
+
+  it('no policyPath -> no --policy anywhere (byte-identical to before)', () => {
+    for (const wrapper of ['local', 'npx', 'wsl'] as const) {
+      const entry = buildWrappedEntry('filesystem', original, { wrapper, localWrapperPath: LOCAL_WRAPPER });
+      expect(entry.args).not.toContain('--policy');
+    }
+  });
+
+  it('structuralUnwrap still recognises entries carrying --policy (local, npx and wsl forms)', () => {
+    for (const wrapper of ['local', 'npx', 'wsl'] as const) {
+      const wrapped = buildWrappedEntry('filesystem', original, {
+        wrapper,
+        localWrapperPath: LOCAL_WRAPPER,
+        dataDir: '/data',
+        policyPath: '/abs/policy.yaml',
+        wslDistro: 'Ubuntu',
+      });
+      expect(structuralUnwrap(wrapped), wrapper).toEqual(original);
+    }
+  });
+
+  it('an entry wrapped with --policy is recognised as already wrapped', () => {
+    const wrapped = buildWrappedEntry('filesystem', original, {
+      wrapper: 'local',
+      localWrapperPath: LOCAL_WRAPPER,
+      policyPath: '/abs/policy.yaml',
+    });
+    expect(isAlreadyWrapped(wrapped, LOCAL_WRAPPER)).toBe(true);
+  });
+});
+
+describe('mcp-recorder setup --policy (via the CLI)', () => {
+  const POLICY = 'version: 1\nmcp:\n  rules:\n    - id: no-exfil\n      match: { tool: http_post }\n      action: deny\n';
+
+  it('bakes the ABSOLUTE policy path into every wrapped entry; --undo restores the originals', async () => {
+    const dir = tmpDir('mcp-rec-setup-policy-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const original = readFileSync(configPath, 'utf8');
+    const policyPath = join(dir, 'policy.yaml');
+    writeFileSync(policyPath, POLICY);
+
+    // A relative --policy is resolved against the cwd (the repo root, where
+    // the CLI is spawned) — so hand it the absolute path and check it is
+    // written back verbatim as an absolute path.
+    const res = await runCli(['setup', '--config', configPath, '--policy', policyPath, '--json']);
+    expect(res.code).toBe(0);
+    const result = JSON.parse(res.stdout) as { wrapped: string[] };
+    expect([...result.wrapped].sort()).toEqual(['custom', 'filesystem']);
+
+    const updated = JSON.parse(readFileSync(configPath, 'utf8')) as { mcpServers: Record<string, WrapServerEntry> };
+    for (const name of ['filesystem', 'custom']) {
+      const args = updated.mcpServers[name]!.args!;
+      const i = args.indexOf('--policy');
+      expect(i, `${name} --policy`).toBeGreaterThan(0);
+      expect(args[i + 1]).toBe(policyPath);
+      expect(i).toBeLessThan(args.indexOf('--'));
+    }
+    // the remote entry is untouched
+    expect(updated.mcpServers.remote).toEqual(claudeDesktopFixture().mcpServers.remote);
+
+    const undo = await runCli(['setup', '--config', configPath, '--undo']);
+    expect(undo.code).toBe(0);
+    expect(readFileSync(configPath, 'utf8')).toBe(original);
+  }, 60_000);
+
+  it('--dry-run shows the --policy argument and writes nothing', async () => {
+    const dir = tmpDir('mcp-rec-setup-policy-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const before = readFileSync(configPath, 'utf8');
+    const policyPath = join(dir, 'policy.yaml');
+    writeFileSync(policyPath, POLICY);
+
+    const res = await runCli(['setup', '--config', configPath, '--policy', policyPath, '--dry-run']);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain('dry run');
+    expect(res.stdout).toContain('"--policy"');
+    expect(res.stdout).toContain(JSON.stringify(policyPath));
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(existsSync(sidecarFor(configPath))).toBe(false);
+  }, 30_000);
+
+  it('a missing policy file exits 2 and leaves the config untouched', async () => {
+    const dir = tmpDir('mcp-rec-setup-policy-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const before = readFileSync(configPath, 'utf8');
+    const res = await runCli(['setup', '--config', configPath, '--policy', join(dir, 'missing.yaml')]);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('cannot read policy file');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(existsSync(sidecarFor(configPath))).toBe(false);
+  }, 30_000);
+
+  it('an invalid policy exits 2 (with the pointer lines) and leaves the config untouched', async () => {
+    const dir = tmpDir('mcp-rec-setup-policy-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const before = readFileSync(configPath, 'utf8');
+    const policyPath = join(dir, 'policy.yaml');
+    writeFileSync(policyPath, 'version: 1\nmcp:\n  rules:\n    - match: { tool: x }\n      action: nope\n');
+    const res = await runCli(['setup', '--config', configPath, '--policy', policyPath, '--json']);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('invalid policy');
+    expect(res.stderr).toContain('/mcp/rules/0/action');
+    expect(res.stdout).toBe('');
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+  }, 30_000);
+
+  it('a policy without an mcp section exits 2', async () => {
+    const dir = tmpDir('mcp-rec-setup-policy-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const policyPath = join(dir, 'policy.yaml');
+    writeFileSync(policyPath, 'version: 1\negress:\n  default: deny\n');
+    const res = await runCli(['setup', '--config', configPath, '--policy', policyPath]);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('no `mcp` section');
+  }, 30_000);
+});

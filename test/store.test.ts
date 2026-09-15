@@ -22,6 +22,7 @@ import type {
   ChainRecord,
   HeadSignature,
   IdentityContext,
+  PolicyDecisionEvent,
   ServerContext,
   SessionEndEvent,
   SessionStartEvent,
@@ -160,6 +161,74 @@ function twoSessionFixture(): ChainRecord[] {
     sessionEnd(SESSION_A, '2026-06-11T10:00:03.000Z'),
     sessionStart(SESSION_B, '2026-06-11T11:00:00.000Z'),
     toolCall(SESSION_B, '2026-06-11T11:00:01.000Z', 'get_file_contents', { requestId: 1 }),
+  ]);
+}
+
+/* --- Gateway mode (additive v1): a denied call is a tool_call with is_error
+ * + error.type policy_denied, preceded by a policy_decision event that
+ * carries NO top-level is_error. */
+const SESSION_G = '33333333-3333-4333-8333-333333333333';
+
+function policyDecision(sessionId: string, timestamp: string, requestId: number): PolicyDecisionEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: sessionId,
+    timestamp,
+    kind: 'policy_decision',
+    identity: IDENTITY,
+    server: SERVER,
+    attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny', 'cresec.policy.rule_id': 'no-exfil' },
+    decision: 'deny',
+    tool: 'http_post',
+    request_id: requestId,
+    rule_id: 'no-exfil',
+    policy_hash: sha256Ref('policy bytes'),
+    args_hash: sha256Ref('{"url":"https://evil.example"}'),
+  };
+}
+
+function deniedToolCall(sessionId: string, timestamp: string, requestId: number): ToolCallEvent {
+  const ev = toolCall(sessionId, timestamp, 'http_post', { isError: true, requestId });
+  ev.error = { type: 'policy_denied' };
+  ev.attributes['error.type'] = 'policy_denied';
+  ev.gateway = { decision: 'deny', rule_id: 'no-exfil' };
+  return ev;
+}
+
+/** One gateway session: an allowed call, a denied call (decision + synthetic tool_call), a held-then-approved call. */
+function gatewaySessionFixture(): ChainRecord[] {
+  const allowed = toolCall(SESSION_G, '2026-06-11T12:00:01.000Z', 'read_note', { requestId: 1 });
+  allowed.gateway = { decision: 'allow', boundary: { scanned: true, action: 'none', secrets_found: 0, injection_found: 0 } };
+  const approvedDecision: PolicyDecisionEvent = {
+    ...policyDecision(SESSION_G, '2026-06-11T12:00:03.000Z', 3),
+    decision: 'hold',
+    outcome: 'approved',
+    tool: 'send_mail',
+    rule_id: 'needs-human',
+    approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
+    waited_ms: 1500,
+    approver: 'alice',
+  };
+  const approved = toolCall(SESSION_G, '2026-06-11T12:00:04.000Z', 'send_mail', { requestId: 3 });
+  approved.gateway = {
+    decision: 'hold',
+    rule_id: 'needs-human',
+    outcome: 'approved',
+    approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
+    waited_ms: 1500,
+    boundary: { scanned: true, action: 'redact', secrets_found: 1, injection_found: 0, secret_refs: [sha256Ref('AKIAIOSFODNN7EXAMPLE')], delivered_result_hash: sha256Ref('delivered') },
+  };
+  const start = sessionStart(SESSION_G, '2026-06-11T12:00:00.000Z');
+  start.policy = { hash: sha256Ref('policy bytes'), name: 'laptop' };
+  return seal([
+    start,
+    allowed,
+    policyDecision(SESSION_G, '2026-06-11T12:00:02.000Z', 2),
+    deniedToolCall(SESSION_G, '2026-06-11T12:00:02.001Z', 2),
+    approvedDecision,
+    approved,
+    sessionEnd(SESSION_G, '2026-06-11T12:00:05.000Z'),
   ]);
 }
 
@@ -344,6 +413,42 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(b.event_count).toBe(2);
     expect(b.tool_call_count).toBe(1);
     expect(b.error_count).toBe(0);
+  });
+
+  it('sessions() counts a gateway session: a denied call is 1 tool call + 1 error, policy_decision adds only to event_count', () => {
+    const store = open();
+    const records = gatewaySessionFixture();
+    store.append(records);
+
+    const sessions = store.sessions();
+    expect(sessions).toHaveLength(1);
+    const g = sessions[0]!;
+    expect(g.session_id).toBe(SESSION_G);
+    expect(g.started_at).toBe('2026-06-11T12:00:00.000Z');
+    expect(g.ended_at).toBe('2026-06-11T12:00:05.000Z');
+    expect(g.server_name).toBe('github-mcp');
+    // 7 events: start, allowed, decision, denied, decision, approved, end.
+    expect(g.event_count).toBe(7);
+    // allowed + denied + approved — the two policy_decision events are not tool calls.
+    expect(g.tool_call_count).toBe(3);
+    // exactly the denied call (policy_decision carries no is_error).
+    expect(g.error_count).toBe(1);
+
+    // The new kind round-trips through the store byte-exactly and the chain still verifies.
+    const back = [...store.iterate({ sessionId: SESSION_G })].map((r) => r.event);
+    expect(back.map((e) => e.kind)).toEqual([
+      'session_start',
+      'tool_call',
+      'policy_decision',
+      'tool_call',
+      'policy_decision',
+      'tool_call',
+      'session_end',
+    ]);
+    expect(back[2]).toEqual(records[2]!.event);
+    expect('is_error' in back[2]!).toBe(false);
+    expect((back[3] as ToolCallEvent).gateway).toEqual({ decision: 'deny', rule_id: 'no-exfil' });
+    expect((back[0] as SessionStartEvent).policy).toEqual({ hash: sha256Ref('policy bytes'), name: 'laptop' });
   });
 
   it('signatures round-trip in insertion order', () => {

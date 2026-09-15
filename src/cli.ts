@@ -11,16 +11,25 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import { Recorder } from './capture/recorder.js';
+import { sha256Hex } from './chain/hash.js';
 import { Signer, publicKeyHexFromPem } from './chain/keys.js';
 import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
 import { BUNDLE_FILES, exportBundle } from './export/bundle.js';
 import { readZipEntries } from './export/unzip.js';
+import { HoldError, HoldStore } from './gateway/holds.js';
+import type { HoldDecision, HoldRecord } from './gateway/holds.js';
+import type { GatewayOptions } from './gateway/options.js';
+import { PolicyLoadError, parsePolicyText, sourceForPath } from './policy/load.js';
+import type { LoadedPolicy } from './policy/load.js';
+import { bundleFileOrder, compileToRego } from './policy/rego.js';
+import { formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
+import type { PolicyError } from './policy/validate.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
 import { queryStore } from './query/touched.js';
@@ -56,21 +65,49 @@ import type {
   VerifyProblem,
   VerifyResult,
 } from './types.js';
-import { FILES } from './types.js';
+import { ENV, FILES } from './types.js';
 import { verifyRecords, verifyStore } from './verify/verify.js';
 import type { VerifyOpts } from './verify/verify.js';
 import { VERSION } from './version.js';
 
 type Flags = Record<string, string | boolean | undefined>;
 
-const SUBCOMMANDS = ['record', 'verify', 'query', 'sessions', 'ui', 'export', 'http', 'setup'] as const;
+const SUBCOMMANDS = [
+  'record',
+  'verify',
+  'query',
+  'sessions',
+  'ui',
+  'export',
+  'http',
+  'setup',
+  'policy',
+  'holds',
+  'approve',
+  'deny',
+] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
 const HELP = `@edut/mcp-recorder v${VERSION} — black-box flight recorder for MCP
 
 Usage:
-  mcp-recorder [record] [flags] -- <server command...>
-      transparent stdio proxy: forwards bytes unchanged, records redacted events
+  mcp-recorder [record] [flags] [--policy FILE] -- <server command...>
+      transparent stdio proxy: forwards bytes unchanged, records redacted events.
+      With --policy FILE (or MCP_RECORDER_POLICY) it becomes a GATEWAY: every
+      tools/call is allowed / held / denied per the policy and tool results
+      pass through the boundary filter (see docs/gateway.md). A policy that
+      cannot be loaded exits 2 before the server is spawned (fail closed)
+  mcp-recorder policy validate FILE [--json]
+      check a policy.yaml against schema v1 (exit 0 valid, 1 invalid, 2 unreadable)
+  mcp-recorder policy compile FILE [--target rego] [--out DIR]
+      compile a policy.yaml to an OPA bundle for the Cresec control plane;
+      without --out the MCP module (cresec/mcp/...) is printed to stdout
+  mcp-recorder holds    [--data-dir D] [--all] [--json]
+      list tools/call requests a gateway is holding for approval
+      (--all includes decided / expired ones)
+  mcp-recorder approve  <id> [--data-dir D]
+  mcp-recorder deny     <id> [--data-dir D]
+      decide a held call; <id> may be a unique prefix, as 'holds' prints it
   mcp-recorder verify   [--data-dir D] [--bundle PATH] [--public-key K] [--allow-unsigned] [--json]
       verify the hash chain + head signatures (exit 1 on failure); --bundle
       accepts a .zip or a bundle directory. By default pins to
@@ -92,13 +129,15 @@ Usage:
       transparent streamable-HTTP proxy in front of an HTTP MCP server
   mcp-recorder setup    --client <claude-desktop|claude-code|cursor> [--config PATH]
                         [--wrapper local|npx|wsl] [--only N,...] [--except N,...]
-                        [--data-dir D] [--dry-run] [--undo] [--json]
+                        [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]
       wrap every stdio MCP server in a client's config behind this recorder,
       safely (timestamped backup + sidecar) and reversibly (--undo). --config
-      overrides the resolved path and makes --client optional. Inside WSL,
-      when the resolved config belongs to a Windows-side client, --wrapper
-      wsl is auto-selected (spawns the wrapped server via wsl.exe so a
-      Windows client can actually launch it) unless --wrapper is given
+      overrides the resolved path and makes --client optional. --policy FILE
+      bakes '--policy <absolute path>' into every wrapped entry (gateway
+      mode). Inside WSL, when the resolved config belongs to a Windows-side
+      client, --wrapper wsl is auto-selected (spawns the wrapped server via
+      wsl.exe so a Windows client can actually launch it) unless --wrapper
+      is given
   mcp-recorder --help | --version
 
 Flags:
@@ -107,6 +146,12 @@ Flags:
   --redact M      redaction mode: allowlist | off      (env MCP_RECORDER_REDACT)
   --name NAME     logical server name stamped on events
   --identity L    operator identity label stamped on events
+  --policy FILE   record: policy.yaml to enforce (gateway mode; env MCP_RECORDER_POLICY)
+                   setup: bake '--policy <absolute FILE>' into every wrapped entry
+                   (stdio only: 'http --policy' is rejected)
+  --target T      policy compile: output target, only 'rego' (default)
+                   http: the upstream MCP server URL
+  --all           holds: include decided / expired holds, not just pending ones
   --session ID    select a session (query / ui / export); a unique prefix of
                    the id works too, same as the ids 'sessions' prints
   --public-key K  pin verify to this ed25519 key instead of the default
@@ -114,7 +159,7 @@ Flags:
   --allow-unsigned
                    verify: downgrade an unsigned chain/tail to a warning
                    instead of a failure (still reported, never silent)
-  --json          machine-readable output (verify / query / sessions / setup)
+  --json          machine-readable output (verify / query / sessions / setup / policy validate / holds)
   --client C      setup: claude-desktop | claude-code | cursor
   --config PATH   setup: config file to edit (overrides --client's default)
   --wrapper W     setup: local (default, this install) | npx (published form) |
@@ -127,7 +172,9 @@ Flags:
   --version, -V   show the version and exit
 
 Environment:
-  MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded
+  MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded — and no gateway
+                           enforcement either (it is the kill switch)
+  MCP_RECORDER_POLICY=F    same as 'record --policy F' when the flag is absent
 `;
 
 const FLAG_DEFS = {
@@ -153,6 +200,8 @@ const FLAG_DEFS = {
   except: { type: 'string' },
   'dry-run': { type: 'boolean' },
   undo: { type: 'boolean' },
+  policy: { type: 'string' },
+  all: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } as const;
@@ -441,6 +490,85 @@ function waitForShutdownSignal(): Promise<void> {
   });
 }
 
+/* ------------------------------ policy files ------------------------------
+ * Shared by `record --policy` (fail closed: exit 2 before the server spawns),
+ * `policy validate|compile` and `setup --policy`. The file is read here
+ * rather than through loadPolicyFile so the three failure classes map onto
+ * distinct exit codes: unreadable (2, thrown), unparseable / invalid (an
+ * error list the caller prints, exit 1 for the inspection commands), valid.
+ */
+
+type PolicyRead = { ok: true; loaded: LoadedPolicy } | { ok: false; errors: PolicyError[] };
+
+/**
+ * `--policy FILE`, else `MCP_RECORDER_POLICY`, resolved to an absolute path
+ * (record is launched by MCP clients from arbitrary working directories).
+ * Empty values count as absent.
+ */
+function resolvePolicyPath(flags: Flags, env: NodeJS.ProcessEnv): string | undefined {
+  const flag = asStr(flags.policy);
+  const raw = flag !== undefined && flag !== '' ? flag : env[ENV.POLICY];
+  if (raw === undefined || raw === '') return undefined;
+  return resolve(raw);
+}
+
+/** Read + parse + validate a policy file. Throws (exit 2) only when the file cannot be read. */
+function readPolicyForCli(path: string, what: string): PolicyRead {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    return err(`${what}: cannot read policy file ${path}: ${msg}`);
+  }
+  const source = sourceForPath(path);
+  let doc: Record<string, unknown>;
+  try {
+    doc = parsePolicyText(bytes.toString('utf8'), source, path);
+  } catch (cause) {
+    if (!(cause instanceof PolicyLoadError)) throw cause;
+    // PolicyLoadError messages are "<path>: <detail>"; keep just the detail
+    // so the error line reads like every other "<pointer>: <message>" one.
+    const prefix = `${path}: `;
+    const detail = cause.message.startsWith(prefix) ? cause.message.slice(prefix.length) : cause.message;
+    return { ok: false, errors: [{ path: '', message: detail, keyword: source }] };
+  }
+  const result = validatePolicyObject(doc);
+  if (!result.ok) return { ok: false, errors: result.errors };
+  const loaded: LoadedPolicy = { policy: result.policy, hash: 'sha256:' + sha256Hex(bytes), source, path };
+  if (result.policy.name !== undefined) loaded.name = result.policy.name;
+  return { ok: true, loaded };
+}
+
+/** "  <pointer>: <message>" lines, one per error, for the human output. */
+function indentedPolicyErrors(errors: readonly PolicyError[]): string[] {
+  return formatPolicyErrors(errors)
+    .split('\n')
+    .map((line) => `  ${line}`);
+}
+
+/**
+ * Load the policy a gateway will enforce. FAIL CLOSED: any problem is a
+ * usage error (exit 2) raised BEFORE the wrapped server is spawned — a
+ * broken or missing policy must never silently degrade to "allow
+ * everything". A policy without an `mcp` section has nothing the stdio
+ * gateway could enforce, so it is refused the same way.
+ */
+function loadGatewayPolicy(path: string): LoadedPolicy {
+  const read = readPolicyForCli(path, 'policy');
+  if (!read.ok) {
+    const n = read.errors.length;
+    return err(
+      `policy: ${path}: invalid policy (${n} error${n === 1 ? '' : 's'})\n` +
+        indentedPolicyErrors(read.errors).join('\n'),
+    );
+  }
+  if (read.loaded.policy.mcp === undefined) {
+    return err(`policy: ${path}: policy has no \`mcp\` section — nothing for the gateway to enforce`);
+  }
+  return read.loaded;
+}
+
 /* ------------------------------ subcommands ------------------------------ */
 
 async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
@@ -452,6 +580,29 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
   // server from spawning. Bad --redact/--store values fall back to defaults.
   const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
   for (const w of warnings) diag(w);
+
+  // Gateway mode is the ONE deliberate exception to fail-open, and it is
+  // decided here, before any store is opened or any process spawned: an
+  // operator who asked for enforcement gets enforcement or a clear exit 2.
+  // MCP_RECORDER_DISABLE=1 is the documented kill switch — it turns the
+  // gateway off along with recording (pure passthrough, said out loud).
+  const policyPath = resolvePolicyPath(flags, process.env);
+  let gateway: GatewayOptions | undefined;
+  if (policyPath !== undefined) {
+    if (config.disabled) {
+      diag(
+        `MCP_RECORDER_DISABLE=1 — gateway disabled too (kill switch): policy ${policyPath} is NOT enforced, ` +
+          'pure passthrough',
+      );
+    } else {
+      const policy = loadGatewayPolicy(policyPath);
+      // The holds dir is created lazily by HoldStore (0700) on the first
+      // hold, independent of the evidence store: a store that fails to open
+      // degrades recording to passthrough but never enforcement.
+      gateway = { policy, holdStore: new HoldStore(config.dataDir) };
+    }
+  }
+
   const setup = await setupProxyRecording(config);
 
   const exitCode = await runStdioProxy({
@@ -460,6 +611,7 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
     redactor: setup.redactor,
     ...(config.serverName !== undefined ? { serverName: config.serverName } : {}),
     ...(config.identityLabel !== undefined ? { identityLabel: config.identityLabel } : {}),
+    ...(gateway !== undefined ? { gateway } : {}),
     proxyVersion: VERSION,
   });
   writeRunSummary(setup);
@@ -469,6 +621,11 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
 async function cmdHttp(flags: Flags): Promise<void> {
   const targetUrl = asStr(flags.target) ?? err('http: --target URL is required');
   const port = parsePort(flags.port);
+  // Gateway mode is stdio-only in v1. Refusing (rather than ignoring the
+  // flag) keeps an operator from believing enforcement is on when it is not.
+  if (resolvePolicyPath(flags, process.env) !== undefined) {
+    err('http: gateway mode is available for the stdio transport only (drop --policy / MCP_RECORDER_POLICY)');
+  }
   installUncaughtExceptionGuard();
   // Lenient: nothing about recording configuration may prevent the proxy
   // from standing up. Bad --redact/--store values fall back to defaults.
@@ -1091,6 +1248,226 @@ async function cmdExport(flags: Flags): Promise<void> {
   }
 }
 
+/* ------------------------- policy validate / compile ----------------------- */
+
+function printPolicyInvalid(path: string, errors: readonly PolicyError[], jsonOut: boolean): void {
+  // Exit code BEFORE printing, for the same EPIPE reason as cmdVerify.
+  process.exitCode = 1;
+  if (jsonOut) {
+    out(JSON.stringify({ path, valid: false, errors }, null, 2));
+    return;
+  }
+  out(`${path}: invalid`);
+  for (const line of indentedPolicyErrors(errors)) out(line);
+}
+
+function policyRuleCounts(loaded: LoadedPolicy): { mcp: number; egress: number } {
+  return {
+    mcp: loaded.policy.mcp?.rules.length ?? 0,
+    egress: loaded.policy.egress?.rules.length ?? 0,
+  };
+}
+
+async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
+  guardStdoutEpipe();
+  const usage =
+    'usage: mcp-recorder policy validate <file> [--json] | mcp-recorder policy compile <file> [--target rego] [--out DIR]';
+  const verb = positionals[0] ?? err(`policy: missing <validate|compile> (${usage})`);
+  if (verb !== 'validate' && verb !== 'compile') {
+    err(`policy: unknown verb '${verb}' (expected 'validate' or 'compile'; ${usage})`);
+  }
+  const fileArg = positionals[1] ?? err(`policy ${verb}: missing <file> (${usage})`);
+  if (positionals.length > 2) {
+    err(`policy ${verb}: unexpected argument '${positionals[2]}' (${usage})`);
+  }
+  const jsonOut = flags.json === true;
+  const path = resolve(fileArg);
+
+  if (verb === 'validate') {
+    const read = readPolicyForCli(path, 'policy validate');
+    if (!read.ok) {
+      printPolicyInvalid(path, read.errors, jsonOut);
+      return;
+    }
+    const counts = policyRuleCounts(read.loaded);
+    if (jsonOut) {
+      out(
+        JSON.stringify(
+          {
+            path,
+            valid: true,
+            ...(read.loaded.name !== undefined ? { name: read.loaded.name } : {}),
+            hash: read.loaded.hash,
+            source: read.loaded.source,
+            mcp_rules: counts.mcp,
+            egress_rules: counts.egress,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    out(`${path}: valid (${counts.mcp} mcp rules, ${counts.egress} egress rules)`);
+    return;
+  }
+
+  // compile
+  const target = asStr(flags.target) ?? 'rego';
+  if (target !== 'rego') err(`policy compile: invalid --target '${target}' (expected 'rego')`);
+  const read = readPolicyForCli(path, 'policy compile');
+  if (!read.ok) {
+    printPolicyInvalid(path, read.errors, jsonOut);
+    return;
+  }
+  const bundle = compileToRego(read.loaded.policy, {
+    policyHash: read.loaded.hash,
+    ...(read.loaded.name !== undefined ? { policyName: read.loaded.name } : {}),
+    toolVersion: VERSION,
+  });
+  const files = bundle.files;
+  const order = bundleFileOrder(files);
+
+  const outDir = asStr(flags.out);
+  if (outDir !== undefined) {
+    const dir = resolve(outDir);
+    for (const rel of order) {
+      // Bundle paths are '/'-separated and produced by the compiler itself
+      // (never user input); join per segment so subdirs land right on win32.
+      const abs = join(dir, ...rel.split('/'));
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, files[rel]!);
+    }
+    out(`wrote ${order.length} file(s) to ${dir}`);
+    for (const rel of order) out(`  ${rel}`);
+    return;
+  }
+
+  // Without --out: the MCP module alone, located in the compiler's own file
+  // map (never a hard-coded name): the module published under cresec/mcp/,
+  // else the .rego whose basename names mcp.
+  const mcpPath = mcpModulePath(order);
+  if (mcpPath === undefined) err('policy compile: the compiler produced no MCP (cresec/mcp/) module');
+  process.stdout.write(files[mcpPath]!);
+}
+
+/** The MCP Rego module's path inside a compiled bundle's file list, if any. */
+function mcpModulePath(paths: readonly string[]): string | undefined {
+  return (
+    paths.find((p) => p.startsWith('cresec/mcp/')) ??
+    paths.find((p) => p.endsWith('.rego') && /(^|\/)[^/]*mcp[^/]*\.rego$/.test(p))
+  );
+}
+
+/* --------------------------- holds / approve / deny ------------------------ */
+
+/** "12s", "3m", "2h", "1d" — coarse, for the AGE / TIMEOUT columns. */
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** ms until `iso`, or undefined when the timestamp does not parse. */
+function msUntil(iso: string, now: number): number | undefined {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? undefined : t - now;
+}
+
+async function cmdHolds(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+  const config = resolveConfig({ flags, env: process.env });
+  const all = flags.all === true;
+  // Read-only: a missing holds dir is simply "no holds" (never created here).
+  const holds = new HoldStore(config.dataDir).list({ all });
+  if (flags.json === true) {
+    out(JSON.stringify(holds, null, 2));
+    return;
+  }
+  if (holds.length === 0) {
+    out(all ? 'no holds recorded' : 'no pending holds');
+    return;
+  }
+  const now = Date.now();
+  const timeoutCell = (h: HoldRecord): string => {
+    if (h.status !== 'pending') return '-';
+    const left = msUntil(h.timeout_at, now);
+    if (left === undefined) return '?';
+    return left <= 0 ? 'expired' : formatDuration(left);
+  };
+  const ageCell = (h: HoldRecord): string => {
+    const since = msUntil(h.created_at, now);
+    return since === undefined ? '?' : formatDuration(-since);
+  };
+  const headers = ['ID', 'AGE', 'SERVER', 'TOOL', 'RULE', 'TIMEOUT', ...(all ? ['STATUS'] : [])];
+  out(
+    formatTable(
+      headers,
+      holds.map((h) => [
+        id8(h.approval_id),
+        ageCell(h),
+        h.server,
+        h.tool,
+        h.rule_id ?? '(default)',
+        timeoutCell(h),
+        ...(all ? [h.status] : []),
+      ]),
+    ),
+  );
+}
+
+/**
+ * `approve <id>` / `deny <id>`: resolve an exact id or a unique prefix (the
+ * 8-char form `holds` prints), then flip the pending hold file. Exit 2 on
+ * usage / ambiguity (names the candidates), 1 when the hold does not exist
+ * or is no longer pending, 0 with one confirmation line otherwise. The
+ * deciding OS user is recorded best-effort (HoldStore fills it in).
+ */
+async function cmdDecide(flags: Flags, positionals: string[], decision: HoldDecision): Promise<void> {
+  guardStdoutEpipe();
+  const verb = decision === 'approved' ? 'approve' : 'deny';
+  const raw = positionals[0] ?? err(`${verb}: missing <id> (usage: mcp-recorder ${verb} <id> [--data-dir D])`);
+  if (positionals.length > 1) err(`${verb}: unexpected argument '${positionals[1]}'`);
+  const config = resolveConfig({ flags, env: process.env });
+  const holdStore = new HoldStore(config.dataDir);
+
+  const resolved = holdStore.resolveId(raw);
+  if (!resolved.ok) {
+    if (resolved.reason === 'ambiguous') {
+      const candidates = holdStore
+        .list({ all: true })
+        .filter((h) => h.approval_id.startsWith(raw))
+        .map((h) => `${id8(h.approval_id)} (${h.tool}, ${h.status})`);
+      err(
+        `${verb}: '${raw}' is ambiguous — it matches ${candidates.length} holds: ${candidates.join(', ')}` +
+          ' (give more of the id)',
+      );
+    }
+    diag(`error: ${verb}: no hold matches '${raw}' in ${holdStore.dir} (see 'mcp-recorder holds --all')`);
+    process.exitCode = 1;
+    return;
+  }
+
+  let rec: HoldRecord;
+  try {
+    rec = holdStore.decide(resolved.id, decision);
+  } catch (cause) {
+    if (cause instanceof HoldError && (cause.code === 'not_pending' || cause.code === 'not_found')) {
+      diag(`error: ${verb}: ${cause.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw cause;
+  }
+  const rule = rec.rule_id !== undefined ? ` (rule ${rec.rule_id})` : '';
+  const by = rec.decided_by !== undefined ? ` by ${rec.decided_by}` : '';
+  out(`${decision} ${rec.approval_id}: ${rec.tool} on ${rec.server}${rule}${by}`);
+}
+
 /* --------------------------------- setup ---------------------------------
  * `mcp-recorder setup` rewrites a client config's `mcpServers` entries to run
  * behind this recorder. cli.ts owns every filesystem side effect and exit
@@ -1340,6 +1717,29 @@ async function cmdSetup(flags: Flags): Promise<void> {
   const only = parseNameList(asStr(flags['only']));
   const except = parseNameList(asStr(flags['except']));
 
+  // --policy: resolved to an absolute path (clients launch servers from
+  // arbitrary cwds) and validated NOW — every wrapped server would otherwise
+  // exit 2 at launch (record --policy fails closed), which is a worse place
+  // to discover a typo. Ignored on --undo. Only the flag counts here, never
+  // MCP_RECORDER_POLICY: setup writes a config, it does not run a recorder.
+  const policyFlag = asStr(flags.policy);
+  let policyPath: string | undefined;
+  if (!isUndo && policyFlag !== undefined && policyFlag !== '') {
+    policyPath = resolve(policyFlag);
+    const read = readPolicyForCli(policyPath, 'setup --policy');
+    if (!read.ok) {
+      diag(`error: setup --policy ${policyPath}: invalid policy`);
+      for (const line of indentedPolicyErrors(read.errors)) diag(line);
+      process.exitCode = 2;
+      return;
+    }
+    if (read.loaded.policy.mcp === undefined) {
+      diag(`error: setup --policy ${policyPath}: policy has no \`mcp\` section — nothing for the gateway to enforce`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+
   // Cheap (env vars + one /proc/version read, no process spawned) — safe to
   // always compute, unlike windowsHomeCandidates() below which may shell
   // out to cmd.exe and is only invoked lazily, when actually needed.
@@ -1417,6 +1817,7 @@ async function cmdSetup(flags: Flags): Promise<void> {
   if (only !== undefined) wrapOpts.only = only;
   if (except !== undefined) wrapOpts.except = except;
   if (wslInfo.distro !== undefined) wrapOpts.wslDistro = wslInfo.distro;
+  if (policyPath !== undefined) wrapOpts.policyPath = policyPath;
 
   const plan = planWrap(servers, wrapOpts);
 
@@ -1516,6 +1917,14 @@ async function main(): Promise<void> {
       return cmdHttp(flags);
     case 'setup':
       return cmdSetup(flags);
+    case 'policy':
+      return cmdPolicy(flags, positionals);
+    case 'holds':
+      return cmdHolds(flags);
+    case 'approve':
+      return cmdDecide(flags, positionals, 'approved');
+    case 'deny':
+      return cmdDecide(flags, positionals, 'denied');
   }
 }
 

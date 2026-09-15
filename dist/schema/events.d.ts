@@ -144,8 +144,8 @@ export interface GatewayOutcome {
     decision: GatewayDecision;
     /** Matching rule id (capped identifier); absent when the section default applied. */
     rule_id?: string;
-    /** Holds only. */
-    outcome?: Exclude<HoldOutcome, 'session_end'>;
+    /** Holds only. `session_end` = the proxy shut down while the call was still held. */
+    outcome?: HoldOutcome;
     /** Holds only: the approval id the operator saw in `mcp-recorder holds`. */
     approval_id?: string;
     /** Holds only: how long the call was parked before it was resolved. */

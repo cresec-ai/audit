@@ -31,6 +31,17 @@ export { renderTimelineHtml, MAX_EMBED_EVENTS } from './replay/render.js';
 export { serveUi } from './replay/serve.js';
 /* export */
 export { exportBundle, BUNDLE_FILES } from './export/bundle.js';
+/* policy.yaml v1: types, schema, validation, loading, engine, Rego compiler */
+export { DEFAULTS as POLICY_DEFAULTS, ID_PATTERN as POLICY_ID_PATTERN, LIMITS as POLICY_LIMITS, REGEX_VALUE_CAP, autoRuleId, normalizePolicy, } from './policy/types.js';
+export { POLICY_SCHEMA, POLICY_SCHEMA_ID } from './policy/schema.js';
+export { validateAgainstSchema } from './policy/jsonschema.js';
+export { checkGlob, checkRe2Subset, formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
+export { PolicyLoadError, PolicyValidationError, findNonJsonValue, loadPolicyFile, parsePolicyText, sourceForPath, } from './policy/load.js';
+export { compileGlob, globMatch, globToRegExp } from './policy/glob.js';
+export { evaluateEgress, evaluateMcp, getPath, ruleLabel } from './policy/engine.js';
+export { bundleFileOrder, compileToRego, policyRevision, renderEgressModule, renderMcpModule, } from './policy/rego.js';
+/* gateway primitives (record --policy): boundary filter, injection markers, hold store */
+export { INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, applyBoundary, blockedText, defaultSecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
 /* config + version */
 export { resolveConfig } from './config.js';
 export { VERSION } from './version.js';

@@ -434,7 +434,6 @@ describe('validatePolicyObject: error paths', () => {
       ['[[:alpha:]]', /POSIX character classes/],
       ['abc\\', /dangling backslash/],
       ['(unclosed', /invalid regular expression/],
-      ['(?i)abc', /invalid regular expression/],
       ['a{2,1}', /invalid regular expression/],
     ];
     for (const [pattern, why] of bad) {
@@ -456,6 +455,50 @@ describe('validatePolicyObject: error paths', () => {
       '',
     ];
     for (const pattern of good) expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+  });
+
+  it('args regexes: every "(?" group that is not "(?:" (or a named group) is rejected explicitly, whatever V8 accepts', () => {
+    // RE2 accepts inline flags, Node 20 rejects them all, Node 24's V8 accepts the "(?i:...)" modifier form:
+    // the validator must decide on its own, before (and independently of) `new RegExp`.
+    const flagGroups: Array<[string, string]> = [
+      ['(?i)abc', '(?i'],
+      ['abc(?i)', '(?i'],
+      ['(?s)a.b', '(?s'],
+      ['(?m)^a$', '(?m'],
+      ['(?U)a*', '(?U'],
+      ['(?is)ab', '(?i'],
+      ['(?i:abc)', '(?i'],
+      ['x(?i:abc)y', '(?i'],
+      ['(?s:.)', '(?s'],
+      ['(?m:^a)', '(?m'],
+      ['(?U:a*)', '(?U'],
+      ['(?-i:abc)', '(?-'],
+      ['(?i-s:abc)', '(?i'],
+      ['(?P<name>x)', '(?P'],
+      ['(?#comment)x', '(?#'],
+      ['(?>x)', '(?>'],
+      ['(?|x)', '(?|'],
+      ['(?)', '(?)'],
+      ['a(?', '(?'],
+      ['[a](?i)b', '(?i'],
+    ];
+    for (const [pattern, shown] of flagGroups) {
+      const why = checkRe2Subset(pattern);
+      expect(why, pattern).toMatch(/^group "\(\?.*" is not supported \(RE2 subset\): only "\(\?:" non-capturing groups are allowed/);
+      expect(why, pattern).toContain(`group ${JSON.stringify(shown)}`);
+      expect(why, pattern).not.toMatch(/invalid regular expression/);
+      expectError(errorsFor((d) => (rule0(d).match.args = { url: pattern })), '/mcp/rules/0/match/args/url', 'regex', /only "\(\?:" non-capturing groups/);
+    }
+    // Inside a character class "(?" is literal in both engines and stays allowed.
+    expect(checkRe2Subset('[(?i]+')).toBeUndefined();
+    expect(checkRe2Subset('\\(\\?i')).toBeUndefined();
+    // Plain non-capturing and named groups are still fine, nested or repeated.
+    for (const pattern of ['(?:a(?:b|c))+', '(?<year>[0-9]{4})-(?<m>[0-9]{2})', '(?:x)(?<n>y)(?:z)']) {
+      expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+    }
+    // The lookaround messages keep their own, more specific wording.
+    expect(checkRe2Subset('(?=x)')).toMatch(/^lookahead/);
+    expect(checkRe2Subset('(?<=x)')).toMatch(/^lookbehind/);
   });
 
   it('max_args_bytes / max_body_bytes: integer >= 0', () => {
