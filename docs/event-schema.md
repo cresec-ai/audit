@@ -213,6 +213,7 @@ Every event carries these fields:
 | `identity` | `IdentityContext` | Who acted. |
 | `server` | `ServerContext` | What was wrapped. |
 | `attributes` | `Attributes` | Flat semconv-named attribute bag. |
+| `source` | `'hook'?` | Additive, optional (schema stays v1). Set to `'hook'` when this event was captured by `mcp-recorder hook` (a Claude Code PreToolUse/PostToolUse/SessionEnd/Stop hook) rather than the stdio/http proxy tap. Undefined on every proxy-captured event. See [Hook-sourced events](#hook-sourced-events-additive) below. |
 
 `EventKind` is one of: `session_start`, `initialize`, `tool_call`, `rpc`,
 `notification`, `protocol_error`, `session_end`.
@@ -255,8 +256,9 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
-| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. |
+| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; `mcp-recorder hook` uses `'policy_denied'` for a call its `--policy` denied — see [Hook-sourced events](#hook-sourced-events-additive). |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
+| `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
 
 ### `rpc`
 
@@ -320,6 +322,52 @@ event's `tool`/`method` is whatever was captured for the pending request — alr
 capped (`structuralString`, see [Privacy posture](#privacy-posture)) at the point the
 request was first seen, so an unanswered call with an oversized/malformed name or
 method is just as capped here as in a normal completed event.
+
+---
+
+## Hook-sourced events (additive)
+
+`mcp-recorder hook` (see [docs/hooks.md](hooks.md)) turns Claude Code
+PreToolUse/PostToolUse/SessionEnd/Stop hook invocations into events using
+the exact same `session_start` / `tool_call` / `session_end` / `notification`
+shapes above — no new event kind was needed. `Stop` (the end of an agent
+turn, which fires many times per session) becomes a `notification` event
+with `method: 'claude-code/stop'` and `direction: 'client_to_server'`, so
+that a session still has exactly one `session_end` (from `SessionEnd`). Three additive, optional fields distinguish a
+hook-sourced event and its finer shape, none of which change any existing
+field:
+
+- **`EventBase.source: 'hook'`** — set on every event `mcp-recorder hook`
+  emits; undefined on every proxy-captured event.
+- **`ToolCallEvent.phase: 'pre' | 'post'`** — a hook-sourced tool call is two
+  separate, separately-timestamped events (one per hook invocation) sharing
+  one `request_id` (Claude Code's own `tool_use_id`), rather than the single
+  request+response-correlated event the proxy records. `'pre'` carries
+  redacted arguments with `result: null` and `duration_ms: 0`; `'post'`
+  carries the redacted result and the measured `duration_ms`.
+- **`ToolCallEvent.error.type: 'policy_denied'`** — a new value under the
+  already free-form `error.type` string field (no schema change), set when
+  `mcp-recorder hook --policy FILE` denies a PreToolUse call; `error.message_ref`
+  is the hash of the policy rule's `reason`.
+
+`SessionEndEvent.reason` is a **frozen closed union**
+(`'child_exit' | 'stdin_closed' | 'signal' | 'error'`) with no member for
+either of Claude Code's own `SessionEnd` reasons — additive-only means
+picking the closest *existing* value rather than inventing a new one, so a
+hook-sourced `session_end` reuses `'stdin_closed'` for the hook's own
+`'logout'` reason and `'child_exit'` for everything else (`'clear'`/
+`'resume'`/`'prompt_input_exit'`/`'other'`). `source: 'hook'`
+is what actually distinguishes these from a proxy-captured `session_end` —
+`reason` alone should not be read as "the wrapped process exited" for a
+hook-sourced event.
+
+`ServerContext.transport` stays `'stdio'` for hook-sourced events (the
+closest existing value — a hook invocation is not literally a stdio pipe
+the way `record`'s proxy is, but it is not an HTTP transport either, and the
+union is frozen the same way); `server.name`/`server.command` follow
+[docs/hooks.md](hooks.md#what-gets-recorded)'s own naming (the MCP server a
+tool call went to, or `'claude-code'` for a built-in tool or a session-level
+event).
 
 ---
 
