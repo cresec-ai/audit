@@ -37,6 +37,7 @@
     "test:watch": "vitest",
     "bench": "tsx bench/latency.ts",
     "demo": "tsx demo/run.ts",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {

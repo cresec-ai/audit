@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "corp-notes": {
+      "command": "npx",
+      "args": [
+        "tsx", "src/cli.ts", "record",
+        "--data-dir", ".mcp-recorder",
+        "--name", "corp-notes",
+        "--",
+        "npx", "tsx", "demo/server.ts"
+      ]
+    },
+    "repo-filesystem": {
+      "command": "npx",
+      "args": [
+        "tsx", "src/cli.ts", "record",
+        "--data-dir", ".mcp-recorder",
+        "--name", "repo-filesystem",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
+      ]
+    }
+  }
+}

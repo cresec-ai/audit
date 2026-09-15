@@ -11,13 +11,47 @@ AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--", "npx", "-y
 
 That's the whole integration. The proxy forwards bytes unchanged, fails open (recording failure never breaks traffic), and adds <5ms p50 latency.
 
-- **License:** GPL-3.0 · **Node:** >= 18.17 · **Binary:** `mcp-recorder`
+- **License:** GPL-3.0 · **Node:** >= 18.17 (macOS/Linux — Windows not yet) · **Binary:** `mcp-recorder`
 
 ---
+
+## Install
+
+`@edut/mcp-recorder` is not on npm yet, so `npx -y @edut/mcp-recorder` doesn't
+resolve for anyone today. Install from the git repository instead — `npm
+install` builds it for you, no manual build step:
+
+```sh
+npm install -g github:cresec-ai/audit#claude/p0-subagents-scoping-qibt2p
+mcp-recorder --version
+```
+
+Then wrap every stdio server in a client's config with one command
+(`--dry-run` first to preview):
+
+```sh
+mcp-recorder setup --client claude-desktop --dry-run
+mcp-recorder setup --client claude-desktop
+```
+
+Or hand the whole thing to Claude: give Claude Desktop or Claude Code a
+prompt asking it to install from git, run `setup --dry-run`, show you the
+diff, then apply it — Claude just needs a shell/terminal or config-file
+access to do this for you.
+
+Full instructions (manual JSON edits per client, uninstall, troubleshooting)
+are in **[docs/install.md](docs/install.md)**.
 
 ## 60-second quickstart
 
 ### 1. Wrap a server
+
+The snippets below use the `npx -y @edut/mcp-recorder` form, which is what
+you'll use **once the package is published to npm**. Until then, use the
+**local wrapper** form instead — absolute paths to `node` and this
+install's `dist/cli.js` — either by running `mcp-recorder setup` (above) or
+by hand; see [docs/install.md](docs/install.md#wrap-your-servers) for the
+exact before/after JSON for each client.
 
 **Claude Desktop** — `claude_desktop_config.json`:
 
@@ -80,12 +114,12 @@ Traffic flows through untouched. Every tool call lands in `~/.mcp-recorder` as a
 ### 3. Look at what happened
 
 ```sh
-npx @edut/mcp-recorder sessions          # what ran, when, by whom
-npx @edut/mcp-recorder ui                # HTML replay timeline in your browser
-npx @edut/mcp-recorder verify            # prove the record is intact
-npx @edut/mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
-npx @edut/mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
-npx @edut/mcp-recorder verify --bundle evidence.zip   # what the stranger runs (or `node verify.cjs` inside the bundle)
+mcp-recorder sessions          # what ran, when, by whom
+mcp-recorder ui                # HTML replay timeline in your browser
+mcp-recorder verify            # prove the record is intact
+mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
+mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
+mcp-recorder verify --bundle evidence.zip   # what the stranger runs (or `node verify.cjs` inside the bundle)
 ```
 
 ---
@@ -159,6 +193,8 @@ npm run demo
 ```
 
 A scripted prompt-injection exfiltration — an agent is tricked into reading a credential and sending it out through an innocent-looking tool — recorded, reconstructed on the replay timeline, blast-radius-queried, and cryptographically verified, in under a minute. It is the fastest way to see what the recorder is for.
+
+Want to see the same story with a real model instead of the scripted agent? [docs/red-team.md](docs/red-team.md) walks through running it live in Claude Desktop.
 
 ---
 
