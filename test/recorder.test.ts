@@ -173,7 +173,9 @@ describe('Recorder', () => {
   it('fails open when the store throws: never rejects, counts drops, sets storeFailed', async () => {
     const store = new FakeStore();
     store.failAppend = true;
-    const rec = new Recorder({ store, signer: new FakeSigner() });
+    // A permanent failure walks the whole retry ladder (~6s of real timers);
+    // this test is about the fail-open outcome, not the backoff.
+    const rec = new Recorder({ store, signer: new FakeSigner(), retryDelaysMs: [] });
 
     for (let i = 1; i <= 100; i++) rec.record(makeEvent(i));
     await expect(rec.flush()).resolves.toBeUndefined();

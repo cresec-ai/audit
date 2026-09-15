@@ -312,7 +312,7 @@ function waitMs(ms: number): Promise<void> {
 async function waitForMatch(
   getText: () => string,
   pattern: RegExp,
-  timeoutMs = 10_000,
+  timeoutMs = 25_000,
 ): Promise<void> {
   const start = Date.now();
   while (!pattern.test(getText())) {

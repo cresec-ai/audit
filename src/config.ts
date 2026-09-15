@@ -20,7 +20,7 @@
  * inspection commands create it via whichever store/signer they open.
  */
 
-import { chmodSync, mkdirSync, statSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ENV } from './types.js';
@@ -54,13 +54,26 @@ function pick(
 /** Ensure the data directory exists with private (0o700) permissions — it
  * holds the ed25519 signing key. */
 export function ensureDataDir(dataDir: string): void {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  // mkdirSync never changes the mode of a directory that already exists (an
-  // earlier inspection command, or the user, may have created it under a
-  // wider umask), and this directory holds the private signing key and the
-  // evidence — tighten it. Best effort: chmod fails on a dir we do not own.
+  let existed = true;
   try {
-    if ((statSync(dataDir).mode & 0o077) !== 0) chmodSync(dataDir, 0o700);
+    statSync(dataDir);
+  } catch {
+    existed = false;
+  }
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  if (!existed || process.platform === 'win32') return;
+  // A directory that already existed is left as the user made it — it may
+  // be shared on purpose (a team evidence dir with group access, a mounted
+  // volume) — but it holds the private signing key and the evidence, so a
+  // group/world-accessible mode gets one warning.
+  try {
+    const mode = statSync(dataDir).mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      process.stderr.write(
+        `[mcp-recorder] warning: data dir ${dataDir} is group/world accessible (mode ${mode.toString(8)}); ` +
+          'it holds the signing key and the evidence — chmod 700 it unless it is shared on purpose\n',
+      );
+    }
   } catch {
     /* best effort */
   }

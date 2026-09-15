@@ -440,7 +440,17 @@ function flagName(arg: string): string | undefined {
  *  without the username, must still find it. */
 function stripUrlUserinfo(
   s: string,
-): { stripped: string; userinfo: string; username: string; password: string } | undefined {
+):
+  | {
+      stripped: string;
+      userinfo: string;
+      username: string;
+      password: string;
+      rawUserinfo: string;
+      rawUsername: string;
+      rawPassword: string;
+    }
+  | undefined {
   let url: URL;
   try {
     url = new URL(s);
@@ -448,12 +458,29 @@ function stripUrlUserinfo(
     return undefined;
   }
   if (!url.username && !url.password) return undefined;
-  const userinfo = url.password ? `${url.username}:${url.password}` : url.username;
+  // The URL parser hands back the percent-encoded userinfo; a password with
+  // @ : / # ? % or a space must be encoded to be a valid URL at all. Decode
+  // so a blast-radius query for the password as the operator knows it
+  // matches; the raw form is fingerprinted too when it differs.
+  const decode = (s: string): string => {
+    try {
+      return decodeURIComponent(s);
+    } catch {
+      return s;
+    }
+  };
+  const username = decode(url.username);
+  const password = decode(url.password);
+  const userinfo = password ? `${username}:${password}` : username;
+  const rawUserinfo = url.password ? `${url.username}:${url.password}` : url.username;
   return {
     stripped: `${url.protocol}//${url.host}${url.pathname}`,
     userinfo,
-    username: url.username,
-    password: url.password,
+    username,
+    password,
+    rawUserinfo,
+    rawUsername: url.username,
+    rawPassword: url.password,
   };
 }
 
@@ -484,20 +511,42 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
   // for the password alone — without knowing the username — still finds it.
   const fingerprintUrlHit = (
     name: string,
-    hit: { userinfo: string; username: string; password: string },
+    hit: {
+      userinfo: string;
+      username: string;
+      password: string;
+      rawUserinfo: string;
+      rawUsername: string;
+      rawPassword: string;
+    },
   ): void => {
-    fingerprint(name, hit.userinfo);
-    if (hit.password) fingerprint(name, hit.password);
-    if (hit.username) fingerprint(name, hit.username);
+    const seen = new Set<string>();
+    const once = (value: string): void => {
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      fingerprint(name, value);
+    };
+    once(hit.userinfo);
+    once(hit.password);
+    once(hit.username);
+    // Percent-encoded forms, when they differ, so a search for either matches.
+    once(hit.rawUserinfo);
+    once(hit.rawPassword);
+    once(hit.rawUsername);
   };
 
   for (let i = 0; i < argv.length; i++) {
     const el = argv[i]!;
 
-    // --flag=value half.
+    // --flag=value half — and NAME=value elements without a dash, the way
+    // `env DSN=postgres://user:pass@host server` (or a KEY=value before npx)
+    // launches a server from a client config: the value half gets the same
+    // treatment either way.
     const eq = el.indexOf('=');
-    if (eq > 0 && el.startsWith('-')) {
-      const fname = flagName(el.slice(0, eq));
+    const isFlagAssign = eq > 0 && el.startsWith('-');
+    const isEnvAssign = eq > 0 && /^[A-Za-z_][\w.-]*$/.test(el.slice(0, eq));
+    if (isFlagAssign || isEnvAssign) {
+      const fname = isFlagAssign ? flagName(el.slice(0, eq)) : el.slice(0, eq);
       const value = el.slice(eq + 1);
       const label = fname ?? `argv[${i}]`;
 

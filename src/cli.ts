@@ -579,6 +579,13 @@ function inflateZipEntry(buf: Buffer, localHeaderOffset: number, method: number,
     try {
       return inflateRawSync(compressed, { maxOutputLength: ZIP_MAX_ENTRY_BYTES });
     } catch (cause) {
+      const code = (cause as NodeJS.ErrnoException).code;
+      if (code === 'ERR_BUFFER_TOO_LARGE' || /larger than/i.test((cause as Error).message)) {
+        err(
+          `${name} inflates past the ${ZIP_MAX_ENTRY_BYTES / (1024 * 1024)} MiB limit of verify --bundle on a .zip; ` +
+            'extract the archive and run verify --bundle on the directory (or node verify.cjs inside it)',
+        );
+      }
       err(`malformed ZIP: cannot inflate ${name}: ${(cause as Error).message}`);
     }
   }

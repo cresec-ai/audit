@@ -20,7 +20,7 @@
  *      notice on fallback.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { GENESIS_HASH } from '../chain/hash.js';
 import { ENV, FILES } from '../types.js';
@@ -116,8 +116,30 @@ export function openStore(opts: OpenStoreOpts): EvidenceStore {
  * running `sessions` on a directory nothing has ever recorded to.
  */
 export function openStoreReadOnly(opts: OpenStoreOpts): EvidenceStore {
+  // Only a data dir that genuinely does not exist counts as "nothing has
+  // been recorded here". A dir we cannot read, or a path that is not a
+  // directory, must be an error — otherwise `verify`/`sessions` would
+  // report an empty PASS / "no sessions" for evidence they simply cannot see.
+  let exists = true;
+  try {
+    const st = statSync(opts.dataDir);
+    if (!st.isDirectory()) {
+      throw new Error(`mcp-recorder: data dir ${opts.dataDir} is not a directory`);
+    }
+    readdirSync(opts.dataDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      exists = false;
+    } else if (err instanceof Error && err.message.startsWith('mcp-recorder:')) {
+      throw err;
+    } else {
+      throw new Error(
+        `mcp-recorder: cannot read data dir ${opts.dataDir}: ${(err as Error).message}`,
+      );
+    }
+  }
   const backend = opts.backend ?? envBackend();
-  const existing = existingBackendFiles(opts.dataDir);
+  const existing = exists ? existingBackendFiles(opts.dataDir) : { sqlite: false, jsonl: false };
   if (backend !== undefined) {
     const present = backend === 'sqlite' ? existing.sqlite : existing.jsonl;
     return present ? openStore(opts) : emptyStore(opts.dataDir, backend);

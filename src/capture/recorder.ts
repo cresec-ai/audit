@@ -24,6 +24,8 @@ export interface RecorderOpts {
   signer: SignerLike | null;
   /** Sign the chain head after every flush (default true). */
   signEveryFlush?: boolean;
+  /** Backoff (ms) before each retry of a failed batch; tests pass [] for none. */
+  retryDelaysMs?: readonly number[];
 }
 
 /**
@@ -58,6 +60,7 @@ export class Recorder implements RecorderLike {
   private readonly store: EvidenceStore | null;
   private readonly signer: SignerLike | null;
   private readonly signEveryFlush: boolean;
+  private readonly retryDelaysMs: readonly number[];
 
   private queue: AnyEvent[] = [];
   private flushScheduled = false;
@@ -78,6 +81,7 @@ export class Recorder implements RecorderLike {
     this.store = opts.store;
     this.signer = opts.signer;
     this.signEveryFlush = opts.signEveryFlush ?? true;
+    this.retryDelaysMs = opts.retryDelaysMs ?? RETRY_DELAYS_MS;
   }
 
   /** Hot path: O(1), never throws. */
@@ -130,8 +134,8 @@ export class Recorder implements RecorderLike {
         break;
       } catch (err) {
         lastErr = err;
-        if (attempt >= RETRY_DELAYS_MS.length) break; // every retry spent
-        await sleep(RETRY_DELAYS_MS[attempt]!);
+        if (attempt >= this.retryDelaysMs.length) break; // every retry spent
+        await sleep(this.retryDelaysMs[attempt]!);
       }
     }
 

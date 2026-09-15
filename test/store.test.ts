@@ -827,3 +827,25 @@ describe('data dir hygiene', () => {
     third.close();
   });
 });
+
+describe('openStoreReadOnly on a data dir it cannot use', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-ro-err-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('throws when the data dir path is a regular file instead of a directory', () => {
+    const notADir = join(dir, 'evidence-file');
+    writeFileSync(notADir, 'not a directory');
+    expect(() => openStoreReadOnly({ dataDir: notADir })).toThrow(/not a directory/);
+  });
+
+  it('still treats a missing dir under a missing parent as nothing recorded', () => {
+    const store = openStoreReadOnly({ dataDir: join(dir, 'missing', 'deeper') });
+    expect(store.count()).toBe(0);
+    expect(existsSync(join(dir, 'missing'))).toBe(false);
+  });
+});

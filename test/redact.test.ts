@@ -657,3 +657,30 @@ describe('scrubArgv: wrapped command argv leak fix (P1)', () => {
     expect(out.fingerprints).toEqual([]);
   });
 });
+
+describe('scrubArgv: NAME=value elements and encoded userinfo', () => {
+  it('scrubs a URL with userinfo in an env-style NAME=value element (env DSN=... server)', () => {
+    const redactor = new Redactor({ mode: 'allowlist' });
+    const { command, fingerprints } = scrubArgv(
+      ['env', 'DSN=postgres://dbuser:S3cretPw@db.internal:5432/app', 'server', '--format=json'],
+      redactor,
+    );
+    expect(command).toBe('env DSN=postgres://db.internal:5432/app server --format=json');
+    expect(command).not.toContain('S3cretPw');
+    expect(fingerprints.map((f) => f.ref)).toContain(redactor.hashString('S3cretPw'));
+    expect(fingerprints.every((f) => f.name === 'DSN')).toBe(true);
+  });
+
+  it('fingerprints the decoded password (and the raw form) for percent-encoded userinfo', () => {
+    const redactor = new Redactor({ mode: 'allowlist' });
+    const { command, fingerprints } = scrubArgv(
+      ['server', '--dsn=postgres://alice:p%40ss%3Aw0rd@db/app'],
+      redactor,
+    );
+    expect(command).toBe('server --dsn=postgres://db/app');
+    const refs = fingerprints.map((f) => f.ref);
+    expect(refs).toContain(redactor.hashString('p@ss:w0rd'));
+    expect(refs).toContain(redactor.hashString('p%40ss%3Aw0rd'));
+    expect(refs).toContain(redactor.hashString('alice:p@ss:w0rd'));
+  });
+});

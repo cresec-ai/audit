@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,13 +20,32 @@ describe('ensureDataDir', () => {
   });
 
   it.skipIf(process.platform === 'win32')(
-    'tightens a data dir that already exists with a wider mode (it holds the signing key)',
+    'leaves a pre-existing wider-mode dir alone but warns once (it may be shared on purpose)',
     () => {
-      const dataDir = join(dir, 'loose');
+      const dataDir = join(dir, 'shared');
       mkdirSync(dataDir, { mode: 0o755 });
-      expect(statSync(dataDir).mode & 0o777).toBe(0o755);
-      ensureDataDir(dataDir);
-      expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+      const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        ensureDataDir(dataDir);
+        expect(statSync(dataDir).mode & 0o777).toBe(0o755);
+        expect(
+          stderrSpy.mock.calls.some((call) => /group\/world accessible \(mode 755\)/.test(String(call[0]))),
+        ).toBe(true);
+      } finally {
+        stderrSpy.mockRestore();
+      }
     },
   );
+
+  it.skipIf(process.platform === 'win32')('does not warn about a pre-existing private dir', () => {
+    const dataDir = join(dir, 'private');
+    mkdirSync(dataDir, { mode: 0o700 });
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      ensureDataDir(dataDir);
+      expect(stderrSpy).not.toHaveBeenCalled();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
