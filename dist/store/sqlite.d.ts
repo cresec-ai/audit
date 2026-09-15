@@ -12,25 +12,16 @@ import type { AnyEvent, ChainRecord, HeadSignature } from '../schema/events.js';
 import type { ChainHead, EvidenceStore, IterateOpts, SessionSummary } from '../types.js';
 /** True when the optional better-sqlite3 dependency can be loaded. */
 export declare function isSqliteAvailable(): boolean;
-/**
- * How long the one-time open/schema step keeps retrying SQLITE_BUSY. It
- * runs once per process, before any traffic flows, so a generous bound is
- * fine — see the constructor for why `busy_timeout` alone is not enough.
- */
-export declare const INIT_BUSY_DEADLINE_MS = 10000;
-/** better-sqlite3 surfaces lock contention as a SqliteError with this code. */
-export declare function isSqliteBusy(err: unknown): boolean;
-/**
- * Run `fn`, retrying with a short exponential backoff (5 ms doubling up to
- * 100 ms) for as long as it fails with SQLITE_BUSY and the deadline has not
- * passed. Any other error, or a busy error past the deadline, propagates.
- * `sleep`/`now` are injectable for tests.
- */
-export declare function retryWhileBusy<T>(fn: () => T, opts: {
-    deadlineMs: number;
-    sleep?: (ms: number) => void;
-    now?: () => number;
-}): T;
+export interface SqliteStoreOpts {
+    /**
+     * How long opening may wait, in total, for another process's write
+     * transaction to clear (the journal-mode switch and schema creation).
+     * Defaults to {@link OPEN_BUSY_TIMEOUT_MS}; tests lower it.
+     */
+    openTimeoutMs?: number;
+}
+/** Synchronous open-time wait: generous, because it happens once before any traffic flows. */
+export declare const OPEN_BUSY_TIMEOUT_MS = 10000;
 export declare class SqliteStore implements EvidenceStore {
     readonly backend: "sqlite";
     readonly path: string;
@@ -40,7 +31,7 @@ export declare class SqliteStore implements EvidenceStore {
     private readonly insertSigStmt;
     private readonly appendTx;
     private readonly appendEventsTx;
-    constructor(dataDir: string);
+    constructor(dataDir: string, opts?: SqliteStoreOpts);
     head(): ChainHead;
     append(records: ChainRecord[]): void;
     appendEvents(events: AnyEvent[]): ChainRecord[];

@@ -12,14 +12,16 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { Recorder } from './capture/recorder.js';
 import { sha256Hex } from './chain/hash.js';
+import { openConfiguredStore, setupProxyRecording } from './capture/setup.js';
+import type { ProxySetup } from './capture/setup.js';
 import { Signer, publicKeyHexFromPem } from './chain/keys.js';
-import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
+import { resolveConfig, resolveConfigLenient } from './config.js';
 import { BUNDLE_FILES, exportBundle } from './export/bundle.js';
 import { readZipEntries } from './export/unzip.js';
 import { HoldError, HoldStore } from './gateway/holds.js';
@@ -30,10 +32,11 @@ import type { LoadedPolicy } from './policy/load.js';
 import { bundleFileOrder, compileToRego } from './policy/rego.js';
 import { formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
 import type { PolicyError } from './policy/validate.js';
+import { buildHookCommand, planHookInstall, planHookUndo } from './hook/install.js';
+import { runHook } from './hook/run.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
 import { queryStore } from './query/touched.js';
-import { Redactor } from './redact/redactor.js';
 import { renderTimelineHtml } from './replay/render.js';
 import { serveUi } from './replay/serve.js';
 import { CLIENT_KINDS, isClientKind, resolveClientConfigPath } from './setup/client-config.js';
@@ -61,14 +64,11 @@ import {
   structuralUnwrap,
 } from './setup/wrap.js';
 import type { BridgeSpec, McpServersMap, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
-import { openStore, openStoreReadOnly } from './store/index.js';
-import type { AnyEvent, ChainRecord } from './schema/events.js';
+import type { ChainRecord } from './schema/events.js';
 import type {
   BundleManifest,
   EvidenceStore,
   RecorderConfig,
-  RecorderLike,
-  SignerLike,
   VerifyProblem,
   VerifyResult,
 } from './types.js';
@@ -92,6 +92,7 @@ const SUBCOMMANDS = [
   'holds',
   'approve',
   'deny',
+  'hook',
 ] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -152,6 +153,25 @@ Usage:
       would otherwise reach from Anthropic's own servers, never touching
       this machine) into a local entry via 'npx -y mcp-remote URL', then
       wraps that like any other stdio server
+  mcp-recorder hook     [--data-dir D] [--store B] [--policy FILE] [--client NAME] [--all-tools]
+      Claude Code PreToolUse/PostToolUse/SessionEnd/Stop hook handler: reads
+      one hook JSON object on stdin, records a redacted tool_call/session_*
+      event, and (PreToolUse only) prints a policy deny decision when
+      --policy says to. This is the ONLY place a third party gets visibility
+      into Anthropic-hosted connectors (mcp__ClickUp__*, mcp__Gmail__*, ...)
+      that no local MCP proxy can see. Fail-open: never blocks a tool call,
+      never exits non-zero, except a deliberate --policy deny. Only
+      mcp__-prefixed (MCP) tools are recorded by default; --all-tools also
+      records built-ins (Bash, Edit, ...). See docs/hooks.md.
+  mcp-recorder hook install [--settings PATH] [--all-tools] [--policy FILE]
+                        [--data-dir D] [--client NAME] [--command CMD]
+                        [--dry-run] [--undo] [--json]
+      merge PreToolUse/PostToolUse (matcher mcp__.* or .* with --all-tools)
+      and SessionEnd/Stop hook entries running 'hook' into a Claude Code
+      settings file (default .claude/settings.json in cwd; created if
+      missing), safely (timestamped backup) and reversibly (--undo).
+      --command overrides the generated command verbatim (e.g. a
+      repo-relative dogfood form)
   mcp-recorder --help | --version
 
 Flags:
@@ -175,7 +195,9 @@ Flags:
                    verify: downgrade an unsigned chain/tail to a warning
                    instead of a failure (still reported, never silent)
   --json          machine-readable output (verify / query / sessions / setup / policy validate / holds)
-  --client C      setup: claude-desktop | claude-code | cursor
+  --client NAME   setup: claude-desktop | claude-code | cursor
+                   hook / hook install: logical client name stamped on events
+                   (default 'claude-code')
   --config PATH   setup: config file to edit (overrides --client's default)
   --wrapper W     setup: local (default, this install) | npx (published form) |
                    wsl (wsl.exe, auto-selected for a Windows-side config in WSL)
@@ -184,8 +206,14 @@ Flags:
   --bridge NAME=URL[,...]
                    setup: bridge a remote MCP connector as a local NAME
                    entry (via npx -y mcp-remote URL), repeatable
-  --dry-run       setup: print what would change; write nothing
-  --undo          setup: restore the servers this tool wrapped
+  --dry-run       setup / hook install: print what would change; write nothing
+  --undo          setup / hook install: undo what this tool added
+  --policy FILE   hook / hook install: PreToolUse allow/deny policy JSON (see docs/hooks.md)
+  --all-tools     hook / hook install: also record built-in tools (Bash,
+                   Edit, ...), not just mcp__-prefixed MCP tools
+  --settings PATH hook install: settings file to edit (default
+                   .claude/settings.json in cwd)
+  --command CMD   hook install: override the generated hook command verbatim
   --help, -h      show this help and exit
   --version, -V   show the version and exit
 
@@ -222,6 +250,9 @@ const FLAG_DEFS = {
   undo: { type: 'boolean' },
   policy: { type: 'string' },
   all: { type: 'boolean' },
+  'all-tools': { type: 'boolean' },
+  settings: { type: 'string' },
+  command: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } as const;
@@ -326,21 +357,6 @@ function id8(id: string): string {
 }
 
 /**
- * `readOnly: true` (used by the inspection commands — verify/query/sessions/
- * ui/export) resolves the backend without ever creating a store file as a
- * side effect of merely looking: on a data dir where nothing has recorded
- * yet, it returns an empty store instead of the write path's "create
- * whichever backend is available" behavior (see src/store/index.ts).
- */
-function openConfiguredStore(config: RecorderConfig, opts: { readOnly?: boolean } = {}): EvidenceStore {
-  const storeOpts =
-    config.storeBackend !== undefined
-      ? { dataDir: config.dataDir, backend: config.storeBackend }
-      : { dataDir: config.dataDir };
-  return opts.readOnly === true ? openStoreReadOnly(storeOpts) : openStore(storeOpts);
-}
-
-/**
  * Resolve `--session` against the store's session list: an exact id, or a
  * unique prefix of the kind `sessions`/`query`/run summaries print (8 chars
  * onward). An ambiguous or unmatched prefix is a usage error (exit 2) that
@@ -411,82 +427,6 @@ function tryOpenBrowser(url: string): void {
   } catch {
     /* best-effort: never fatal to the ui command */
   }
-}
-
-/** Wrap a recorder so the CLI learns the session id of the first event. */
-function tapSessionId(recorder: Recorder): { recorder: RecorderLike; sessionId(): string | undefined } {
-  let sessionId: string | undefined;
-  const wrapped: RecorderLike = {
-    record(event: AnyEvent): void {
-      if (sessionId === undefined) sessionId = event.session_id;
-      recorder.record(event);
-    },
-    flush: () => recorder.flush(),
-    close: () => recorder.close(),
-    stats: () => recorder.stats(),
-  };
-  return { recorder: wrapped, sessionId: () => sessionId };
-}
-
-interface ProxySetup {
-  recorder: RecorderLike;
-  redactor: Redactor;
-  sessionId(): string | undefined;
-  storePath: string | undefined;
-  stats(): { written: number; dropped: number };
-}
-
-/**
- * Build redactor/store/signer/recorder for a proxy run. ANY init failure is
- * fail-open: warn on stderr and continue as a pure passthrough. This is also
- * where the data directory gets created (moved out of config resolution —
- * see config.ts) so a bad --data-dir/MCP_RECORDER_DATA_DIR degrades to pure
- * passthrough here instead of throwing before the wrapped server can spawn.
- *
- * Store and signer failures are handled separately: a store that can't be
- * opened means nothing can be recorded (full passthrough). A signer that
- * can't be loaded (e.g. a corrupt identity.key) still leaves the store
- * usable — recording continues, just without head signatures.
- */
-async function setupProxyRecording(config: RecorderConfig): Promise<ProxySetup> {
-  const redactor = new Redactor({ mode: config.redactMode });
-  let store: EvidenceStore | null = null;
-  let signer: SignerLike | null = null;
-  if (config.disabled) {
-    diag('MCP_RECORDER_DISABLE=1 — recording disabled, pure passthrough');
-  } else {
-    try {
-      ensureDataDir(config.dataDir);
-      store = openConfiguredStore(config);
-    } catch (cause) {
-      const msg = cause instanceof Error ? cause.message : String(cause);
-      diag(`recording disabled (init failed, traffic unaffected): ${msg}`);
-      try {
-        store?.close();
-      } catch {
-        /* fail-open */
-      }
-      store = null;
-    }
-    if (store !== null) {
-      try {
-        signer = await Signer.load(config.dataDir);
-      } catch (cause) {
-        const msg = cause instanceof Error ? cause.message : String(cause);
-        diag(`recording without head signatures (identity key init failed): ${msg}`);
-        signer = null;
-      }
-    }
-  }
-  const inner = new Recorder({ store, signer });
-  const { recorder, sessionId } = tapSessionId(inner);
-  return {
-    recorder,
-    redactor,
-    sessionId,
-    storePath: store?.path,
-    stats: () => inner.stats(),
-  };
 }
 
 function writeRunSummary(setup: ProxySetup): void {
@@ -629,7 +569,7 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
     }
   }
 
-  const setup = await setupProxyRecording(config);
+  const setup = await setupProxyRecording(config, diag);
 
   const exitCode = await runStdioProxy({
     command: serverCommand,
@@ -666,7 +606,7 @@ async function cmdHttp(flags: Flags): Promise<void> {
   // from standing up. Bad --redact/--store values fall back to defaults.
   const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
   for (const w of warnings) diag(w);
-  const setup = await setupProxyRecording(config);
+  const setup = await setupProxyRecording(config, diag);
 
   const proxy = await runHttpProxy({
     targetUrl,
@@ -1982,6 +1922,227 @@ async function cmdSetup(flags: Flags): Promise<void> {
   printSetupResult(configPath, backup, plan, jsonOut, false, bridgedNames);
 }
 
+/* --------------------------------- hook ----------------------------------
+ * `mcp-recorder hook` is a Claude Code PreToolUse/PostToolUse/SessionEnd/Stop
+ * hook handler — see src/hook/run.ts's file-level doc comment for the full
+ * contract and citations. `mcp-recorder hook install` merges the settings.json
+ * entries that wire it up; see src/hook/install.ts.
+ */
+
+/**
+ * Read all of a stdin stream as UTF-8 text. Bounded by a hard timeout (a
+ * hook's stdin is a short, complete JSON object that Claude Code writes and
+ * closes itself — if that somehow never happens, this command must still
+ * return promptly rather than hang the tool call indefinitely) rather than
+ * relying solely on Claude Code's own hook timeout.
+ */
+function readStdinText(stream: NodeJS.ReadStream): Promise<string> {
+  return new Promise((resolvePromise) => {
+    let data = '';
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolvePromise(data);
+    };
+    try {
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk: string) => {
+        data += chunk;
+      });
+      stream.on('end', finish);
+      stream.on('error', finish); // fail-open: treat a stdin error as "nothing sent"
+      setTimeout(finish, 5_000).unref?.();
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function cmdHook(flags: Flags, positionals: string[]): Promise<void> {
+  if (positionals[0] === 'install') {
+    return cmdHookInstall(flags);
+  }
+  // Fail-open, ALWAYS: nothing below may throw or leave a non-zero exit
+  // code — this command is spawned fresh by Claude Code for every
+  // PreToolUse/PostToolUse/SessionEnd/Stop hook event, and a bug here must
+  // never block a tool call or an agent turn. runHook() itself never
+  // throws; this try/catch is defense in depth around stdin reading and
+  // flag resolution too.
+  try {
+    const stdinText = await readStdinText(process.stdin);
+    const { config } = resolveConfigLenient({ flags, env: process.env });
+    const policyPathRaw = asStr(flags.policy);
+    const result = await runHook(stdinText, {
+      config,
+      clientName: asStr(flags.client) ?? 'claude-code',
+      allTools: flags['all-tools'] === true,
+      proxyVersion: VERSION,
+      ...(policyPathRaw !== undefined ? { policyPath: resolve(policyPathRaw) } : {}),
+    });
+    if (result.stdout !== undefined) process.stdout.write(result.stdout + '\n');
+  } catch {
+    /* fail-open: never let a bug here block a tool call */
+  }
+}
+
+interface HookInstallReport {
+  added: string[];
+  alreadyInstalled: string[];
+  removed: string[];
+}
+
+function printHookInstallResult(
+  settingsPath: string,
+  backup: string | null,
+  report: HookInstallReport,
+  jsonOut: boolean,
+  dryRun: boolean,
+  isUndo: boolean,
+): void {
+  if (jsonOut) {
+    out(JSON.stringify({ settings: settingsPath, backup, ...report }, null, 2));
+    return;
+  }
+  out(`settings: ${settingsPath}`);
+  if (dryRun) out('(dry run — nothing written)');
+  if (isUndo) {
+    out(
+      report.removed.length > 0
+        ? `removed hook entries for: ${report.removed.join(', ')}`
+        : 'nothing to remove',
+    );
+  } else {
+    if (report.added.length > 0) out(`installed hooks for: ${report.added.join(', ')}`);
+    if (report.alreadyInstalled.length > 0) {
+      out(`already installed, left alone: ${report.alreadyInstalled.join(', ')}`);
+    }
+    if (report.added.length === 0 && report.alreadyInstalled.length === 0) out('nothing to install');
+  }
+  if (backup !== null) {
+    out('');
+    out(`backup: ${backup}`);
+  }
+}
+
+async function cmdHookInstall(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+
+  const settingsPath = resolve(asStr(flags.settings) ?? join('.claude', 'settings.json'));
+  const dryRun = flags['dry-run'] === true;
+  const isUndo = flags.undo === true;
+  const jsonOut = flags.json === true;
+  const allTools = flags['all-tools'] === true;
+
+  const dataDir = resolve(asStr(flags['data-dir']) ?? join(homedir(), '.mcp-recorder'));
+  const policyPathRaw = asStr(flags.policy);
+  const policyPath = policyPathRaw !== undefined ? resolve(policyPathRaw) : undefined;
+  const clientName = asStr(flags.client);
+
+  const command =
+    asStr(flags.command) ??
+    buildHookCommand({
+      execPath: process.execPath,
+      cliPath: resolveLocalWrapperPath(),
+      dataDir,
+      allTools,
+      ...(policyPath !== undefined ? { policyPath } : {}),
+      ...(clientName !== undefined ? { clientName } : {}),
+    });
+  const matcher = allTools ? '.*' : 'mcp__.*';
+
+  let raw = '{}';
+  const existed = existsSync(settingsPath);
+  if (existed) {
+    try {
+      raw = readFileSync(settingsPath, 'utf8');
+    } catch (cause) {
+      diag(`error: cannot read ${settingsPath}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripBom(raw));
+  } catch (cause) {
+    diag(`error: ${settingsPath} is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    diag(`error: ${settingsPath} does not contain a JSON object`);
+    process.exitCode = 2;
+    return;
+  }
+  const root = parsed as Record<string, unknown>;
+  const indent = detectIndent(raw);
+  const eol = detectEol(raw);
+
+  if (isUndo) {
+    const plan = planHookUndo(root, { command });
+    if (dryRun || plan.removed.length === 0) {
+      printHookInstallResult(
+        settingsPath,
+        null,
+        { added: [], alreadyInstalled: [], removed: plan.removed },
+        jsonOut,
+        dryRun,
+        true,
+      );
+      return;
+    }
+    const backup = writeBackup(settingsPath);
+    writeJsonAtomic(settingsPath, plan.root, indent, eol);
+    printHookInstallResult(
+      settingsPath,
+      backup,
+      { added: [], alreadyInstalled: [], removed: plan.removed },
+      jsonOut,
+      false,
+      true,
+    );
+    return;
+  }
+
+  const plan = planHookInstall(root, { command, matcher });
+  if (dryRun) {
+    printHookInstallResult(
+      settingsPath,
+      null,
+      { added: plan.added, alreadyInstalled: plan.alreadyInstalled, removed: [] },
+      jsonOut,
+      true,
+      false,
+    );
+    return;
+  }
+  if (plan.added.length === 0) {
+    // Idempotent: everything managed was already installed — report it, but
+    // never touch the file (no new backup) and never CREATE a settings file
+    // that didn't already exist just to report "nothing to install".
+    printHookInstallResult(
+      settingsPath,
+      null,
+      { added: [], alreadyInstalled: plan.alreadyInstalled, removed: [] },
+      jsonOut,
+      false,
+      false,
+    );
+    return;
+  }
+  const backup = existed ? writeBackup(settingsPath) : null;
+  writeJsonAtomic(settingsPath, plan.root, indent, eol);
+  printHookInstallResult(
+    settingsPath,
+    backup,
+    { added: plan.added, alreadyInstalled: plan.alreadyInstalled, removed: [] },
+    jsonOut,
+    false,
+    false,
+  );
+}
+
 /* -------------------------------- dispatch ------------------------------- */
 
 async function main(): Promise<void> {
@@ -2050,6 +2211,8 @@ async function main(): Promise<void> {
       return cmdDecide(flags, positionals, 'approved');
     case 'deny':
       return cmdDecide(flags, positionals, 'denied');
+    case 'hook':
+      return cmdHook(flags, positionals);
   }
 }
 

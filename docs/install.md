@@ -457,10 +457,16 @@ local for the recorder to sit in front of.
 The way to record such a server today is `--bridge`: it reaches the *same*
 remote MCP endpoint, but from your machine, through the
 [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, so it
-becomes a local stdio entry `setup` can wrap like any other. First-party
-Anthropic-hosted connectors — Google Drive, Gmail, Calendar — have no public
-MCP endpoint of their own to bridge to; only third-party remote MCP servers
-(ClickUp and similar) can be bridged this way.
+becomes a local stdio entry `setup` can wrap like any other. Google Drive,
+Gmail and Calendar are served from Google-hosted MCP endpoints as well
+(`drivemcp`, `gmailmcp` and `calendarmcp.googleapis.com`, as seen in a Claude
+Code cloud session's connector wiring), but whether an independent OAuth
+client such as `mcp-remote` can authorise against them is untested; the GitHub
+connector has no vendor endpoint at all. Inside Claude Code (CLI, IDE, Desktop
+Code tab, cloud sessions) the recorder sees every connector call anyway,
+through Claude Code's own hooks: see [docs/hooks.md](hooks.md). The full
+picture of what can and cannot be seen or controlled per surface is in
+[docs/connector-coverage.md](connector-coverage.md).
 
 ### Bridge a remote MCP server
 
