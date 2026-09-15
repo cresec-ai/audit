@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
@@ -15,6 +15,7 @@ import type {
   RpcEvent,
   Scrubbed,
   SessionEndEvent,
+  SessionStartEvent,
   ToolCallEvent,
 } from '../src/schema/events.js';
 import type {
@@ -356,5 +357,219 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
     expect(end?.reason).toBe('child_exit');
     expect(end?.child_exit_code).toBe(3);
+  });
+
+  it('a spawn failure (ENOENT) exits 127 and records spawn_error', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const code = await runStdioProxy({
+      command: ['/definitely/not/a/real/binary-xyz'],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    expect(code).toBe(127);
+    const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
+    expect(end?.reason).toBe('error');
+    expect(end?.spawn_error).toBe('ENOENT');
+  });
+
+  it('a child killed by a signal exits 128+<signal number> and records child_signal', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const code = await runStdioProxy({
+      command: [process.execPath, '-e', "process.kill(process.pid, 'SIGKILL')"],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    expect(code).toBe(128 + 9); // SIGKILL = 9 on POSIX
+    const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
+    expect(end?.child_signal).toBe('SIGKILL');
+  });
+
+  it('EPIPE on the proxy stdout does not crash the proxy, and a session_end is still written', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stderr = new PassThrough();
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    // Simulates the MCP client closing its read end mid-session: the first
+    // write (the initialize response) succeeds, every write after that
+    // fails with EPIPE (the server's follow-up notification, in this case).
+    let writes = 0;
+    const stdout = new Writable({
+      write(_chunk, _enc, cb) {
+        writes++;
+        if (writes > 1) {
+          const err = new Error('write EPIPE') as NodeJS.ErrnoException;
+          err.code = 'EPIPE';
+          cb(err);
+          return;
+        }
+        cb();
+      },
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    stdin.write(JSON.stringify(CLIENT_SCRIPT[0]) + '\n'); // initialize
+    await new Promise((r) => setTimeout(r, 300));
+    stdin.end(); // echo-server exits once stdin ends
+
+    const exitCode = await done; // must resolve, not hang or throw
+    expect(exitCode).toBe(0);
+
+    const end = store.events().find((e): e is SessionEndEvent => e.kind === 'session_end');
+    expect(end).toBeDefined();
+  });
+
+  it('keeps numeric and string JSON-RPC ids distinct in the pending-request map', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    // id 1 (number) and id "1" (string) are distinct JSON-RPC ids in flight
+    // at once; a key scheme that collapses them would misroute one response
+    // to the other's pending entry and orphan the other.
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n');
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: '1',
+        method: 'tools/call',
+        params: { name: 'echo', arguments: {} },
+      }) + '\n',
+    );
+    await waitFor(() => out.lines().length >= 2, 'both responses');
+    stdin.end();
+    await done;
+
+    const events = store.events();
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+
+    const rpc = events.find((e): e is RpcEvent => e.kind === 'rpc' && e.method === 'tools/list');
+    expect(rpc?.request_id).toBe(1);
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call?.request_id).toBe('1');
+  });
+
+  it('deriveServerName skips runner flags (npx -y <pkg> shape)', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    stdout.on('data', () => {
+      /* drain */
+    });
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    // 'node' is a known runner; '-y' must be skipped when deriving the
+    // server name, the same shape as the README's own `npx -y <pkg>`
+    // wrapping (deriveServerName previously returned '-y' itself here).
+    const done = runStdioProxy({
+      command: [process.execPath, '-y', ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.end();
+    await done;
+
+    const start = store.events().find((e): e is SessionStartEvent => e.kind === 'session_start');
+    expect(start?.server.name).toBe('echo-server.cjs');
+  });
+
+  it('a tools/call still pending at shutdown yields a tool_call event with error.type "unanswered"', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    stdout.on('data', () => {
+      /* drain */
+    });
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      // Reads the request and simply never replies.
+      command: [process.execPath, '-e', "process.stdin.once('data', () => {})"],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'delete_everything', arguments: { path: '/' } },
+      }) + '\n',
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    stdin.end();
+    await done;
+
+    const events = store.events();
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call).toBeDefined();
+    expect(call!.tool).toBe('delete_everything');
+    expect(call!.request_id).toBe(7);
+    expect(call!.is_error).toBe(true);
+    expect(call!.error?.type).toBe('unanswered');
+    expect(call!.result).toBeNull();
+    expect(call!.result_hash).toBe(sha256Ref(canonicalJson(null)));
+    expect(call!.duration_ms).toBeGreaterThan(0);
+
+    // Also present, before session_end, so the trace is never silently lost.
+    const end = events.find((e): e is SessionEndEvent => e.kind === 'session_end');
+    expect(events.indexOf(call!)).toBeLessThan(events.indexOf(end!));
   });
 });

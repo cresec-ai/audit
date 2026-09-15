@@ -282,4 +282,57 @@ describe('mcp-recorder CLI', () => {
     expect(res.code).toBe(1);
     expect(res.stderr).toContain('nothing to export');
   }, 60_000);
+
+  it('an invalid MCP_RECORDER_REDACT value warns and falls back instead of failing to spawn', async () => {
+    const dataDir = tmpDir('mcp-rec-badenv-');
+    const child = spawnCli(['--data-dir', dataDir, '--', 'node', ECHO_SERVER], {
+      MCP_RECORDER_REDACT: 'bogus',
+    });
+    const stderrText = collect(child.stderr);
+    await driveSession(child);
+    const exitCode = await waitExit(child);
+    expect(exitCode).toBe(0);
+    expect(stderrText()).toContain("invalid redact mode 'bogus'");
+    expect(stderrText()).toContain("using 'allowlist'");
+
+    const sessions = await runCli(['sessions', '--data-dir', dataDir, '--json']);
+    const list = JSON.parse(sessions.stdout) as Array<{ tool_call_count: number }>;
+    expect(list).toHaveLength(1);
+    expect(list[0]!.tool_call_count).toBe(1);
+  }, 60_000);
+
+  it('an invalid MCP_RECORDER_STORE value warns and falls back instead of failing to spawn', async () => {
+    const dataDir = tmpDir('mcp-rec-badstore-');
+    const child = spawnCli(['--data-dir', dataDir, '--', 'node', ECHO_SERVER], {
+      MCP_RECORDER_STORE: 'postgres',
+    });
+    const stderrText = collect(child.stderr);
+    await driveSession(child);
+    const exitCode = await waitExit(child);
+    expect(exitCode).toBe(0);
+    expect(stderrText()).toContain("invalid store backend 'postgres'");
+  }, 60_000);
+
+  it('an unwritable --data-dir still spawns the server and exits with its code (fail-open)', async () => {
+    const child = spawnCli([
+      '--data-dir',
+      '/dev/null/mcp-recorder-not-a-real-dir',
+      '--',
+      'node',
+      '-e',
+      'process.exit(5)',
+    ]);
+    const stderrText = collect(child.stderr);
+    child.stdin!.end();
+    const exitCode = await waitExit(child);
+    expect(exitCode).toBe(5);
+    expect(stderrText()).toContain('recording disabled (init failed, traffic unaffected)');
+  }, 30_000);
+
+  it('a command that cannot be spawned (ENOENT) exits 127', async () => {
+    const dataDir = tmpDir('mcp-rec-enoent-');
+    const res = await runCli(['--data-dir', dataDir, '--', '/definitely/not/a/real/binary-xyz']);
+    expect(res.code).toBe(127);
+    expect(res.stderr).toContain('failed to run');
+  }, 30_000);
 });

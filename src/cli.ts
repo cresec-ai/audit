@@ -16,7 +16,7 @@ import { parseArgs } from 'node:util';
 
 import { Recorder } from './capture/recorder.js';
 import { Signer } from './chain/keys.js';
-import { resolveConfig } from './config.js';
+import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
 import { exportBundle } from './export/bundle.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
@@ -98,7 +98,29 @@ function err(msg: string): never {
 }
 
 function diag(msg: string): void {
-  process.stderr.write(`[mcp-recorder] ${msg}\n`);
+  try {
+    process.stderr.write(`[mcp-recorder] ${msg}\n`);
+  } catch {
+    /* even diagnostics are fail-open */
+  }
+}
+
+/**
+ * Last-resort safety net for record/http mode: an exception that somehow
+ * escapes every other fail-open guard must never take the wrapped server's
+ * traffic down with it. Logs once, best-effort, and keeps the process alive.
+ */
+let uncaughtGuardInstalled = false;
+let uncaughtLogged = false;
+function installUncaughtExceptionGuard(): void {
+  if (uncaughtGuardInstalled) return;
+  uncaughtGuardInstalled = true;
+  process.on('uncaughtException', (error: unknown) => {
+    if (uncaughtLogged) return;
+    uncaughtLogged = true;
+    const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    diag(`uncaught exception (recording degraded, traffic unaffected): ${detail}`);
+  });
 }
 
 function out(msg: string): void {
@@ -163,7 +185,15 @@ interface ProxySetup {
 
 /**
  * Build redactor/store/signer/recorder for a proxy run. ANY init failure is
- * fail-open: warn on stderr and continue as a pure passthrough.
+ * fail-open: warn on stderr and continue as a pure passthrough. This is also
+ * where the data directory gets created (moved out of config resolution —
+ * see config.ts) so a bad --data-dir/MCP_RECORDER_DATA_DIR degrades to pure
+ * passthrough here instead of throwing before the wrapped server can spawn.
+ *
+ * Store and signer failures are handled separately: a store that can't be
+ * opened means nothing can be recorded (full passthrough). A signer that
+ * can't be loaded (e.g. a corrupt identity.key) still leaves the store
+ * usable — recording continues, just without head signatures.
  */
 async function setupProxyRecording(config: RecorderConfig): Promise<ProxySetup> {
   const redactor = new Redactor({ mode: config.redactMode });
@@ -173,8 +203,8 @@ async function setupProxyRecording(config: RecorderConfig): Promise<ProxySetup> 
     diag('MCP_RECORDER_DISABLE=1 — recording disabled, pure passthrough');
   } else {
     try {
+      ensureDataDir(config.dataDir);
       store = openConfiguredStore(config);
-      signer = await Signer.load(config.dataDir);
     } catch (cause) {
       const msg = cause instanceof Error ? cause.message : String(cause);
       diag(`recording disabled (init failed, traffic unaffected): ${msg}`);
@@ -184,7 +214,15 @@ async function setupProxyRecording(config: RecorderConfig): Promise<ProxySetup> 
         /* fail-open */
       }
       store = null;
-      signer = null;
+    }
+    if (store !== null) {
+      try {
+        signer = await Signer.load(config.dataDir);
+      } catch (cause) {
+        const msg = cause instanceof Error ? cause.message : String(cause);
+        diag(`recording without head signatures (identity key init failed): ${msg}`);
+        signer = null;
+      }
     }
   }
   const inner = new Recorder({ store, signer });
@@ -231,7 +269,11 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
   if (serverCommand.length === 0) {
     err("record: missing server command (usage: mcp-recorder [record] [flags] -- <command...>)");
   }
-  const config = resolveConfig({ flags, env: process.env });
+  installUncaughtExceptionGuard();
+  // Lenient: nothing about recording configuration may prevent the wrapped
+  // server from spawning. Bad --redact/--store values fall back to defaults.
+  const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
+  for (const w of warnings) diag(w);
   const setup = await setupProxyRecording(config);
 
   const exitCode = await runStdioProxy({
@@ -249,7 +291,11 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
 async function cmdHttp(flags: Flags): Promise<void> {
   const targetUrl = asStr(flags.target) ?? err('http: --target URL is required');
   const port = parsePort(flags.port);
-  const config = resolveConfig({ flags, env: process.env });
+  installUncaughtExceptionGuard();
+  // Lenient: nothing about recording configuration may prevent the proxy
+  // from standing up. Bad --redact/--store values fall back to defaults.
+  const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
+  for (const w of warnings) diag(w);
   const setup = await setupProxyRecording(config);
 
   const proxy = await runHttpProxy({
@@ -543,6 +589,6 @@ async function main(): Promise<void> {
 
 main().catch((cause: unknown) => {
   const msg = cause instanceof Error ? cause.message : String(cause);
-  process.stderr.write(`[mcp-recorder] error: ${msg}\n`);
+  diag(`error: ${msg}`);
   process.exit(2);
 });

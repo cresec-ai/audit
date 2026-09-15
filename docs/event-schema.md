@@ -63,7 +63,7 @@ Identity context stamped on **every** event ("identity-stamp everything").
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `fingerprint` | `Sha256Ref` | Stable identity hash for the acting agent/credential pair: sha256 over (os_user, hostname, client_name, client_version, label). |
+| `fingerprint` | `Sha256Ref` | Stable identity hash for the acting agent/credential pair: sha256 over (os_user, hostname, label, initial server name) — the context known at proxy startup, before the MCP `initialize` handshake. `client_name`/`client_version` are learned later from that handshake and are **not** part of the fingerprint. |
 | `os_user` | `string?` | OS user running the proxy. |
 | `hostname` | `string?` | Host the proxy ran on. |
 | `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. |
@@ -192,6 +192,19 @@ Proxy shutting down (child exit, stdin close, or signal).
 | `child_exit_code` | `number \| null?` | Exit code of the wrapped server, when known. |
 | `events_recorded` | `number` | Events successfully written this session. |
 | `events_dropped` | `number` | Events lost to fail-open recording (store failure, backpressure). |
+| `spawn_error` | `string?` | errno code (e.g. `ENOENT`, `EACCES`) when the wrapped command could not be spawned at all (`reason: 'error'`). The proxy's own exit code is mapped from this: `ENOENT` → 127, `EACCES` → 126, anything else → 1. |
+| `child_signal` | `string?` | Signal name (e.g. `SIGKILL`) when the wrapped process was terminated by a signal. The proxy's own exit code is `128 + <signal number>` in that case. |
+
+Before `session_end` is recorded, any request still awaiting a response when the
+session ends (the wrapped server crashed or was killed mid-call, or the client
+disconnected mid-handshake) is flushed as one synthetic event per pending
+request, so the chain never silently drops in-flight work: a `tools/call`
+becomes a `tool_call` event, everything else (including an unanswered
+`initialize`) becomes an `rpc` event. Both are marked `is_error: true`,
+`error: { type: 'unanswered' }`, `result_hash` is the hash of canonical `null`
+(a `tool_call` also sets `result: null`), and `duration_ms` is measured from
+the request crossing the proxy to session shutdown. `error.type` is an
+existing free-form string field, so this needed no schema change.
 
 ---
 
