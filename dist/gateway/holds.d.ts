@@ -77,6 +77,20 @@ export declare class HoldError extends Error {
 }
 /** Default poll interval for `waitForDecision`. */
 export declare const DEFAULT_POLL_MS = 200;
+/** Total wall-clock budget for {@link renameRetrying} before the error propagates. */
+export declare const RENAME_RETRY_BUDGET_MS = 1000;
+export interface RenameRetryDeps {
+    rename: (from: string, to: string) => void;
+    sleep: (ms: number) => void;
+    now: () => number;
+}
+/**
+ * `renameSync(from, to)` that retries the transient Windows sharing errors
+ * above with exponential backoff (2, 4, 8, … 50 ms) for at most
+ * {@link RENAME_RETRY_BUDGET_MS}. Every other error, and a transient one
+ * that outlives the budget, is thrown unchanged.
+ */
+export declare function renameRetrying(from: string, to: string, deps?: RenameRetryDeps): void;
 export declare class HoldStore {
     /** `<dataDir>/holds` */
     readonly dir: string;

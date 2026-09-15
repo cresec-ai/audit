@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_POLL_MS, HoldError, HoldStore, type HoldCreateInput } from '../src/gateway/index.js';
+import { RENAME_RETRY_BUDGET_MS, renameRetrying } from '../src/gateway/holds.js';
 import { spawnTsx } from './helpers/tsx.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -298,6 +299,69 @@ describe('HoldStore.waitForDecision', () => {
     expect(seen.length).toBeGreaterThan(1);
     expect(seen.every((e) => e.unref)).toBe(true);
     expect(DEFAULT_POLL_MS).toBe(200);
+  });
+});
+
+/* ------------------- Windows-safe rename in the atomic write ------------------- */
+
+describe('renameRetrying (the atomic write on Windows)', () => {
+  const errnoError = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`${code}: rename`), { code });
+
+  function harness(failures: string[], opts: { advancePerSleep?: number } = {}) {
+    const calls: Array<[string, string]> = [];
+    const sleeps: number[] = [];
+    let clock = 1_000;
+    const deps = {
+      rename: (from: string, to: string): void => {
+        calls.push([from, to]);
+        const code = failures.shift();
+        if (code !== undefined) throw errnoError(code);
+      },
+      sleep: (ms: number): void => {
+        sleeps.push(ms);
+        clock += opts.advancePerSleep ?? ms;
+      },
+      now: (): number => clock,
+    };
+    return { calls, sleeps, deps };
+  }
+
+  it('retries EPERM (a reader still has the target open) and succeeds once it clears', () => {
+    // The Windows CI failure: two racing decide() processes, the winner's
+    // rename-over hit EPERM because the loser was reading the record.
+    const h = harness(['EPERM', 'EPERM']);
+    expect(() => renameRetrying('a.tmp', 'a', h.deps)).not.toThrow();
+    expect(h.calls).toHaveLength(3);
+    expect(h.sleeps).toEqual([2, 4]); // exponential backoff, starting small
+  });
+
+  it('EACCES and EBUSY are retried the same way', () => {
+    for (const code of ['EACCES', 'EBUSY']) {
+      const h = harness([code]);
+      expect(() => renameRetrying('a.tmp', 'a', h.deps)).not.toThrow();
+      expect(h.calls).toHaveLength(2);
+    }
+  });
+
+  it('a transient error that outlives the budget is thrown unchanged (never a silent success)', () => {
+    const forever = new Proxy([] as string[], { get: (arr, k) => (k === 'shift' ? () => 'EPERM' : Reflect.get(arr, k)) });
+    const h = harness(forever, { advancePerSleep: 100 });
+    expect(() => renameRetrying('a.tmp', 'a', h.deps)).toThrow(/EPERM/);
+    const slept = h.sleeps.reduce((a, b) => a + b, 0);
+    expect(h.sleeps.length).toBeGreaterThan(1);
+    expect(h.sleeps.every((ms) => ms <= 50)).toBe(true); // backoff is capped
+    expect(slept).toBeLessThanOrEqual(RENAME_RETRY_BUDGET_MS); // the deadline, not the sleeps, ends it
+  });
+
+  it('any other error is thrown immediately, without a retry', () => {
+    for (const code of ['ENOENT', 'EXDEV', 'EIO']) {
+      const h = harness([code]);
+      expect(() => renameRetrying('a.tmp', 'a', h.deps)).toThrow(new RegExp(code));
+      expect(h.calls).toHaveLength(1);
+      expect(h.sleeps).toEqual([]);
+    }
+    const noCode = { rename: (): void => { throw new Error('plain'); }, sleep: (): void => {}, now: (): number => 0 };
+    expect(() => renameRetrying('a.tmp', 'a', noCode)).toThrow('plain');
   });
 });
 

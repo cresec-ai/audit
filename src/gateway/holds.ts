@@ -47,6 +47,7 @@ import {
 } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
+import { sleepSync } from '../util/sleep-sync.js';
 
 export type HoldStatus = 'pending' | 'approved' | 'denied' | 'timeout' | 'cancelled' | 'session_end';
 
@@ -147,12 +148,58 @@ function withExpiry(rec: HoldRecord, now: number): HoldRecord {
   return { ...rec, status: 'timeout' };
 }
 
-/** Atomic 0600 write: temp file in the same directory, then rename. */
+/**
+ * Rename errors Windows reports while ANOTHER process momentarily has the
+ * target open: Node opens files without FILE_SHARE_DELETE there, so a
+ * rename-over fails with EPERM (sometimes EACCES/EBUSY) for exactly as long
+ * as a concurrent `readFileSync` of the record is in flight — the proxy
+ * polling its hold, `mcp-recorder holds` listing, or the loser of a decide()
+ * race reading the status it lost to. Readers hold the file for
+ * microseconds, so a short bounded retry is the whole fix. POSIX never
+ * returns these for a rename inside our own 0700 directory, so a genuine
+ * permission problem still surfaces — after the budget, unchanged.
+ */
+const TRANSIENT_RENAME_CODES: ReadonlySet<string> = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+/** Total wall-clock budget for {@link renameRetrying} before the error propagates. */
+export const RENAME_RETRY_BUDGET_MS = 1_000;
+
+export interface RenameRetryDeps {
+  rename: (from: string, to: string) => void;
+  sleep: (ms: number) => void;
+  now: () => number;
+}
+
+const REAL_RENAME_DEPS: RenameRetryDeps = { rename: renameSync, sleep: sleepSync, now: Date.now };
+
+/**
+ * `renameSync(from, to)` that retries the transient Windows sharing errors
+ * above with exponential backoff (2, 4, 8, … 50 ms) for at most
+ * {@link RENAME_RETRY_BUDGET_MS}. Every other error, and a transient one
+ * that outlives the budget, is thrown unchanged.
+ */
+export function renameRetrying(from: string, to: string, deps: RenameRetryDeps = REAL_RENAME_DEPS): void {
+  const deadline = deps.now() + RENAME_RETRY_BUDGET_MS;
+  let delay = 2;
+  for (;;) {
+    try {
+      deps.rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === undefined || !TRANSIENT_RENAME_CODES.has(code) || deps.now() >= deadline) throw err;
+      deps.sleep(delay);
+      delay = Math.min(delay * 2, 50);
+    }
+  }
+}
+
+/** Atomic 0600 write: temp file in the same directory, then rename (Windows-safe, see above). */
 function writeFileAtomic0600(path: string, content: string): void {
   const tmp = `${path}.tmp-${randomBytes(6).toString('hex')}`;
   try {
     writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 });
-    renameSync(tmp, path);
+    renameRetrying(tmp, path);
   } catch (err) {
     rmSync(tmp, { force: true });
     throw err;

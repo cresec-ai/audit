@@ -28,6 +28,7 @@ import { Buffer } from 'node:buffer';
 import { GENESIS_HASH, makeRecord } from '../chain/hash.js';
 import { validateExtendsHead } from './sqlite.js';
 import { FILES } from '../types.js';
+import { sleepSync } from '../util/sleep-sync.js';
 /**
  * Test-only I/O counters (bytes and call counts), so a test can prove a
  * sync did an incremental catch-up rather than a full reload without
@@ -334,13 +335,6 @@ const LOCK_RETRY_MAX_MS = 20;
  * of dropping the batch.
  */
 const STALE_LOCK_MS = 5_000;
-/** A real synchronous sleep, without a native dependency. */
-function sleepSync(ms) {
-    if (ms <= 0)
-        return;
-    const sab = new SharedArrayBuffer(4);
-    Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
 /** True when `dir`'s lock looks abandoned (missing/unreadable owner info). */
 function lockLooksStale(lockDir) {
     const ownerPath = join(lockDir, 'owner');

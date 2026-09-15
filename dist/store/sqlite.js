@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { GENESIS_HASH, canonicalJson, computeHash, makeRecord } from '../chain/hash.js';
 import { FILES } from '../types.js';
+import { sleepSync } from '../util/sleep-sync.js';
 let cachedCtor;
 let loadFailed = false;
 function loadSqlite() {
@@ -86,11 +87,6 @@ export const OPEN_BUSY_TIMEOUT_MS = 10_000;
 function isBusyError(err) {
     const code = err?.code;
     return typeof code === 'string' && (code.startsWith('SQLITE_BUSY') || code === 'SQLITE_LOCKED');
-}
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
-/** Block the thread for `ms` (open-time only — never on the forwarding path). */
-function sleepSync(ms) {
-    Atomics.wait(sleepCell, 0, 0, ms);
 }
 /**
  * Run `fn`, retrying on SQLITE_BUSY/SQLITE_LOCKED with a short, jittered
