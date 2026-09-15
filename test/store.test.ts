@@ -28,6 +28,7 @@ import type {
   ToolCallEvent,
 } from '../src/schema/events.js';
 import { SCHEMA } from '../src/schema/events.js';
+import { jsonlIoStats } from '../src/store/jsonl.js';
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -542,6 +543,165 @@ describe('JsonlStore trailing partial line', () => {
     writeFileSync(logPath, lines.join('\n'));
 
     expect(() => openStore({ dataDir: dir, backend: 'jsonl' })).toThrow(/corrupt JSONL line 1/);
+  });
+});
+
+describe('JsonlStore incremental catch-up', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-jsonl-incr-'));
+    // `jsonlIoStats` is process-wide test instrumentation (see its doc
+    // comment in src/store/jsonl.ts): a small internal hook, used here
+    // instead of spying on `node:fs` directly, because `vi.spyOn` cannot
+    // reliably intercept a *named* import's bare call site (`readFileSync`,
+    // as jsonl.ts uses it) — under Vitest/Vite's module transform that name
+    // is bound once at import time rather than read live off the module
+    // object, so a spy on the object silently never gets invoked. Reset the
+    // counters so each test only sees its own I/O.
+    jsonlIoStats.fullReloadBytes = 0;
+    jsonlIoStats.fullReloadCalls = 0;
+    jsonlIoStats.incrementalReadBytes = 0;
+    jsonlIoStats.incrementalReadCalls = 0;
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a second instance's many appended batches are picked up without any full-file re-read", () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    const storeB = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      // Seed one record through A so B's first catch-up has a non-empty
+      // head to reconcile against, same as a real hand-off between two
+      // `mcp-recorder record` processes.
+      const seeded = seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(1);
+
+      // Everything from here on must go through the incremental path: no
+      // full reload (of either store) is allowed for the rest of this test.
+      jsonlIoStats.fullReloadCalls = 0;
+
+      const N_BATCHES = 40;
+      const BATCH_SIZE = 25;
+      for (let b = 0; b < N_BATCHES; b++) {
+        const events: AnyEvent[] = [];
+        for (let i = 0; i < BATCH_SIZE; i++) {
+          events.push(
+            toolCall(
+              SESSION_A,
+              `2026-06-11T10:01:${String(b).padStart(2, '0')}.${String(i).padStart(3, '0')}Z`,
+              `t_${b}_${i}`,
+            ),
+          );
+        }
+        // storeB is the "other process": it never re-reads anything either
+        // (its own writes update its cache directly), but its appends are
+        // what storeA must catch up to below.
+        storeB.appendEvents(events);
+      }
+
+      const total = 1 + N_BATCHES * BATCH_SIZE;
+      // storeA wrote none of this — every one of these must come from disk
+      // via storeA's own catch-up logic, purely incrementally.
+      expect(storeA.count()).toBe(total);
+      expect(storeA.head().seq).toBe(total);
+      expect([...storeA.iterate()]).toHaveLength(total);
+
+      expect(jsonlIoStats.fullReloadCalls).toBe(0);
+      // And it really did read incrementally (not just "nothing happened").
+      expect(jsonlIoStats.incrementalReadCalls).toBeGreaterThan(0);
+    } finally {
+      storeA.close();
+      storeB.close();
+    }
+  });
+
+  it('a torn trailing line from another process is skipped by sync, then consumed once completed', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      const seeded = seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(1);
+
+      // A real, well-formed second record — written byte-for-byte so the
+      // "crash" below is a genuine torn line, not just invalid JSON.
+      const next = seal(
+        [toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'partial_write')],
+        storeA.head(),
+      )[0]!;
+      const line = JSON.stringify(next);
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const half = Math.floor(line.length / 2);
+
+      // Simulate a second process mid-write: half the line lands, no
+      // trailing newline yet. storeA is NOT holding the lock (there is no
+      // lock on a read), so its sync must tolerate observing this.
+      appendFileSync(logPath, line.slice(0, half));
+      expect(storeA.count()).toBe(1);
+      expect(storeA.head()).toEqual({ seq: 1, hash: seeded[0]!.hash });
+      expect([...storeA.iterate()]).toHaveLength(1);
+      // Sync again with nothing new on disk: still tolerated, still stable.
+      expect(storeA.count()).toBe(1);
+
+      // The "crashed" process's continuation lands, completing the line.
+      appendFileSync(logPath, line.slice(half) + '\n');
+
+      expect(storeA.count()).toBe(2);
+      expect(storeA.head()).toEqual({ seq: 2, hash: next.hash });
+      expect([...storeA.iterate()].map((r) => r.seq)).toEqual([1, 2]);
+    } finally {
+      storeA.close();
+    }
+  });
+
+  it('a shrunk file triggers a full reload', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      const seeded = twoSessionFixture();
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(6);
+
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const text = readFileSync(logPath, 'utf8');
+      const lines = text.split('\n').filter((l) => l.trim() !== '');
+      // Simulate the log having been replaced by a shorter one (e.g. a
+      // rotation) that keeps only the first two records.
+      writeFileSync(logPath, lines.slice(0, 2).join('\n') + '\n');
+      expect(statSync(logPath).size).toBeLessThan(text.length);
+
+      jsonlIoStats.fullReloadCalls = 0;
+      expect(storeA.count()).toBe(2);
+      expect(jsonlIoStats.fullReloadCalls).toBeGreaterThan(0);
+      expect(storeA.head()).toEqual({ seq: 2, hash: seeded[1]!.hash });
+      expect([...storeA.iterate()].map((r) => r.seq)).toEqual([1, 2]);
+    } finally {
+      storeA.close();
+    }
+  });
+
+  it('a grown-but-replaced file (misaligned with the old offset) triggers a full reload', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      storeA.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+      expect(storeA.count()).toBe(1);
+
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const original = readFileSync(logPath, 'utf8');
+      // Replace with different, larger content shifted by one byte, so the
+      // byte at the previous end-of-file no longer marks the start of a
+      // line — the cheap "still the same file, just longer" check must
+      // catch this even though the file only grew.
+      writeFileSync(logPath, ' ' + original + original);
+
+      jsonlIoStats.fullReloadCalls = 0;
+      expect(storeA.count()).toBe(2); // full, tolerant reparse of the new content
+      expect(jsonlIoStats.fullReloadCalls).toBeGreaterThan(0); // fell back to a full reload
+    } finally {
+      storeA.close();
+    }
   });
 });
 

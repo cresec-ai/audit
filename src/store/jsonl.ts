@@ -16,8 +16,11 @@
  * Read methods (`head`/`count`/`iterate`/`sessions`/`latestSignature`/
  * `signatures`) reflect on-disk state written by other processes: each one
  * first checks whether the file's size changed since this instance last
- * loaded it and reloads when it has. Simple and correct beats clever here —
- * this is the no-native-deps path.
+ * loaded it, and — since the log is append-only — reads and parses just the
+ * bytes another process added since our last read, rather than re-parsing
+ * the whole file (see `syncJsonlArray` / `readJsonlFrom` below). A shrink or
+ * a replace/rotate falls back to a full reload, same as before this file
+ * kept a byte offset at all.
  */
 
 import {
@@ -43,13 +46,35 @@ import { FILES } from '../types.js';
 import type { ChainHead, EvidenceStore, IterateOpts, SessionSummary } from '../types.js';
 
 /**
+ * Test-only I/O counters (bytes and call counts), so a test can prove a
+ * sync did an incremental catch-up rather than a full reload without
+ * intercepting `node:fs` itself: spying on a *named* import's call site
+ * (`import { readFileSync } from 'node:fs'` used bare, as this file does)
+ * isn't reliably interceptable via `vi.spyOn` under every ESM/bundler
+ * transform — some bind the local name once at import time rather than
+ * reading the exporting module live. Nothing in this module reads these;
+ * they are not part of the `EvidenceStore` contract.
+ */
+export const jsonlIoStats = {
+  /** Bytes read via a full reload (`loadJsonlFile` — the whole file). */
+  fullReloadBytes: 0,
+  fullReloadCalls: 0,
+  /** Bytes read via an incremental catch-up (`readJsonlFrom` — from an offset). */
+  incrementalReadBytes: 0,
+  incrementalReadCalls: 0,
+};
+
+/**
  * Read a JSONL file into objects. A trailing partial line (e.g. from a crash
  * mid-write) is tolerated with a stderr warning; corruption anywhere else is
  * an error — silent data loss in an evidence store is never acceptable.
  */
 function loadJsonlFile<T>(path: string): T[] {
   if (!existsSync(path)) return [];
-  const lines = readFileSync(path, 'utf8').split('\n');
+  const text = readFileSync(path, 'utf8');
+  jsonlIoStats.fullReloadBytes += Buffer.byteLength(text, 'utf8');
+  jsonlIoStats.fullReloadCalls += 1;
+  const lines = text.split('\n');
   const out: T[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = (lines[i] ?? '').trim();
@@ -79,6 +104,116 @@ function sizeOf(path: string): number {
   } catch {
     return 0;
   }
+}
+
+/**
+ * True when `offset` is the start of a line in `path`: either 0, or the
+ * byte immediately before it is `\n`. This is how a genuine append (the
+ * file still begins with exactly what we last read, merely extended) is
+ * told apart from a replace/rotate that happens to leave the file no
+ * smaller — where reading on from the old offset would parse garbage.
+ * Cheap: a single 1-byte read, and only ever called once the size has
+ * already been seen to change.
+ */
+function isLineStart(path: string, offset: number): boolean {
+  if (offset <= 0) return true;
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch {
+    return false;
+  }
+  try {
+    const buf = Buffer.alloc(1);
+    const n = readSync(fd, buf, 0, 1, offset - 1);
+    return n === 1 && buf[0] === 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Parse only the *complete* lines found in `path` at or after `fromOffset`
+ * — the incremental counterpart to `loadJsonlFile`, used to catch a cached
+ * copy up to disk without re-reading bytes already parsed. Byte offsets
+ * (not string indices) are used throughout so a record containing
+ * multi-byte UTF-8 text is never split mid-character: `\n` (0x0a) is a
+ * single-byte code point that can never occur inside a multi-byte UTF-8
+ * sequence, so scanning a raw `Buffer` for it is always safe.
+ *
+ * A trailing run of bytes with no closing newline yet is left unconsumed
+ * (excluded from `nextOffset`) rather than guessed at. Unlike
+ * `loadJsonlFile`'s tolerance for a torn final line, this is not even an
+ * error case here: a reader that does not hold the lock can simply observe
+ * another process's write still landing, and pick the bytes up on its next
+ * sync once the newline arrives. A `JSON.parse` failure on a line that DOES
+ * have its closing newline is real corruption (mirrors `loadJsonlFile`'s
+ * handling of a non-trailing bad line) and throws.
+ */
+function readJsonlFrom<T>(path: string, fromOffset: number): { items: T[]; nextOffset: number } {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch {
+    return { items: [], nextOffset: fromOffset };
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= fromOffset) return { items: [], nextOffset: fromOffset };
+    const length = size - fromOffset;
+    const buf = Buffer.alloc(length);
+    const n = readSync(fd, buf, 0, length, fromOffset);
+    const bytes = n === length ? buf : buf.subarray(0, n);
+    jsonlIoStats.incrementalReadBytes += bytes.length;
+    jsonlIoStats.incrementalReadCalls += 1;
+    const items: T[] = [];
+    let lineStart = 0;
+    let consumed = 0;
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] !== 0x0a) continue;
+      const line = bytes.subarray(lineStart, i).toString('utf8').trim();
+      lineStart = i + 1;
+      consumed = lineStart;
+      if (line === '') continue;
+      try {
+        items.push(JSON.parse(line) as T);
+      } catch (err) {
+        throw new Error(
+          `mcp-recorder: corrupt JSONL record at byte offset ${fromOffset + lineStart - line.length - 1} in ${path}: ${(err as Error).message}`,
+        );
+      }
+    }
+    return { items, nextOffset: fromOffset + consumed };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Bring an in-memory JSONL array in line with what is on disk right now.
+ * When the file has simply grown past `loadedSize` — and the boundary check
+ * above confirms it is still the same file, merely extended — only the new
+ * bytes are read and parsed: the expensive full re-parse this scheme exists
+ * to avoid, on what is normally a cross-process catch-up done under the
+ * advisory lock on every append. A shrink, or a grow that fails that
+ * boundary check (replaced/rotated from under us), falls back to a full
+ * reload exactly as this store always has.
+ */
+function syncJsonlArray<T>(
+  path: string,
+  current: T[],
+  loadedSize: number,
+): { items: T[]; loadedSize: number } {
+  const size = sizeOf(path);
+  if (size === loadedSize) return { items: current, loadedSize };
+  if (size < loadedSize || !isLineStart(path, loadedSize)) {
+    return { items: loadJsonlFile<T>(path), loadedSize: sizeOf(path) };
+  }
+  const { items: added, nextOffset } = readJsonlFrom<T>(path, loadedSize);
+  return {
+    items: added.length > 0 ? current.concat(added) : current,
+    loadedSize: nextOffset,
+  };
 }
 
 /** Last KiB window read from the tail of a file, to cheaply find its last line. */
@@ -307,22 +442,22 @@ export class JsonlStore implements EvidenceStore {
     this.sigsLoadedSize = sizeOf(this.sigsPath);
   }
 
-  /** Re-read the record log from disk iff another process has grown it. */
+  /**
+   * Catch the record log up with disk iff another process has grown it,
+   * reading only the bytes added since we last looked (see
+   * `syncJsonlArray`) rather than re-parsing the whole file.
+   */
   private syncRecords(): void {
-    const size = sizeOf(this.path);
-    if (size !== this.recordsLoadedSize) {
-      this.records = loadJsonlFile<ChainRecord>(this.path);
-      this.recordsLoadedSize = size;
-    }
+    const { items, loadedSize } = syncJsonlArray(this.path, this.records, this.recordsLoadedSize);
+    this.records = items;
+    this.recordsLoadedSize = loadedSize;
   }
 
-  /** Re-read the signatures log from disk iff another process has grown it. */
+  /** Same as `syncRecords`, for the signatures log. */
   private syncSigs(): void {
-    const size = sizeOf(this.sigsPath);
-    if (size !== this.sigsLoadedSize) {
-      this.sigs = loadJsonlFile<HeadSignature>(this.sigsPath);
-      this.sigsLoadedSize = size;
-    }
+    const { items, loadedSize } = syncJsonlArray(this.sigsPath, this.sigs, this.sigsLoadedSize);
+    this.sigs = items;
+    this.sigsLoadedSize = loadedSize;
   }
 
   private withLock<T>(fn: () => T): T {
@@ -359,14 +494,24 @@ export class JsonlStore implements EvidenceStore {
 
   /**
    * Bring `this.records` in line with `diskHead` when the cache is behind
-   * (another process wrote since this instance last loaded). A full reload
-   * only when actually needed keeps the common single-writer case cheap,
-   * and — unlike an unconditional reload after every write — never makes a
-   * write re-parse the log purely because IT just grew it.
+   * (another process wrote since this instance last loaded). Checking the
+   * head first — rather than syncing unconditionally — keeps the common
+   * single-writer case cheap: a write never re-parses the log purely
+   * because IT just grew it. When a catch-up IS needed, `syncRecords`
+   * reads only the bytes another process added (not the whole log) unless
+   * the file was shrunk or replaced out from under us, in which case it
+   * falls back to a full reload on its own. The head is re-checked
+   * afterwards as a safety net: if it still doesn't match `diskHead` (e.g.
+   * a stat raced a concurrent write elsewhere), a full reload is forced
+   * rather than validating new appends against a chain we're not sure is
+   * current.
    */
   private catchUpTo(diskHead: ChainHead): void {
     const cached = this.cachedHead();
-    if (cached.seq !== diskHead.seq || cached.hash !== diskHead.hash) {
+    if (cached.seq === diskHead.seq && cached.hash === diskHead.hash) return;
+    this.syncRecords();
+    const after = this.cachedHead();
+    if (after.seq !== diskHead.seq || after.hash !== diskHead.hash) {
       this.records = loadJsonlFile<ChainRecord>(this.path);
       this.recordsLoadedSize = sizeOf(this.path);
     }
