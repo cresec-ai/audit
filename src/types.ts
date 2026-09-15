@@ -294,6 +294,10 @@ export const ENV = {
   STORE: 'MCP_RECORDER_STORE',
   REDACT: 'MCP_RECORDER_REDACT',
   DISABLE: 'MCP_RECORDER_DISABLE',
+  /** `hook`: MCP config file(s) to resolve server origins from — one path or
+   *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
+   *  See src/hook/mcp-config.ts. */
+  MCP_CONFIG: 'MCP_RECORDER_MCP_CONFIG',
 } as const;
 
 /** File names inside the data dir. */

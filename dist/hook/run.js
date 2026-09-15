@@ -43,7 +43,8 @@ import { setupProxyRecording } from '../capture/setup.js';
 import { canonicalJson, sha256Hex, sha256Ref } from '../chain/hash.js';
 import { scrubArgv, scrubToolArguments } from '../redact/redactor.js';
 import { SCHEMA } from '../schema/events.js';
-import { parseToolName } from './names.js';
+import { resolveServerOrigin } from './mcp-config.js';
+import { hostAliasToolName, parseToolName } from './names.js';
 import { evaluatePolicy, loadPolicy } from './policy.js';
 import { claimSessionStart, markPending, sweepStalePending, takePending } from './state.js';
 /** sha256:<hex> of canonical `null` — result_hash for a PreToolUse marker
@@ -137,6 +138,18 @@ export async function runHook(stdinText, opts) {
         if (isToolEvent && parsed !== undefined && !parsed.isMcp && !opts.allTools) {
             return ALLOW; // built-in tool, --all-tools not set: not recorded, policy not evaluated
         }
+        // Where the MCP server actually is, from the config file Claude Code was
+        // started with (src/hook/mcp-config.ts). In a cloud session the hosted
+        // connectors are named by opaque UUIDs (mcp__47d587b8-…__clickup_get_list),
+        // and that file is the only place the UUID maps to a vendor endpoint. The
+        // resolved URL is stamped as the additive `server.url`; the host also
+        // forms the policy alias `mcp__<host>__<tool>`. `server.name` stays what
+        // Claude Code calls the server (the UUID), so it matches Claude Code's
+        // own matchers and transcripts. Fail-open: `{}` when nothing resolves.
+        const origin = parsed !== undefined && parsed.isMcp ? resolveServerOrigin(parsed.server) : {};
+        const policyAlias = parsed !== undefined && parsed.isMcp && origin.host !== undefined
+            ? hostAliasToolName(origin.host, parsed.tool)
+            : undefined;
         /* -------------------------- recording setup -------------------------- */
         let setup;
         try {
@@ -173,6 +186,11 @@ export async function runHook(stdinText, opts) {
         // attacker/remote controlled — defense in depth, and it costs nothing.
         const scrubbedCommand = scrubArgv([`hook:${opts.clientName}`], setup.redactor).command;
         const baseServer = { name: opts.clientName, command: scrubbedCommand, transport: 'stdio' };
+        // The session_start emitted by the first hook event of a session carries
+        // the origin of that first event's server too (when it resolved), so the
+        // evidence says up front which vendor endpoint the session opened on.
+        // Its `name` stays the client name: it is a session-level event.
+        const sessionStartServer = origin.url !== undefined ? { ...baseServer, url: origin.url } : baseServer;
         const base = (kind, attributes, server = baseServer) => ({
             schema: SCHEMA,
             event_id: randomUUID(),
@@ -190,7 +208,7 @@ export async function runHook(stdinText, opts) {
             if (firstEventOfSession) {
                 const cwd = typeof input.cwd === 'string' ? input.cwd : process.cwd();
                 const sessionStart = {
-                    ...base('session_start', { 'rpc.system': 'hook' }),
+                    ...base('session_start', { 'rpc.system': 'hook' }, sessionStartServer),
                     kind: 'session_start',
                     proxy_version: opts.proxyVersion,
                     cwd,
@@ -235,6 +253,8 @@ export async function runHook(stdinText, opts) {
                 // isToolEvent, with toolName/parsed both guaranteed defined by the
                 // early filtering above.
                 const server = { ...baseServer, name: parsed.server };
+                if (origin.url !== undefined)
+                    server.url = origin.url;
                 const requestId = typeof input.tool_use_id === 'string' && input.tool_use_id.length > 0
                     ? input.tool_use_id
                     : computeFallbackRequestId(sessionId, toolName, input.tool_input);
@@ -242,7 +262,7 @@ export async function runHook(stdinText, opts) {
                     const { policy, warning } = loadPolicy(opts.policyPath);
                     if (warning !== undefined)
                         diagStderr(warning);
-                    const decision = evaluatePolicy(policy, toolName);
+                    const decision = evaluatePolicy(policy, toolName, policyAlias);
                     const isDenied = decision.decision === 'deny';
                     const attributes = {
                         'gen_ai.operation.name': 'execute_tool',

@@ -95,18 +95,25 @@ export function loadPolicy(path) {
         return { policy: null, warning: `--policy ${path} is invalid (${msg}); allowing all tool calls` };
     }
 }
-/** Evaluate a policy against a hook's full `tool_name`. `policy: null` (no
- *  policy configured, or one that failed to load) always allows. */
-export function evaluatePolicy(policy, toolName) {
+/** Evaluate a policy against a hook's full `tool_name`, and — when given —
+ *  its host alias (`mcp__<host>__<tool>`, see `hostAliasToolName` in
+ *  src/hook/names.ts): a rule matches when its regex matches EITHER
+ *  string, and the first matching rule wins in the same order as before
+ *  (deny rules, then allow rules, then `default`). The alias only ever adds
+ *  matches, never removes one, so a policy written against raw names
+ *  behaves exactly as it did. `policy: null` (no policy configured, or one
+ *  that failed to load) always allows. */
+export function evaluatePolicy(policy, toolName, alias) {
     if (policy === null)
         return { decision: 'allow' };
+    const matches = (rule) => rule.tool.test(toolName) || (alias !== undefined && alias !== toolName && rule.tool.test(alias));
     for (const rule of policy.deny) {
-        if (rule.tool.test(toolName)) {
+        if (matches(rule)) {
             return { decision: 'deny', reason: rule.reason ?? `denied by policy rule /${rule.tool.source}/` };
         }
     }
     for (const rule of policy.allow) {
-        if (rule.tool.test(toolName))
+        if (matches(rule))
             return { decision: 'allow' };
     }
     return { decision: policy.default };

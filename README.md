@@ -190,6 +190,7 @@ mcp-recorder [record] [options] -- <server command...>
 | `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: whichever evidence file already exists in the data dir wins; on a fresh data dir, sqlite when available, else jsonl). |
 | `MCP_RECORDER_REDACT` | `allowlist` (default) or `off`. Secret-shaped values are hashed in every mode. |
 | `MCP_RECORDER_DISABLE` | `1` → pure passthrough, no recording. |
+| `MCP_RECORDER_MCP_CONFIG` | `hook` only: the Claude Code MCP config file(s) to resolve server origins from (`server.url`, and the policy alias `mcp__<host>__<tool>`) — one path or comma-separated paths. Default: the cloud session's `/tmp/mcp-config-*.json`. See [docs/hooks.md](docs/hooks.md#cloud-sessions-uuid-server-names-and-serverurl). |
 
 ---
 

@@ -57,10 +57,19 @@ function waitExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolvePromise) => child.once('close', (code) => resolvePromise(code)));
 }
 
-function spawnCli(args: string[]): ChildProcess {
+/** Fixture shaped exactly like a cloud session's /tmp/mcp-config-<session>.json
+ *  (cloud dogfood 3, step 5), with fake ids — see test/fixtures/mcp-config. */
+const CLOUD_MCP_CONFIG = join(ROOT, 'test', 'fixtures', 'mcp-config', 'cloud-session.json');
+/** A path that does not exist: "no MCP config file at all". Every test runs
+ *  with this unless it says otherwise, so the hook's default lookup of the
+ *  host's own /tmp/mcp-config-*.json (this suite may itself run inside a
+ *  cloud session) can never leak into an assertion. */
+const NO_MCP_CONFIG = join(ROOT, 'test', 'fixtures', 'mcp-config', 'does-not-exist.json');
+
+function spawnCli(args: string[], env: Record<string, string | undefined> = {}): ChildProcess {
   const child = spawnTsx(['src/cli.ts', ...args], {
     cwd: ROOT,
-    env: { ...process.env, MCP_RECORDER_DISABLE: undefined },
+    env: { ...process.env, MCP_RECORDER_DISABLE: undefined, MCP_RECORDER_MCP_CONFIG: NO_MCP_CONFIG, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   cleanups.push(() => {
@@ -80,8 +89,12 @@ async function runCli(args: string[]): Promise<CliResult> {
 }
 
 /** Run `mcp-recorder hook <args>`, feeding `stdinText` on stdin. */
-async function runHook(args: string[], stdinText: string): Promise<CliResult> {
-  const child = spawnCli(['hook', ...args]);
+async function runHook(
+  args: string[],
+  stdinText: string,
+  env: Record<string, string | undefined> = {},
+): Promise<CliResult> {
+  const child = spawnCli(['hook', ...args], env);
   const stdout = collect(child.stdout);
   const stderr = collect(child.stderr);
   child.stdin!.write(stdinText);
@@ -848,5 +861,220 @@ describe('mcp-recorder hook install', () => {
     const payload = JSON.parse(result.stdout) as { removed: string[] };
     expect(payload.removed).toEqual([]);
     expect(readFileSync(settingsPath, 'utf8')).toBe(before);
+  });
+});
+
+/* ------------------- cloud sessions: UUID server names -------------------- */
+
+describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, policy aliases)', () => {
+  const CLICKUP_UUID = '47d587b8-3fb9-42e9-b596-f8b25371248c';
+  const CLICKUP_URL = 'https://mcp.clickup.com/mcp';
+  const SESSION_ID_IN_CONFIG = 'cse_01FIXTURESESSION0000AAAA';
+  const withConfig = { MCP_RECORDER_MCP_CONFIG: CLOUD_MCP_CONFIG };
+  const noConfig = { MCP_RECORDER_MCP_CONFIG: NO_MCP_CONFIG };
+  const store = ['--store', 'jsonl'];
+
+  /** Nothing from the config file but the scrubbed URL may ever reach the store. */
+  function expectNoConfigLeak(rawStore: string): void {
+    expect(rawStore).not.toContain(SESSION_ID_IN_CONFIG);
+    expect(rawStore).not.toContain('cse_');
+    expect(rawStore).not.toContain('X-Session-UUID');
+    expect(rawStore).not.toContain('X-MCP-Server-ID');
+    expect(rawStore).not.toContain('63df81a5-fc81-5b12-b7fe-654a2d253da9'); // X-MCP-Server-ID header value
+    expect(rawStore).not.toContain('b3f9ab90-0a14-5a2c-adab-e845e0658cec'); // mcp_server_id query value
+    expect(rawStore).not.toContain('mcp_server_id');
+    expect(rawStore).not.toContain('toolbox_mcp_server_id');
+    expect(rawStore).not.toContain('permission_policy');
+    expect(rawStore).not.toContain('always_allow');
+    expect(rawStore).not.toContain('mail-pass');
+    expect(rawStore).not.toContain('sk-fixture');
+    expect(rawStore).not.toContain('mcp__mcp.clickup.com'); // the policy alias is never recorded
+  }
+
+  it('stamps server.url (the vendor endpoint) on session_start and on every pre/post/failure event; server.name stays the UUID', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-url-');
+    const sessionId = freshSessionId();
+    const toolName = `mcp__${CLICKUP_UUID}__clickup_get_list`;
+    const toolInput = { list_id: '901818701787' };
+
+    const pre = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId, toolName, toolInput, toolUseId: 'toolu_cloud_ok' }),
+      withConfig,
+    );
+    expect(pre.code).toBe(0);
+    expect(pre.stdout).toBe('');
+    const post = await runHook(
+      ['--data-dir', dataDir, ...store],
+      postToolUseInput({
+        sessionId,
+        toolName,
+        toolInput,
+        toolUseId: 'toolu_cloud_ok',
+        toolResponse: { content: [{ type: 'text', text: 'list-body' }] },
+      }),
+      withConfig,
+    );
+    expect(post.code).toBe(0);
+    const failTool = `mcp__${CLICKUP_UUID}__clickup_filter_tasks`;
+    await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId, toolName: failTool, toolInput: {}, toolUseId: 'toolu_cloud_fail' }),
+      withConfig,
+    );
+    const failure = await runHook(
+      ['--data-dir', dataDir, ...store],
+      postToolUseFailureInput({
+        sessionId,
+        toolName: failTool,
+        toolInput: {},
+        toolUseId: 'toolu_cloud_fail',
+        error: 'RATE_LIMIT_EXCEEDED: Daily MCP limit reached',
+      }),
+      withConfig,
+    );
+    expect(failure.code).toBe(0);
+    expect(failure.stdout).toBe('');
+
+    const events = readEvents(dataDir);
+    expect(events.map((e) => e.kind)).toEqual(['session_start', 'tool_call', 'tool_call', 'tool_call', 'tool_call']);
+    const sessionStart = events[0] as SessionStartEvent;
+    expect(sessionStart.server.name).toBe('claude-code'); // a session-level event keeps the client name...
+    expect(sessionStart.server.url).toBe(CLICKUP_URL); // ...and says which vendor endpoint the session opened on
+
+    const toolCalls = events.slice(1) as ToolCallEvent[];
+    expect(toolCalls.map((e) => e.phase)).toEqual(['pre', 'post', 'pre', 'post']);
+    for (const call of toolCalls) {
+      expect(call.server.name).toBe(CLICKUP_UUID); // what Claude Code calls the server, unchanged
+      expect(call.server.url).toBe(CLICKUP_URL);
+      expect(call.server.transport).toBe('stdio');
+    }
+    expect(toolCalls[0]!.tool).toBe('clickup_get_list');
+    expect(toolCalls[3]!.tool).toBe('clickup_filter_tasks');
+    expect(toolCalls[3]!.is_error).toBe(true);
+    expect(toolCalls[3]!.error?.type).toBe('tool_error');
+
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expectNoConfigLeak(rawStore);
+    expect(rawStore).not.toContain('901818701787'); // args are still hashed as always
+    expect(rawStore).not.toContain('list-body');
+  });
+
+  it('a readable name (github) gets its relay URL with the session id hashed out of the path', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-github-');
+    const result = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName: 'mcp__github__get_me', toolInput: {}, toolUseId: 'toolu_cloud_gh' }),
+      withConfig,
+    );
+    expect(result.code).toBe(0);
+    const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(toolCall.server.name).toBe('github');
+    expect(toolCall.server.url).toBe(
+      `https://api.anthropic.com/v2/ccr-sessions/${sha256Ref(SESSION_ID_IN_CONFIG)}/github/mcp`,
+    );
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('a deny rule against the vendor-host alias blocks the UUID-named tool; the raw name still matches; without a config the alias never fires', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-alias-');
+    const uuidTool = `mcp__${CLICKUP_UUID}__clickup_delete_task`;
+    const aliasPolicy = join(dataDir, 'alias-policy.json');
+    writeFileSync(
+      aliasPolicy,
+      JSON.stringify({
+        deny: [{ tool: '^mcp__mcp\\.clickup\\.com__clickup_delete_task$', reason: 'destructive ClickUp calls are blocked (alias rule)' }],
+        default: 'allow',
+      }),
+    );
+    type DenyPayload = { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
+    const call = (toolUseId: string, env: Record<string, string | undefined>, toolName = uuidTool) =>
+      runHook(
+        ['--data-dir', dataDir, ...store, '--policy', aliasPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: { task_id: 'x' }, toolUseId }),
+        env,
+      );
+
+    // With the config: the alias mcp__mcp.clickup.com__clickup_delete_task matches → denied.
+    const denied = await call('toolu_alias_deny', withConfig);
+    expect(denied.code).toBe(0);
+    const payload = JSON.parse(denied.stdout) as DenyPayload;
+    expect(payload.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(payload.hookSpecificOutput.permissionDecisionReason).toContain('alias rule');
+
+    // Without any config the alias does not exist: the same rule cannot match the UUID name → allowed.
+    const allowed = await call('toolu_alias_noconfig', noConfig);
+    expect(allowed.code).toBe(0);
+    expect(allowed.stdout).toBe('');
+
+    // A rule against the raw UUID name keeps working exactly as before, config or not.
+    const rawPolicy = join(dataDir, 'raw-policy.json');
+    writeFileSync(rawPolicy, JSON.stringify({ deny: [{ tool: `^mcp__${CLICKUP_UUID}__clickup_delete_task$` }] }));
+    for (const env of [withConfig, noConfig]) {
+      const rawDenied = await runHook(
+        ['--data-dir', dataDir, ...store, '--policy', rawPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName: uuidTool, toolInput: {}, toolUseId: 'toolu_raw_deny' }),
+        env,
+      );
+      expect((JSON.parse(rawDenied.stdout) as DenyPayload).hookSpecificOutput.permissionDecision).toBe('deny');
+    }
+
+    // The documented both-forms rule denies the local readable name AND the cloud UUID name.
+    const bothPolicy = join(dataDir, 'both-policy.json');
+    writeFileSync(
+      bothPolicy,
+      JSON.stringify({ deny: [{ tool: '^mcp__(ClickUp|mcp\\.clickup\\.com)__clickup_delete_task$' }] }),
+    );
+    const bothCases: Array<[string, Record<string, string | undefined>]> = [
+      ['mcp__ClickUp__clickup_delete_task', noConfig],
+      [uuidTool, withConfig],
+    ];
+    for (const [toolName, env] of bothCases) {
+      const r = await runHook(
+        ['--data-dir', dataDir, ...store, '--policy', bothPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_both' }),
+        env,
+      );
+      expect((JSON.parse(r.stdout) as DenyPayload).hookSpecificOutput.permissionDecision).toBe('deny');
+    }
+    // ...while a different tool of the same connector is untouched by any of them.
+    const other = await call('toolu_alias_other', withConfig, `mcp__${CLICKUP_UUID}__clickup_get_task`);
+    expect(other.stdout).toBe('');
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(events.find((e) => e.request_id === 'toolu_alias_deny')?.error?.type).toBe('policy_denied');
+    expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.is_error).toBe(false);
+    expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.server.url).toBeUndefined();
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('a missing or malformed MCP_RECORDER_MCP_CONFIG is fail-open: allowed and recorded, just without server.url; comma-separated paths are tried in order', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-failopen-');
+    const toolName = `mcp__${CLICKUP_UUID}__clickup_get_list`;
+    const malformed = join(ROOT, 'test', 'fixtures', 'mcp-config', 'malformed.json');
+
+    const broken = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_cfg_malformed' }),
+      { MCP_RECORDER_MCP_CONFIG: malformed },
+    );
+    expect(broken.code).toBe(0);
+    expect(broken.stdout).toBe('');
+
+    const resolved = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_cfg_list' }),
+      { MCP_RECORDER_MCP_CONFIG: `${NO_MCP_CONFIG},${malformed},${CLOUD_MCP_CONFIG}` },
+    );
+    expect(resolved.code).toBe(0);
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    const fromMalformed = events.find((e) => e.request_id === 'toolu_cfg_malformed')!;
+    expect(fromMalformed.server.name).toBe(CLICKUP_UUID);
+    expect(fromMalformed.server.url).toBeUndefined();
+    expect(fromMalformed.is_error).toBe(false);
+    const fromList = events.find((e) => e.request_id === 'toolu_cfg_list')!;
+    expect(fromList.server.url).toBe(CLICKUP_URL);
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
   });
 });

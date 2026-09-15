@@ -15,7 +15,9 @@ never go through a locally wrapped server at all: **Anthropic-hosted
 connectors** such as `mcp__ClickUp__*`, `mcp__Gmail__*`, `mcp__github__*`,
 `mcp__Google_Calendar__*` and `mcp__Google_Drive__*` run entirely on
 Anthropic's infrastructure. No local proxy — this one included — can sit in
-front of them.
+front of them. (In a Claude Code *cloud* session most of them are not even
+named that readably: they arrive as opaque UUIDs — see
+[Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl).)
 
 Every tool call Claude Code makes, hosted connectors included, passes
 through its **PreToolUse** hook first, and then exactly one of
@@ -182,12 +184,88 @@ with `tool` as the full name (e.g. `Bash`) and `server.name: "claude-code"`.
 **Only `mcp__`-prefixed tool calls are recorded by default** — pass
 `--all-tools` (to `hook` or `hook install`) to also record built-ins.
 
+**Where the server is (`server.url`).** For every MCP tool call the hook
+also looks the server segment up in the MCP config file Claude Code was
+started with and, when it finds it, stamps the server's endpoint on the
+event as the additive `server.url` — `https://mcp.clickup.com/mcp` for a
+hosted ClickUp connector, whatever a cloud session's UUID for it is. It goes
+on every `pre`/`post` `tool_call` event and on the `session_start` that the
+first event of a session emits (whose `server.name` stays `claude-code`: it
+records which vendor endpoint the session opened on). Absent when nothing
+resolved. See [Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl)
+for where it comes from, what is (not) taken from that file, and the
+policy alias it enables.
+
 **Redaction.** Exactly the same redaction path the stdio/HTTP proxy uses:
 tool arguments are hashed unconditionally (`scrubToolArguments`, same as
 every other `tool_call.args`), the result goes through the same
 position/value-aware allowlist as a proxy-recorded `tool_call.result`, and
 `result_hash` is the SHA-256 of the complete raw result before redaction. No
 readable payload string from a hook's stdin ever reaches the store.
+
+## Cloud sessions: UUID server names and `server.url`
+
+In a Claude Code **cloud** session (Claude Code on the web) the
+Anthropic-hosted connectors are registered under opaque UUIDs, not the
+readable names the CLI and this document use elsewhere. What the hook
+sees there is
+
+```
+mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_get_list    ClickUp
+mcp__ce5e992d-730d-4f07-95c8-4ba759ea3e3b__send_message        Gmail
+mcp__github__pull_request_read                                  only github is readable
+```
+
+(cloud dogfood 3, surprise 2). The UUID is what Claude Code calls the
+server: it is what Claude Code's own hook `matcher` is tested against and
+what its transcript shows, so **`server.name` is recorded as the UUID,
+unchanged** — renaming it would make the evidence disagree with Claude
+Code's own record of the same call. The UUID → service mapping exists in
+exactly one place: the MCP config file Claude Code was started with,
+`/tmp/mcp-config-<session>.json`, shaped like
+
+```json
+{"mcpServers":{
+  "github":{"url":"https://api.anthropic.com/v2/ccr-sessions/<session>/github/mcp","type":"http",
+            "headers":{"X-Session-UUID":"<session>","X-MCP-Server-ID":"..."}},
+  "47d587b8-3fb9-42e9-b596-f8b25371248c":{
+            "url":"https://api.anthropic.com/v2/ccr-sessions/<session>/mcp?mcp_server_id=...&mcp_url=https%3A%2F%2Fmcp.clickup.com%2Fmcp&toolbox_mcp_server_id=47d587b8-...",
+            "type":"http","tools":[{"name":"clickup_get_list","permission_policy":"always_allow"}, ...]},
+  ...}}
+```
+
+Every hosted connector is reached through an Anthropic relay URL; for a
+UUID-named one the vendor endpoint rides along, URL-encoded, in the
+relay URL's `mcp_url` query parameter.
+
+For every MCP tool call, `mcp-recorder hook` looks the server segment up in
+that file and records what it finds as the additive `server.url`: the
+decoded `mcp_url` when present (`https://mcp.clickup.com/mcp`), else the
+entry's own URL — so `github` gets its relay,
+`https://api.anthropic.com/v2/ccr-sessions/sha256:.../github/mcp`. The
+URL's hostname also becomes the **policy alias** described under
+[Policy](#policy-allow--deny). The sources, in order:
+
+1. **`MCP_RECORDER_MCP_CONFIG`** — one path, or comma-separated paths tried
+   in order. Set it in the environment the hook runs in to pin a specific
+   file (or to point a local Claude Code's hook at its own `.mcp.json`).
+2. Otherwise **the files matching `/tmp/mcp-config-*.json`** — what a cloud
+   session has, so cloud sessions need no configuration at all.
+
+The first file whose `mcpServers` has the segment wins. **Nothing else from
+the file is recorded**: not the `headers` (they carry the session id and
+server ids), not the session id embedded in the relay URL's path (it is
+replaced in place by its `sha256:` ref, computed exactly like every other
+redacted value, so a blast-radius `query` for the session id still finds
+the events), not the `tools` list or its permission policies, not any other
+entry. The recorded URL is scrubbed the way the http proxy scrubs its
+`--target` before stamping it on events: userinfo stripped, query string
+and fragment dropped, and every path segment that is secret-shaped or an
+opaque identifier (a UUID, a `cse_...` session id) hashed. This is
+fail-open like everything else here: a missing, unreadable, malformed or
+oversized (> 4 MiB) file is ignored, an entry with no usable URL (a stdio
+server) yields nothing, and the call is allowed and recorded exactly the
+same either way — just without `server.url` and without a policy alias.
 
 ## Policy: allow / deny
 
@@ -199,8 +277,8 @@ Claude Code then never runs the tool at all.
 ```json
 {
   "deny": [
-    { "tool": "^mcp__ClickUp__clickup_delete_task$", "reason": "destructive ClickUp calls are blocked" },
-    { "tool": "^mcp__Gmail__(send_message|trash_.*)$" }
+    { "tool": "^mcp__(ClickUp|mcp\\.clickup\\.com)__clickup_delete_task$", "reason": "destructive ClickUp calls are blocked" },
+    { "tool": "^mcp__(Gmail|[0-9a-f-]{36})__(send_message|trash_.*)$" }
   ],
   "allow": [
     { "tool": "^mcp__github__.*$" }
@@ -211,10 +289,28 @@ Claude Code then never runs the tool at all.
 
 - `tool` is a **regex tested against the full hook `tool_name`** — the same
   string Claude Code's own hook `matcher` field is tested against (e.g.
-  `mcp__ClickUp__clickup_delete_task`, or `Bash` for a built-in).
+  `mcp__ClickUp__clickup_delete_task`, or `Bash` for a built-in) — **and,
+  when the server's origin was resolved (see
+  [Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl)), also
+  against the alias `mcp__<host>__<tool>`**: a cloud session's
+  `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_delete_task` is
+  also tested as `mcp__mcp.clickup.com__clickup_delete_task`. A rule
+  matches when either string matches. That is why the example spells the
+  ClickUp rule `(ClickUp|mcp\.clickup\.com)`: `ClickUp` is the name a
+  local Claude Code gives the connector, `mcp.clickup.com` is the host every
+  cloud session resolves it to, so one rule works in both. When a
+  connector's vendor host is not known yet, `[0-9a-f-]{36}` matches any
+  UUID-named server, as the Gmail rule does — read `server.url` off a
+  recorded event (`query --json`, `ui`), or the `mcp_url` in
+  `/tmp/mcp-config-*.json`, to learn the host. `github` keeps its readable
+  name in cloud sessions, so `^mcp__github__` needs no alias (its alias
+  would be the relay host, `mcp__api.anthropic.com__...`). The alias is
+  only ever used for policy evaluation: it is never recorded and never
+  shown to Claude Code.
 - Evaluated in order: the first matching `deny` rule wins; else the first
   matching `allow` rule; else `default` (itself `"allow"` unless set to
-  `"deny"`).
+  `"deny"`). The alias only ever adds matches, so a policy written against
+  raw names behaves exactly as it did.
 - A `deny` rule's `reason` (when given) is shown to Claude Code — and,
   through it, to whoever is watching the session — as the reason the tool
   call was blocked.

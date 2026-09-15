@@ -20,3 +20,16 @@ export interface ParsedToolName {
     tool: string;
 }
 export declare function parseToolName(toolName: string): ParsedToolName;
+/**
+ * The policy ALIAS of an MCP tool name: the same `mcp__<server>__<tool>`
+ * shape with the server segment replaced by the hostname the server was
+ * resolved to (src/hook/mcp-config.ts), e.g.
+ * `mcp__mcp.clickup.com__clickup_get_list` for a cloud session's
+ * `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_get_list`. A policy
+ * rule matches when its regex matches either the raw name or this alias,
+ * so one rule written against the vendor host works in a local session
+ * (readable server names) and a cloud session (opaque UUID names) alike.
+ * The alias is never recorded or shown to Claude Code — it only exists for
+ * policy evaluation; `server.name` stays what Claude Code calls the server.
+ */
+export declare function hostAliasToolName(host: string, tool: string): string;

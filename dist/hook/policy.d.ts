@@ -46,6 +46,12 @@ export interface LoadPolicyResult {
 /** Load a policy file from disk. `path: undefined` means "no policy
  *  configured" (`policy: null`, allow everything) — not a warning. */
 export declare function loadPolicy(path: string | undefined): LoadPolicyResult;
-/** Evaluate a policy against a hook's full `tool_name`. `policy: null` (no
- *  policy configured, or one that failed to load) always allows. */
-export declare function evaluatePolicy(policy: CompiledPolicy | null, toolName: string): PolicyDecision;
+/** Evaluate a policy against a hook's full `tool_name`, and — when given —
+ *  its host alias (`mcp__<host>__<tool>`, see `hostAliasToolName` in
+ *  src/hook/names.ts): a rule matches when its regex matches EITHER
+ *  string, and the first matching rule wins in the same order as before
+ *  (deny rules, then allow rules, then `default`). The alias only ever adds
+ *  matches, never removes one, so a policy written against raw names
+ *  behaves exactly as it did. `policy: null` (no policy configured, or one
+ *  that failed to load) always allows. */
+export declare function evaluatePolicy(policy: CompiledPolicy | null, toolName: string, alias?: string): PolicyDecision;

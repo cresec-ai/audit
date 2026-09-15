@@ -133,6 +133,11 @@ Flags:
 
 Environment:
   MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded
+  MCP_RECORDER_MCP_CONFIG=PATH[,PATH...]
+                           hook: Claude Code MCP config file(s) to resolve
+                           server origins (server.url, policy alias
+                           mcp__<host>__<tool>) from; default: the cloud
+                           session's /tmp/mcp-config-*.json (see docs/hooks.md)
 `;
 const FLAG_DEFS = {
     'data-dir': { type: 'string' },

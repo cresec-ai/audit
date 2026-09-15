@@ -245,6 +245,10 @@ export declare const ENV: {
     readonly STORE: "MCP_RECORDER_STORE";
     readonly REDACT: "MCP_RECORDER_REDACT";
     readonly DISABLE: "MCP_RECORDER_DISABLE";
+    /** `hook`: MCP config file(s) to resolve server origins from — one path or
+     *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
+     *  See src/hook/mcp-config.ts. */
+    readonly MCP_CONFIG: "MCP_RECORDER_MCP_CONFIG";
 };
 /** File names inside the data dir. */
 export declare const FILES: {

@@ -86,6 +86,18 @@ export interface ServerContext {
   /** The wrapped command line (argv joined), env values never included. */
   command: string;
   transport: 'stdio' | 'http';
+  /**
+   * Additive optional field (schema stays v1). Where the server actually
+   * is, when known. Set by `mcp-recorder hook` from the MCP config file
+   * Claude Code was started with (src/hook/mcp-config.ts): the vendor
+   * endpoint behind an Anthropic-hosted connector's relay (`mcp_url`, e.g.
+   * `https://mcp.clickup.com/mcp`), else the config entry's own URL —
+   * always scrubbed (userinfo stripped, query/fragment dropped, secret-
+   * shaped or opaque path segments such as a cloud session id replaced in
+   * place by `sha256:<hex>`). Undefined when unresolved and on every
+   * proxy-captured event (the http proxy records its target in `command`).
+   */
+  url?: string;
 }
 
 export type EventKind =

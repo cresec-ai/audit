@@ -145,6 +145,7 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
+| `url` | `string?` | Additive, optional (schema stays v1); hook-sourced. Where the server actually is, when `mcp-recorder hook` could resolve it from the MCP config file Claude Code was started with (`MCP_RECORDER_MCP_CONFIG`, else `/tmp/mcp-config-*.json` in a cloud session): the vendor endpoint behind an Anthropic-hosted connector's relay (the relay URL's decoded `mcp_url`, e.g. `https://mcp.clickup.com/mcp`), else the config entry's own URL. Scrubbed exactly like the http transport's target URL below — userinfo stripped, query string and fragment dropped — plus every path segment that is secret-shaped **or an opaque identifier** (a UUID, a cloud session id such as `cse_...`) is replaced in place by its `sha256:<hex>` ref, so a relay URL never carries the session id. Undefined when unresolved, and on every proxy-captured event (the http proxy records its target in `command`). See [Hook-sourced events](#hook-sourced-events-additive) and [docs/hooks.md](hooks.md#cloud-sessions-uuid-server-names-and-serverurl). |
 
 **`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
 `--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`
@@ -333,7 +334,7 @@ the exact same `session_start` / `tool_call` / `session_end` / `notification`
 shapes above — no new event kind was needed. `Stop` (the end of an agent
 turn, which fires many times per session) becomes a `notification` event
 with `method: 'claude-code/stop'` and `direction: 'client_to_server'`, so
-that a session still has exactly one `session_end` (from `SessionEnd`). Three additive, optional fields distinguish a
+that a session still has exactly one `session_end` (from `SessionEnd`). Four additive, optional fields distinguish a
 hook-sourced event and its finer shape, none of which change any existing
 field:
 
@@ -366,6 +367,18 @@ field:
   PostToolUse event whose `tool_response` is shaped `{isError: true}` (the
   MCP CallToolResult convention) sets `is_error: true` and the
   `'tool_error'` *attribute* only, with no `error` object.
+- **`ServerContext.url`** — the resolved endpoint of the MCP server a
+  hook-sourced `tool_call` went to (see the `ServerContext` table above
+  for the value and its scrubbing), set on both halves of the call and on
+  the `session_start` emitted by the first event of a session (whose
+  `server.name` stays the client name — it records which endpoint the
+  session opened on). `server.name` itself is always what Claude Code calls
+  the server — in a cloud session an opaque UUID like
+  `47d587b8-3fb9-42e9-b596-f8b25371248c` (cloud dogfood 3, surprise 2) —
+  so that it matches Claude Code's own hook matchers and transcripts;
+  `url` is what makes such an event self-describing. Absent when the
+  config file was missing, malformed, oversized, or had no usable URL for
+  that server.
 
 `SessionEndEvent.reason` is a **frozen closed union**
 (`'child_exit' | 'stdin_closed' | 'signal' | 'error'`) with no member for
