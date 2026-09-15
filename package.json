@@ -31,7 +31,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "compile": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
@@ -39,8 +39,7 @@
     "test:watch": "vitest",
     "bench": "tsx bench/latency.ts",
     "demo": "tsx demo/run.ts",
-    "prepare": "node scripts/prepare.cjs",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run compile && npm test"
   },
   "dependencies": {
     "@noble/ed25519": "^2.1.0",

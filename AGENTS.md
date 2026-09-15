@@ -27,10 +27,14 @@ setup hook calls the same script:
 
 ## Rules that must hold
 
-- `dist/` is committed. It exists so `npm install -g github:cresec-ai/audit#main`
-  works without a build (npm runs a git package's `prepare` without its
-  devDependencies on a global install). After changing anything under `src/`,
-  run `npm run build` and commit the `dist/` changes with it — CI fails on a
+- `dist/` is committed, and package.json deliberately has NO `build`,
+  `prepare`, `prepack` or `install` script — the compile step is `npm run
+  compile`. npm runs a nested `npm install` inside a git clone whenever any of
+  those script names exist, and on a global install (`npm install -g
+  github:cresec-ai/audit#main`) that nested install runs in global mode and
+  fails; with none of them present, npm packs the clone as-is and the
+  committed `dist/` is what ships. After changing anything under `src/`, run
+  `npm run compile` and commit the `dist/` changes with it — CI fails on a
   stale `dist/`. `tsconfig.json` pins `newLine: lf` so the output is identical
   on every platform.
 
