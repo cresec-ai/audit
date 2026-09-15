@@ -21,3 +21,6 @@ bundle*.zip
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Claude Code agent worktrees
+.claude/worktrees/

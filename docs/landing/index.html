@@ -100,7 +100,7 @@
     redacted at the edge, and sealed into a signed hash chain &mdash; on your machine.
     Nothing to trust, nothing to break.
   </p>
-  <div class="install"><span class="dollar">$</span> npx -y @edut/mcp-recorder -- npx -y @some/mcp-server</div>
+  <div class="install"><span class="dollar">$</span> mcp-recorder setup --client claude-desktop</div>
   <p class="hero-links">
     Transparent stdio proxy &middot; fail-open &middot; &lt;5ms p50 added latency &middot; GPL-3.0
   </p>
@@ -140,7 +140,7 @@
   <div class="terminal">
     <div class="terminal-bar"><span></span><span></span><span></span><span class="title">~ mcp-recorder</span></div>
     <pre><span class="c"># 1. wrap your MCP server (any client: Claude Desktop, Claude Code, Cursor...)</span>
-<span class="p">$</span> npx -y @edut/mcp-recorder -- npx -y @modelcontextprotocol/server-filesystem .
+<span class="p">$</span> mcp-recorder record -- npx -y @modelcontextprotocol/server-filesystem .
 
 <span class="c"># 2. use your agent normally, then ask what happened</span>
 <span class="p">$</span> mcp-recorder sessions
@@ -187,7 +187,7 @@ signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.8
       If you run agents with MCP in production and care about what they did &mdash; incident
       response, compliance, or plain peace of mind &mdash; we want your hardest questions.
     </p>
-    <a class="btn solid" href="https://github.com/edut-sec/mcp-recorder">GitHub</a>
+    <a class="btn solid" href="https://github.com/cresec-ai/audit">GitHub</a>
     <a class="btn" href="mailto:hello@example.com?subject=mcp-recorder%20design%20partner">Become a design partner</a>
   </div>
 </section>
@@ -195,7 +195,7 @@ signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.8
 <footer class="wrap">
   @edut/mcp-recorder <span class="sep">|</span> GPL-3.0 <span class="sep">|</span>
   local-first, no cloud, no telemetry <span class="sep">|</span>
-  <a href="https://github.com/edut-sec/mcp-recorder">github.com/edut-sec/mcp-recorder</a>
+  <a href="https://github.com/cresec-ai/audit">github.com/cresec-ai/audit</a>
 </footer>
 
 </body>

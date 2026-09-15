@@ -1,20 +1,18 @@
 {
   "mcpServers": {
     "corp-notes": {
-      "command": "npx",
+      "command": "sh",
       "args": [
-        "tsx", "src/cli.ts", "record",
-        "--data-dir", ".mcp-recorder",
+        "scripts/dogfood-wrap.sh",
         "--name", "corp-notes",
         "--",
         "npx", "tsx", "demo/server.ts"
       ]
     },
     "repo-filesystem": {
-      "command": "npx",
+      "command": "sh",
       "args": [
-        "tsx", "src/cli.ts", "record",
-        "--data-dir", ".mcp-recorder",
+        "scripts/dogfood-wrap.sh",
         "--name", "repo-filesystem",
         "--",
         "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
