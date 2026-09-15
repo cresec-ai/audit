@@ -19,9 +19,21 @@
  *    pending" until the deadline.
  *  - Ids are uuid v4 (`randomUUID`) and are validated before they touch a
  *    path, so a CLI argument can never escape the holds directory.
+ *  - The pending -> final transition happens EXACTLY ONCE, across processes.
+ *    Reading the file and writing it back is not enough: two
+ *    `mcp-recorder approve|deny` runs (or an approval racing the proxy's own
+ *    timeout) both saw `pending`, both wrote, and the last rename won. Every
+ *    writer therefore first creates `<id>.decided` with `openSync(..., 'wx')`
+ *    — an atomic, Windows-safe create-if-absent — and only the process that
+ *    wins that CAS writes the record: `decide()` throws `not_pending` when it
+ *    loses, `finalize()` (timeout / cancelled / session_end) returns without
+ *    touching a decision that got there first.
+ *  - A `pending` hold whose `timeout_at` has passed is reported and treated
+ *    as `timeout` even if nothing ever rewrote it: the proxy that parked it
+ *    may have died, and a stale hold must not stay approvable forever.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 export class HoldError extends Error {
@@ -34,6 +46,8 @@ export class HoldError extends Error {
 }
 /** Default poll interval for `waitForDecision`. */
 export const DEFAULT_POLL_MS = 200;
+/** Name suffix of the exclusive sentinel that makes a decision a cross-process CAS. */
+const SENTINEL_SUFFIX = '.decided';
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const STATUSES = new Set([
     'pending',
@@ -63,6 +77,20 @@ function asHoldRecord(v) {
         return undefined;
     return v;
 }
+/**
+ * The record as it should be READ: a `pending` hold whose `timeout_at` has
+ * passed is a `timeout`, whoever (if anyone) is still around to write that
+ * down. An unparseable `timeout_at` is left alone — the clock is the only
+ * thing that could be wrong, and a hold is never silently invalidated by it.
+ */
+function withExpiry(rec, now) {
+    if (rec.status !== 'pending')
+        return rec;
+    const deadline = Date.parse(rec.timeout_at);
+    if (Number.isNaN(deadline) || deadline > now)
+        return rec;
+    return { ...rec, status: 'timeout' };
+}
 /** Atomic 0600 write: temp file in the same directory, then rename. */
 function writeFileAtomic0600(path, content) {
     const tmp = `${path}.tmp-${randomBytes(6).toString('hex')}`;
@@ -90,10 +118,44 @@ export class HoldStore {
     constructor(dataDir) {
         this.dir = join(dataDir, 'holds');
     }
-    pathOf(id) {
+    pathOf(id, suffix = '.json') {
         if (!ID_RE.test(id))
             throw new HoldError('invalid_id', `invalid hold id: ${JSON.stringify(id)}`);
-        return join(this.dir, `${id}.json`);
+        return join(this.dir, `${id}${suffix}`);
+    }
+    /**
+     * Win the pending -> final transition, atomically and across processes.
+     * `wx` fails with EEXIST when the file is already there — the one syscall
+     * POSIX and Windows both make exclusive — so exactly one caller can ever
+     * see `true` for a given hold.
+     */
+    claim(id) {
+        this.ensureDir();
+        let fd;
+        try {
+            fd = openSync(this.pathOf(id, SENTINEL_SUFFIX), 'wx', 0o600);
+        }
+        catch (err) {
+            if (err.code === 'EEXIST')
+                return false;
+            throw err;
+        }
+        try {
+            closeSync(fd);
+        }
+        catch {
+            /* the file exists; that is all the claim needs */
+        }
+        return true;
+    }
+    /** Give a claim back when the record it was taken for could not be written. */
+    releaseClaim(id) {
+        try {
+            rmSync(this.pathOf(id, SENTINEL_SUFFIX), { force: true });
+        }
+        catch {
+            /* best effort */
+        }
     }
     ensureDir() {
         mkdirSync(this.dir, { recursive: true, mode: 0o700 });
@@ -158,13 +220,21 @@ export class HoldStore {
         }
         return out;
     }
-    /** Pending holds (default) or every hold with `all`, oldest first. Corrupt files are skipped. */
+    /**
+     * Pending holds (default) or every hold with `all`, oldest first. Corrupt
+     * files are skipped. A hold still marked `pending` on disk whose
+     * `timeout_at` has passed is reported as `timeout` (and is therefore NOT in
+     * the default, actionable listing) — the proxy that would have written that
+     * status may be long gone.
+     */
     list(opts = {}) {
         const out = [];
+        const now = Date.now();
         for (const id of this.ids()) {
-            const rec = this.read(id);
-            if (rec === undefined)
+            const raw = this.read(id);
+            if (raw === undefined)
                 continue;
+            const rec = withExpiry(raw, now);
             if (opts.all === true || rec.status === 'pending')
                 out.push(rec);
         }
@@ -182,19 +252,35 @@ export class HoldStore {
             return { ok: true, id: matches[0] };
         return { ok: false, reason: matches.length === 0 ? 'not_found' : 'ambiguous' };
     }
-    /** Approve or deny a PENDING hold (the CLI path). Throws HoldError otherwise. */
+    /**
+     * Approve or deny a PENDING hold (the CLI path). Throws HoldError
+     * otherwise — including when another process (a second `approve`, or the
+     * proxy's own timeout) won the transition between the read and the write:
+     * the sentinel makes that race a clean `not_pending`, never two "success"
+     * lines for one hold.
+     */
     decide(id, status, by) {
         const rec = this.read(id);
         if (rec === undefined)
             throw new HoldError('not_found', `hold not found: ${id}`);
-        if (rec.status !== 'pending') {
-            throw new HoldError('not_pending', `hold ${id} is not pending (status: ${rec.status})`);
+        const current = withExpiry(rec, Date.now());
+        if (current.status !== 'pending') {
+            throw new HoldError('not_pending', `hold ${id} is not pending (status: ${current.status})`);
+        }
+        if (!this.claim(id)) {
+            throw new HoldError('not_pending', `hold ${id} is not pending (another process decided it first)`);
         }
         const decided = { ...rec, status, decided_at: new Date().toISOString() };
         const who = by ?? bestEffortUser();
         if (who !== undefined)
             decided.decided_by = who;
-        this.write(decided);
+        try {
+            this.write(decided);
+        }
+        catch (err) {
+            this.releaseClaim(id); // nothing was decided after all: let the next writer try
+            throw err;
+        }
         return decided;
     }
     /**
@@ -202,12 +288,20 @@ export class HoldStore {
      * (timeout / cancelled / session_end, or an approval it acted on). Best
      * effort: a missing or unreadable file, or an I/O failure, is ignored —
      * this runs on the proxy's fail-open path.
+     *
+     * It takes the same sentinel as `decide()`: a human decision that got there
+     * first is NEVER overwritten (the call simply returns, leaving the approver,
+     * their timestamp and the status a concurrent `waitForDecision` is about to
+     * read), and a timeout that got there first cannot be undone by a late
+     * approval either.
      */
     finalize(id, status) {
         try {
             const rec = this.read(id);
             if (rec === undefined)
                 return;
+            if (!this.claim(id))
+                return; // somebody already settled this hold
             const final = { ...rec, status };
             if (final.decided_at === undefined)
                 final.decided_at = new Date().toISOString();

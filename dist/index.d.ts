@@ -33,6 +33,9 @@ export { POLICY_SCHEMA, POLICY_SCHEMA_ID } from './policy/schema.js';
 export { validateAgainstSchema } from './policy/jsonschema.js';
 export type { JsonSchema, SchemaError } from './policy/jsonschema.js';
 export { checkGlob, checkRe2Subset, formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
+export { checkCatastrophicShape } from './policy/redos.js';
+export { REGEX_DEADLINE_MS, REGEX_STARTUP_MS, RegexGuardError, configureRegexGuard, regexGuardState, resetRegexGuard, setRegexGuardDiag, warmRegexGuard, } from './policy/regex-guard.js';
+export type { RegexGuardFailure, RegexGuardOptions } from './policy/regex-guard.js';
 export type { PolicyError, ValidationResult as PolicyValidationResult } from './policy/validate.js';
 export { PolicyLoadError, PolicyValidationError, findNonJsonValue, loadPolicyFile, parsePolicyText, sourceForPath, } from './policy/load.js';
 export type { LoadedPolicy, PolicySource } from './policy/load.js';
@@ -42,7 +45,7 @@ export { evaluateEgress, evaluateMcp, getPath, ruleLabel } from './policy/engine
 export type { Decision as PolicyDecision, EgressDecision, EgressRequestInput, McpDecision, McpRequestInput, } from './policy/engine.js';
 export { bundleFileOrder, compileToRego, policyRevision, renderEgressModule, renderMcpModule, } from './policy/rego.js';
 export type { CompileOptions as RegoCompileOptions, RegoBundle } from './policy/rego.js';
-export { INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, applyBoundary, blockedText, defaultSecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
+export { BOUNDARY_SECRET_FAMILIES, INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, applyBoundary, blockedText, boundarySecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
 export type { BoundaryAction, BoundaryDeps, BoundaryOptions, BoundaryOutcome, BoundaryReport as BoundaryFilterReport, DeniedHoldOutcome, DeniedTextInput, HoldCreateInput, HoldDecision, HoldErrorCode, HoldRecord, HoldStatus, HoldWaitOptions, HoldWaitResult, InjectionPattern, Span, } from './gateway/index.js';
 export type { GatewayOptions } from './gateway/options.js';
 export { resolveConfig } from './config.js';

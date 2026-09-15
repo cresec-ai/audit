@@ -102,6 +102,18 @@ export { POLICY_SCHEMA, POLICY_SCHEMA_ID } from './policy/schema.js';
 export { validateAgainstSchema } from './policy/jsonschema.js';
 export type { JsonSchema, SchemaError } from './policy/jsonschema.js';
 export { checkGlob, checkRe2Subset, formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
+export { checkCatastrophicShape } from './policy/redos.js';
+export {
+  REGEX_DEADLINE_MS,
+  REGEX_STARTUP_MS,
+  RegexGuardError,
+  configureRegexGuard,
+  regexGuardState,
+  resetRegexGuard,
+  setRegexGuardDiag,
+  warmRegexGuard,
+} from './policy/regex-guard.js';
+export type { RegexGuardFailure, RegexGuardOptions } from './policy/regex-guard.js';
 export type { PolicyError, ValidationResult as PolicyValidationResult } from './policy/validate.js';
 export {
   PolicyLoadError,
@@ -133,13 +145,14 @@ export type { CompileOptions as RegoCompileOptions, RegoBundle } from './policy/
 
 /* gateway primitives (record --policy): boundary filter, injection markers, hold store */
 export {
+  BOUNDARY_SECRET_FAMILIES,
   INJECTION_MARKER,
   INJECTION_PATTERNS,
   MARKER_HASH_HEX,
   MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS,
   applyBoundary,
   blockedText,
-  defaultSecretPatterns,
+  boundarySecretPatterns,
   deniedText,
   findInjectionSpans,
   findSecretSpans,

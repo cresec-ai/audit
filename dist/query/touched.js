@@ -11,6 +11,10 @@
  *                 larger leaf), OR an object KEY that was itself hashed to
  *                 sha256(needle)
  *   result_hash — the event's result_hash equals sha256(needle)
+ *   args_hash   — a policy_decision's args_hash equals sha256(needle), i.e.
+ *                 the needle is the canonical JSON of the arguments of a call
+ *                 the gateway denied or held (gateway mode; those arguments
+ *                 exist nowhere else in clear)
  *   credential  — an identity credential fingerprint equals sha256(needle)
  *   name        — tool / method / server.name equals the needle (case-insensitive)
  *   plain       — a plain string leaf contains the needle (case-sensitive)
@@ -24,9 +28,10 @@ import { sha256Ref } from '../chain/hash.js';
 const PRIORITY = {
     ref: 0,
     result_hash: 1,
-    credential: 2,
-    name: 3,
-    plain: 4,
+    args_hash: 2,
+    credential: 3,
+    name: 4,
+    plain: 5,
 };
 function isRedactedRef(value) {
     return (typeof value === 'object' &&
@@ -102,6 +107,14 @@ function findCandidates(seq, event, needle, needleHash) {
     if ((event.kind === 'tool_call' || event.kind === 'rpc') &&
         event.result_hash === needleHash) {
         candidates.push({ matched_on: 'result_hash', path: '$.result_hash' });
+    }
+    // Gateway mode (additive): a denied or held call never reached the server,
+    // so its arguments exist only as `args_hash` — sha256 of their canonical
+    // JSON — on the policy_decision. That is a plain string field, not a
+    // RedactedRef leaf, so the walk above never sees it. Querying the exact
+    // canonical-JSON arguments must still name the call that was refused.
+    if (event.kind === 'policy_decision' && event.args_hash === needleHash) {
+        candidates.push({ matched_on: 'args_hash', path: '$.args_hash' });
     }
     const fingerprints = event.identity.credential_fingerprints;
     if (fingerprints !== undefined) {

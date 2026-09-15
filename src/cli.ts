@@ -441,6 +441,13 @@ function writeRunSummary(setup: ProxySetup): void {
 /**
  * Block until SIGINT/SIGTERM. Holds the event loop open itself (signal
  * listeners alone do not), so it also covers unref()'d servers like the UI's.
+ *
+ * The listeners are installed synchronously, when this is CALLED — so call
+ * it before printing "(Ctrl-C to stop)", not after. A process that announces
+ * itself first and arms the handler second has a window in which a SIGINT
+ * kills it with the default disposition (exit 130, no clean close, no run
+ * summary), and a script or test that reacts to the announcement lands in
+ * that window often enough to matter.
  */
 function waitForShutdownSignal(): Promise<void> {
   return new Promise((resolveWait) => {
@@ -626,8 +633,9 @@ async function cmdHttp(flags: Flags): Promise<void> {
   } catch {
     /* leave the placeholder */
   }
+  const shutdown = waitForShutdownSignal(); // armed before the announcement, see the helper
   diag(`http proxy listening at ${proxy.url} -> ${targetOrigin} (Ctrl-C to stop)`);
-  await waitForShutdownSignal();
+  await shutdown;
   await proxy.close();
   writeRunSummary(setup);
   process.exit(0);
@@ -1160,9 +1168,10 @@ async function cmdUi(flags: Flags): Promise<void> {
       port,
       ...(sessionId !== undefined ? { sessionId } : {}),
     });
+    const shutdown = waitForShutdownSignal(); // armed before the announcement, see the helper
     diag(`replay UI at ${ui.url} (Ctrl-C to stop)`);
     if (flags['no-open'] !== true) tryOpenBrowser(ui.url);
-    await waitForShutdownSignal();
+    await shutdown;
     await ui.close();
   } finally {
     store.close();

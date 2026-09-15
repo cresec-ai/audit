@@ -19,6 +19,18 @@
  *    pending" until the deadline.
  *  - Ids are uuid v4 (`randomUUID`) and are validated before they touch a
  *    path, so a CLI argument can never escape the holds directory.
+ *  - The pending -> final transition happens EXACTLY ONCE, across processes.
+ *    Reading the file and writing it back is not enough: two
+ *    `mcp-recorder approve|deny` runs (or an approval racing the proxy's own
+ *    timeout) both saw `pending`, both wrote, and the last rename won. Every
+ *    writer therefore first creates `<id>.decided` with `openSync(..., 'wx')`
+ *    — an atomic, Windows-safe create-if-absent — and only the process that
+ *    wins that CAS writes the record: `decide()` throws `not_pending` when it
+ *    loses, `finalize()` (timeout / cancelled / session_end) returns without
+ *    touching a decision that got there first.
+ *  - A `pending` hold whose `timeout_at` has passed is reported and treated
+ *    as `timeout` even if nothing ever rewrote it: the proxy that parked it
+ *    may have died, and a stale hold must not stay approvable forever.
  */
 export type HoldStatus = 'pending' | 'approved' | 'denied' | 'timeout' | 'cancelled' | 'session_end';
 export interface HoldRecord {
@@ -70,6 +82,15 @@ export declare class HoldStore {
     readonly dir: string;
     constructor(dataDir: string);
     private pathOf;
+    /**
+     * Win the pending -> final transition, atomically and across processes.
+     * `wx` fails with EEXIST when the file is already there — the one syscall
+     * POSIX and Windows both make exclusive — so exactly one caller can ever
+     * see `true` for a given hold.
+     */
+    private claim;
+    /** Give a claim back when the record it was taken for could not be written. */
+    private releaseClaim;
     private ensureDir;
     private write;
     /** Write a new pending hold. Throws on I/O failure (caller denies: "hold unavailable"). */
@@ -78,7 +99,13 @@ export declare class HoldStore {
     read(id: string): HoldRecord | undefined;
     /** Ids of every well-formed hold file name in the directory (unsorted). */
     private ids;
-    /** Pending holds (default) or every hold with `all`, oldest first. Corrupt files are skipped. */
+    /**
+     * Pending holds (default) or every hold with `all`, oldest first. Corrupt
+     * files are skipped. A hold still marked `pending` on disk whose
+     * `timeout_at` has passed is reported as `timeout` (and is therefore NOT in
+     * the default, actionable listing) — the proxy that would have written that
+     * status may be long gone.
+     */
     list(opts?: {
         all?: boolean;
     }): HoldRecord[];
@@ -90,13 +117,25 @@ export declare class HoldStore {
         ok: false;
         reason: 'not_found' | 'ambiguous';
     };
-    /** Approve or deny a PENDING hold (the CLI path). Throws HoldError otherwise. */
+    /**
+     * Approve or deny a PENDING hold (the CLI path). Throws HoldError
+     * otherwise — including when another process (a second `approve`, or the
+     * proxy's own timeout) won the transition between the read and the write:
+     * the sentinel makes that race a clean `not_pending`, never two "success"
+     * lines for one hold.
+     */
     decide(id: string, status: HoldDecision, by?: string): HoldRecord;
     /**
      * Record the final status of a hold the proxy stopped waiting on
      * (timeout / cancelled / session_end, or an approval it acted on). Best
      * effort: a missing or unreadable file, or an I/O failure, is ignored —
      * this runs on the proxy's fail-open path.
+     *
+     * It takes the same sentinel as `decide()`: a human decision that got there
+     * first is NEVER overwritten (the call simply returns, leaving the approver,
+     * their timestamp and the status a concurrent `waitForDecision` is about to
+     * read), and a timeout that got there first cannot be undone by a late
+     * approval either.
      */
     finalize(id: string, status: HoldStatus): void;
     /**

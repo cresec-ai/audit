@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, openSync, closeSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_POLL_MS, HoldError, HoldStore, type HoldCreateInput } from '../src/gateway/index.js';
+import { spawnTsx } from './helpers/tsx.js';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+/** The module under test, as a specifier a spawned child can import. */
+const HOLDS_MODULE = pathToFileURL(join(ROOT, 'src', 'gateway', 'holds.ts')).href;
+/** `<id>.decided`: the exclusive sentinel that makes a decision a cross-process CAS. */
+const sentinel = (store: HoldStore, id: string): string => join(store.dir, `${id}.decided`);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -291,4 +299,144 @@ describe('HoldStore.waitForDecision', () => {
     expect(seen.every((e) => e.unref)).toBe(true);
     expect(DEFAULT_POLL_MS).toBe(200);
   });
+});
+
+/* ------------------- the pending -> decided transition is a CAS ------------------- */
+
+describe('HoldStore: the pending -> final transition is exclusive', () => {
+  it('decide() takes the <id>.decided sentinel and a caller that loses it gets not_pending', () => {
+    const rec = store.create(input());
+    const decided = store.decide(rec.approval_id, 'approved', 'alice');
+    expect(existsSync(sentinel(store, rec.approval_id))).toBe(true);
+    expect(store.read(rec.approval_id)).toEqual(decided);
+    // Sentinel files are not hold files: they never show up as holds.
+    expect(store.list({ all: true }).map((r) => r.approval_id)).toEqual([rec.approval_id]);
+
+    // A hold whose sentinel exists is decided, whatever the record still says:
+    // this is exactly the state the loser of a real race observes.
+    const other = store.create(input({ approval_id: 'raced-1' }));
+    closeSync(openSync(sentinel(store, other.approval_id), 'wx', 0o600));
+    let err: unknown;
+    try {
+      store.decide(other.approval_id, 'denied', 'bob');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(HoldError);
+    expect((err as HoldError).code).toBe('not_pending');
+    expect((err as HoldError).message).toMatch(/another process decided it first/);
+    expect(store.read(other.approval_id)?.status).toBe('pending'); // untouched by the loser
+  });
+
+  it('finalize() never overwrites a decision that got there first, and the decision is what a waiter sees', async () => {
+    const rec = store.create(input());
+    const wait = store.waitForDecision(rec.approval_id, { timeoutMs: 10_000, pollMs: 10 });
+    const decided = store.decide(rec.approval_id, 'approved', 'alice');
+    store.finalize(rec.approval_id, 'timeout'); // the proxy gave up at the same moment
+    expect(store.read(rec.approval_id)).toEqual(decided);
+    const res = await wait;
+    expect(res.status).toBe('approved');
+    expect(res.record?.decided_by).toBe('alice');
+  });
+
+  it('finalize() that wins first cannot be undone by a late decide()', () => {
+    const rec = store.create(input());
+    store.finalize(rec.approval_id, 'timeout');
+    expect(store.read(rec.approval_id)?.status).toBe('timeout');
+    expect(() => store.decide(rec.approval_id, 'approved', 'alice')).toThrow(HoldError);
+    expect(store.read(rec.approval_id)?.status).toBe('timeout');
+    // A second finalize is a no-op too: the first final status stands.
+    store.finalize(rec.approval_id, 'session_end');
+    expect(store.read(rec.approval_id)?.status).toBe('timeout');
+  });
+
+  it('a pending hold past its timeout_at is reported and treated as timeout', () => {
+    const stale = store.create(input({ approval_id: 'stale-1', timeout_at: new Date(Date.now() - 1_000).toISOString() }));
+    const live = store.create(input({ approval_id: 'live-1' }));
+    // Nothing rewrote the file: the proxy that parked it may be gone.
+    expect(store.read(stale.approval_id)?.status).toBe('pending');
+    expect(store.list().map((r) => r.approval_id)).toEqual([live.approval_id]);
+    const all = store.list({ all: true });
+    expect(all.find((r) => r.approval_id === stale.approval_id)?.status).toBe('timeout');
+    expect(all.find((r) => r.approval_id === live.approval_id)?.status).toBe('pending');
+
+    let err: unknown;
+    try {
+      store.decide(stale.approval_id, 'approved', 'alice');
+    } catch (e) {
+      err = e;
+    }
+    expect((err as HoldError).code).toBe('not_pending');
+    expect((err as HoldError).message).toMatch(/status: timeout/);
+    expect(existsSync(sentinel(store, stale.approval_id))).toBe(false); // no claim was taken
+    // An unparseable timeout_at is never treated as expired.
+    const odd = store.create(input({ approval_id: 'odd-1', timeout_at: 'not-a-date' }));
+    expect(store.list().map((r) => r.approval_id)).toContain(odd.approval_id);
+    expect(store.decide(odd.approval_id, 'approved', 'alice').status).toBe('approved');
+  });
+
+  it('two racing processes: exactly one decide() wins every time', async () => {
+    const trials = 20;
+    const ids = Array.from({ length: trials }, (_, i) => `race-${i}`);
+    for (const id of ids) store.create(input({ approval_id: id }));
+
+    const child = join(dataDir, 'decide-child.ts');
+    writeFileSync(
+      child,
+      [
+        `import { HoldError, HoldStore } from ${JSON.stringify(HOLDS_MODULE)};`,
+        'const [dir, startAt, gap, count, who] = process.argv.slice(2);',
+        'const store = new HoldStore(dir);',
+        'const out: string[] = [];',
+        'for (let i = 0; i < Number(count); i++) {',
+        '  const at = Number(startAt) + i * Number(gap);',
+        '  while (Date.now() < at) { /* spin onto the shared instant */ }',
+        '  try {',
+        "    store.decide(`race-${i}`, 'approved', who);",
+        "    out.push('won');",
+        '  } catch (e) {',
+        "    out.push(e instanceof HoldError ? e.code : `threw:${String(e)}`);",
+        '  }',
+        '}',
+        'process.stdout.write(JSON.stringify(out));',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const startAt = Date.now() + 3_000; // enough for both tsx processes to be up
+    const runChild = (who: string): Promise<string[]> =>
+      new Promise((resolve, reject) => {
+        const proc = spawnTsx([child, dataDir, String(startAt), '25', String(trials), who], { cwd: ROOT });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', (b: Buffer) => (stdout += b.toString('utf8')));
+        proc.stderr.on('data', (b: Buffer) => (stderr += b.toString('utf8')));
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+          if (code !== 0) {
+            reject(new Error(`child ${who} exited ${code}: ${stderr}`));
+            return;
+          }
+          resolve(JSON.parse(stdout) as string[]);
+        });
+      });
+
+    const [alice, bob] = await Promise.all([runChild('alice'), runChild('bob')]);
+    expect(alice).toHaveLength(trials);
+    expect(bob).toHaveLength(trials);
+    for (let i = 0; i < trials; i++) {
+      const pair = [alice[i], bob[i]];
+      // Before the sentinel both processes could read `pending`, both write and
+      // both report success (the reviewer saw it in 7 of 40 trials).
+      expect(pair.filter((r) => r === 'won'), `trial ${i}: ${JSON.stringify(pair)}`).toHaveLength(1);
+      expect(pair.filter((r) => r === 'not_pending'), `trial ${i}: ${JSON.stringify(pair)}`).toHaveLength(1);
+      const rec = store.read(ids[i]!)!;
+      expect(rec.status).toBe('approved');
+      expect(rec.decided_by).toBe(alice[i] === 'won' ? 'alice' : 'bob');
+    }
+    // Exactly `trials` successes in total across both processes — never two for
+    // one hold, never zero (which is what a lock that is too eager would give).
+    const won = [...alice, ...bob].filter((r) => r === 'won').length;
+    expect(won).toBe(trials);
+  }, 60_000);
 });

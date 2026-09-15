@@ -198,7 +198,22 @@ JavaScript engine and OPA's RE2 agree. `policy validate` rejects:
 - a `]` written directly after `[` or `[^` — `[]a]` is a class containing
   `]` and `a` in RE2 but an *empty* class in JavaScript. Escape it: `[\]a]`;
 - POSIX classes (`[:alpha:]`) and `\x{...}`;
-- every backslash escape outside this list.
+- every backslash escape outside this list;
+- repeated groups whose repetition is ambiguous — `(a+)+`, `(a|aa)+`,
+  `(\w+[ ]?)*`, `(.*a)*`, `(ab?)*`: RE2 matches these in linear time, but the
+  local JavaScript engine backtracks exponentially (`^(a+)+$` against 29
+  non-matching characters takes about 14 seconds and, on the single-threaded
+  proxy, stalls every other call behind it). A repeated group must end with
+  something the repeated part cannot match — `([a-z0-9-]+\.)*` and
+  `(\d{1,3}\.){3}\d{1,3}` are fine, as is a group that is not repeated
+  (`(^|/)(\.env|id_rsa)$`) or repeated only with `?`.
+
+Belt and braces: at run time every `match.args` regex is matched on a worker
+thread under a 25 ms deadline. A match that overruns it is abandoned, the
+pattern is disabled for the rest of the process, and the call is denied with
+`policy evaluation error: regex timed out (<rule id>)` — enforcement fails
+closed, so a pattern that cannot be evaluated is never treated as "did not
+match".
 
 The accepted escapes — each means exactly the same thing in RE2 and in V8
 without the `u` flag — are:
@@ -231,10 +246,12 @@ what the compiled policy does too.)
 
 The value at the path is coerced before matching: strings as-is, numbers and
 booleans via their canonical string form (`1.5`, `true`), anything else
-(`null`, objects, arrays, missing) never matches. Values longer than 64 KiB
-are truncated to 64 KiB before the regex runs (a bound against pathological
-inputs; RE2 is linear-time, so the Rego side does not truncate and only
-values beyond the cap can differ).
+(`null`, objects, arrays, missing) never matches. Values longer than 4 KiB
+are truncated to 4 KiB (4096 UTF-16 units) before the regex runs: the local
+engine matches with JavaScript's backtracking RegExp, so the cap is also the
+bound on how much work a single argument can ask of it. RE2 is linear-time,
+so the Rego side does not truncate at all and only values beyond the cap can
+ever make the two engines differ.
 
 The number form is JavaScript's: the shortest text that round-trips, with an
 exponent only below `1e-6` or at/above `1e21`. `1234567.5` is `"1234567.5"`,
@@ -293,20 +310,40 @@ evicted, or the server volunteered one) that still carries `result.content`
 blocks. That last case is scanned fail-closed and still recorded as
 `protocol_error` `orphan_response`, exactly as in record mode:
 
-- **Secrets.** Spans matching the recorder's `alwaysPatterns` — the very same
-  regexes that produce `secret_refs` in recorded events (AWS keys, GitHub and
-  OpenAI tokens, Slack tokens, JWTs, PEM private keys, bearer tokens, …).
-  `redact` replaces each span with `[redacted:sha256:<16 hex>]`; the full
-  `sha256:<hex>` of every redacted token is recorded on the event
-  (`gateway.boundary.secret_refs`) so `mcp-recorder query <value>` still finds
-  the call even though the model never saw the value.
+- **Secrets.** A deliberately narrow, high-confidence subset of the recorder's
+  `alwaysPatterns` (`boundarySecretPatterns()` in `src/gateway/boundary.ts`):
+  AWS access key ids (`AKIA…`/`ASIA…`), GitHub tokens
+  (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), `sk-…` API keys (OpenAI and Anthropic
+  `sk-ant-…`), Slack tokens (`xox[baprs]-…`), JWTs (three base64url segments
+  behind an `eyJ` header), PEM private-key blocks, `Bearer` authorization
+  values, and `password=` / `passwd:` / `secret=` / `token:` / `api_key=`
+  assignments carrying a value. The generic long-hex (32+ hex characters) and
+  long-base64 (40+ characters) shapes are deliberately excluded at the
+  boundary: they match git SHAs, sha256 checksums, dash-less UUIDs, container
+  digests and inline base64 images, and rewriting those would corrupt ordinary
+  output a coding agent reads (`git log`, `sha256sum`, lockfiles). Storage
+  redaction is unchanged and still hashes every one of those shapes, so they
+  never reach the evidence store in clear and `secret_refs` on stored events
+  keeps its wider meaning. `redact` replaces each span with
+  `[redacted:sha256:<16 hex>]`; the full `sha256:<hex>` of every redacted
+  token is recorded on the event (`gateway.boundary.secret_refs`) so
+  `mcp-recorder query <value>` still finds the call even though the model
+  never saw the value.
 - **Injection markers.** A conservative, documented list
   (`src/gateway/injection.ts`): "ignore previous instructions", "SYSTEM
   OVERRIDE", developer-mode jailbreaks, "do not mention this step", "reveal
   your system prompt", HTML comments carrying imperative instructions, and
   similar. False positives are possible on security documentation that
   quotes such phrases; that is why the default is `flag` (record, don't
-  touch).
+  touch). Before scanning, the filter normalizes a copy of the text:
+  zero-width and bidi control characters (U+200B–U+200F, U+2060–U+2064,
+  U+202A–U+202E, U+FEFF) are stripped, NFKC folds homoglyphs (fullwidth,
+  mathematical and other compatibility forms) onto their ASCII equivalents,
+  and runs of whitespace collapse to a single space; every marker found is
+  mapped back onto the original text, so what gets reported and rewritten is
+  exactly the original bytes. Base64-encoded instructions and keywords split
+  by markdown or HTML markup are out of scope — the filter does not decode or
+  un-mark-up text before scanning.
 - **Actions.** `redact` rewrites the matched span; `block` replaces the whole
   result with an `isError` result saying what was found; `flag` forwards the
   result unchanged and only records; `off` skips the scan. When secrets and

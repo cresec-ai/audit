@@ -258,7 +258,7 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
-| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; a call the gateway refused carries `error.type: 'policy_denied'` (see [Gateway mode fields](#gateway-mode-fields-additive)), and `mcp-recorder hook` uses the same value for a call its `--policy` denied — see [Hook-sourced events](#hook-sourced-events-additive). |
+| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; a call the gateway refused carries `error.type: 'policy_denied'` (see [Gateway mode fields](#gateway-mode-fields-additive)), and `mcp-recorder hook` uses the same value for a call its `--policy` denied — see [Hook-sourced events](#hook-sourced-events-additive). A call the gateway refused because its JSON-RPC request id was still in flight (held for approval, or pending) carries `error.type: 'duplicate_id'`. |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
 | `gateway` | `GatewayOutcome?` | Additive (v1). Present on every `tool_call` recorded in gateway mode — see [Gateway mode fields](#gateway-mode-fields-additive). |
 | `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
@@ -324,7 +324,10 @@ existing free-form string field, so this needed no schema change. The synthetic
 event's `tool`/`method` is whatever was captured for the pending request — already
 capped (`structuralString`, see [Privacy posture](#privacy-posture)) at the point the
 request was first seen, so an unanswered call with an oversized/malformed name or
-method is just as capped here as in a normal completed event.
+method is just as capped here as in a normal completed event. The same
+synthetic shape is reused with `error.type: 'duplicate_id'` when gateway mode
+seals a pending request whose id an approved hold reclaims — identical
+`result_hash` / `result: null` / `is_error: true`, only the error class differs.
 
 ## Gateway mode fields (additive)
 
@@ -351,7 +354,7 @@ exactly as before (canonical JSON drops nothing that was never there).
 | --- | --- | --- |
 | `scanned` | `boolean` | `false` when the result exceeded `boundary.max_scan_bytes` or the filter hit an internal error. |
 | `action` | `'none' \| 'redact' \| 'block' \| 'flag'` | What was applied to the result the client received. |
-| `secrets_found` | `number` | Secret-shaped spans found (`alwaysPatterns`, the same regexes behind `secret_refs`). |
+| `secrets_found` | `number` | Secret-shaped spans found. The boundary filter runs a **narrowed** subset of `alwaysPatterns` — provider-prefixed tokens, JWTs, PEM private keys, bearer values and `secret=`-style assignments — excluding the generic long-hex and long-base64 shapes so ordinary output (git SHAs, checksums, inline images) is never rewritten. `secret_refs` on stored `RedactedRef` leaves keeps the full, wider `alwaysPatterns` meaning. |
 | `injection_found` | `number` | Prompt-injection marker spans found. |
 | `secret_refs` | `Sha256Ref[]?` | Hashes of the secret tokens found (de-duplicated, capped at 8) — the model may never have seen the values, `query` still finds the call. |
 | `delivered_result_hash` | `Sha256Ref?` | Present only when the filter modified the result: `sha256:<hex>` of the canonical JSON of the result **the client actually received**. `result_hash`/`result` keep their frozen meaning — the complete raw result the server returned, pre-redaction and pre-filter. |
@@ -447,7 +450,7 @@ typed event fields to their semconv equivalents.
 | `rpc.system` | constant | `jsonrpc` — MCP is JSON-RPC 2.0. |
 | `rpc.jsonrpc.request_id` | `RpcEvent.request_id`, `InitializeEvent.request_id` | Correlated request id. |
 | `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. Same capped value as `method` (see above). |
-| `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. `policy_denied` marks a call the gateway refused. |
+| `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. `policy_denied` marks a call the gateway refused; `duplicate_id` marks a call refused for reusing a request id that was still in flight, and a request sealed to hand an approved hold its pending slot back. |
 | `cresec.policy.decision` | `PolicyDecisionEvent.decision`, `ToolCallEvent.gateway.decision` | `allow` / `hold` / `deny`. Not an OTel semconv name; namespaced under `cresec.` to say so. |
 | `cresec.policy.rule_id` | `PolicyDecisionEvent.rule_id`, `ToolCallEvent.gateway.rule_id` | The matching `policy.yaml` rule id, when one matched. |
 

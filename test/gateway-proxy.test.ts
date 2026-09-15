@@ -27,7 +27,12 @@ import { blockedText, deniedText, oversizeBlockedText } from '../src/gateway/bou
 import type { LoadedPolicy } from '../src/policy/load.js';
 import type { Policy, PolicyInput } from '../src/policy/types.js';
 import { validatePolicyObject } from '../src/policy/validate.js';
-import { MAX_HOLDS, runStdioProxy } from '../src/proxy/stdio.js';
+import {
+  MAX_HOLDS,
+  NULL_ID_TOOLS_CALL_MESSAGE,
+  duplicateIdText,
+  runStdioProxy,
+} from '../src/proxy/stdio.js';
 import { queryStore } from '../src/query/touched.js';
 import { Redactor } from '../src/redact/redactor.js';
 import type {
@@ -245,6 +250,8 @@ function standardPolicy(tweak?: (p: Policy) => void, over: Partial<NonNullable<P
 
 interface Session {
   store: FakeStore;
+  /** The proxy's own recorder: `stats()` is where a fail-open drop is visible. */
+  recorder: Recorder;
   stdin: PassThrough;
   out: ReturnType<typeof collectLines>;
   err: ReturnType<typeof collectLines>;
@@ -277,10 +284,14 @@ function startProxy(
     stdout?: Writable;
     holdStore?: HoldStore;
     store?: FakeStore;
+    /** Recorder retry backoff; [] = give up after the first failed append. */
+    retryDelaysMs?: readonly number[];
   } = {},
 ): Session {
   const store = opts.store ?? new FakeStore();
-  const recorder = new Recorder({ store, signer: null });
+  const recorderOpts: ConstructorParameters<typeof Recorder>[0] = { store, signer: null };
+  if (opts.retryDelaysMs !== undefined) recorderOpts.retryDelaysMs = opts.retryDelaysMs;
+  const recorder = new Recorder(recorderOpts);
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -305,6 +316,7 @@ function startProxy(
   const responded = (id: string | number) => () => out.lines().some((l) => parseLine(l)?.id === id);
   const session: Session = {
     store,
+    recorder,
     stdin,
     out,
     err,
@@ -1283,6 +1295,105 @@ function holdFileCount(dataDir: string): number {
   }
 }
 
+/* ------------------- recording stays fail-open in gateway mode ------------
+ * AGENTS.md: "Inside gateway mode, recording stays fail-open (a store
+ * failure never becomes a deny) while enforcement fails closed". The two
+ * halves are independent: the evidence store is dead here, and every
+ * enforcement path must still behave exactly as it does with a healthy one.
+ */
+
+describe('gateway: recording is fail-open (a store failure never becomes a deny)', () => {
+  it('B3: with an appendEvents that always throws, allow/deny/hold all behave normally and the recorder just counts drops', async () => {
+    const store = new FakeStore();
+    let attempts = 0;
+    store.beforeAppend = () => {
+      attempts++;
+      throw new Error('evidence store is unwritable (test)');
+    };
+    // retryDelaysMs: [] — one attempt, then the Recorder flips to drop mode.
+    const s = startProxy(standardPolicy(), { store, retryDelaysMs: [] });
+    await handshake(s);
+
+    // 1. ALLOWED: forwarded byte-for-byte; the echo server answers for real.
+    s.send(toolsCall(2, 'echo', { ok: 1, secret: SECRET }));
+    await waitFor(s.responded(2), 'allowed call with a dead store');
+    const allowed = s.response(2).result as { content: { text: string }[]; isError?: boolean };
+    expect(allowed.isError).toBeUndefined();
+    expect(allowed.content[0]!.text).toBe(JSON.stringify({ ok: 1, secret: SECRET }));
+
+    // 2. DENIED: the deny is still synthesized, with the same text as ever.
+    s.send(toolsCall(3, 'delete_everything', { path: '/' }));
+    await waitFor(s.responded(3), 'synthesized deny with a dead store');
+    const deny = s.response(3).result as { isError: boolean; content: { text: string }[] };
+    expect(deny.isError).toBe(true);
+    expect(deny.content[0]!.text).toBe(deniedText({ tool: 'delete_everything', ruleId: 'no-delete', reason: 'destructive' }));
+    expect(s.err.raw()).toContain('gateway: denied tools/call "delete_everything" (rule no-delete)');
+
+    // 3. HELD then APPROVED: the hold store is a separate store and still
+    //    works; the server sees the original bytes after the approval.
+    const held = { to: 'ops@example.com', secret: SECRET };
+    s.send(toolsCall(4, 'send_mail', held));
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file with a dead store');
+    const [pending] = s.holdStore.list();
+    expect(s.responded(4)()).toBe(false);
+    s.holdStore.decide(pending!.approval_id, 'approved', 'alice');
+    await waitFor(s.responded(4), 'forwarded after approval with a dead store');
+    const approved = s.response(4).result as { content: { text: string }[]; isError?: boolean };
+    expect(approved.isError).toBeUndefined();
+    expect(approved.content[0]!.text).toBe(JSON.stringify(held));
+
+    // The proxy did not crash: the session ends cleanly with the child's code.
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    // Nothing was recorded, and the recorder says so in its own counters
+    // rather than by throwing at the proxy.
+    expect(attempts).toBeGreaterThan(0);
+    expect(store.records).toHaveLength(0);
+    const stats = s.recorder.stats();
+    expect(stats.storeFailed).toBe(true);
+    expect(stats.written).toBe(0);
+    expect(stats.enqueued).toBeGreaterThan(0);
+    expect(stats.dropped).toBe(stats.enqueued); // every event accounted for
+    // A dropped batch is never a leak either: the hold file and stderr still
+    // carry hashes and tool names only.
+    assertNoLeak(s, SECRET, 'ops@example.com');
+  });
+
+  it('B3: a store that fails only for policy_decision events still denies, and the deny is not retried into the traffic', async () => {
+    const store = new FakeStore();
+    let refused = 0;
+    store.beforeAppend = (events) => {
+      if (!events.some((e) => e.kind === 'policy_decision')) return;
+      refused++;
+      throw new Error('cannot seal a policy_decision (test)');
+    };
+    const s = startProxy(standardPolicy(), { store, retryDelaysMs: [] });
+    await handshake(s);
+    s.send(toolsCall(2, 'delete_everything', { path: '/' }));
+    await waitFor(s.responded(2), 'deny whose evidence cannot be stored');
+    const deny = s.response(2).result as { isError: boolean; content: { text: string }[] };
+    expect(deny.isError).toBe(true);
+    expect(deny.content[0]!.text).toBe(deniedText({ tool: 'delete_everything', ruleId: 'no-delete', reason: 'destructive' }));
+    // Exactly one answer for that id: the failed append never re-synthesized it.
+    expect(s.out.lines().filter((l) => parseLine(l)?.id === 2)).toHaveLength(1);
+
+    // Traffic after the failed batch is still forwarded, unchanged.
+    s.send(toolsCall(3, 'echo', { after: true }));
+    await waitFor(s.responded(3), 'allowed call after the failed batch');
+    expect((s.response(3).result as { content: { text: string }[] }).content[0]!.text).toBe('{"after":true}');
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    expect(refused).toBeGreaterThan(0);
+    // One failed batch flips the Recorder into its documented drop mode, so
+    // recording is off from here on. That is still fail-open: the traffic
+    // above was forwarded, denied and answered exactly as with a live store.
+    expect(s.recorder.stats().dropped).toBeGreaterThan(0);
+    expect(s.recorder.stats().storeFailed).toBe(true);
+  });
+});
+
 describe('gateway: adversarial regressions', () => {
   it('F1: a batch ANSWER is filtered element by element; every tool_call carries a boundary report', async () => {
     const s = startProxy(ALLOW_SCAN, {
@@ -1585,5 +1696,241 @@ describe('gateway: adversarial regressions', () => {
     const calls = new Map(toolCalls(s.events()).map((c) => [c.request_id, c]));
     expect(calls.get(2)!.gateway).toMatchObject({ decision: 'hold', outcome: 'approved' });
     expect(calls.get(3)!.gateway).toMatchObject({ decision: 'hold', outcome: 'approved' });
+  });
+});
+
+/* ---------------- external-review regressions (E1, E2) ------------------- */
+
+/**
+ * E1: `pending` and `holds` are both keyed by pendingKey('c2s:', id), and a
+ * held call sits on its key for as long as a human takes to answer. A second
+ * `tools/call` reusing that id used to be forwarded and registered under the
+ * same key, so approving the hold overwrote it and the server's real answer
+ * to the second call was delivered but recorded only as an orphan
+ * protocol_error. Gateway mode now refuses id reuse, fail-closed.
+ *
+ * E2: a `tools/call` with `id: null` used to slip past policy evaluation
+ * (isRpcId rejects null) and cross unevaluated. MCP forbids a null id, so it
+ * is refused instead — never forwarded.
+ */
+describe('gateway: duplicate and null request ids', () => {
+  /** Every response line the client got for one id, in order. */
+  const responsesFor = (s: Session, id: unknown): Record<string, unknown>[] =>
+    s.out
+      .lines()
+      .map((l) => parseLine(l))
+      .filter((m): m is Record<string, unknown> => m !== undefined && m.id === id);
+
+  it('E1: a tools/call reusing the id of a HELD call is refused (duplicate_id); the hold survives and its approval is recorded as its own tool_call', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)));
+    await handshake(s);
+    const heldArgs = { to: 'ops@example.com', secret: SECRET };
+    s.send(toolsCall(7, 'send_mail', heldArgs));
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    const [parked] = s.holdStore.list();
+
+    // Same id, and a tool this policy would happily ALLOW: refused anyway.
+    s.send(toolsCall(7, 'echo', { n: 1 }));
+    await waitFor(() => responsesFor(s, 7).length === 1, 'the duplicate-id refusal');
+    const refusal = responsesFor(s, 7)[0]!;
+    const refused = refusal.result as { isError: boolean; content: { text: string }[] };
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]!.text).toBe(duplicateIdText('echo', 7, 'held'));
+    // Never forwarded: echo-server would have echoed {"n":1} straight back.
+    expect(s.out.raw()).not.toContain('\\"n\\":1');
+    // The hold is untouched — still parked, still pending, still the only one.
+    expect(s.holdStore.list()).toHaveLength(1);
+    expect(s.holdStore.read(parked!.approval_id)?.status).toBe('pending');
+
+    s.holdStore.decide(parked!.approval_id, 'approved', 'alice');
+    await waitFor(() => responsesFor(s, 7).length === 2, 'the approved call, forwarded and answered');
+    const answer = responsesFor(s, 7)[1]!;
+    expect((answer.result as { content: { text: string }[] }).content[0]!.text).toBe(JSON.stringify(heldArgs));
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    // The refusal: policy_decision (deny, no rule id) then a synthetic tool_call.
+    const dupDecision = decisions(events).find((d) => d.decision === 'deny')!;
+    expect(dupDecision).toMatchObject({
+      decision: 'deny',
+      tool: 'echo',
+      request_id: 7,
+      policy_hash: standardPolicy().hash,
+      args_hash: sha256Ref(canonicalJson({ n: 1 })),
+    });
+    expect(dupDecision.rule_id).toBeUndefined();
+    expect(dupDecision.outcome).toBeUndefined();
+    expect(dupDecision.attributes['cresec.policy.rule_id']).toBeUndefined();
+    const dupCall = toolCalls(events).find((c) => c.error?.type === 'duplicate_id')!;
+    expect(dupCall).toMatchObject({ tool: 'echo', request_id: 7, is_error: true, duration_ms: 0 });
+    expect(dupCall.attributes['error.type']).toBe('duplicate_id');
+    expect(dupCall.gateway).toEqual({ decision: 'deny' }); // no rule matched: none was consulted
+    expect(dupCall.result_hash).toBe(sha256Ref(canonicalJson(refusal.result)));
+    expect(dupCall.args).toEqual({ n: 1 });
+    expect(events.indexOf(dupDecision)).toBeLessThan(events.indexOf(dupCall));
+
+    // The held call: forwarded on approval, recorded once, from the SERVER's answer.
+    const heldCalls = toolCalls(events).filter((c) => c.request_id === 7 && c.error?.type !== 'duplicate_id');
+    expect(heldCalls).toHaveLength(1);
+    expect(heldCalls[0]!.is_error).toBe(false);
+    expect(heldCalls[0]!.gateway).toMatchObject({
+      decision: 'hold',
+      outcome: 'approved',
+      approval_id: parked!.approval_id,
+      rule_id: 'needs-human',
+    });
+    expect(heldCalls[0]!.result_hash).toBe(sha256Ref(canonicalJson(echoResult(heldArgs))));
+    // Nothing landed uncorrelated, and nothing was sealed twice.
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    expect(toolCalls(events).filter((c) => c.request_id === 7)).toHaveLength(2);
+    expect(s.err.raw()).toContain(
+      'gateway: refused tools/call "echo" — a tools/call with this id is already held for approval (id 7)',
+    );
+    assertNoLeak(s, SECRET, 'ops@example.com');
+    assertChainIntact(s.store);
+  });
+
+  it('E1: an approved hold reclaims its pending slot and seals whatever took it as duplicate_id (nothing silently lost)', async () => {
+    // Answers tools/call only: the tools/list below stays in flight, sitting
+    // on the same id as the parked hold (the gateway guards tools/call, so
+    // that is how another request can still reach the same pending key).
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)), {
+      command: lineServer(`
+  if (!msg || msg.id === undefined) return;
+  if (msg.method === 'tools/call') { answer(msg.id, JSON.stringify(msg.params && msg.params.arguments)); return; }
+  send({ jsonrpc: '2.0', method: 'notifications/saw', params: { method: msg.method } });
+`),
+    });
+    s.send(toolsCall(7, 'send_mail', { n: 1 }));
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    const [parked] = s.holdStore.list();
+    s.send({ jsonrpc: '2.0', id: 7, method: 'tools/list' });
+    await waitFor(() => s.out.raw().includes('notifications/saw'), 'the server has the tools/list');
+
+    s.holdStore.decide(parked!.approval_id, 'approved', 'alice');
+    await waitFor(() => responsesFor(s, 7).length === 1, 'the approved call, forwarded and answered');
+    expect((responsesFor(s, 7)[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe('{"n":1}');
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    // The displaced request was sealed with its own evidence, not overwritten.
+    const sealed = events.filter((e): e is RpcEvent => e.kind === 'rpc' && e.error?.type === 'duplicate_id');
+    expect(sealed).toHaveLength(1);
+    expect(sealed[0]).toMatchObject({
+      method: 'tools/list',
+      request_id: 7,
+      is_error: true,
+      result_hash: sha256Ref(canonicalJson(null)),
+    });
+    expect(sealed[0]!.attributes['error.type']).toBe('duplicate_id');
+    // ...and it was sealed THEN, not swept up as 'unanswered' at shutdown.
+    expect(events.filter((e) => e.kind === 'rpc' && e.error?.type === 'unanswered')).toHaveLength(0);
+    const call = toolCalls(events).find((c) => c.request_id === 7)!;
+    expect(call.is_error).toBe(false);
+    expect(call.gateway).toMatchObject({ decision: 'hold', outcome: 'approved', approval_id: parked!.approval_id });
+    expect(events.indexOf(sealed[0]!)).toBeLessThan(events.indexOf(call));
+    expect(s.err.raw()).toContain('sealed as duplicate_id before the approved tools/call took the slot back');
+    assertChainIntact(s.store);
+  });
+
+  it('E1: a tools/call reusing an id that is merely IN FLIGHT is refused too, and the original call keeps its slot', async () => {
+    const s = startProxy(ALLOW_ALL, {
+      command: lineServer(`
+  if (!msg || msg.id === undefined) return;
+  const name = msg.params && msg.params.name;
+  if (name === 'slow') { send({ jsonrpc: '2.0', method: 'notifications/started', params: {} }); return; }
+  answer(msg.id, 'ok');
+`),
+    });
+    s.send(toolsCall(5, 'slow', { a: 1 })); // allowed, forwarded, never answered
+    await waitFor(() => s.out.raw().includes('notifications/started'), 'the server has the first call');
+    s.send(toolsCall(5, 'echo', { b: 2 }));
+    await waitFor(() => responsesFor(s, 5).length === 1, 'the duplicate-id refusal');
+    const refused = responsesFor(s, 5)[0]!.result as { isError: boolean; content: { text: string }[] };
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]!.text).toBe(duplicateIdText('echo', 5, 'pending'));
+    // Traffic continues on a fresh id.
+    s.send(toolsCall(6, 'echo', {}));
+    await waitFor(s.responded(6), 'the session continues');
+    expect(responsesFor(s, 5)).toHaveLength(1); // the server never answered an 'echo' with id 5
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    const forId5 = toolCalls(events).filter((c) => c.request_id === 5);
+    expect(forId5.map((c) => c.error?.type)).toEqual(['duplicate_id', 'unanswered']);
+    expect(forId5[0]!.tool).toBe('echo');
+    expect(forId5[0]!.gateway).toEqual({ decision: 'deny' });
+    // The original call kept its own pending slot and its own decision.
+    expect(forId5[1]!.tool).toBe('slow');
+    expect(forId5[1]!.gateway).toEqual({ decision: 'allow' });
+    expect(decisions(events).map((d) => [d.request_id, d.decision])).toEqual([[5, 'deny']]);
+    expect(s.err.raw()).toContain('a tools/call with this id is already in flight (id 5)');
+  });
+
+  it('E1: the number 7 and the string "7" are different ids — no false duplicate against a held call', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)));
+    await handshake(s);
+    s.send(toolsCall(7, 'send_mail', {})); // held under the NUMBER 7
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    s.send(toolsCall('7', 'echo', { ok: 1 })); // the STRING "7": a different id
+    await waitFor(s.responded('7'), 'the string-id call, forwarded and answered');
+    const answer = s.response('7');
+    expect(answer.id).toBe('7');
+    expect((answer.result as { isError?: boolean }).isError).toBeUndefined();
+    expect((answer.result as { content: { text: string }[] }).content[0]!.text).toBe('{"ok":1}');
+    expect(s.holdStore.list()).toHaveLength(1); // the hold is untouched
+    s.stdin.end();
+    await s.done;
+
+    const call = toolCalls(s.events()).find((c) => c.request_id === '7')!;
+    expect(call.is_error).toBe(false);
+    expect(call.gateway).toMatchObject({ decision: 'allow' });
+    expect(toolCalls(s.events()).some((c) => c.error?.type === 'duplicate_id')).toBe(false);
+    expect(decisions(s.events()).some((d) => d.decision === 'deny')).toBe(false);
+  });
+
+  it('E2: a tools/call with a null id is refused with a JSON-RPC error, never forwarded, and still recorded as a notification', async () => {
+    // Counts the tools/call messages that actually reached it, and reports
+    // the count when asked (so "not forwarded" is the SERVER's own answer).
+    const s = startProxy(ALLOW_ALL, {
+      command: lineServer(`
+  if (!msg) return;
+  const name = msg.params && msg.params.name;
+  if (msg.method === 'tools/call' && name !== 'report') globalThis.__seen = (globalThis.__seen || 0) + 1;
+  if (msg.id === undefined || msg.id === null) return;
+  answer(msg.id, name === 'report' ? 'tools/call seen=' + (globalThis.__seen || 0) : 'ok');
+`),
+    });
+    s.send({ jsonrpc: '2.0', id: null, method: 'tools/call', params: { name: 'echo', arguments: { x: SECRET } } });
+    await waitFor(() => responsesFor(s, null).length === 1, 'the null-id error response');
+    expect(responsesFor(s, null)[0]).toEqual({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: NULL_ID_TOOLS_CALL_MESSAGE },
+    });
+
+    // The session continues, and the server never saw the null-id call.
+    s.send(toolsCall(2, 'report', {}));
+    await waitFor(s.responded(2), 'the report');
+    expect((s.response(2).result as { content: { text: string }[] }).content[0]!.text).toBe('tools/call seen=0');
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    // Recorded exactly as the tap records any id-less message: one
+    // notification. No policy_decision and no tool_call could describe it —
+    // the frozen schema's request_id is string | number.
+    const notes = events.filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.direction).toBe('client_to_server');
+    expect(decisions(events)).toHaveLength(0);
+    expect(toolCalls(events).map((c) => c.request_id)).toEqual([2]);
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    expect(s.err.raw()).toContain('gateway: refused a tools/call with a null id (not a valid request); not forwarded');
+    assertNoLeak(s, SECRET);
+    assertChainIntact(s.store);
   });
 });

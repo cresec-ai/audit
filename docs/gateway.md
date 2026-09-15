@@ -275,6 +275,34 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   refused immediately, recorded with `outcome: session_end` and no
   `approval_id`, and no hold file is written — a hold can never outlive the
   session that created it.
+- It does not let two in-flight calls share a JSON-RPC request id. A
+  `tools/call` whose id is currently held for approval, or is already pending,
+  is refused immediately (fail-closed) with a synthesized `isError` result and
+  is never forwarded, so the call that owns the id keeps its slot and its own
+  result is still correlated, boundary-filtered and recorded. The refusal is
+  recorded as a `policy_decision` (`deny`, no `rule_id` — no rule was
+  consulted) plus a `tool_call` carrying `error.type: 'duplicate_id'`; the
+  reason appears in the text the model sees and on stderr, never as readable
+  event data. The number `7` and the string `"7"` are different ids, and
+  record mode (no `--policy`) keeps its last-writer-wins behaviour. Two paths
+  are not checked up front, because the gateway only guards `tools/call`
+  requests: a `tools/call` reusing an in-flight id inside a JSON-RPC batch,
+  and a non-`tools/call` request (`tools/list`, ...) on the same id. If either
+  is still pending when a hold on that id is approved, it is sealed first — a
+  `tool_call` or `rpc` event with `error.type: 'duplicate_id'`, `result:
+  null`, `result_hash` the hash of canonical `null` and `is_error: true` — so
+  an approved hold never silently overwrites another call's evidence.
+- It does not forward a `tools/call` with `id: null`. MCP forbids a null
+  request id (the official SDK rejects one) and such a message is not a
+  notification either, so gateway mode refuses it whatever the policy says — a
+  matching `hold` rule is a deny, and the call is not evaluated at all — and
+  answers `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":
+  "mcp-recorder gateway: tools/call with a null id is not a valid request"}}`
+  (JSON-RPC permits a null id on an error response). Because the event
+  schema's `request_id` is `string | number`, the message is recorded exactly
+  as any id-less message is — one `notification` event — with the refusal
+  itself visible on stderr. Without `--policy` it crosses unevaluated, as
+  before.
 - It is stdio-only in v1; `mcp-recorder http --policy` is rejected (exit 2),
   and `http` ignores an exported `MCP_RECORDER_POLICY` with a one-line note
   on stderr rather than refusing to start.
@@ -282,6 +310,11 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   turns into a deny. Enforcement, on the other hand, fails closed — a policy
   that cannot be evaluated denies, and a hold that cannot be written is a
   deny.
+  Belt and braces for `match.args` regexes: at run time every one is matched
+  on a worker thread under a 25 ms deadline. A match that overruns it is
+  abandoned, the pattern is disabled for the rest of the process, and the
+  call is denied with `policy evaluation error: regex timed out (<rule id>)`
+  — a pattern that cannot be evaluated is never treated as "did not match".
 - `MCP_RECORDER_DISABLE=1` is the kill switch: it disables recording *and*
   the gateway, so a misbehaving policy can always be bypassed by the person
   who controls the environment — which is why this is a laptop/CI control,

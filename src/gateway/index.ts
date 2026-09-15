@@ -9,16 +9,19 @@ export {
   findInjectionSpans,
   matchSpans,
   mergeSpans,
+  normalizeForScan,
   type InjectionPattern,
+  type NormalizedScan,
   type Span,
 } from './injection.js';
 export {
+  BOUNDARY_SECRET_FAMILIES,
   INJECTION_MARKER,
   MARKER_HASH_HEX,
   MAX_SECRET_REFS,
   applyBoundary,
   blockedText,
-  defaultSecretPatterns,
+  boundarySecretPatterns,
   deniedText,
   findSecretSpans,
   oversizeBlockedText,
@@ -30,6 +33,7 @@ export {
   type BoundaryOptions,
   type BoundaryOutcome,
   type BoundaryReport,
+  type BoundarySecretFamily,
   type DeniedHoldOutcome,
   type DeniedTextInput,
 } from './boundary.js';

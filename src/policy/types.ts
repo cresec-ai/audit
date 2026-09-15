@@ -181,8 +181,17 @@ export const LIMITS = {
 /** Identifier pattern shared by `name` and rule `id`. */
 export const ID_PATTERN = '^[A-Za-z0-9_.:/-]{1,64}$';
 
-/** Values longer than this (UTF-16 units) are truncated before regex matching. */
-export const REGEX_VALUE_CAP = 65_536;
+/**
+ * Values longer than this (UTF-16 units) are truncated before regex matching.
+ *
+ * 4 KiB, not the 64 KiB of earlier drafts: the local engine matches with V8's
+ * BACKTRACKING RegExp, whose worst case grows with the subject length, so the
+ * cap is also the bound on how much work one hostile argument can ask for.
+ * The Rego side matches with RE2 (linear time) and does not truncate at all,
+ * so only values longer than the cap can ever make the two engines disagree —
+ * documented in `docs/policy.md`.
+ */
+export const REGEX_VALUE_CAP = 4_096;
 
 /* ------------------------------- normalize -------------------------------- */
 

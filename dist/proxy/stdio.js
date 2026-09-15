@@ -29,10 +29,39 @@
  * whose `params.name` is missing or not a string: it is evaluated as the
  * tool name '' so the section default — and any glob matching the empty
  * string — applies. Known v1 limits, on purpose: a `hold` inside a
- * JSON-RPC batch is treated as deny, a `tools/call` without an id (a
- * notification) is forwarded unevaluated, and a line over the 32 MiB tap
- * cap cannot be parsed so it is forwarded unchanged and recorded as
- * `protocol_error` — as in record mode.
+ * JSON-RPC batch is treated as deny, a `tools/call` with no `id` property
+ * at all (a notification) is forwarded unevaluated, and a line over the
+ * 32 MiB tap cap cannot be parsed so it is forwarded unchanged and
+ * recorded as `protocol_error` — as in record mode.
+ *
+ * DUPLICATE REQUEST IDS. `pending` and `holds` are both keyed by the
+ * request id, and a held call sits on its key for as long as a human takes
+ * to answer. A second `tools/call` reusing an id that is still in flight
+ * (JSON-RPC forbids it) would take that key over, so the first call's real
+ * response would arrive uncorrelated — delivered to the client but recorded
+ * as an orphan `protocol_error`, with no tool_call, no args hash and no
+ * gateway outcome for a call that did execute. Gateway mode therefore fails
+ * CLOSED on id reuse: a `tools/call` whose id is currently held, or already
+ * pending, is refused immediately with a synthesized isError result and
+ * recorded as a `policy_decision` (deny) plus a synthetic `tool_call` with
+ * `error.type: 'duplicate_id'` — it is never forwarded, so the in-flight
+ * call keeps its slot. Belt and braces, an approved hold that still finds a
+ * pending entry on its key (one that slipped in through a path with no such
+ * check) seals that entry as `duplicate_id` before taking the slot back, so
+ * nothing is ever silently overwritten. Record mode is untouched: without a
+ * policy the tap keeps its last-writer-wins `pending` map.
+ *
+ * NULL REQUEST IDS. `{"id": null}` is not a valid MCP request (the official
+ * SDK rejects it) and is not a notification either, so a `tools/call`
+ * carrying it is refused, fail-closed, whatever the policy says — a `hold`
+ * rule matching it is a deny like any other decision, and the call is not
+ * even evaluated. It is NEVER forwarded; the client gets
+ * `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,...}}` (JSON-RPC
+ * permits a null id on an error response). It is recorded exactly as the
+ * tap has always recorded an id-less message — one `notification` event —
+ * because the frozen schema's `request_id` is `string | number` and cannot
+ * describe it; the refusal itself is visible on stderr. Without `--policy`
+ * it is forwarded unevaluated, as before.
  */
 import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
@@ -40,8 +69,9 @@ import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { canonicalJson, sha256Ref } from '../chain/hash.js';
-import { applyBoundary, defaultSecretPatterns, deniedText, synthesizeDeniedResult, } from '../gateway/boundary.js';
+import { applyBoundary, boundarySecretPatterns, deniedText, synthesizeDeniedResult, } from '../gateway/boundary.js';
 import { evaluateMcp } from '../policy/engine.js';
+import { setRegexGuardDiag, warmRegexGuard } from '../policy/regex-guard.js';
 import { normalizePolicy } from '../policy/types.js';
 import { planSpawn, spawnWrapped, terminateChild, withNodeDirOnPath } from './spawn.js';
 import { SCHEMA } from '../schema/events.js';
@@ -144,6 +174,14 @@ function isToolsCallRequest(msg) {
     return isPlainObject(msg) && msg.method === 'tools/call' && isRpcId(msg.id);
 }
 /**
+ * A `tools/call` carrying an explicit `id: null`. Neither a request (MCP
+ * forbids a null id and the official SDK rejects it) nor a notification, so
+ * gateway mode refuses it instead of forwarding it — see the module header.
+ */
+function isNullIdToolsCall(msg) {
+    return isPlainObject(msg) && msg.method === 'tools/call' && msg.id === null;
+}
+/**
  * The `params` object and tool name of a `tools/call` request. A missing or
  * non-string `params.name` (and a non-object `params`) yields '': the call
  * is evaluated like any other, so `mcp.default` applies and tool globs match
@@ -175,6 +213,32 @@ export const MAX_HOLDS = 256;
 const TOO_MANY_HOLDS_REASON = 'too many pending holds';
 /** Reason a call is refused instead of held because finalize() already began. */
 const SESSION_END_HOLD_REASON = 'session_end (hold not started)';
+const DUPLICATE_ID_REASON = {
+    held: 'a tools/call with this id is already held for approval',
+    pending: 'a tools/call with this id is already in flight',
+};
+/** `error.type` of both events recorded for a refused duplicate id (free-form string, v1). */
+const DUPLICATE_ID_ERROR_TYPE = 'duplicate_id';
+/**
+ * The text the model sees for a `tools/call` refused because its id is
+ * still in use. Like every other synthesized text it names the tool as the
+ * CLIENT wrote it (and the id it chose); events carry the capped forms.
+ */
+export function duplicateIdText(tool, id, state) {
+    return (`mcp-recorder gateway: tools/call "${tool}" refused: ${DUPLICATE_ID_REASON[state]}.` +
+        ` JSON-RPC request id ${JSON.stringify(id)} must be unique while in flight; retry with a fresh id.`);
+}
+/**
+ * A `tools/call` with `id: null` is refused with this JSON-RPC error
+ * (-32600 Invalid Request); JSON-RPC permits a null id on an error
+ * response. See the module header (NULL REQUEST IDS).
+ */
+export const NULL_ID_TOOLS_CALL_MESSAGE = 'mcp-recorder gateway: tools/call with a null id is not a valid request';
+const NULL_ID_ERROR_RESPONSE = {
+    jsonrpc: '2.0',
+    id: null,
+    error: { code: -32600, message: NULL_ID_TOOLS_CALL_MESSAGE },
+};
 // Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
 // contended store delays session_end rather than losing it.
 const CLOSE_TIMEOUT_MS = 8_000;
@@ -530,6 +594,71 @@ export async function runStdioProxy(opts) {
             evictOnePending();
         pending.set(key, entry);
     };
+    /**
+     * Seal one pending request that will never get its real response, so the
+     * chain never silently drops in-flight work: a `tools/call` becomes a
+     * `tool_call` event, everything else (including an unanswered
+     * `initialize`) an `rpc` event — both `is_error: true` with
+     * `error.type` = `errorType` (a free-form string under the frozen
+     * schema), `result_hash` the hash of canonical `null` and, for a
+     * `tool_call`, `result: null`. The shutdown sweep passes 'unanswered';
+     * gateway mode passes 'duplicate_id' when an approved hold reclaims a
+     * pending slot a same-id call had taken (see the module header). The
+     * caller owns removing the entry from `pending`.
+     */
+    const sealPending = (entry, errorType, durationMs) => {
+        if (entry.method === 'tools/call') {
+            const tool = entry.toolName ?? '';
+            const reqParams = isPlainObject(entry.params) ? entry.params : {};
+            const attributes = {
+                'gen_ai.operation.name': 'execute_tool',
+                'gen_ai.tool.name': tool,
+                'gen_ai.tool.call.id': String(entry.id),
+                'mcp.method.name': 'tools/call',
+                'rpc.system': 'jsonrpc',
+                'error.type': errorType,
+            };
+            if (entry.gateway !== undefined) {
+                attributes['cresec.policy.decision'] = entry.gateway.decision;
+                if (entry.gateway.rule_id !== undefined) {
+                    attributes['cresec.policy.rule_id'] = entry.gateway.rule_id;
+                }
+            }
+            const ev = {
+                ...base('tool_call', attributes),
+                kind: 'tool_call',
+                tool,
+                request_id: entry.id,
+                args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
+                result_hash: NULL_RESULT_HASH,
+                result: null,
+                is_error: true,
+                duration_ms: durationMs,
+                error: { type: errorType },
+            };
+            if (entry.gateway !== undefined)
+                ev.gateway = { ...entry.gateway };
+            record(ev);
+            return;
+        }
+        const ev = {
+            ...base('rpc', {
+                'mcp.method.name': entry.method,
+                'rpc.system': 'jsonrpc',
+                'rpc.jsonrpc.request_id': String(entry.id),
+                'error.type': errorType,
+            }),
+            kind: 'rpc',
+            method: entry.method,
+            request_id: entry.id,
+            params: redactor.scrub(entry.params ?? null),
+            result_hash: NULL_RESULT_HASH,
+            is_error: true,
+            duration_ms: durationMs,
+            error: { type: errorType },
+        };
+        record(ev);
+    };
     const protocolError = (direction, reason, bytesLen, lineHashHex) => {
         const ev = {
             ...base('protocol_error', { 'rpc.system': 'jsonrpc' }),
@@ -776,7 +905,7 @@ export async function runStdioProxy(opts) {
         // default boundary); the CLI refuses such a policy before spawning.
         const mcp = loaded.policy.mcp ?? normalizePolicy({ version: 1, mcp: {} }).mcp;
         const boundaryDeps = {
-            secretPatterns: defaultSecretPatterns(),
+            secretPatterns: boundarySecretPatterns(),
             hashString: (value) => redactor.hashString(value),
         };
         const holds = new Map();
@@ -902,21 +1031,27 @@ export async function runStdioProxy(opts) {
             matched: false,
             reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
         });
-        const evaluate = (rawTool, args) => {
-            // The canonical JSON gets its OWN guard: when it succeeds, args_hash
-            // is the real hash of the arguments even if the evaluation that
-            // follows blows up (the deny is recorded, the evidence still points
-            // at the exact arguments). Only a canonicalJson/sha256Ref throw — a
-            // hostile args tree — falls back to the hash of `null`.
-            let canonical;
-            let argsHash;
+        /**
+         * Canonical JSON of a call's arguments, plus its hash. The canonical
+         * JSON gets its OWN guard: when it succeeds, args_hash is the real hash
+         * of the arguments even if whatever follows blows up (the refusal is
+         * recorded, the evidence still points at the exact arguments). Only a
+         * canonicalJson/sha256Ref throw — a hostile args tree — yields
+         * `canonical: null` and the hash of `null`.
+         */
+        const argsCanonical = (args) => {
             try {
-                canonical = canonicalJson(args);
-                argsHash = sha256Ref(canonical);
+                const canonical = canonicalJson(args);
+                return { canonical, argsHash: sha256Ref(canonical) };
             }
             catch (err) {
-                return { decision: evaluationFailed(err), argsHash: NULL_RESULT_HASH };
+                return { canonical: null, argsHash: NULL_RESULT_HASH, err };
             }
+        };
+        const evaluate = (rawTool, args) => {
+            const { canonical, argsHash, err } = argsCanonical(args);
+            if (canonical === null)
+                return { decision: evaluationFailed(err), argsHash };
             try {
                 const decision = evaluateMcp(loaded.policy, {
                     server: currentServer().name,
@@ -932,20 +1067,33 @@ export async function runStdioProxy(opts) {
                 return { decision: evaluationFailed(err), argsHash };
             }
         };
+        /** The policy-independent half of a GatewayCall. */
+        const newCall = (id, params, name, args, argsHash) => ({
+            id,
+            params,
+            rawTool: name,
+            // '' stays '': structuralString would hash the empty string, and ''
+            // is what a nameless call's tool_call event has always carried.
+            tool: name === '' ? '' : structuralString(name, 'identifier'),
+            args,
+            argsHash,
+        });
+        /**
+         * A call refused on PROTOCOL grounds (a duplicate request id): the
+         * policy is not consulted at all — no rule could allow an id that is
+         * already in flight — so the call carries no rule id and no reason, just
+         * the evidence (tool, id, args and their hash).
+         */
+        const unevaluatedCall = (msg) => {
+            const { params, name } = toolsCallParts(msg);
+            const args = params.arguments ?? {};
+            return newCall(msg.id, params, name, args, argsCanonical(args).argsHash);
+        };
         const buildCall = (msg) => {
             const { params, name } = toolsCallParts(msg);
             const args = params.arguments ?? {};
             const { decision, argsHash } = evaluate(name, args);
-            const call = {
-                id: msg.id,
-                params,
-                rawTool: name,
-                // '' stays '': structuralString would hash the empty string, and ''
-                // is what a nameless call's tool_call event has always carried.
-                tool: name === '' ? '' : structuralString(name, 'identifier'),
-                args,
-                argsHash,
-            };
+            const call = newCall(msg.id, params, name, args, argsHash);
             if (decision.ruleId !== undefined) {
                 call.rawRuleId = decision.ruleId;
                 call.ruleId = cappedRuleId(decision.ruleId);
@@ -1003,15 +1151,19 @@ export async function runStdioProxy(opts) {
             }
             return out;
         };
-        /** A call the gateway did not forward: is_error, error.type policy_denied, result = what the model got. */
-        const recordSyntheticToolCall = (call, result, hold) => {
+        /**
+         * A call the gateway did not forward: is_error, result = what the model
+         * got. `errorType` is 'policy_denied' for a policy refusal and
+         * 'duplicate_id' for one refused on protocol grounds (see the header).
+         */
+        const recordSyntheticToolCall = (call, result, hold, errorType = 'policy_denied') => {
             const gatewayOutcome = gatewayOutcomeFor(call, hold);
             if (hold === undefined)
                 gatewayOutcome.decision = 'deny';
             const attributes = {
                 'gen_ai.operation.name': 'execute_tool',
                 ...policyAttributes(call, gatewayOutcome.decision === 'deny' ? 'deny' : 'hold'),
-                'error.type': 'policy_denied',
+                'error.type': errorType,
             };
             const ev = {
                 ...base('tool_call', attributes),
@@ -1023,7 +1175,7 @@ export async function runStdioProxy(opts) {
                 result: redactor.scrub(result),
                 is_error: true,
                 duration_ms: 0,
-                error: { type: 'policy_denied' },
+                error: { type: errorType },
                 gateway: gatewayOutcome,
             };
             record(ev);
@@ -1060,6 +1212,42 @@ export async function runStdioProxy(opts) {
                 diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
             }
         };
+        /**
+         * Refuse a `tools/call` whose JSON-RPC id is still in use. It is never
+         * forwarded, so the call already sitting on that id keeps its pending
+         * slot (and its hold, if it has one) and its own response still
+         * correlates. Recorded like any other refusal, `policy_decision` first:
+         * a deny with NO rule id (the policy was never consulted), then the
+         * synthetic `tool_call` carrying `error.type: 'duplicate_id'`. The
+         * reason travels in the text the model sees and in the diagnostic line;
+         * the events carry hashes only, never arguments.
+         */
+        const refuseDuplicateId = (msg, state) => {
+            const call = unevaluatedCall(msg);
+            const response = synthesizeDeniedResult(call.id, duplicateIdText(call.rawTool, call.id, state));
+            guarded(() => {
+                recordPolicyDecision(call);
+                recordSyntheticToolCall(call, response.result, undefined, DUPLICATE_ID_ERROR_TYPE);
+            });
+            writeToClient(Buffer.from(JSON.stringify(response) + '\n'));
+            // The id is client-supplied, so it is capped like any other protocol
+            // string before it reaches a diagnostic line.
+            diag(`gateway: refused tools/call "${call.tool}" — ${DUPLICATE_ID_REASON[state]}` +
+                ` (id ${structuralString(String(call.id), 'identifier')})`);
+        };
+        /**
+         * A `tools/call` carrying `id: null` (see the module header): refused
+         * with a JSON-RPC -32600 error and NOT forwarded, whatever the policy
+         * says. There is no request id to record a `policy_decision` or a
+         * `tool_call` against, so it is recorded exactly as the tap records any
+         * id-less message — one `notification` event — and the refusal itself
+         * is visible on stderr.
+         */
+        const refuseNullIdToolsCall = (msg, line) => {
+            writeToClient(Buffer.from(JSON.stringify(NULL_ID_ERROR_RESPONSE) + '\n'));
+            diag('gateway: refused a tools/call with a null id (not a valid request); not forwarded');
+            guarded(() => handleMessage(msg, 'client_to_server', line));
+        };
         /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
         const registerCall = (call, gatewayOutcome) => {
             const entry = {
@@ -1071,6 +1259,25 @@ export async function runStdioProxy(opts) {
                 gateway: gatewayOutcome,
             };
             registerPending(pendingKey('c2s:', call.id), entry);
+        };
+        /**
+         * A hold sits on its `pending` key for as long as a human takes to
+         * answer, so by approval time another request may have taken that key
+         * over (a path with no duplicate-id check of its own: a
+         * non-`tools/call` request, or a `tools/call` inside a JSON-RPC batch).
+         * Overwriting it silently would lose a call that DID execute — its real
+         * response would land as an orphan `protocol_error` with no tool_call,
+         * args hash or gateway outcome. Seal it first, as `duplicate_id`, then
+         * hand the slot back to the held call.
+         */
+        const reclaimPendingSlot = (key) => {
+            const displaced = pending.get(key);
+            if (displaced === undefined)
+                return;
+            pending.delete(key);
+            guarded(() => sealPending(displaced, DUPLICATE_ID_ERROR_TYPE, round2(performance.now() - displaced.t0)));
+            diag(`gateway: a "${displaced.method}" request was still in flight on the held id;` +
+                ` sealed as ${DUPLICATE_ID_ERROR_TYPE} before the approved tools/call took the slot back`);
         };
         /* ---- holds ---- */
         const settleHold = (entry, status, decided) => {
@@ -1100,6 +1307,7 @@ export async function runStdioProxy(opts) {
             const forward = status === 'approved' || (status === 'timeout' && mcp.hold.on_timeout === 'allow');
             if (forward && c2sOpen && !clientGone && !sessionClosing) {
                 guarded(() => recordPolicyDecision(entry, resolution));
+                reclaimPendingSlot(entry.key);
                 registerCall(entry, gatewayOutcomeFor(entry, resolution));
                 forwardHeldC2s(entry.raw);
                 diag(`gateway: hold ${entry.approvalId} ${status}; forwarding tools/call "${entry.tool}" after ${resolution.waitedMs} ms`);
@@ -1255,6 +1463,22 @@ export async function runStdioProxy(opts) {
                 forwardHeldC2s(bytes);
         };
         const c2sToolsCall = (msg, raw) => {
+            // Fail closed on id reuse BEFORE the policy is consulted (see the
+            // module header): a `tools/call` on an id that is currently held, or
+            // that belongs to a request the server has not answered yet, is
+            // refused instead of forwarded — otherwise it would take over the
+            // other call's `pending`/`holds` slot and that call's real response
+            // would be recorded as an orphan. `pendingKey` folds the id's TYPE in,
+            // so the number 7 and the string "7" are different ids here too.
+            const key = pendingKey('c2s:', msg.id);
+            if (holds.has(key)) {
+                refuseDuplicateId(msg, 'held');
+                return;
+            }
+            if (pending.has(key)) {
+                refuseDuplicateId(msg, 'pending');
+                return;
+            }
             const { call, action } = buildCall(msg);
             if (action === 'allow') {
                 forwardC2s(raw);
@@ -1345,6 +1569,10 @@ export async function runStdioProxy(opts) {
             }
             if (isToolsCallRequest(msg)) {
                 c2sToolsCall(msg, raw);
+                return;
+            }
+            if (isNullIdToolsCall(msg)) {
+                refuseNullIdToolsCall(msg, line);
                 return;
             }
             forwardC2s(raw);
@@ -1489,6 +1717,15 @@ export async function runStdioProxy(opts) {
         child.stdout.pipe(s2c).pipe(proxyStdout, { end: false });
         const ruleCount = mcp.rules.length;
         diag(`gateway: policy ${loaded.name ?? loaded.path} (${ruleCount} rule${ruleCount === 1 ? '' : 's'})`);
+        // `match.args` regexes run on the regex-guard worker under a hard
+        // deadline (see ../policy/regex-guard.ts). Route its diagnostics (a
+        // poisoned pattern, a degraded guard) to stderr with everything else, and
+        // pay the one-time worker handshake here, at startup, rather than on the
+        // first tools/call that hits a rule with `args`. Both are best-effort:
+        // enforcement is correct (fail-closed) whether or not the worker is warm.
+        setRegexGuardDiag(diag);
+        if (mcp.rules.some((r) => r.match.args !== undefined))
+            warmRegexGuard();
     }
     /* ---------------------------- session events ---------------------------- */
     const sessionStart = {
@@ -1576,60 +1813,7 @@ export async function runStdioProxy(opts) {
                 return;
             const shutdownT0 = performance.now();
             for (const entry of pending.values()) {
-                const durationMs = round2(shutdownT0 - entry.t0);
-                if (entry.method === 'tools/call') {
-                    const tool = entry.toolName ?? '';
-                    const reqParams = isPlainObject(entry.params) ? entry.params : {};
-                    const attributes = {
-                        'gen_ai.operation.name': 'execute_tool',
-                        'gen_ai.tool.name': tool,
-                        'gen_ai.tool.call.id': String(entry.id),
-                        'mcp.method.name': 'tools/call',
-                        'rpc.system': 'jsonrpc',
-                        'error.type': 'unanswered',
-                    };
-                    if (entry.gateway !== undefined) {
-                        attributes['cresec.policy.decision'] = entry.gateway.decision;
-                        if (entry.gateway.rule_id !== undefined) {
-                            attributes['cresec.policy.rule_id'] = entry.gateway.rule_id;
-                        }
-                    }
-                    const ev = {
-                        ...base('tool_call', attributes),
-                        kind: 'tool_call',
-                        tool,
-                        request_id: entry.id,
-                        args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
-                        result_hash: NULL_RESULT_HASH,
-                        result: null,
-                        is_error: true,
-                        duration_ms: durationMs,
-                        error: { type: 'unanswered' },
-                    };
-                    if (entry.gateway !== undefined)
-                        ev.gateway = { ...entry.gateway };
-                    record(ev);
-                }
-                else {
-                    const attributes = {
-                        'mcp.method.name': entry.method,
-                        'rpc.system': 'jsonrpc',
-                        'rpc.jsonrpc.request_id': String(entry.id),
-                        'error.type': 'unanswered',
-                    };
-                    const ev = {
-                        ...base('rpc', attributes),
-                        kind: 'rpc',
-                        method: entry.method,
-                        request_id: entry.id,
-                        params: redactor.scrub(entry.params ?? null),
-                        result_hash: NULL_RESULT_HASH,
-                        is_error: true,
-                        duration_ms: durationMs,
-                        error: { type: 'unanswered' },
-                    };
-                    record(ev);
-                }
+                sealPending(entry, 'unanswered', round2(shutdownT0 - entry.t0));
             }
             pending.clear();
         };

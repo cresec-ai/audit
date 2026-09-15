@@ -19,31 +19,21 @@
  *   differ, and that is documented).
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
+ * Every `args` regex runs through `regex-guard.ts`, which matches it off the
+ * main thread under a hard deadline: V8's RegExp is a backtracking engine and
+ * RE2 is not, so a pattern that is linear under OPA can still hang the proxy
+ * thread here. A match that overruns its deadline is UNEVALUABLE — the rule
+ * neither matches nor is skipped, it denies — and the offending pattern is
+ * poisoned for the rest of the process.
+ *
  * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
  * deny with `reason: "policy evaluation error: ..."` (enforcement is
- * fail-closed, unlike recording).
+ * fail-closed, unlike recording). A timed-out args regex lands there as
+ * `policy evaluation error: regex timed out (<rule id>)`.
  */
 import { globMatch } from './glob.js';
+import { RegexGuardError, matchBounded } from './regex-guard.js';
 import { DEFAULTS, REGEX_VALUE_CAP } from './types.js';
-/** Max compiled arg regexes retained (LRU). */
-export const REGEX_CACHE_SIZE = 512;
-const regexCache = new Map();
-function compiledRegex(pattern) {
-    const hit = regexCache.get(pattern);
-    if (hit !== undefined) {
-        regexCache.delete(pattern);
-        regexCache.set(pattern, hit);
-        return hit;
-    }
-    const re = new RegExp(pattern);
-    if (regexCache.size >= REGEX_CACHE_SIZE) {
-        const oldest = regexCache.keys().next();
-        if (!oldest.done)
-            regexCache.delete(oldest.value);
-    }
-    regexCache.set(pattern, re);
-    return re;
-}
 const ARRAY_INDEX = /^(0|[1-9][0-9]*)$/;
 /** Split a dot-path into Rego-style segments: canonical integers become numbers. */
 export function dotPathSegments(dotPath) {
@@ -93,12 +83,27 @@ export function coerceScalar(value) {
             return undefined;
     }
 }
-function argsMatch(args, input) {
+/**
+ * All `args` conditions of one rule. Throws when a pattern is unevaluable
+ * (deadline overrun, poisoned, or no guard worker for a pattern that is not
+ * provably linear): the rule is then neither a match nor a miss, and the
+ * caller's fail-closed path turns it into a deny naming `ruleId`.
+ */
+function argsMatch(args, input, ruleId) {
     for (const [dotPath, pattern] of Object.entries(args)) {
         const s = coerceScalar(getPath(input, dotPath));
         if (s === undefined)
             return false;
-        if (!compiledRegex(pattern).test(s))
+        let matched;
+        try {
+            matched = matchBounded(pattern, s);
+        }
+        catch (err) {
+            if (err instanceof RegexGuardError)
+                throw new Error(`${err.message} (${ruleId})`);
+            throw err;
+        }
+        if (!matched)
             return false;
     }
     return true;
@@ -109,7 +114,7 @@ function mcpRuleMatches(rule, input) {
         return false;
     if (!m.tool.some((g) => globMatch(g, '/', input.tool)))
         return false;
-    if (m.args !== undefined && !argsMatch(m.args, input.args))
+    if (m.args !== undefined && !argsMatch(m.args, input.args, rule.id))
         return false;
     if (m.max_args_bytes !== undefined && !(input.argsBytes <= m.max_args_bytes))
         return false;

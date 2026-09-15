@@ -19,9 +19,17 @@
  *   differ, and that is documented).
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
+ * Every `args` regex runs through `regex-guard.ts`, which matches it off the
+ * main thread under a hard deadline: V8's RegExp is a backtracking engine and
+ * RE2 is not, so a pattern that is linear under OPA can still hang the proxy
+ * thread here. A match that overruns its deadline is UNEVALUABLE — the rule
+ * neither matches nor is skipped, it denies — and the offending pattern is
+ * poisoned for the rest of the process.
+ *
  * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
  * deny with `reason: "policy evaluation error: ..."` (enforcement is
- * fail-closed, unlike recording).
+ * fail-closed, unlike recording). A timed-out args regex lands there as
+ * `policy evaluation error: regex timed out (<rule id>)`.
  */
 import type { Action, Policy } from './types.js';
 export interface McpRequestInput {
@@ -48,8 +56,6 @@ export interface Decision {
 }
 export type McpDecision = Decision;
 export type EgressDecision = Decision;
-/** Max compiled arg regexes retained (LRU). */
-export declare const REGEX_CACHE_SIZE = 512;
 /** Split a dot-path into Rego-style segments: canonical integers become numbers. */
 export declare function dotPathSegments(dotPath: string): Array<string | number>;
 /**

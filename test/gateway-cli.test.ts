@@ -29,7 +29,7 @@ import { join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsx } from './helpers/tsx.js';
+import { spawnTsx, spawnTsxInProcess } from './helpers/tsx.js';
 import { sha256Ref } from '../src/chain/hash.js';
 import { HoldStore } from '../src/gateway/holds.js';
 import type { HoldRecord } from '../src/gateway/holds.js';
@@ -763,10 +763,21 @@ describe('record --policy: startup is fail-closed', () => {
     // recommends for stdio servers; it must not make `http` unusable.
     const dir = tmpDir('mcp-rec-gw-http-env-');
     const policy = writePolicy(dir, 'policy.yaml', VALID_POLICY);
-    const child = spawnCli(
-      ['http', '--target', 'http://127.0.0.1:1/mcp', '--port', '0', '--data-dir', join(dir, 'data')],
-      { MCP_RECORDER_POLICY: policy },
+    // In-process tsx, not the tsx CLI: `http` is stopped with SIGINT below and
+    // its exit code asserted, and the tsx CLI's parent/child signal relay
+    // (30 ms acknowledgement window, then SIGKILL + exit 130) turns that
+    // assertion into a CI flake. See spawnTsxInProcess.
+    const child = spawnTsxInProcess(
+      ['src/cli.ts', 'http', '--target', 'http://127.0.0.1:1/mcp', '--port', '0', '--data-dir', join(dir, 'data')],
+      {
+        cwd: ROOT,
+        env: { ...process.env, MCP_RECORDER_DISABLE: undefined, MCP_RECORDER_POLICY: policy },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
     );
+    cleanups.push(() => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    });
     const stderrText = collect(child.stderr);
     const exited = waitExit(child);
     await waitForText(stderrText, 'http proxy listening at');
@@ -779,8 +790,19 @@ describe('record --policy: startup is fail-closed', () => {
     ]);
     expect(stderrText()).not.toContain('stdio transport only (drop --policy)');
 
+    if (process.platform === 'win32') {
+      // No POSIX signals on Windows: child.kill() is TerminateProcess, so a
+      // clean-shutdown exit code cannot be observed there (same caveat as the
+      // signal tests in cli.test.ts). The note above is the assertion.
+      child.kill();
+      await exited;
+      return;
+    }
+    // Ctrl-C shuts the proxy down cleanly: exit 0 and the usual run summary,
+    // proving the ignored variable left recording itself untouched.
     child.kill('SIGINT');
     expect(await exited).toBe(0);
+    expect(stderrText()).toMatch(/\[mcp-recorder\] session [0-9a-f-]+ recorded \d+ events/);
   }, 60_000);
 });
 

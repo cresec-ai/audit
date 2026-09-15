@@ -164,8 +164,13 @@ export interface QueryMatch {
     kind: AnyEvent['kind'];
     /** tool or method name when applicable. */
     name?: string;
-    /** Where the needle matched: 'ref' | 'result_hash' | 'plain' | 'credential' | 'name'. */
-    matched_on: 'ref' | 'result_hash' | 'plain' | 'credential' | 'name';
+    /**
+     * Where the needle matched:
+     * 'ref' | 'result_hash' | 'args_hash' | 'credential' | 'name' | 'plain'.
+     * `args_hash` is additive (gateway mode): the canonical-JSON hash of the
+     * arguments of a call the gateway denied or held.
+     */
+    matched_on: 'ref' | 'result_hash' | 'args_hash' | 'plain' | 'credential' | 'name';
     /** JSON-path-ish location of the match inside the event. */
     path: string;
 }

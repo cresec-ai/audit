@@ -15,6 +15,10 @@
  *   whitelisted escapes, no leading `]` in a character class) so the local
  *   engine and OPA agree on every input, whatever the running Node version's
  *   V8 happens to accept;
+ * - regexes avoid the repeated-group shapes that are linear under RE2 but
+ *   EXPONENTIAL under V8's backtracking engine (`redos.ts`): the compiled
+ *   Rego would shrug them off, the local engine on the proxy thread would
+ *   not;
  * - globs are not blank and use neither `[ ] { } \`, which OPA's glob library
  *   interprets and ours does not, nor `?`, which both interpret but not the
  *   same way (OPA's `?` is ASCII-only).
@@ -22,6 +26,7 @@
  * Every error keeps an RFC 6901 pointer (`/mcp/rules/1/match/tool`).
  */
 import { escapePointerToken, validateAgainstSchema } from './jsonschema.js';
+import { checkCatastrophicShape } from './redos.js';
 import { POLICY_SCHEMA } from './schema.js';
 import { normalizePolicy } from './types.js';
 /** Characters with glob meaning in OPA (`glob.match`) but not in policy v1. */
@@ -112,6 +117,12 @@ function checkEscape(pattern, i, inClass) {
  * escape outside `PORTABLE_LETTER_ESCAPES` + `\xhh`, a leading `]` in a
  * character class, and POSIX classes `[:alpha:]`.
  *
+ * Last, a pattern that compiles and is portable is still rejected when it has
+ * a clearly exponential shape — a repeated group whose body alternates
+ * (`(a|aa)+`), ends with a quantified atom (`(a+)+`, `(\w+[ ]?)*`) or ends
+ * with characters the repeated part can also match (`(.*a)*`). See
+ * `redos.ts`; `([a-z0-9-]+\.)*` and friends stay allowed.
+ *
  * The `(?` check is explicit and runs BEFORE `new RegExp`: RE2 accepts inline
  * flags, Node 20's V8 rejects them all, and Node 24's V8 accepts the
  * `(?i:...)` modifier form — the policy must mean the same thing everywhere,
@@ -160,7 +171,7 @@ export function checkRe2Subset(pattern) {
     catch (err) {
         return `invalid regular expression: ${err instanceof Error ? err.message : String(err)}`;
     }
-    return undefined;
+    return checkCatastrophicShape(pattern);
 }
 /**
  * Why the `(?` group whose body starts at `at` is not acceptable, or
