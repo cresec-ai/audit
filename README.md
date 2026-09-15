@@ -11,13 +11,47 @@ AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--", "npx", "-y
 
 That's the whole integration. The proxy forwards bytes unchanged, fails open (recording failure never breaks traffic), and adds <5ms p50 latency.
 
-- **License:** GPL-3.0 · **Node:** >= 18.17 · **Binary:** `mcp-recorder`
+- **License:** GPL-3.0 · **Node:** >= 18.17 (macOS/Linux — Windows not yet) · **Binary:** `mcp-recorder`
 
 ---
+
+## Install
+
+`@edut/mcp-recorder` is not on npm yet, so `npx -y @edut/mcp-recorder` doesn't
+resolve for anyone today. Install from the git repository instead — `npm
+install` builds it for you, no manual build step:
+
+```sh
+npm install -g github:cresec-ai/audit#claude/p0-subagents-scoping-qibt2p
+mcp-recorder --version
+```
+
+Then wrap every stdio server in a client's config with one command
+(`--dry-run` first to preview):
+
+```sh
+mcp-recorder setup --client claude-desktop --dry-run
+mcp-recorder setup --client claude-desktop
+```
+
+Or hand the whole thing to Claude: give Claude Desktop or Claude Code a
+prompt asking it to install from git, run `setup --dry-run`, show you the
+diff, then apply it — Claude just needs a shell/terminal or config-file
+access to do this for you.
+
+Full instructions (manual JSON edits per client, uninstall, troubleshooting)
+are in **[docs/install.md](docs/install.md)**.
 
 ## 60-second quickstart
 
 ### 1. Wrap a server
+
+The snippets below use the `npx -y @edut/mcp-recorder` form, which is what
+you'll use **once the package is published to npm**. Until then, use the
+**local wrapper** form instead — absolute paths to `node` and this
+install's `dist/cli.js` — either by running `mcp-recorder setup` (above) or
+by hand; see [docs/install.md](docs/install.md#wrap-your-servers) for the
+exact before/after JSON for each client.
 
 **Claude Desktop** — `claude_desktop_config.json`:
 
@@ -80,11 +114,12 @@ Traffic flows through untouched. Every tool call lands in `~/.mcp-recorder` as a
 ### 3. Look at what happened
 
 ```sh
-npx @edut/mcp-recorder sessions          # what ran, when, by whom
-npx @edut/mcp-recorder ui                # HTML replay timeline in your browser
-npx @edut/mcp-recorder verify            # prove the record is intact
-npx @edut/mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
-npx @edut/mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
+mcp-recorder sessions          # what ran, when, by whom
+mcp-recorder ui                # HTML replay timeline in your browser
+mcp-recorder verify            # prove the record is intact
+mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
+mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
+mcp-recorder verify --bundle evidence.zip   # what the stranger runs (or `node verify.cjs` inside the bundle)
 ```
 
 ---
@@ -114,9 +149,11 @@ npx @edut/mcp-recorder export --out evidence.zip   # signed bundle a stranger ca
 Four pillars:
 
 1. **Transparent fail-open stdio proxy.** The proxy never parses-then-rewrites; it forwards the exact bytes and taps a copy. If recording dies, traffic keeps flowing. Added latency is <5ms p50.
-2. **Edge redaction.** Payload strings never reach disk. Each string leaf is replaced by its SHA-256 (`sha256:<hex>`) plus its length — structure preserved, content gone. Hashes are unsalted *by design*: if you later need to know whether a known value (an API key, a customer email) ever passed through, hash it and search.
+2. **Edge redaction.** Payload strings never reach disk. Each string leaf is replaced by its SHA-256 (`sha256:<hex>`) plus its length — structure preserved, content gone. Object *keys* are redacted too (a map keyed by an email or a secret-shaped string doesn't land in clear either). A tool call's `arguments` are hashed unconditionally, key and position notwithstanding; a small, fixed vocabulary of structural fields (`type`, `role`, `level`, `mimeType`, `protocolVersion`, `method`, and `name` only at `tools[*].name`/`prompts[*].name`) may pass elsewhere, and only when the *value* also looks like that field, not merely because the key matches. Hashes are unsalted *by design*: if you later need to know whether a known value (an API key, a customer email) ever passed through, hash it and search — including a value glued into a longer string, which is tracked separately so it isn't lost inside one opaque leaf hash.
 3. **Tamper-evident store.** SQLite (JSONL fallback), append-only. Every event is sealed as `sha256(prev_hash + "\n" + canonicalJson(event))`, and the chain head is signed with a local ed25519 key. `mcp-recorder verify` re-walks every link; altering, inserting, or deleting any stored row makes it fail loudly.
 4. **Reconstruction tools.** An HTML replay timeline (see → act → effect, with identity context on every event), a blast-radius query ("which sessions touched X?"), and a signed evidence bundle — a ZIP containing `events.jsonl`, `manifest.json`, `public_key.pem`, and a standalone, dependency-free `verify.cjs` that anyone can run with bare `node`.
+
+**Multiple wrapped servers, one data dir.** The normal setup is one `mcp-recorder record` process per MCP server, all pointed at the same `--data-dir`. Any number of them may run at once: each append is sealed under the store's own exclusive lock (a `busy_timeout`'d transaction for sqlite, an advisory lock for jsonl), so writers never lose or fork the chain — their sessions simply interleave, seq by seq, in one shared hash chain.
 
 ---
 
@@ -129,19 +166,22 @@ mcp-recorder [record] [options] -- <server command...>
 | Command | What it does |
 | --- | --- |
 | `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. |
-| `mcp-recorder verify [--json] [--bundle PATH]` | Re-walk the hash chain and check head signatures — for the local store, or for an exported bundle with `--bundle`. |
-| `mcp-recorder query <needle> [--json]` | Blast radius: hash the needle and find every event and session that touched that value. |
-| `mcp-recorder sessions [--json]` | List recorded sessions: server, identity, event/tool-call/error counts. |
-| `mcp-recorder ui [--port P] [--out FILE] [--no-open]` | Serve the HTML replay timeline (or write it to a file with `--out`). |
-| `mcp-recorder export [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. |
+| `mcp-recorder verify [--data-dir D] [--store sqlite\|jsonl] [--bundle PATH] [--public-key K] [--allow-unsigned] [--json]` | Re-walk the hash chain and check head signatures — for the local store, or for an exported bundle with `--bundle` (accepts either form `export` produces: a `.zip` or a bundle directory). `--public-key` pins to a key obtained out of band instead of the default (`<data-dir>/identity.pub`, or the bundle's own manifest key); `--allow-unsigned` downgrades an unsigned chain/tail from a failure to a warning (store mode only — a bundle's own manifest range/signature must always match exactly, see "Security model"). |
+| `mcp-recorder query <needle> [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--json]` | Blast radius: hash the needle and find every event and session that touched that value. `--session` accepts a unique id prefix, the same short id `sessions` prints. |
+| `mcp-recorder sessions [--data-dir D] [--store sqlite\|jsonl] [--json]` | List recorded sessions: server, identity, event/tool-call/error counts. |
+| `mcp-recorder ui [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--port P] [--out FILE] [--no-open] [--public-key K] [--allow-unsigned]` | Serve the HTML replay timeline (or write it to a file with `--out`). Opens your default browser to the served URL unless `--no-open` is set, `--out` is used, or the host looks headless. The integrity banner is resolved the same way as `verify` (same default `identity.pub` pin, same `--public-key`/`--allow-unsigned`), so it never shows green for a chain `verify` would reject. |
+| `mcp-recorder export [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. `--session` accepts a unique id prefix, the same short id `sessions` prints. Requires an existing `identity.key` in the data dir — it signs with the key that actually produced the chain, never minting a fresh one, so exit 2 on a data dir with no key (e.g. a store copied without it). |
 | `mcp-recorder http --target URL [--port P]` | Recording proxy for HTTP-transport MCP servers. |
+| `mcp-recorder setup --client claude-desktop\|claude-code\|cursor [--config PATH] [--wrapper local\|npx] [--only N,...] [--except N,...] [--data-dir D] [--dry-run] [--undo] [--json]` | Wrap every stdio MCP server in a client's config behind the recorder — safely (a timestamped backup + a sidecar recording the originals) and reversibly (`--undo`). `--config` overrides the resolved path (and makes `--client` optional). `--wrapper local` (default) points at this install's own `dist/cli.js`; `--wrapper npx` writes the published-package form. `--dry-run` previews without writing. See [docs/install.md](docs/install.md) for the full walkthrough. |
+
+`--help`/`-h` and `--version`/`-V` work on every invocation.
 
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `MCP_RECORDER_DATA_DIR` | Override the data directory (default `~/.mcp-recorder`). |
-| `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: try sqlite, fall back to jsonl). |
+| `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: whichever evidence file already exists in the data dir wins; on a fresh data dir, sqlite when available, else jsonl). |
 | `MCP_RECORDER_REDACT` | `allowlist` (default) or `off`. Secret-shaped values are hashed in every mode. |
 | `MCP_RECORDER_DISABLE` | `1` → pure passthrough, no recording. |
 
@@ -155,6 +195,8 @@ npm run demo
 
 A scripted prompt-injection exfiltration — an agent is tricked into reading a credential and sending it out through an innocent-looking tool — recorded, reconstructed on the replay timeline, blast-radius-queried, and cryptographically verified, in under a minute. It is the fastest way to see what the recorder is for.
 
+Want to see the same story with a real model instead of the scripted agent? [docs/red-team.md](docs/red-team.md) walks through running it live in Claude Desktop.
+
 ---
 
 ## Security model (the honest version)
@@ -164,8 +206,13 @@ A scripted prompt-injection exfiltration — an agent is tricked into reading a 
 Read the fine print:
 
 - **Tail truncation.** Deleting events from the end of the chain is detectable only back to the last signed head. The recorder signs the head on every flush, which keeps the unsigned window small, but an attacker who can also delete signatures can roll the chain back to an older signed head. For stronger guarantees, anchor head signatures externally (ship them to another machine, a log, a timestamping service) — the `HeadSignature` records are small and self-contained.
-- **Unsalted hashes — a deliberate tradeoff.** Redaction refs are plain `sha256(value)`, no salt. This is what makes blast-radius queries possible: hash a candidate value and search for it. The flip side: a party who *already holds* a candidate value (or can enumerate a small space of them) can confirm whether it was seen. The store never leaks values to someone who doesn't already have them, but it does confirm membership to someone who does. If that tradeoff is wrong for your threat model, treat the store itself as sensitive.
-- **The recorder trusts its own key.** The ed25519 key lives in the data dir. An attacker who owns the key can re-sign a forged chain. The signature proves the chain was produced by the holder of that key, and a bundle proves integrity to a third party who pins the public key — it does not protect against a fully compromised host.
+- **An unsigned chain is a failure, not a warning.** `verify` fails (not just warns) when no part of the chain carries a single valid signature, and when the unsigned tail after the newest valid signature contains a `session_end` event — the recorder signs on every flush, *including* the session_end flush, so that signature is missing outright, not merely pending the next one. (Several concurrent recorder processes can interleave sessions in one chain, so this is "the tail contains *any* session_end", not just the latest session's.) A genuine crash mid-session — an unsigned tail with no `session_end` in it — stays a warning: flushes can legitimately outrun head signing. Pass `--allow-unsigned` to downgrade the hard failures back to warnings, e.g. for tooling that needs to tolerate an in-flight session.
+- **Unsalted hashes — a deliberate tradeoff.** Redaction refs are plain `sha256(value)`, no salt. This is what makes blast-radius queries possible: hash a candidate value and search for it. The flip side: a party who *already holds* a candidate value (or can enumerate a small space of them) can confirm whether it was seen. The store never leaks values to someone who doesn't already have them, but it does confirm membership to someone who does. If that tradeoff is wrong for your threat model, treat the store itself as sensitive. This applies uniformly to leaf values, object keys, argv elements/credential fingerprints, and tokens embedded inside a larger string — everything `query` can find was hashed the same unsalted way.
+- **A `query` miss is not proof of absence.** `query` finds a value if it was hashed as a whole leaf, hashed as an object key, embedded inside a larger leaf as a recognizable secret shape (`secret_refs`, capped at 8 per leaf), or scrubbed out of the wrapped command's argv. A value that never took one of those shapes — folded into a longer plain string under a key the allowlist doesn't recognize, for instance — was still hashed (nothing readable reaches disk either way), there just isn't a standalone ref to search for. Treat a miss as "not found this way", not as "never touched the proxy".
+- **The recorder trusts its own key — unless you pin it.** The ed25519 key lives in the data dir (`identity.key` / `identity.pub`). Signing alone proves nothing about *who* signed: an attacker who can rewrite the store can also write a forged chain, sign it with a fresh key of their own, and the signature is cryptographically genuine — it just isn't the operator's. So `verify` pins a specific key rather than trusting whatever key rode along with the data being checked: for a local store it reads `<data-dir>/identity.pub` by default and rejects any signature made by a different key; for an exported bundle it defaults to the bundle's own `manifest.json` key, which only proves the bundle is *internally self-consistent* (an attacker who forges a whole bundle from scratch ships a key that matches itself, so this alone is not third-party assurance). Pass `--public-key <64-hex | path to a hex or PEM file>` — to `mcp-recorder verify` or to the standalone `verify.cjs` shipped inside every bundle — pinned to a key you obtained **out of band** (from the operator directly, never from the artifact you're checking) for real independent verification. None of this protects against a fully compromised host that can rewrite `identity.key`/`identity.pub` together with the chain. If a local store has neither `identity.pub` nor a `--public-key`, `verify` still checks the chain but accepts a signature from *any* key — this is never silent: the human output prints a `WARNING` line and the verdict reads `PASS (unpinned)` (`--json` carries `pinned_public_key: null, unpinned: true`), and `ui`'s integrity banner uses this same pin resolution so it can never show green for a chain `verify` rejects.
+- **A bundle is a sealed artifact — its own manifest must match exactly.** `manifest.json`'s `range`/`event_count`/`head_hash`/`signature` are checked against what `events.jsonl` and `public_key.pem` actually contain: any mismatch is an unconditional failure (`bundle_manifest_mismatch` or `signature_invalid`), never downgradable by `--allow-unsigned`. Without this, records self-consistently chained onto the real signed head but appended *after* export — no key needed — would verify as a mere "unsigned tail" warning, since a bundle's manifest is the only thing declaring where the sealed range is supposed to end; a forgery re-signed with an attacker key that ships the operator's genuine `public_key.pem` is caught the same way (the shipped PEM must match the key named in `manifest.signature`). `verify --bundle` and the standalone `verify.cjs` inside every bundle agree on every one of these checks. A `.zip` bundle with a duplicate entry name (e.g. two `events.jsonl`) is rejected outright rather than trusting whichever copy is found first — real unzip tools extract whichever comes *last*, and silently accepting the first would let a genuine copy verify while a forged one gets written to disk.
+- **`export` never mints a signing key.** It signs with the *same* key that produced the chain (`Signer.loadExisting`), and exits 2 if `identity.key` is missing from the data dir — e.g. a store copied to another machine without it. The alternative (silently minting a fresh key, which `record` does on a brand-new data dir) would let `export` "succeed" signing with an identity that never touched the evidence, and would repoint the default `identity.pub` pin out from under the next `verify`.
+- **A reader that goes away doesn't erase a FAIL.** `verify`'s exit code is decided before anything is printed, so `mcp-recorder verify | head -1` on a failing store still exits 1 — a `SIGPIPE`/`EPIPE` from an early-closing reader can no longer be mistaken for the command's own success.
 - **Fail-open means recording can be lost.** By design, if the store breaks mid-session the proxy keeps forwarding and counts dropped events (`events_dropped` in the `session_end` event). Availability of your agent always wins over completeness of the record.
 
 ## Event schema
@@ -174,7 +221,7 @@ Events follow the frozen schema `edut.mcp-recorder.event.v1`, with field names a
 
 ## What we explicitly do NOT do
 
-- **No payload storage.** Strings are hashed at the edge; original values never land in the store.
+- **No payload storage.** Strings are hashed at the edge — leaf values, object keys, and the wrapped command's argv alike; original values never land in the store. A tool call's `arguments` are hashed unconditionally, regardless of key.
 - **No cloud.** Local-first, no telemetry, no phone-home. Evidence leaves your machine only when you run `export`.
 - **No enforcement.** The recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a flight recorder, not a firewall.
 

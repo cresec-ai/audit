@@ -28,6 +28,15 @@ export interface RedactedRef {
   ref: Sha256Ref;
   /** Length of the original string in UTF-16 code units. */
   len: number;
+  /**
+   * Hashes of secret-shaped tokens (alwaysPatterns matches) found EMBEDDED
+   * within this leaf, e.g. an AWS key inside "AWS_ACCESS_KEY_ID=AKIA...\n".
+   * De-duplicated, capped at 8, excludes any hash equal to `ref` itself.
+   * Optional and additive (v1). A miss against `secret_refs` is NOT proof a
+   * value never appeared here — only alwaysPatterns-shaped tokens are
+   * captured this way; see docs/event-schema.md.
+   */
+  secret_refs?: Sha256Ref[];
 }
 
 /** JSON tree after edge redaction: structure preserved, sensitive leaves replaced. */
@@ -52,7 +61,10 @@ export interface CredentialFingerprint {
 export interface IdentityContext {
   /**
    * Stable identity hash for the acting agent/credential pair:
-   * sha256 over (os_user, hostname, client_name, client_version, label).
+   * sha256 over (os_user, hostname, label, initial server name) — the
+   * identity/server context known at proxy startup, before the MCP
+   * `initialize` handshake (client_name/client_version are learned later
+   * and are not part of the fingerprint).
    */
   fingerprint: Sha256Ref;
   os_user?: string;
@@ -183,6 +195,10 @@ export interface SessionEndEvent extends EventBase {
   child_exit_code?: number | null;
   events_recorded: number;
   events_dropped: number;
+  /** errno code (e.g. 'ENOENT') when the wrapped command failed to spawn. */
+  spawn_error?: string;
+  /** Signal name (e.g. 'SIGKILL') when the wrapped process was killed by a signal. */
+  child_signal?: string;
 }
 
 export type AnyEvent =

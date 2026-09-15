@@ -4,17 +4,21 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Recorder } from '../src/capture/recorder.js';
+import { sha256Ref } from '../src/chain/hash.js';
 import { Signer } from '../src/chain/keys.js';
 import { runHttpProxy } from '../src/proxy/http.js';
 import { Redactor } from '../src/redact/redactor.js';
+import { queryStore } from '../src/query/touched.js';
 import { openStore } from '../src/store/index.js';
 import { verifyStore } from '../src/verify/verify.js';
 import type {
   AnyEvent,
   InitializeEvent,
+  NotificationEvent,
+  RpcEvent,
   ToolCallEvent,
 } from '../src/schema/events.js';
 
@@ -272,5 +276,620 @@ describe('runHttpProxy', () => {
     const res2 = await post(proxy.url, initializeMsg);
     expect(res2.status).toBe(502);
     await proxy.close();
+  });
+
+  it('correlates concurrent clients that both use JSON-RPC id 1 (no collision)', async () => {
+    // Every MCP client starts its id counter at 1; the target answers the
+    // *first* call (id 1, tool A) after the *second* call (id 1, tool B) has
+    // already been sent, so a process-wide pending map keyed on id alone
+    // would misattribute one response to the other client's tool/args.
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const params = msg.params as { name: string };
+      const delay = params.name === 'A_tool' ? 60 : 10; // A answers last
+      setTimeout(() => {
+        const out = JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { content: [{ type: 'text', text: 'from ' + params.name }] },
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(out);
+      }, delay);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const call = (tool: string) =>
+      post(proxy.url, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: tool, arguments: { who: tool } },
+      }).then((r) => r.json() as Promise<Rpc>);
+
+    const [a, b] = await Promise.all([
+      call('A_tool'),
+      new Promise((r) => setTimeout(r, 5)).then(() => call('B_tool')),
+    ]);
+    // Forwarding is untouched: each client gets its own correct wire reply.
+    const aText = (a.result as { content: [{ text: string }] }).content[0].text;
+    const bText = (b.result as { content: [{ text: string }] }).content[0].text;
+    expect(aText).toBe('from A_tool');
+    expect(bText).toBe('from B_tool');
+
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.some((e) => e.kind === 'protocol_error')).toBe(false);
+    const calls = events.filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(calls).toHaveLength(2);
+    const byTool = new Map(calls.map((c) => [c.tool, c]));
+    // "who" is not allow-listed, so it's redacted — assert the ref matches
+    // that CLIENT's own value, i.e. args were not swapped between clients.
+    const redactor = new Redactor();
+    expect(byTool.get('A_tool')?.args).toEqual(redactor.scrub({ who: 'A_tool' }));
+    expect(byTool.get('B_tool')?.args).toEqual(redactor.scrub({ who: 'B_tool' }));
+    // Duration also confirms no swap: A was delayed 60ms, B only 10ms.
+    expect(byTool.get('A_tool')!.duration_ms).toBeGreaterThan(byTool.get('B_tool')!.duration_ms);
+  });
+
+  it('numeric id 1 and string id "1" do not collide', async () => {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const out = JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { content: [{ type: 'text', text: `id-type:${typeof msg.id}` }] },
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const numeric = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'numeric', arguments: {} },
+    }).then((r) => r.json() as Promise<Rpc>);
+    const stringy = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: '1',
+      method: 'tools/call',
+      params: { name: 'stringy', arguments: {} },
+    }).then((r) => r.json() as Promise<Rpc>);
+
+    expect(typeof numeric.id).toBe('number');
+    expect(typeof stringy.id).toBe('string');
+
+    await proxy.close();
+    const events = loadEvents(dataDir);
+    expect(events.some((e) => e.kind === 'protocol_error')).toBe(false);
+    const calls = events.filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(calls).toHaveLength(2);
+    const num = calls.find((c) => c.tool === 'numeric')!;
+    const str = calls.find((c) => c.tool === 'stringy')!;
+    expect(num.request_id).toBe(1);
+    expect(str.request_id).toBe('1');
+  });
+
+  it('an idle SSE stream survives past a short upstream-headers timeout', async () => {
+    const upstream = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': open\n\n');
+      // then stay silent — headers already sent, this must not be torn down
+    });
+    const upstreamUrl = await listen(upstream);
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const store = openStore({ dataDir });
+    const signer = await Signer.load(dataDir);
+    const recorder = new Recorder({ store, signer });
+    // Budgeted in the hundreds of ms, not tens: a busy test runner can
+    // easily burn 50ms of scheduling delay before this same-process
+    // upstream's handler even gets to call writeHead/write, which would
+    // trip a too-tight header-wait timeout before headers ever arrive and
+    // fail the test for a reason that has nothing to do with the behavior
+    // under test. The point under test is that this timeout is cleared the
+    // instant headers arrive and never applies again afterwards, so the
+    // idle period below is picked to clearly (4x) exceed it.
+    const headersTimeoutMs = 300;
+    const proxy = await runHttpProxy({
+      targetUrl: upstreamUrl + '/mcp',
+      recorder,
+      redactor: new Redactor(),
+      proxyVersion: '0.0.0-test',
+      upstreamHeadersTimeoutMs: headersTimeoutMs,
+    });
+    cleanups.push(() => proxy.close());
+
+    const res = await fetch(proxy.url, { headers: { accept: 'text/event-stream' } });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(Buffer.from(first.value!).toString()).toContain('open');
+
+    // Idle for several times the header timeout: the stream must still be
+    // alive (no error, no premature close) once headers arrived.
+    const idleMs = headersTimeoutMs * 4;
+    const raced = await Promise.race([
+      reader.read().then(() => 'more-data' as const),
+      new Promise<'still-open'>((r) => setTimeout(() => r('still-open'), idleMs)),
+    ]);
+    expect(raced).toBe('still-open');
+    await reader.cancel();
+  });
+
+  it('a long-silent POST (no response yet) survives with no default timeout', async () => {
+    const upstream = createServer((req, res) => {
+      setTimeout(() => {
+        const out = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(out);
+      }, 300); // no bytes at all — not even headers — for 300ms
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    // No upstreamHeadersTimeoutMs configured: default is no cap at all.
+    const proxy = await startProxy(url, dataDir);
+
+    const res = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'slow', arguments: {} },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Rpc;
+    expect(body.result).toEqual({ ok: true });
+    await proxy.close();
+  });
+
+  it('aborts the upstream connection when the client disconnects early', async () => {
+    let opened = 0;
+    let closed = 0;
+    const upstream = createServer((req, res) => {
+      opened++;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': open\n\n');
+      const ping = setInterval(() => {
+        try {
+          res.write(': ping\n\n');
+        } catch {
+          /* ignore */
+        }
+      }, 20);
+      res.on('close', () => {
+        closed++;
+        clearInterval(ping);
+      });
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    const ac = new AbortController();
+    const res = await fetch(proxy.url, {
+      headers: { accept: 'text/event-stream' },
+      signal: ac.signal,
+    });
+    const reader = res.body!.getReader();
+    await reader.read();
+    ac.abort();
+
+    await vi.waitFor(() => expect(closed).toBe(opened), { timeout: 2000 });
+    expect(opened).toBe(1);
+    await proxy.close();
+  });
+
+  it('records an unanswered event for a request still pending at close()', async () => {
+    // A positive signal that the request has fully reached the upstream,
+    // in place of a fixed sleep: the proxy's tap parses the request body
+    // (registering the pending entry) in the SAME 'end' event tick as it
+    // pipes the body onward to upReq — see the request-body handling in
+    // src/proxy/http.ts, where the tap's own `req.on('end', ...)` listener
+    // is attached before `req.pipe(upReq)`, so it always runs first. That
+    // means the pending entry is registered strictly before `upReq.end()`
+    // is even called, which itself happens strictly before this upstream
+    // stub can physically observe the end of the request body below — so
+    // waiting for THIS promise guarantees the proxy has already registered
+    // the pending entry, on any runner speed.
+    let requestReceived: () => void;
+    const received = new Promise<void>((resolve) => {
+      requestReceived = resolve;
+    });
+    const upstream = createServer((req) => {
+      // Never respond — simulates a tool call still in flight at shutdown.
+      // Consume (don't just ignore) the body so 'end' actually fires.
+      req.resume();
+      req.on('end', () => requestReceived());
+    });
+    const url = (await listen(upstream)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(url, dataDir);
+
+    // Attach the rejection handler in the same tick the fetch starts, so
+    // the inevitable socket-close-on-shutdown never counts as unhandled.
+    const pending = post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 42,
+      method: 'tools/call',
+      params: { name: 'never_returns', arguments: { x: 1 } },
+    }).catch(() => undefined);
+    await received;
+    await proxy.close();
+    // The client-facing response socket is torn down by close(); swallow.
+    await pending;
+
+    const events = loadEvents(dataDir);
+    const call = events.find(
+      (e) => e.kind === 'tool_call' && (e as ToolCallEvent).tool === 'never_returns',
+    ) as ToolCallEvent | undefined;
+    expect(call).toBeDefined();
+    expect(call!.is_error).toBe(true);
+    expect(call!.result).toBeNull();
+    expect(call!.error?.type).toBe('unanswered');
+    expect(call!.request_id).toBe(42);
+
+    // Recorded strictly before session_end.
+    const callIdx = events.indexOf(call!);
+    const endIdx = events.findIndex((e) => e.kind === 'session_end');
+    expect(endIdx).toBeGreaterThan(callIdx);
+  });
+
+  it('never stores target URL userinfo in ServerContext.command or any event', async () => {
+    const target = await startJsonTarget();
+    const withCreds = target.url.replace('http://', 'http://svcuser:sup3rSecr3t@');
+
+    const dataDir = tmpDataDir();
+    const store = openStore({ dataDir });
+    const signer = await Signer.load(dataDir);
+    const recorder = new Recorder({ store, signer });
+    const proxy = await runHttpProxy({
+      targetUrl: withCreds,
+      recorder,
+      redactor: new Redactor(),
+      proxyVersion: '0.0.0-test',
+    });
+    cleanups.push(() => proxy.close());
+
+    // The credentials must still reach the upstream server (forwarding is
+    // unaffected); the plain target has no auth check here, so this just
+    // proves traffic still flows through the credentialed URL.
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain('svcuser');
+    expect(serialized).not.toContain('sup3rSecr3t');
+    for (const e of events) {
+      expect(e.server.command).not.toContain('svcuser');
+      expect(e.server.command).not.toContain('sup3rSecr3t');
+      expect(e.server.command.startsWith('http://')).toBe(true);
+    }
+
+    // P2: the password is fingerprinted separately from the joined
+    // "user:pass" string, so a blast-radius query for the leaked PASSWORD
+    // ALONE — without knowing the username — still finds the event.
+    const passwordHash = sha256Ref('sup3rSecr3t');
+    const userHash = sha256Ref('svcuser');
+    const hitPassword = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === passwordHash),
+    );
+    const hitUser = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === userHash),
+    );
+    expect(hitPassword).toBe(true);
+    expect(hitUser).toBe(true);
+  });
+
+  /* --- P1: hosted-MCP URLs sometimes carry the credential in the PATH
+   * (`https://host/mcp/sk-.../sse`) or QUERY STRING (`?api_key=...`,
+   * `?token=...`) rather than userinfo. Previously only userinfo was
+   * stripped, so both shapes landed readable in ServerContext.command on
+   * every event (session_start, rpc, session_end, ...), in replay and in
+   * export bundles. */
+  it('never stores a credential embedded in the target URL PATH (hosted-MCP shape)', async () => {
+    const target = await startJsonTarget(); // .../mcp
+    const secretSegment = 'sk-ak-1234567890abcdefXYZ';
+    const withPathCred = target.url + '/' + secretSegment + '/sse';
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(withPathCred, dataDir);
+
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(secretSegment);
+
+    for (const e of events) {
+      expect(e.server.command).not.toContain(secretSegment);
+      expect(e.server.command.startsWith('http://')).toBe(true);
+    }
+
+    // A blast-radius query for the path-embedded credential still finds it.
+    const needleHash = sha256Ref(secretSegment);
+    const hit = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === needleHash),
+    );
+    expect(hit).toBe(true);
+  });
+
+  it('never stores credentials in the target URL QUERY STRING, and drops the query entirely', async () => {
+    const target = await startJsonTarget(); // .../mcp
+    const apiKey = 'AKIAABCDEFGHIJKLMNOP';
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz1234';
+    const withQueryCreds = `${target.url}?api_key=${apiKey}&token=${token}`;
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(withQueryCreds, dataDir);
+
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(apiKey);
+    expect(serialized).not.toContain(token);
+
+    for (const e of events) {
+      // The query string is dropped entirely, not merely scrubbed in place.
+      expect(e.server.command).not.toContain('?');
+      expect(e.server.command).not.toContain(apiKey);
+      expect(e.server.command).not.toContain(token);
+      expect(e.server.command).toBe(target.url);
+    }
+
+    const apiKeyHash = sha256Ref(apiKey);
+    const tokenHash = sha256Ref(token);
+    const hitApiKey = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === apiKeyHash),
+    );
+    const hitToken = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === tokenHash),
+    );
+    expect(hitApiKey).toBe(true);
+    expect(hitToken).toBe(true);
+  });
+});
+
+/* --- P0: capping verbatim protocol strings (tool name, method, clientInfo/
+ * serverInfo, protocolVersion). A misbehaving or malicious peer used to be
+ * able to stuff kilobytes of arbitrary text into every event through these
+ * fields, uncapped by length or character shape — structuralString() now
+ * caps each one at the edge. */
+describe('structuralString capping of protocol strings (P0)', () => {
+  const HUGE_NAME = 'x'.repeat(5000);
+  const NAME_WITH_SPACES = 'not a valid tool name';
+  const NAME_WITH_NEWLINE = 'bad\nname';
+  const HUGE_METHOD = 'y'.repeat(5000);
+  const MALFORMED_PROTOCOL_VERSION = 'not-a-date';
+  const HUGE_SERVER_NAME = 'srv-' + 'z'.repeat(5000);
+  const MALFORMED_SERVER_VERSION = 'bad version';
+
+  /** Replies `{ok:true}` to everything, regardless of method/params — unlike
+   *  startJsonTarget, it never echoes params/method back into the result, so
+   *  a capped tool/method name's sha256 ref cannot show up anywhere in the
+   *  tree except the `tool`/`method` field itself (keeps the query-match
+   *  assertions below precise about WHERE the match was found). */
+  async function startPlainAckTarget(): Promise<{ url: string }> {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      const out = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { ok: true } });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(out) });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    return { url };
+  }
+
+  /** Same shape as startJsonTarget, but `initialize` replies with an
+   *  oversized/malformed serverInfo instead of a normal one. */
+  async function startHugeServerInfoTarget(): Promise<{ url: string }> {
+    const server = createServer(async (req, res) => {
+      const body = await readBody(req);
+      const msg = JSON.parse(body) as Rpc;
+      let result: unknown;
+      if (msg.method === 'initialize') {
+        result = {
+          protocolVersion: '2025-03-26',
+          serverInfo: { name: HUGE_SERVER_NAME, version: MALFORMED_SERVER_VERSION },
+          capabilities: {},
+        };
+      } else if (msg.method === 'tools/call') {
+        result = { content: [{ type: 'text', text: JSON.stringify(msg.params) }] };
+      } else {
+        result = { ok: true };
+      }
+      const out = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(out) });
+      res.end(out);
+    });
+    const url = (await listen(server)) + '/mcp';
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    return { url };
+  }
+
+  it('an oversized / space-containing / newline-containing tools/call name is capped to a sha256 ref in tool_call.tool and the gen_ai.tool.name attribute, and a blast-radius query for the original name finds it', async () => {
+    const target = await startPlainAckTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const names = [HUGE_NAME, NAME_WITH_SPACES, NAME_WITH_NEWLINE];
+    for (const [i, name] of names.entries()) {
+      const res = await post(proxy.url, {
+        jsonrpc: '2.0',
+        id: 200 + i,
+        method: 'tools/call',
+        params: { name, arguments: {} },
+      });
+      expect(res.status).toBe(200);
+    }
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    const calls = events.filter((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(calls).toHaveLength(3);
+
+    const store = openStore({ dataDir });
+    try {
+      calls.forEach((call, i) => {
+        const name = names[i]!;
+        const expectedRef = sha256Ref(name);
+        expect(call.tool).toBe(expectedRef);
+        expect(call.attributes['gen_ai.tool.name']).toBe(expectedRef);
+        expect(call.tool).not.toContain(name);
+
+        const result = queryStore(store, name);
+        expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.tool')).toBe(true);
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('a normal, short tool name passes through unchanged', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const res = await post(proxy.url, toolCallMsg); // params.name === 'echo'
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call?.tool).toBe('echo');
+    expect(call?.attributes['gen_ai.tool.name']).toBe('echo');
+  });
+
+  it('an oversized JSON-RPC method is capped to a sha256 ref in rpc.method / notification.method and the mcp.method.name attribute, and query finds the original method', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const rpcRes = await post(proxy.url, { jsonrpc: '2.0', id: 1, method: HUGE_METHOD });
+    expect(rpcRes.status).toBe(200);
+    // A notification carrying the same oversized method (no id).
+    const noteRes = await post(proxy.url, { jsonrpc: '2.0', method: HUGE_METHOD });
+    expect(noteRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedRef = sha256Ref(HUGE_METHOD);
+    const events = loadEvents(dataDir);
+    const rpc = events.find((e): e is RpcEvent => e.kind === 'rpc');
+    expect(rpc).toBeDefined();
+    expect(rpc!.method).toBe(expectedRef);
+    expect(rpc!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const note = events.find(
+      (e): e is NotificationEvent => e.kind === 'notification' && e.direction === 'client_to_server',
+    );
+    expect(note).toBeDefined();
+    expect(note!.method).toBe(expectedRef);
+    expect(note!.attributes['mcp.method.name']).toBe(expectedRef);
+
+    const store = openStore({ dataDir });
+    try {
+      const result = queryStore(store, HUGE_METHOD);
+      expect(result.matches.some((m) => m.matched_on === 'ref' && m.path === '$.method')).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('an oversized clientInfo name/version and a malformed protocolVersion are capped on the initialize event, and the capped client_name is what later events carry as identity context', async () => {
+    const target = await startJsonTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const initRes = await post(proxy.url, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: MALFORMED_PROTOCOL_VERSION,
+        clientInfo: { name: HUGE_NAME, version: NAME_WITH_SPACES },
+        capabilities: {},
+      },
+    });
+    expect(initRes.status).toBe(200);
+    const callRes = await post(proxy.url, toolCallMsg);
+    expect(callRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedNameRef = sha256Ref(HUGE_NAME);
+    const expectedVersionRef = sha256Ref(NAME_WITH_SPACES);
+    const expectedProtoRef = sha256Ref(MALFORMED_PROTOCOL_VERSION);
+
+    const events = loadEvents(dataDir);
+    const init = events.find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.client_name).toBe(expectedNameRef);
+    expect(init!.client_version).toBe(expectedVersionRef);
+    expect(init!.protocol_version).toBe(expectedProtoRef);
+    expect(init!.client_name).not.toContain(HUGE_NAME.slice(0, 50));
+
+    // The remembered clientName/clientVersion feed identity context on every
+    // LATER event too, not just the initialize event itself.
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call!.identity.client_name).toBe(expectedNameRef);
+    expect(call!.identity.client_version).toBe(expectedVersionRef);
+  });
+
+  it('an oversized/malformed serverInfo learned from the handshake is capped on the initialize event, and later events carry the capped server name/version', async () => {
+    const target = await startHugeServerInfoTarget();
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(target.url, dataDir);
+
+    const initRes = await post(proxy.url, initializeMsg);
+    expect(initRes.status).toBe(200);
+    const callRes = await post(proxy.url, toolCallMsg);
+    expect(callRes.status).toBe(200);
+    await proxy.close();
+
+    const expectedNameRef = sha256Ref(HUGE_SERVER_NAME);
+    const expectedVersionRef = sha256Ref(MALFORMED_SERVER_VERSION);
+
+    const events = loadEvents(dataDir);
+    const init = events.find((e): e is InitializeEvent => e.kind === 'initialize');
+    expect(init).toBeDefined();
+    expect(init!.server_name).toBe(expectedNameRef);
+    expect(init!.server_version).toBe(expectedVersionRef);
+
+    // server.name / server.version stamped on events AFTER the handshake
+    // carry the capped, learned value too.
+    const call = events.find((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(call!.server.name).toBe(expectedNameRef);
+    expect(call!.server.version).toBe(expectedVersionRef);
   });
 });

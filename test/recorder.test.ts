@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Recorder } from '../src/capture/recorder.js';
-import { GENESIS_HASH, computeHash, signedPayload, sha256Hex } from '../src/chain/hash.js';
+import { GENESIS_HASH, computeHash, makeRecord, signedPayload, sha256Hex } from '../src/chain/hash.js';
 import { SCHEMA, type AnyEvent, type ChainRecord, type HeadSignature } from '../src/schema/events.js';
 import type {
   ChainHead,
@@ -18,6 +18,8 @@ class FakeStore implements EvidenceStore {
   sigs: HeadSignature[] = [];
   closed = 0;
   failAppend = false;
+  /** Fail this many appendEvents calls (e.g. lock contention), then succeed. */
+  failTimes = 0;
 
   head(): ChainHead {
     const last = this.records[this.records.length - 1];
@@ -37,6 +39,22 @@ class FakeStore implements EvidenceStore {
       this.records.push(r);
       head = { seq: r.seq, hash: r.hash };
     }
+  }
+  appendEvents(events: AnyEvent[]): ChainRecord[] {
+    if (this.failAppend) throw new Error('disk on fire');
+    if (this.failTimes > 0) {
+      this.failTimes--;
+      throw new Error('database is locked');
+    }
+    let head = this.head();
+    const sealed: ChainRecord[] = [];
+    for (const event of events) {
+      const record = makeRecord(head, event);
+      sealed.push(record);
+      head = { seq: record.seq, hash: record.hash };
+    }
+    this.records.push(...sealed);
+    return sealed;
   }
   addSignature(sig: HeadSignature): void {
     this.sigs.push(sig);
@@ -155,7 +173,9 @@ describe('Recorder', () => {
   it('fails open when the store throws: never rejects, counts drops, sets storeFailed', async () => {
     const store = new FakeStore();
     store.failAppend = true;
-    const rec = new Recorder({ store, signer: new FakeSigner() });
+    // A permanent failure walks the whole retry ladder (~6s of real timers);
+    // this test is about the fail-open outcome, not the backoff.
+    const rec = new Recorder({ store, signer: new FakeSigner(), retryDelaysMs: [] });
 
     for (let i = 1; i <= 100; i++) rec.record(makeEvent(i));
     await expect(rec.flush()).resolves.toBeUndefined();
@@ -226,5 +246,21 @@ describe('Recorder', () => {
     expect(signer.calls).toHaveLength(0);
     expect(store.sigs).toHaveLength(0);
     await rec.close();
+  });
+});
+
+describe('Recorder retry on transient store failure', () => {
+  it('retries a batch that fails transiently (lock contention) and drops nothing', async () => {
+    const store = new FakeStore();
+    store.failTimes = 2; // the first two attempts hit "database is locked"
+    const recorder = new Recorder({ store, signer: null });
+    recorder.record(makeEvent(1));
+    recorder.record(makeEvent(2));
+    recorder.record(makeEvent(3));
+    await recorder.flush();
+    expect(store.records.map((r) => r.seq)).toEqual([1, 2, 3]);
+    expect(recorder.stats()).toMatchObject({ written: 3, dropped: 0, storeFailed: false });
+    expect(store.failTimes).toBe(0);
+    await recorder.close();
   });
 });

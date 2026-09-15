@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import type Database from 'better-sqlite3';
 import type { AnyEvent, ChainRecord, HeadSignature } from '../schema/events.js';
-import { GENESIS_HASH, canonicalJson, computeHash } from '../chain/hash.js';
+import { GENESIS_HASH, canonicalJson, computeHash, makeRecord } from '../chain/hash.js';
 import { FILES } from '../types.js';
 import type { ChainHead, EvidenceStore, IterateOpts, SessionSummary } from '../types.js';
 
@@ -135,17 +135,35 @@ export class SqliteStore implements EvidenceStore {
     [number, string, string, string, string, string]
   >;
   private readonly appendTx: (records: ChainRecord[]) => void;
+  private readonly appendEventsTx: (events: AnyEvent[]) => ChainRecord[];
 
   constructor(dataDir: string) {
     const Ctor = loadSqlite();
     if (Ctor === undefined) {
       throw new Error('mcp-recorder: better-sqlite3 is not available in this environment');
     }
-    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.path = join(dataDir, FILES.SQLITE_DB);
     this.db = new Ctor(this.path);
+    // Several `mcp-recorder record` processes normally share one data dir
+    // (one wrapper per MCP server) — without a busy_timeout, a concurrent
+    // writer makes better-sqlite3 throw SQLITE_BUSY immediately instead of
+    // waiting for the other transaction to finish. The wait is SYNCHRONOUS
+    // (better-sqlite3 blocks the event loop, and with it the proxy's
+    // forwarding), so it is kept very short: write transactions here take
+    // microseconds, and the recorder retries a busy batch asynchronously
+    // with ~6s of non-blocking backoff (src/capture/recorder.ts).
+    // Opening: several processes starting at once all race to switch the
+    // journal mode and create the schema, which takes real time on a slow
+    // machine. This happens once, before any traffic flows, so a generous
+    // synchronous wait is fine here — a failure at this point would disable
+    // recording for the whole session.
+    this.db.pragma('busy_timeout = 10000');
     this.db.pragma('journal_mode = WAL');
     this.db.exec(DDL);
+    // Steady state: appends must never stall forwarding, so the wait is
+    // short and the recorder retries asynchronously instead.
+    this.db.pragma('busy_timeout = 100');
 
     this.headStmt = this.db.prepare<[], HeadRow>(
       'SELECT seq, hash FROM records ORDER BY seq DESC LIMIT 1',
@@ -172,6 +190,31 @@ export class SqliteStore implements EvidenceStore {
         head = { seq: record.seq, hash: record.hash };
       }
     }) as (records: ChainRecord[]) => void;
+
+    // IMMEDIATE: grabs the write lock up front (rather than deferring it
+    // until the first write, as a normal BEGIN would), so the head read
+    // below is never followed by another connection sneaking in a write
+    // before we insert — the read-then-write is atomic across processes.
+    const sealAndInsert = this.db.transaction((events: AnyEvent[]): ChainRecord[] => {
+      let head = this.head();
+      const sealed: ChainRecord[] = [];
+      for (const event of events) {
+        const record = makeRecord(head, event);
+        this.insertRecordStmt.run(
+          record.seq,
+          record.prev_hash,
+          record.hash,
+          record.event.session_id,
+          record.event.kind,
+          record.event.timestamp,
+          canonicalJson(record.event),
+        );
+        sealed.push(record);
+        head = { seq: record.seq, hash: record.hash };
+      }
+      return sealed;
+    });
+    this.appendEventsTx = (events: AnyEvent[]) => sealAndInsert.immediate(events);
   }
 
   head(): ChainHead {
@@ -182,6 +225,11 @@ export class SqliteStore implements EvidenceStore {
   append(records: ChainRecord[]): void {
     if (records.length === 0) return;
     this.appendTx(records);
+  }
+
+  appendEvents(events: AnyEvent[]): ChainRecord[] {
+    if (events.length === 0) return [];
+    return this.appendEventsTx(events);
   }
 
   addSignature(sig: HeadSignature): void {

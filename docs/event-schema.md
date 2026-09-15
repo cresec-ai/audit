@@ -24,6 +24,71 @@ Payloads never land in the store readable. String values are replaced at the edg
 hashing it the same way. See the tradeoff discussion in the
 [README security model](../README.md#security-model-the-honest-version).
 
+**The allowlist is position- and value-aware, not just key-aware.** A string only
+survives un-hashed when BOTH hold: its key is one of a small fixed set (`type`,
+`role`, `level`, `mimeType`, `protocolVersion`, `method`, `name`), AND its value
+belongs to that key's structural vocabulary — an MCP content-block `type`
+(`text`/`image`/`audio`/`resource`/`resource_link`), a `role` of `user`/`assistant`, a
+logging `level`, a `mimeType` matching `^[\w.+-]+/[\w.+-]+$`, a `protocolVersion`
+matching `^\d{4}-\d{2}-\d{2}$`, a `method` matching `^[a-z]+(/[a-zA-Z_]+)*$`, or a
+`name` that is specifically `tools[*].name` / `prompts[*].name` inside a list result
+(matching `^[\w.-]{1,64}$`) — never a bare top-level `name`, and never one hop deeper
+(`tools[*].inputSchema.name` does not qualify). Every other string, under every other
+key or position, is hashed. `code`, `status`, `kind` and `tool` were removed from the
+allowlist entirely: no safe structural vocabulary exists for them, so they always hash.
+
+**Under a `tool_call`'s `args` NOTHING passes, in any redaction mode.** Arguments are
+the most attacker/user-controlled data the proxy ever sees, so every string leaf there
+is hashed unconditionally — the vocabulary above only ever applies elsewhere (e.g.
+`tool_call.result`, `rpc.params`, `notification.params`).
+
+**Object keys are redacted too, not just values.** A key survives as-is only if it
+matches `^[A-Za-z_$][\w$-]{0,63}$` (a plain identifier, hyphens allowed) AND does not
+itself look secret-shaped (the same `alwaysPatterns` used for values, checked in every
+redaction mode); otherwise the key is replaced by `sha256:<hex>` of the original key
+text — still a plain JSON string, so no schema change. This closes two gaps: a map
+keyed by email/username/file-path/header-line no longer lands in clear, and hashing the
+key (rather than dropping it) means `query` can still find a needle that was only ever
+used as a key. A literal `__proto__` key is preserved as a genuine own property (the
+scrubbed tree is built without going through a normal object's prototype setter), never
+silently dropped.
+
+**Verbatim protocol strings copied off the wire are capped too (P0).** A handful of
+fields are stamped onto events directly from the MCP handshake / JSON-RPC envelope
+rather than through a `scrub()`-walked tree — they stay plain top-level strings by
+schema, so `scrub()`'s length/vocabulary gates never applied to them:
+`ToolCallEvent.tool` (and the `gen_ai.tool.name` attribute), `RpcEvent`/
+`NotificationEvent.method` (and the `mcp.method.name` attribute), and the
+`initialize` handshake's `protocol_version`/`client_name`/`client_version`/
+`server_name`/`server_version` — plus the `client_name`/`client_version` remembered on
+`IdentityContext` and the `name`/`version` learned onto `ServerContext`, both reused on
+every event recorded after the handshake. A misbehaving or malicious peer could
+otherwise stuff kilobytes of arbitrary text — including payload it wants to smuggle
+past redaction — into every event through any one of these. `structuralString()`
+(`src/redact/redactor.ts`) closes this: a value survives AS-IS only when it is at most
+128 characters **and** matches a conservative shape for its kind —
+
+| Kind | Applies to | Shape |
+| --- | --- | --- |
+| `identifier` | tool name, JSON-RPC method, clientInfo/serverInfo `name` | `^[A-Za-z0-9_.:/-]+$` |
+| `version` | clientInfo/serverInfo `version` | `^[A-Za-z0-9_.+-]+$` |
+| `protocol_version` | negotiated `protocolVersion` | `^\d{4}-\d{2}-\d{2}$` |
+
+— otherwise the value is replaced by its `sha256:<hex>` reference, computed the exact
+same way as any other redacted value (`sha256Ref`/`Redactor.hashString`), so a
+blast-radius `query` for the original value still finds it. The field itself stays a
+plain `string` either way — never a `RedactedRef` object — so this is not a schema
+change. Each value is capped ONCE, at the point it is first read off the wire (a
+request's own `method`/`params.name`, or the `initialize` handshake's
+`clientInfo`/`serverInfo`); every later use of that same value — the identity/server
+context stamped on every subsequent event, and the synthetic `unanswered` events sealed
+at shutdown (see [`session_end`](#session_end) below) — reuses the already-capped value,
+so nothing downstream needs its own cap.
+
+Note the asymmetry on `ServerContext.name`: it is `--name` (operator-supplied, never
+capped) else the serverInfo name **learned from the handshake** (capped) else a locally
+derived basename of the wrapped command (not peer-controlled, not capped either).
+
 ---
 
 ## Common types
@@ -41,6 +106,7 @@ A redacted leaf value. The original never leaves the machine readable.
 | `redacted` | `true` | Discriminator; always literally `true`. |
 | `ref` | `Sha256Ref` | `sha256:<hex>` of the exact UTF-8 encoding of the original string. |
 | `len` | `number` | Length of the original string in UTF-16 code units. |
+| `secret_refs` | `Sha256Ref[]?` | Optional, additive (v1). Hashes of secret-shaped tokens (`alwaysPatterns` matches) found **embedded inside** this leaf — e.g. the AWS key inside `"AWS_ACCESS_KEY_ID=AKIA...\n"`. De-duplicated, capped at 8, and never includes a hash equal to `ref` itself. This exists because `query` otherwise only matches a *whole* leaf: a credential glued into a longer string (a log line, an exfiltrated file's contents, a sentence) would hash as one opaque blob and never surface. **A miss against `secret_refs` is not proof a value never appeared here** — only tokens shaped like a known `alwaysPatterns` entry are captured this way; a value that isn't secret-shaped on its own (and isn't under an allow-listed key/position) is still hashed as part of the whole leaf, but no per-token record of it exists. |
 
 ### `Scrubbed`
 
@@ -63,11 +129,11 @@ Identity context stamped on **every** event ("identity-stamp everything").
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `fingerprint` | `Sha256Ref` | Stable identity hash for the acting agent/credential pair: sha256 over (os_user, hostname, client_name, client_version, label). |
+| `fingerprint` | `Sha256Ref` | Stable identity hash for the acting agent/credential pair: sha256 over (os_user, hostname, label, initial server name) — the context known at proxy startup, before the MCP `initialize` handshake. `client_name`/`client_version` are learned later from that handshake and are **not** part of the fingerprint. |
 | `os_user` | `string?` | OS user running the proxy. |
 | `hostname` | `string?` | Host the proxy ran on. |
-| `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. |
-| `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. |
+| `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `label` | `string?` | Operator-supplied label (`--identity`). |
 | `credential_fingerprints` | `CredentialFingerprint[]?` | Hashes of secret-looking env values passed to the wrapped server. |
 
@@ -75,10 +141,55 @@ Identity context stamped on **every** event ("identity-stamp everything").
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `name` | `string` | Logical server name (`--name` flag, else derived from command/initialize). |
-| `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. |
-| `command` | `string` | The wrapped command line (argv joined); env values never included. |
+| `name` | `string` | Logical server name (`--name` flag, else derived from command/initialize). The initialize-learned component is capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an operator-supplied `--name` is not. |
+| `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
+| `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
+
+**`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
+`--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`
+straight into every event, the replay HTML, and export bundles. Each argv element is
+scrubbed before joining:
+
+- an element that looks secret-shaped (`looksSecret` / `alwaysPatterns`) is replaced
+  whole by `sha256:<hex>`;
+- a URL carrying userinfo (`scheme://user:pass@host/path`) has the userinfo stripped —
+  only `scheme://host/path` is kept, dropping the credential and any query/fragment;
+- an element that is (or immediately follows) a flag whose name matches
+  `/(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i` — both `--token X` and
+  `--token=X` — is replaced whole by `sha256:<hex>`;
+- a `--flag=value` pair whose FLAG name does **not** match that credential-name pattern
+  still has its VALUE half scrubbed on its own (looks-secret check, then the
+  URL-userinfo check) before being re-joined as `--flag=<scrubbed-value>` — this covers
+  DSN/URL-shaped flags a fixed name list can't anticipate, e.g. `--dsn=postgres://u:p@h`
+  or `--database-url=mysql://u:p@h/db`.
+
+Every replaced or stripped piece is also recorded as a `CredentialFingerprint` on
+`identity.credential_fingerprints` (`name` is the flag name when one applied, else
+`argv[<index>]`), so a blast-radius `query` for the leaked value still finds the event
+that carried it, even though `command` itself no longer contains it. When a piece is a
+URL's `user:pass` userinfo, the joined string is fingerprinted AND (additive) the
+password and username are each fingerprinted separately, so a query for the leaked
+password alone — without knowing the username — still matches.
+
+**`command` target-URL handling (http transport).** The `--target` URL can carry a
+credential in three different places, not just userinfo, so all three are scrubbed
+independently before the URL is recorded:
+
+- userinfo (`http://user:pass@host/...`) is stripped from the recorded URL;
+- each PATH segment that looks secret-shaped (`looksSecret`) — the shape hosted-MCP
+  endpoints use, e.g. `https://host/mcp/sk-.../sse` — is replaced in place by
+  `sha256:<hex>`, leaving the rest of the path intact;
+- the entire QUERY STRING and fragment are dropped from the recorded URL
+  unconditionally (e.g. `?api_key=...`, `?token=...`) — there is no safe subset of a
+  query string to keep once any single parameter can be a bearer credential.
+
+The real upstream connection still uses the original, unscrubbed target URL; only the
+copy stamped on events is affected. Every stripped/replaced piece (userinfo — joined
+and, additively, user/password separately — each secret-shaped path segment, each
+secret-shaped query value) is recorded as a `CredentialFingerprint` on
+`identity.credential_fingerprints`, named `target_url_userinfo`, `target_url_path[<i>]`,
+or `target_url_query.<key>` respectively.
 
 ### `Attributes`
 
@@ -125,11 +236,11 @@ The MCP initialize handshake (request + response correlated).
 | Field | Type | Description |
 | --- | --- | --- |
 | `request_id` | `string \| number` | JSON-RPC request id. |
-| `protocol_version` | `string?` | Negotiated MCP protocol version. |
-| `client_name` | `string?` | From clientInfo. |
-| `client_version` | `string?` | From clientInfo. |
-| `server_name` | `string?` | From serverInfo. |
-| `server_version` | `string?` | From serverInfo. |
+| `protocol_version` | `string?` | Negotiated MCP protocol version. Capped (`structuralString`, kind `protocol_version`) — see [above](#privacy-posture). |
+| `client_name` | `string?` | From clientInfo. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `client_version` | `string?` | From clientInfo. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
+| `server_name` | `string?` | From serverInfo. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
+| `server_version` | `string?` | From serverInfo. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
 
 ### `tool_call`
@@ -138,11 +249,11 @@ A completed `tools/call` (request + response correlated). The flagship event.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `tool` | `string` | Tool name (`gen_ai.tool.name`). |
+| `tool` | `string` | Tool name (`gen_ai.tool.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped name is stored as its `sha256:<hex>` reference instead. |
 | `request_id` | `string \| number` | JSON-RPC request id (`gen_ai.tool.call.id`). |
-| `args` | `Scrubbed` | Redacted argument tree (structure preserved, string leaves hashed). |
+| `args` | `Scrubbed` | Redacted argument tree. **Every string leaf is hashed, unconditionally, regardless of key or position or redaction mode** — see [Privacy posture](#privacy-posture). |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
-| `result` | `Scrubbed` | Redacted result tree. |
+| `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
 | `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
@@ -153,7 +264,7 @@ Any other correlated JSON-RPC request/response (`tools/list`, `resources/read`, 
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `method` | `string` | JSON-RPC method (`mcp.method.name`). |
+| `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `request_id` | `string \| number` | JSON-RPC request id. |
 | `params` | `Scrubbed` | Redacted params tree. |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the complete raw result, pre-redaction. |
@@ -167,7 +278,7 @@ One-way JSON-RPC notification in either direction.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `method` | `string` | JSON-RPC method (`mcp.method.name`). |
+| `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `direction` | `'client_to_server' \| 'server_to_client'` | Which way it flowed. |
 | `params` | `Scrubbed` | Redacted params tree. |
 
@@ -192,6 +303,23 @@ Proxy shutting down (child exit, stdin close, or signal).
 | `child_exit_code` | `number \| null?` | Exit code of the wrapped server, when known. |
 | `events_recorded` | `number` | Events successfully written this session. |
 | `events_dropped` | `number` | Events lost to fail-open recording (store failure, backpressure). |
+| `spawn_error` | `string?` | errno code (e.g. `ENOENT`, `EACCES`) when the wrapped command could not be spawned at all (`reason: 'error'`). The proxy's own exit code is mapped from this: `ENOENT` → 127, `EACCES` → 126, anything else → 1. |
+| `child_signal` | `string?` | Signal name (e.g. `SIGKILL`) when the wrapped process was terminated by a signal. The proxy's own exit code is `128 + <signal number>` in that case. |
+
+Before `session_end` is recorded, any request still awaiting a response when the
+session ends (the wrapped server crashed or was killed mid-call, or the client
+disconnected mid-handshake) is flushed as one synthetic event per pending
+request, so the chain never silently drops in-flight work: a `tools/call`
+becomes a `tool_call` event, everything else (including an unanswered
+`initialize`) becomes an `rpc` event. Both are marked `is_error: true`,
+`error: { type: 'unanswered' }`, `result_hash` is the hash of canonical `null`
+(a `tool_call` also sets `result: null`), and `duration_ms` is measured from
+the request crossing the proxy to session shutdown. `error.type` is an
+existing free-form string field, so this needed no schema change. The synthetic
+event's `tool`/`method` is whatever was captured for the pending request — already
+capped (`structuralString`, see [Privacy posture](#privacy-posture)) at the point the
+request was first seen, so an unanswered call with an oversized/malformed name or
+method is just as capped here as in a normal completed event.
 
 ---
 
@@ -204,11 +332,11 @@ typed event fields to their semconv equivalents.
 | Semconv attribute | Recorder source | Notes |
 | --- | --- | --- |
 | `gen_ai.operation.name` | event `kind = 'tool_call'` | `execute_tool` for tool-call events. |
-| `gen_ai.tool.name` | `ToolCallEvent.tool` | The MCP tool invoked. |
+| `gen_ai.tool.name` | `ToolCallEvent.tool` | The MCP tool invoked. Same capped value as `tool` (see above). |
 | `gen_ai.tool.call.id` | `ToolCallEvent.request_id` | The JSON-RPC request id of the call. |
 | `rpc.system` | constant | `jsonrpc` — MCP is JSON-RPC 2.0. |
 | `rpc.jsonrpc.request_id` | `RpcEvent.request_id`, `InitializeEvent.request_id` | Correlated request id. |
-| `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. |
+| `mcp.method.name` | `RpcEvent.method`, `NotificationEvent.method` | e.g. `tools/list`, `resources/read`. Same capped value as `method` (see above). |
 | `error.type` | `error.type` on `tool_call` / `rpc` events | Stable error class; message stored only as `message_ref` hash. |
 
 ---

@@ -60,3 +60,9 @@ blast-radius query finds zero matches — the demo refuses to lie about itself).
   `not found` to everything else.
 
 The artifacts live in `demo-data/` (wiped and recreated on every run).
+
+## Want the real thing?
+
+This demo's agent is a fixed script, not an LLM. To run the same
+prompt-injection story against a real model in Claude Desktop, see
+[docs/red-team.md](../docs/red-team.md).

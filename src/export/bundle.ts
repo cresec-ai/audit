@@ -165,8 +165,17 @@ export async function exportBundle(
 const VERIFY_CJS: string = String.raw`#!/usr/bin/env node
 /*
  * Standalone verifier for an @edut/mcp-recorder evidence bundle.
- * Usage: node verify.cjs        (run from inside the bundle directory)
+ * Usage: node verify.cjs [--public-key <hex|path>]   (run from inside the bundle directory)
  * Zero dependencies: node:crypto, node:fs, node:path only.
+ *
+ * By default this checks that the bundle is INTERNALLY self-consistent: the
+ * chain recomputes, and the shipped public_key.pem matches the key named in
+ * manifest.signature. That does NOT prove who signed it — a bundle carries
+ * its own key, so an attacker who forges a bundle from scratch ships a key
+ * that "verifies" against itself. For real assurance, obtain the signer's
+ * public key OUT OF BAND (e.g. from the operator directly, not from this
+ * bundle) and pass it as --public-key <64-hex, or a path to a file holding
+ * hex or a PEM>: verification then fails unless THAT key made the signature.
  *
  * Reimplements the recipes from src/chain/hash.ts of @edut/mcp-recorder —
  * if that file ever changes, this template must change with it:
@@ -179,6 +188,48 @@ const VERIFY_CJS: string = String.raw`#!/usr/bin/env node
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+
+function usageFail(message) {
+  console.log('FAIL: ' + message);
+  console.log('Usage: node verify.cjs [--public-key <64-hex|path-to-hex-or-PEM>]');
+  process.exit(2);
+}
+
+/* --public-key <value>: resolve to a 64-hex raw ed25519 public key. Accepts
+ * the hex directly, or a path (resolved against the CURRENT working
+ * directory, not __dirname — the whole point is a key from OUTSIDE this
+ * bundle) to a file holding either hex or an SPKI PEM. */
+const HEX64 = /^[0-9a-f]{64}$/i;
+function resolvePinnedHex(argv) {
+  let value;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--public-key') { value = argv[i + 1]; break; }
+    if (argv[i].indexOf('--public-key=') === 0) { value = argv[i].slice('--public-key='.length); break; }
+  }
+  if (value === undefined) return null;
+  const trimmed = value.trim();
+  if (HEX64.test(trimmed)) return trimmed.toLowerCase();
+  let content;
+  try {
+    content = fs.readFileSync(path.resolve(trimmed), 'utf8');
+  } catch (err) {
+    usageFail("--public-key '" + value + "' is neither 64-hex nor a readable file: " + err.message);
+  }
+  const text = content.trim();
+  if (HEX64.test(text)) return text.toLowerCase();
+  if (text.indexOf('BEGIN PUBLIC KEY') !== -1) {
+    let key;
+    try {
+      key = crypto.createPublicKey(text);
+    } catch (err) {
+      usageFail("--public-key file '" + value + "' is not a valid public key PEM: " + err.message);
+    }
+    const der = key.export({ format: 'der', type: 'spki' });
+    return der.subarray(der.length - 32).toString('hex');
+  }
+  usageFail("--public-key file '" + value + "' is neither 64-hex nor a PEM public key");
+}
+const pinnedHex = resolvePinnedHex(process.argv.slice(2));
 
 function canonicalJson(value) {
   if (value === null || value === undefined) return 'null';
@@ -313,7 +364,17 @@ if (manifest.public_key_pem !== undefined && manifest.public_key_pem !== pem) {
   fail('public_key.pem on disk differs from the PEM embedded in the manifest');
 }
 
-/* 5. ed25519 verification of the signed head payload. */
+/* 5. If --public-key pinned an externally-obtained key, the signature MUST
+ *    have been made by THAT key — not merely by whatever key the bundle
+ *    itself ships. Without --public-key this step is skipped: the checks
+ *    above only prove the bundle is internally self-consistent (see the
+ *    header comment), not who produced it. */
+if (pinnedHex !== null && String(sig.public_key).toLowerCase() !== pinnedHex) {
+  fail('signed by unexpected key ' + String(sig.public_key).slice(0, 16) + '..., expected ' +
+    pinnedHex.slice(0, 16) + '... (--public-key) - this signature was not made by the pinned key');
+}
+
+/* 6. ed25519 verification of the signed head payload. */
 let signatureOk = false;
 try {
   signatureOk = crypto.verify(
@@ -332,13 +393,31 @@ if (!signatureOk) {
 console.log('PASS: evidence bundle verified');
 console.log('  events     : ' + lines.length + ' (seq ' + manifest.range.from_seq +
   '..' + manifest.range.to_seq + ')');
-if (manifest.session_id !== undefined) {
-  console.log('  session    : ' + manifest.session_id);
-}
 console.log('  base hash  : ' + manifest.base_hash);
 console.log('  head hash  : ' + manifest.head_hash);
 console.log('  signed by  : ed25519 ' + sig.public_key + ' at ' + sig.signed_at);
 console.log('Every event hash recomputes, the chain is contiguous, and the head');
 console.log('signature verifies against the bundled public key.');
+if (pinnedHex !== null) {
+  console.log('  key check  : matches the --public-key you pinned - independently verified.');
+} else {
+  console.log('  key check  : NOT independently verified - the key came from this bundle');
+  console.log('               itself (public_key.pem / manifest.json), which an attacker');
+  console.log('               who forged the whole bundle controls too. Re-run with');
+  console.log('               --public-key <hex|path> using a key you obtained out of band');
+  console.log('               (e.g. from the operator directly) for real assurance.');
+}
+/* manifest.session_id / created_at / tool_version are NOT covered by the head
+ * signature above (it covers only sig.seq + sig.chain_hash, checked in step
+ * 3) — they are the exporting tool's own unverified say-so, so they are
+ * printed separately and clearly labeled rather than folded into the PASS
+ * block above, where a reader could mistake them for verified facts. */
+console.log('');
+console.log('UNSIGNED metadata (not covered by the signature - informational only):');
+if (manifest.session_id !== undefined) {
+  console.log('  session_id   : ' + manifest.session_id);
+}
+console.log('  created_at   : ' + manifest.created_at);
+console.log('  tool_version : ' + manifest.tool_version);
 process.exit(0);
 `;

@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "corp-notes": {
+      "command": "sh",
+      "args": [
+        "scripts/dogfood-wrap.sh",
+        "--name", "corp-notes",
+        "--",
+        "npx", "tsx", "demo/server.ts"
+      ]
+    },
+    "repo-filesystem": {
+      "command": "sh",
+      "args": [
+        "scripts/dogfood-wrap.sh",
+        "--name", "repo-filesystem",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
+      ]
+    }
+  }
+}

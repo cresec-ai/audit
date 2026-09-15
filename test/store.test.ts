@@ -1,10 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  statSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { GENESIS_HASH, computeHash, makeRecord, sha256Hex, sha256Ref } from '../src/chain/hash.js';
-import { openStore, isSqliteAvailable } from '../src/store/index.js';
+import { openStore, openStoreReadOnly, isSqliteAvailable } from '../src/store/index.js';
+import { verifyStore } from '../src/verify/verify.js';
 import { ENV, FILES } from '../src/types.js';
 import type { ChainHead, EvidenceStore } from '../src/types.js';
 import type {
@@ -18,6 +28,7 @@ import type {
   ToolCallEvent,
 } from '../src/schema/events.js';
 import { SCHEMA } from '../src/schema/events.js';
+import { jsonlIoStats } from '../src/store/jsonl.js';
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -367,6 +378,46 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     ]);
     expect([...store.iterate({ sessionId: 'no-such-session' })]).toEqual([]);
   });
+
+  it('appendEvents seals raw events into a contiguous, verifiable chain', () => {
+    const store = open();
+    const events: AnyEvent[] = [
+      sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'list_issues', { requestId: 1 }),
+      sessionEnd(SESSION_A, '2026-06-11T10:00:02.000Z'),
+    ];
+    const sealed = store.appendEvents(events);
+
+    expect(sealed).toHaveLength(3);
+    let prev = GENESIS_HASH;
+    sealed.forEach((record, idx) => {
+      expect(record.seq).toBe(idx + 1);
+      expect(record.prev_hash).toBe(prev);
+      expect(record.hash).toBe(computeHash(prev, record.event));
+      expect(record.event).toEqual(events[idx]);
+      prev = record.hash;
+    });
+    expect(store.head()).toEqual({ seq: 3, hash: sealed[2]!.hash });
+    expect(store.count()).toBe(3);
+    expect([...store.iterate()]).toEqual(sealed);
+  });
+
+  it('appendEvents keeps the chain linked across multiple calls', () => {
+    const store = open();
+    const first = store.appendEvents([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+    const second = store.appendEvents([
+      toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'list_issues', { requestId: 1 }),
+      sessionEnd(SESSION_A, '2026-06-11T10:00:02.000Z'),
+    ]);
+    expect(first[0]!.seq).toBe(1);
+    expect(second[0]!.seq).toBe(2);
+    expect(second[0]!.prev_hash).toBe(first[0]!.hash);
+    expect(second[1]!.seq).toBe(3);
+    expect(second[1]!.prev_hash).toBe(second[0]!.hash);
+    expect(store.count()).toBe(3);
+    expect(store.append([])).toBeUndefined();
+    expect(store.appendEvents([])).toEqual([]);
+  });
 });
 
 /* --------------------------- sqlite-specific --------------------------- */
@@ -427,7 +478,7 @@ describe('JsonlStore trailing partial line', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('ignores a truncated final line with a stderr warning', () => {
+  it('ignores a truncated final line with a stderr warning', async () => {
     const records = twoSessionFixture();
     const store = openStore({ dataDir: dir, backend: 'jsonl' });
     store.append(records);
@@ -451,7 +502,30 @@ describe('JsonlStore trailing partial line', () => {
       );
       reopened.append(more);
       expect(reopened.count()).toBe(7);
+      // The writer trimmed the torn bytes (which never formed a sealed record)
+      // so the new record was not glued onto them.
+      expect(
+        stderrSpy.mock.calls.some((call) => String(call[0]).includes('discarded a torn trailing line')),
+      ).toBe(true);
+      expect(readFileSync(join(dir, FILES.JSONL_LOG), 'utf8')).not.toContain('"trunc');
       reopened.close();
+
+      // ...and it all survives a fresh open + a second append + verification:
+      // before the repair, the glued line was either silently dropped as a
+      // "trailing partial line" (losing seq 7) or, once seq 8 followed it,
+      // became mid-file corruption that made the store unopenable.
+      const again = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(again.count()).toBe(7);
+      expect(again.head()).toEqual({ seq: 7, hash: more[0]!.hash });
+      const sealed = again.appendEvents([
+        toolCall(SESSION_B, '2026-06-11T11:00:10.000Z', 'after_recovery'),
+      ]);
+      expect(sealed[0]!.seq).toBe(8);
+      again.close();
+      const third = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(third.count()).toBe(8);
+      expect((await verifyStore(third, { allowUnsigned: true })).ok).toBe(true);
+      third.close();
     } finally {
       stderrSpy.mockRestore();
     }
@@ -469,6 +543,224 @@ describe('JsonlStore trailing partial line', () => {
     writeFileSync(logPath, lines.join('\n'));
 
     expect(() => openStore({ dataDir: dir, backend: 'jsonl' })).toThrow(/corrupt JSONL line 1/);
+  });
+});
+
+describe('JsonlStore incremental catch-up', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-jsonl-incr-'));
+    // `jsonlIoStats` is process-wide test instrumentation (see its doc
+    // comment in src/store/jsonl.ts): a small internal hook, used here
+    // instead of spying on `node:fs` directly, because `vi.spyOn` cannot
+    // reliably intercept a *named* import's bare call site (`readFileSync`,
+    // as jsonl.ts uses it) — under Vitest/Vite's module transform that name
+    // is bound once at import time rather than read live off the module
+    // object, so a spy on the object silently never gets invoked. Reset the
+    // counters so each test only sees its own I/O.
+    jsonlIoStats.fullReloadBytes = 0;
+    jsonlIoStats.fullReloadCalls = 0;
+    jsonlIoStats.incrementalReadBytes = 0;
+    jsonlIoStats.incrementalReadCalls = 0;
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a second instance's many appended batches are picked up without any full-file re-read", () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    const storeB = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      // Seed one record through A so B's first catch-up has a non-empty
+      // head to reconcile against, same as a real hand-off between two
+      // `mcp-recorder record` processes.
+      const seeded = seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(1);
+
+      // Everything from here on must go through the incremental path: no
+      // full reload (of either store) is allowed for the rest of this test.
+      jsonlIoStats.fullReloadCalls = 0;
+
+      const N_BATCHES = 40;
+      const BATCH_SIZE = 25;
+      for (let b = 0; b < N_BATCHES; b++) {
+        const events: AnyEvent[] = [];
+        for (let i = 0; i < BATCH_SIZE; i++) {
+          events.push(
+            toolCall(
+              SESSION_A,
+              `2026-06-11T10:01:${String(b).padStart(2, '0')}.${String(i).padStart(3, '0')}Z`,
+              `t_${b}_${i}`,
+            ),
+          );
+        }
+        // storeB is the "other process": it never re-reads anything either
+        // (its own writes update its cache directly), but its appends are
+        // what storeA must catch up to below.
+        storeB.appendEvents(events);
+      }
+
+      const total = 1 + N_BATCHES * BATCH_SIZE;
+      // storeA wrote none of this — every one of these must come from disk
+      // via storeA's own catch-up logic, purely incrementally.
+      expect(storeA.count()).toBe(total);
+      expect(storeA.head().seq).toBe(total);
+      expect([...storeA.iterate()]).toHaveLength(total);
+
+      expect(jsonlIoStats.fullReloadCalls).toBe(0);
+      // And it really did read incrementally (not just "nothing happened").
+      expect(jsonlIoStats.incrementalReadCalls).toBeGreaterThan(0);
+    } finally {
+      storeA.close();
+      storeB.close();
+    }
+  });
+
+  it('a torn trailing line from another process is skipped by sync, then consumed once completed', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      const seeded = seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]);
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(1);
+
+      // A real, well-formed second record — written byte-for-byte so the
+      // "crash" below is a genuine torn line, not just invalid JSON.
+      const next = seal(
+        [toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'partial_write')],
+        storeA.head(),
+      )[0]!;
+      const line = JSON.stringify(next);
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const half = Math.floor(line.length / 2);
+
+      // Simulate a second process mid-write: half the line lands, no
+      // trailing newline yet. storeA is NOT holding the lock (there is no
+      // lock on a read), so its sync must tolerate observing this.
+      appendFileSync(logPath, line.slice(0, half));
+      expect(storeA.count()).toBe(1);
+      expect(storeA.head()).toEqual({ seq: 1, hash: seeded[0]!.hash });
+      expect([...storeA.iterate()]).toHaveLength(1);
+      // Sync again with nothing new on disk: still tolerated, still stable.
+      expect(storeA.count()).toBe(1);
+
+      // The "crashed" process's continuation lands, completing the line.
+      appendFileSync(logPath, line.slice(half) + '\n');
+
+      expect(storeA.count()).toBe(2);
+      expect(storeA.head()).toEqual({ seq: 2, hash: next.hash });
+      expect([...storeA.iterate()].map((r) => r.seq)).toEqual([1, 2]);
+    } finally {
+      storeA.close();
+    }
+  });
+
+  it('a shrunk file triggers a full reload', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      const seeded = twoSessionFixture();
+      storeA.append(seeded);
+      expect(storeA.count()).toBe(6);
+
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const text = readFileSync(logPath, 'utf8');
+      const lines = text.split('\n').filter((l) => l.trim() !== '');
+      // Simulate the log having been replaced by a shorter one (e.g. a
+      // rotation) that keeps only the first two records.
+      writeFileSync(logPath, lines.slice(0, 2).join('\n') + '\n');
+      expect(statSync(logPath).size).toBeLessThan(text.length);
+
+      jsonlIoStats.fullReloadCalls = 0;
+      expect(storeA.count()).toBe(2);
+      expect(jsonlIoStats.fullReloadCalls).toBeGreaterThan(0);
+      expect(storeA.head()).toEqual({ seq: 2, hash: seeded[1]!.hash });
+      expect([...storeA.iterate()].map((r) => r.seq)).toEqual([1, 2]);
+    } finally {
+      storeA.close();
+    }
+  });
+
+  it('a grown-but-replaced file (misaligned with the old offset) triggers a full reload', () => {
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      storeA.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+      expect(storeA.count()).toBe(1);
+
+      const logPath = join(dir, FILES.JSONL_LOG);
+      const original = readFileSync(logPath, 'utf8');
+      // Replace with different, larger content shifted by one byte, so the
+      // byte at the previous end-of-file no longer marks the start of a
+      // line — the cheap "still the same file, just longer" check must
+      // catch this even though the file only grew.
+      writeFileSync(logPath, ' ' + original + original);
+
+      jsonlIoStats.fullReloadCalls = 0;
+      expect(storeA.count()).toBe(2); // full, tolerant reparse of the new content
+      expect(jsonlIoStats.fullReloadCalls).toBeGreaterThan(0); // fell back to a full reload
+    } finally {
+      storeA.close();
+    }
+  });
+});
+
+describe('JsonlStore appendEvents across instances (simulates separate processes)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-jsonl-xproc-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('two stores appending alternately produce one contiguous, verifiable chain', async () => {
+    const SESSION_C = '33333333-3333-4333-8333-333333333333';
+    const SESSION_D = '44444444-4444-4444-8444-444444444444';
+    const track = (sessionId: string, tag: string): AnyEvent[] => [
+      sessionStart(sessionId, '2026-06-11T12:00:00.000Z'),
+      toolCall(sessionId, '2026-06-11T12:00:01.000Z', `tool_${tag}`, { requestId: 1 }),
+      sessionEnd(sessionId, '2026-06-11T12:00:02.000Z'),
+    ];
+    const eventsA = track(SESSION_C, 'a');
+    const eventsB = track(SESSION_D, 'b');
+
+    // Two independent JsonlStore instances on the same data dir — each one
+    // stands in for a separate `mcp-recorder record` process, appending one
+    // event at a time so the instances truly interleave on disk.
+    const storeA = openStore({ dataDir: dir, backend: 'jsonl' });
+    const storeB = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      for (let i = 0; i < eventsA.length; i++) {
+        storeA.appendEvents([eventsA[i]!]);
+        storeB.appendEvents([eventsB[i]!]);
+      }
+    } finally {
+      storeA.close();
+      storeB.close();
+    }
+
+    const verifyOpen = openStore({ dataDir: dir, backend: 'jsonl' });
+    try {
+      expect(verifyOpen.count()).toBe(6);
+      const seqs = [...verifyOpen.iterate()].map((r) => r.seq);
+      expect(seqs).toEqual([1, 2, 3, 4, 5, 6]);
+
+      const result = await verifyStore(verifyOpen, { allowUnsigned: true });
+      expect(result.problems.filter((p) => p.warning !== true)).toEqual([]);
+      expect(result.checked_events).toBe(6);
+
+      const sessions = verifyOpen.sessions();
+      expect(sessions).toHaveLength(2);
+      for (const s of sessions) {
+        expect(s.event_count).toBe(3);
+        expect(s.ended_at).toBeDefined();
+      }
+    } finally {
+      verifyOpen.close();
+    }
   });
 });
 
@@ -500,5 +792,220 @@ describe('openStore backend resolution', () => {
     const store = openStore({ dataDir: dir });
     expect(store.backend).toBe(isSqliteAvailable() ? 'sqlite' : 'jsonl');
     store.close();
+  });
+});
+
+/* ------------------- prefers whichever backend file exists ------------------- */
+
+describe('openStore prefers an already-existing evidence file', () => {
+  let dir: string;
+  const savedEnv = process.env[ENV.STORE];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-existing-backend-'));
+    delete process.env[ENV.STORE];
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV.STORE];
+    else process.env[ENV.STORE] = savedEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('an existing evidence.jsonl wins over sqlite availability (no backend forced)', () => {
+    expect(isSqliteAvailable()).toBe(true); // the interesting case: sqlite IS available
+
+    const seeded = openStore({ dataDir: dir, backend: 'jsonl' });
+    seeded.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    seeded.close();
+    expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(true);
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+
+    // No --store, no env: auto-detection must not silently pick sqlite and
+    // "lose" the existing jsonl chain.
+    const reopened = openStore({ dataDir: dir });
+    expect(reopened.backend).toBe('jsonl');
+    expect(reopened.count()).toBe(1);
+    reopened.close();
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+  });
+
+  it('warns on stderr and prefers sqlite when both evidence files exist', () => {
+    const sq = openStore({ dataDir: dir, backend: 'sqlite' });
+    sq.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    sq.close();
+    // A second, independent jsonl file shows up in the same data dir (e.g. a
+    // native-module availability flip caused a later run to fall back).
+    const jl = openStore({ dataDir: dir, backend: 'jsonl' });
+    jl.append(seal([sessionStart(SESSION_B, '2026-06-11T11:00:00.000Z')]));
+    jl.close();
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const store = openStore({ dataDir: dir });
+      expect(store.backend).toBe('sqlite');
+      expect(store.count()).toBe(1); // the sqlite chain's own single event
+      expect(
+        stderrSpy.mock.calls.some(
+          (call) =>
+            String(call[0]).includes('both') &&
+            String(call[0]).includes(FILES.SQLITE_DB) &&
+            String(call[0]).includes(FILES.JSONL_LOG),
+        ),
+      ).toBe(true);
+      store.close();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('fails loudly (not a silent jsonl fallback) when evidence.db exists but better-sqlite3 cannot load', async () => {
+    const sq = openStore({ dataDir: dir, backend: 'sqlite' });
+    sq.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    sq.close();
+
+    vi.resetModules();
+    vi.doMock('../src/store/sqlite.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/store/sqlite.js')>();
+      return { ...actual, isSqliteAvailable: () => false };
+    });
+    try {
+      const { openStore: openStoreWithMockedSqlite } = await import('../src/store/index.js');
+      expect(() => openStoreWithMockedSqlite({ dataDir: dir })).toThrow(
+        /evidence\.db exists but better-sqlite3 cannot load/,
+      );
+      // And it must not have started a second (empty) chain in jsonl instead.
+      expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(false);
+    } finally {
+      vi.doUnmock('../src/store/sqlite.js');
+      vi.resetModules();
+    }
+  });
+});
+
+/* --------------------- openStoreReadOnly: no side-effect files -------------------- */
+
+describe('openStoreReadOnly (used by inspection commands)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-readonly-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('opening an empty data dir creates no evidence files', () => {
+    expect(isSqliteAvailable()).toBe(true); // the case that used to create evidence.db
+    const store = openStoreReadOnly({ dataDir: dir });
+    expect(store.count()).toBe(0);
+    expect(store.sessions()).toEqual([]);
+    store.close();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('still opens an existing store normally (no behavior change when data exists)', () => {
+    const seeded = openStore({ dataDir: dir, backend: 'jsonl' });
+    seeded.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    seeded.close();
+
+    const store = openStoreReadOnly({ dataDir: dir });
+    expect(store.backend).toBe('jsonl');
+    expect(store.count()).toBe(1);
+    store.close();
+  });
+});
+
+describe('data dir hygiene', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-hygiene-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32')('openStore creates the data dir 0700', () => {
+    const dataDir = join(dir, 'fresh');
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    store.close();
+    expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+  });
+
+  it('openStoreReadOnly on a dir nothing recorded to creates no files and no directory', () => {
+    const dataDir = join(dir, 'never-recorded');
+    const store = openStoreReadOnly({ dataDir });
+    expect(store.count()).toBe(0);
+    expect(store.sessions()).toEqual([]);
+    expect([...store.iterate()]).toEqual([]);
+    expect(store.latestSignature()).toBeNull();
+    expect(() => store.appendEvents([])).toThrow(/read-only/);
+    store.close();
+    expect(existsSync(dataDir)).toBe(false);
+  });
+
+  it('openStoreReadOnly with a forced backend never creates that backend\'s file', () => {
+    for (const backend of ['sqlite', 'jsonl'] as const) {
+      const store = openStoreReadOnly({ dataDir: dir, backend });
+      expect(store.backend).toBe(backend);
+      expect(store.count()).toBe(0);
+      store.close();
+    }
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+    expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(false);
+  });
+
+  it('jsonl: a complete last record that merely lacks its newline is kept, not discarded', async () => {
+    const records = twoSessionFixture();
+    const store = openStore({ dataDir: dir, backend: 'jsonl' });
+    store.append(records);
+    store.close();
+    const logPath = join(dir, FILES.JSONL_LOG);
+    const text = readFileSync(logPath, 'utf8');
+    expect(text.endsWith('\n')).toBe(true);
+    writeFileSync(logPath, text.slice(0, -1)); // the write was cut at the final byte
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const reopened = openStore({ dataDir: dir, backend: 'jsonl' });
+      expect(reopened.count()).toBe(records.length);
+      const sealed = reopened.appendEvents([
+        toolCall(SESSION_B, '2026-06-11T11:00:09.000Z', 'after_cut_newline'),
+      ]);
+      expect(sealed[0]!.seq).toBe(records.length + 1);
+      reopened.close();
+      expect(
+        stderrSpy.mock.calls.some((call) => String(call[0]).includes('discarded a torn trailing line')),
+      ).toBe(false);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    const third = openStore({ dataDir: dir, backend: 'jsonl' });
+    expect(third.count()).toBe(records.length + 1);
+    expect((await verifyStore(third, { allowUnsigned: true })).ok).toBe(true);
+    third.close();
+  });
+});
+
+describe('openStoreReadOnly on a data dir it cannot use', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-ro-err-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('throws when the data dir path is a regular file instead of a directory', () => {
+    const notADir = join(dir, 'evidence-file');
+    writeFileSync(notADir, 'not a directory');
+    expect(() => openStoreReadOnly({ dataDir: notADir })).toThrow(/not a directory/);
+  });
+
+  it('still treats a missing dir under a missing parent as nothing recorded', () => {
+    const store = openStoreReadOnly({ dataDir: join(dir, 'missing', 'deeper') });
+    expect(store.count()).toBe(0);
+    expect(existsSync(join(dir, 'missing'))).toBe(false);
   });
 });

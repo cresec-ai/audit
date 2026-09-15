@@ -9,7 +9,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { hostname as osHostname, userInfo } from 'node:os';
+import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
@@ -30,6 +30,7 @@ import type {
   ToolCallEvent,
 } from '../schema/events.js';
 import { SCHEMA } from '../schema/events.js';
+import { scrubArgv, scrubToolArguments, structuralString } from '../redact/redactor.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
 import { LineScanner, type ScannedLine } from './framing.js';
 
@@ -52,20 +53,65 @@ interface PendingEntry {
   params: unknown;
   t0: number;
   toolName?: string;
+  /** The JSON-RPC request id, preserved with its original type. */
+  id: string | number;
 }
 
 type Direction = 'client_to_server' | 'server_to_client';
 
 const CREDENTIAL_NAME_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
 const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
+// Runner flags with no value (skipped outright) vs. flags that consume the
+// next argv token as their value (that token is skipped too).
+const RUNNER_BARE_FLAGS = new Set(['-y', '--yes', '-q', '--quiet']);
+const RUNNER_VALUE_FLAGS = new Set(['-p', '--package']);
 const MAX_PENDING = 10_000;
-const CLOSE_TIMEOUT_MS = 2_000;
+// Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
+// contended store delays session_end rather than losing it.
+const CLOSE_TIMEOUT_MS = 8_000;
+/**
+ * Credential-fingerprint caps (P2 fix): env-derived fingerprints are capped
+ * on their own so a wrapped server with many credential-shaped env vars
+ * cannot fill the whole budget and silently crowd out argv/URL-derived
+ * fingerprints pushed afterward — those must always have room to append, up
+ * to the overall total below.
+ */
+const ENV_CREDENTIAL_FINGERPRINT_CAP = 32;
+const MAX_CREDENTIAL_FINGERPRINTS = 64;
+/** result_hash for a synthesized "unanswered" event: sha256 of canonical `null`. */
+const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
 
+/** Exit code for a child terminated by a signal: 128 + signal number (POSIX convention). */
+function signalExitCode(signal: NodeJS.Signals): number {
+  const num = (osConstants.signals as Partial<Record<NodeJS.Signals, number>>)[signal];
+  return num !== undefined ? 128 + num : 1;
+}
+
+/** Exit code for a command that failed to spawn at all. */
+function spawnErrorExitCode(code: string | undefined): number {
+  if (code === 'ENOENT') return 127;
+  if (code === 'EACCES') return 126;
+  return 1;
+}
+
+/**
+ * Best-effort logical server name from argv. For a bare command this is just
+ * its basename; for a runner (`npx`, `node`, `tsx`, ...) it walks past known
+ * runner flags (e.g. the `-y` in the README's own `npx -y <pkg>` wrapping)
+ * to find the first positional argument, which is the actual server.
+ */
 function deriveServerName(command: string[]): string {
   const first = basename(command[0] ?? '');
   const firstNoExt = first.replace(/\.(c|m)?(js|ts|exe)$/i, '');
-  if (RUNNERS.has(firstNoExt.toLowerCase()) && command.length > 1) {
-    return basename(command[1]);
+  if (!RUNNERS.has(firstNoExt.toLowerCase())) return first;
+  for (let i = 1; i < command.length; i++) {
+    const tok = command[i] ?? '';
+    if (RUNNER_BARE_FLAGS.has(tok) || tok.startsWith('--package=')) continue;
+    if (RUNNER_VALUE_FLAGS.has(tok)) {
+      i++; // skip the flag's value too
+      continue;
+    }
+    return basename(tok);
   }
   return first;
 }
@@ -76,6 +122,15 @@ function round2(n: number): number {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Pending-request map key. JSON-RPC ids may be a number or a string, and
+ * `1` and `"1"` are distinct ids — String(id) alone would collapse them, so
+ * the id's type is folded into the key too.
+ */
+function pendingKey(prefix: 'c2s:' | 's2c:', id: string | number): string {
+  return prefix + (typeof id === 'number' ? 'n:' : 's:') + String(id);
 }
 
 export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
@@ -119,13 +174,34 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     `${osUser}\0${host}\0${opts.identityLabel || ''}\0${initialServerName}`,
   );
 
+  // P2 fix: env-derived fingerprints are capped at ENV_CREDENTIAL_FINGERPRINT_CAP
+  // on their own (not the shared total), reserving room below the overall
+  // MAX_CREDENTIAL_FINGERPRINTS cap for argv/URL-derived fingerprints so
+  // those are never silently dropped just because env filled the budget
+  // first.
   const credentialFingerprints: { name: string; ref: string }[] = [];
   try {
     for (const [name, value] of Object.entries(env)) {
-      if (credentialFingerprints.length >= 32) break;
+      if (credentialFingerprints.length >= ENV_CREDENTIAL_FINGERPRINT_CAP) break;
       if (typeof value !== 'string' || value.length < 8) continue;
       if (!CREDENTIAL_NAME_RE.test(name)) continue;
       credentialFingerprints.push({ name, ref: redactor.hashString(value) });
+    }
+  } catch (err) {
+    tapError(err);
+  }
+
+  // Wrapped command argv leak fix (P1): a raw argv.join(' ') stamped on every
+  // event verbatim would leak `--api-key sk-...` / `--token ...` / DSNs with
+  // userinfo. scrubArgv() hashes credential-shaped elements and strips URL
+  // userinfo; every replaced piece is also fingerprinted so `query` finds it.
+  let scrubbedCommand = opts.command.join(' ');
+  try {
+    const scrubbedArgv = scrubArgv(opts.command, redactor);
+    scrubbedCommand = scrubbedArgv.command;
+    for (const fp of scrubbedArgv.fingerprints) {
+      if (credentialFingerprints.length >= MAX_CREDENTIAL_FINGERPRINTS) break;
+      credentialFingerprints.push(fp);
     }
   } catch (err) {
     tapError(err);
@@ -153,7 +229,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   const currentServer = (): ServerContext => {
     const server: ServerContext = {
       name: opts.serverName || learnedServerName || initialServerName,
-      command: opts.command.join(' '),
+      command: scrubbedCommand,
       transport: 'stdio',
     };
     if (learnedServerVersion !== undefined) server.version = learnedServerVersion;
@@ -199,6 +275,57 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   proxyStdin.on('error', (err: Error) => diag(`stdin error: ${err.message}`));
   child.stdout.on('error', (err: Error) => diag(`child stdout error: ${err.message}`));
   child.stderr.on('error', (err: Error) => diag(`child stderr error: ${err.message}`));
+
+  // The MCP client can close its read end of our stdout/stderr at any time
+  // (it exited, it stopped reading, a downstream pipe broke). .pipe()'s
+  // destination gets no default 'error' listener, so without one an EPIPE
+  // here is an unhandled 'error' event — it crashes the whole proxy, drops
+  // whatever was queued, and session_end never gets written. Both directions
+  // must survive it.
+  const isEpipeLike = (err: NodeJS.ErrnoException): boolean =>
+    err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED';
+  proxyStdout.on('error', (err: NodeJS.ErrnoException) => {
+    if (!isEpipeLike(err)) {
+      diag(`stdout error: ${err.message}`);
+      return;
+    }
+    // The client is gone. Stop feeding it, and end the child's stdin per the
+    // stdio shutdown convention so the server winds down on its own; the
+    // normal child 'close' -> finalize path then seals the session.
+    // unpipe() can leave child.stdout paused even though the tap's own
+    // 'data' listener is still attached (and Node's ChildProcess delays its
+    // 'close' event until every stdio stream is drained) — resume() keeps
+    // it flowing into the tap and lets 'close' fire normally.
+    try {
+      child.stdout.unpipe(proxyStdout);
+      child.stdout.resume();
+    } catch {
+      /* fail-open */
+    }
+    try {
+      if (!child.stdin.writableEnded) child.stdin.end();
+    } catch {
+      /* fail-open */
+    }
+  });
+  proxyStderr.on('error', (err: NodeJS.ErrnoException) => {
+    if (!isEpipeLike(err)) {
+      diag(`stderr error: ${err.message}`);
+      return;
+    }
+    // Diagnostics/child stderr have nowhere to go; stop piping and keep
+    // draining the child's stderr so it never blocks on a full pipe.
+    try {
+      child.stderr.unpipe(proxyStderr);
+    } catch {
+      /* fail-open */
+    }
+    try {
+      child.stderr.resume();
+    } catch {
+      /* fail-open */
+    }
+  });
 
   /* ------------------------------ tap state ------------------------------- */
 
@@ -258,7 +385,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   ): void => {
     const id = msg.id as string | number;
     // Client-initiated requests are answered server->client and vice versa.
-    const key = (arrivedOn === 'server_to_client' ? 'c2s:' : 's2c:') + String(id);
+    const key = pendingKey(arrivedOn === 'server_to_client' ? 'c2s:' : 's2c:', id);
     const entry = pending.get(key);
     if (!entry) {
       protocolError(arrivedOn, 'orphan_response', line.bytesLen, line.lineHashHex);
@@ -279,11 +406,24 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       const clientInfo = isPlainObject(reqParams.clientInfo) ? reqParams.clientInfo : {};
       const res = isPlainObject(rawResult) ? rawResult : {};
       const serverInfo = isPlainObject(res.serverInfo) ? res.serverInfo : {};
-      // Remember for subsequent events' identity/server context.
-      if (typeof clientInfo.name === 'string') clientName = clientInfo.name;
-      if (typeof clientInfo.version === 'string') clientVersion = clientInfo.version;
-      if (typeof serverInfo.name === 'string') learnedServerName = serverInfo.name;
-      if (typeof serverInfo.version === 'string') learnedServerVersion = serverInfo.version;
+      // Remember for subsequent events' identity/server context. Capped here
+      // (P0): these are copied verbatim off the wire and reused on every
+      // later event, so an oversized/malformed value is capped once, at the
+      // point it's learned — every downstream use (this event's own
+      // client_name/server_name below, plus identity/server context on every
+      // later event) inherits the capped value for free.
+      if (typeof clientInfo.name === 'string') {
+        clientName = structuralString(clientInfo.name, 'identifier');
+      }
+      if (typeof clientInfo.version === 'string') {
+        clientVersion = structuralString(clientInfo.version, 'version');
+      }
+      if (typeof serverInfo.name === 'string') {
+        learnedServerName = structuralString(serverInfo.name, 'identifier');
+      }
+      if (typeof serverInfo.version === 'string') {
+        learnedServerVersion = structuralString(serverInfo.version, 'version');
+      }
 
       const ev: InitializeEvent = {
         ...base('initialize', {
@@ -296,7 +436,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         duration_ms: durationMs,
       };
       const protoVersion = reqParams.protocolVersion ?? res.protocolVersion;
-      if (typeof protoVersion === 'string') ev.protocol_version = protoVersion;
+      if (typeof protoVersion === 'string') {
+        ev.protocol_version = structuralString(protoVersion, 'protocol_version');
+      }
       if (clientName !== undefined) ev.client_name = clientName;
       if (clientVersion !== undefined) ev.client_version = clientVersion;
       if (learnedServerName !== undefined) ev.server_name = learnedServerName;
@@ -321,7 +463,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         kind: 'tool_call',
         tool,
         request_id: id,
-        args: redactor.scrub(reqParams.arguments ?? {}),
+        args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
         result_hash: resultHash,
         result: redactor.scrub(rawResult ?? null),
         is_error: isError,
@@ -362,28 +504,36 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const hasId = id !== undefined && id !== null;
 
     if (hasMethod && hasId) {
-      // Request: register pending under the direction it was sent on.
+      // Request: register pending under the direction it was sent on. The
+      // method/tool name is capped HERE (P0), once, at capture time: every
+      // downstream event built from this entry (the eventual response event
+      // AND the synthetic 'unanswered' event sealed at shutdown, see
+      // emitUnanswered below) reads `entry.method`/`entry.toolName`, so
+      // capping the source field once covers both for free.
       const keyPrefix = direction === 'client_to_server' ? 'c2s:' : 's2c:';
+      const reqId = id as string | number;
       const params = msg.params;
       const entry: PendingEntry = {
-        method: msg.method as string,
+        method: structuralString(msg.method as string, 'identifier'),
         params,
         t0: performance.now(),
+        id: reqId,
       };
       if (isPlainObject(params) && typeof params.name === 'string') {
-        entry.toolName = params.name;
+        entry.toolName = structuralString(params.name, 'identifier');
       }
-      registerPending(keyPrefix + String(id as string | number), entry);
+      registerPending(pendingKey(keyPrefix, reqId), entry);
       return;
     }
     if (hasMethod) {
+      const method = structuralString(msg.method as string, 'identifier');
       const ev: NotificationEvent = {
         ...base('notification', {
-          'mcp.method.name': msg.method as string,
+          'mcp.method.name': method,
           'rpc.system': 'jsonrpc',
         }),
         kind: 'notification',
-        method: msg.method as string,
+        method,
         direction,
         params: redactor.scrub(msg.params ?? null),
       };
@@ -482,6 +632,67 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
   return await new Promise<number>((resolve) => {
     let finished = false;
+    /** errno code from the child 'error' event, when spawning failed outright. */
+    let spawnErrorCode: string | undefined;
+
+    // A request still pending at session end (server crashed or was killed
+    // mid-call, or the client disconnected mid-handshake) would otherwise
+    // vanish from the chain with no trace. Seal one synthetic event per
+    // pending entry before session_end: a tools/call becomes a tool_call
+    // event, everything else (including an unanswered initialize) becomes
+    // an rpc event — both is_error, error.type 'unanswered'.
+    const emitUnanswered = (): void => {
+      if (pending.size === 0) return;
+      const shutdownT0 = performance.now();
+      for (const entry of pending.values()) {
+        const durationMs = round2(shutdownT0 - entry.t0);
+        if (entry.method === 'tools/call') {
+          const tool = entry.toolName ?? '';
+          const reqParams = isPlainObject(entry.params) ? entry.params : {};
+          const attributes: Attributes = {
+            'gen_ai.operation.name': 'execute_tool',
+            'gen_ai.tool.name': tool,
+            'gen_ai.tool.call.id': String(entry.id),
+            'mcp.method.name': 'tools/call',
+            'rpc.system': 'jsonrpc',
+            'error.type': 'unanswered',
+          };
+          const ev: ToolCallEvent = {
+            ...base('tool_call', attributes),
+            kind: 'tool_call',
+            tool,
+            request_id: entry.id,
+            args: scrubToolArguments(redactor, reqParams.arguments ?? {}),
+            result_hash: NULL_RESULT_HASH,
+            result: null,
+            is_error: true,
+            duration_ms: durationMs,
+            error: { type: 'unanswered' },
+          };
+          record(ev);
+        } else {
+          const attributes: Attributes = {
+            'mcp.method.name': entry.method,
+            'rpc.system': 'jsonrpc',
+            'rpc.jsonrpc.request_id': String(entry.id),
+            'error.type': 'unanswered',
+          };
+          const ev: RpcEvent = {
+            ...base('rpc', attributes),
+            kind: 'rpc',
+            method: entry.method,
+            request_id: entry.id,
+            params: redactor.scrub(entry.params ?? null),
+            result_hash: NULL_RESULT_HASH,
+            is_error: true,
+            duration_ms: durationMs,
+            error: { type: 'unanswered' },
+          };
+          record(ev);
+        }
+      }
+      pending.clear();
+    };
 
     const finalize = async (
       reason: SessionEndEvent['reason'],
@@ -491,9 +702,11 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       if (finished) return;
       finished = true;
       removeSignalHandlers();
-      // Pending requests still open at session end are intentionally ignored:
-      // there is no response to correlate, and synthesizing half-events would
-      // pollute the chain. The protocol_error/orphan path covers true anomalies.
+      try {
+        emitUnanswered();
+      } catch (err) {
+        tapError(err);
+      }
       try {
         await recorder.flush();
       } catch {
@@ -509,6 +722,8 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
           events_recorded: stats.written,
           events_dropped: stats.dropped,
         };
+        if (spawnErrorCode !== undefined) ev.spawn_error = spawnErrorCode;
+        if (signal !== null) ev.child_signal = signal;
         record(ev);
       } catch (err) {
         tapError(err);
@@ -521,12 +736,22 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       } catch {
         /* fail-open */
       }
-      const code = exitCode ?? (signal ? 1 : 0);
+      let code: number;
+      if (exitCode !== null) {
+        code = exitCode;
+      } else if (signal !== null) {
+        code = signalExitCode(signal);
+      } else if (spawnErrorCode !== undefined) {
+        code = spawnErrorExitCode(spawnErrorCode);
+      } else {
+        code = 0;
+      }
       resolve(code);
     };
 
-    child.on('error', (err: Error) => {
+    child.on('error', (err: NodeJS.ErrnoException) => {
       diag(`failed to run ${opts.command[0]}: ${err.message}`);
+      spawnErrorCode = err.code ?? 'UNKNOWN';
       void finalize('error', null, null);
     });
 

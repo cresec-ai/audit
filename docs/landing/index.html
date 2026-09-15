@@ -100,7 +100,7 @@
     redacted at the edge, and sealed into a signed hash chain &mdash; on your machine.
     Nothing to trust, nothing to break.
   </p>
-  <div class="install"><span class="dollar">$</span> npx -y @edut/mcp-recorder -- npx -y @some/mcp-server</div>
+  <div class="install"><span class="dollar">$</span> mcp-recorder setup --client claude-desktop</div>
   <p class="hero-links">
     Transparent stdio proxy &middot; fail-open &middot; &lt;5ms p50 added latency &middot; GPL-3.0
   </p>
@@ -140,23 +140,38 @@
   <div class="terminal">
     <div class="terminal-bar"><span></span><span></span><span></span><span class="title">~ mcp-recorder</span></div>
     <pre><span class="c"># 1. wrap your MCP server (any client: Claude Desktop, Claude Code, Cursor...)</span>
-<span class="p">$</span> npx -y @edut/mcp-recorder -- npx -y @modelcontextprotocol/server-filesystem .
+<span class="p">$</span> mcp-recorder record -- npx -y @modelcontextprotocol/server-filesystem .
 
 <span class="c"># 2. use your agent normally, then ask what happened</span>
 <span class="p">$</span> mcp-recorder sessions
-<span class="g">1 session</span>  filesystem  14 tool calls  0 errors
+SESSION   STARTED                   ENDED                     SERVER      EVENTS  TOOL_CALLS  ERRORS
+a1b2c3d4  2026-09-15T09:14:02.113Z  2026-09-15T09:14:21.885Z  filesystem  17      14          0
 
 <span class="c"># 3. prove the record is intact</span>
 <span class="p">$</span> mcp-recorder verify
-<span class="g">OK</span>  17 events checked, chain head signed (ed25519), no problems found
+verify store ~/.mcp-recorder/evidence.db (sqlite)
+pinned signer: ed25519 c397380b4a18ee5a&hellip; (~/.mcp-recorder/identity.pub)
+<span class="g">PASS</span> &mdash; chain intact: 17 event(s), head seq 17
+signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.887Z
 
 <span class="c"># 4. blast radius: did anything ever touch this API key?</span>
 <span class="p">$</span> mcp-recorder query "AKIAIOSFODNN7EXAMPLE"
-<span class="g">2 matches</span> in 1 session  tool_call read_file &rarr; args.path, result
+TIMESTAMP                 KIND       NAME       SESSION   MATCHED_ON  PATH
+2026-09-15T09:14:10.001Z  tool_call  read_file  a1b2c3d4  ref         $.args.path
 
-<span class="c"># 5. hand the evidence to someone who doesn't trust you</span>
+<span class="g">1 matches</span> across 1 sessions
+
+<span class="c"># 5. hand the evidence to a stranger &mdash; and they can verify it themselves</span>
 <span class="p">$</span> mcp-recorder export --out evidence.zip
-<span class="g">wrote</span> evidence.zip  (events.jsonl + manifest + public key + standalone verify.cjs)</pre>
+exported 17 event(s) (seq 1..17), head 71ce5ebcf36d1666&hellip; signed by ed25519 c397380b4a18ee5a&hellip;
+bundle zip: /Users/me/projects/evidence.zip
+verify anywhere with: node verify.cjs (inside the bundle)
+
+<span class="p">$</span> mcp-recorder verify --bundle evidence.zip
+verify bundle /Users/me/projects/evidence.zip
+pinned signer: ed25519 c397380b4a18ee5a&hellip; (bundle's own manifest.json &mdash; self-pinned; pass --public-key with a key obtained out of band for independent assurance)
+<span class="g">PASS</span> &mdash; chain intact: 17 event(s), head seq 17
+signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.887Z</pre>
   </div>
   <p class="onelnr">
     Adoption is one config edit: change
@@ -172,7 +187,7 @@
       If you run agents with MCP in production and care about what they did &mdash; incident
       response, compliance, or plain peace of mind &mdash; we want your hardest questions.
     </p>
-    <a class="btn solid" href="https://github.com/edut-sec/mcp-recorder">GitHub</a>
+    <a class="btn solid" href="https://github.com/cresec-ai/audit">GitHub</a>
     <a class="btn" href="mailto:hello@example.com?subject=mcp-recorder%20design%20partner">Become a design partner</a>
   </div>
 </section>
@@ -180,7 +195,7 @@
 <footer class="wrap">
   @edut/mcp-recorder <span class="sep">|</span> GPL-3.0 <span class="sep">|</span>
   local-first, no cloud, no telemetry <span class="sep">|</span>
-  <a href="https://github.com/edut-sec/mcp-recorder">github.com/edut-sec/mcp-recorder</a>
+  <a href="https://github.com/cresec-ai/audit">github.com/cresec-ai/audit</a>
 </footer>
 
 </body>

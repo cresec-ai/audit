@@ -1,15 +1,18 @@
 /**
  * Async, fail-open capture sink (M1). `record()` is synchronous, O(1) and
- * never throws; events are sealed into chain records and batched to the
- * store off the hot path via setImmediate. A store failure flips the
- * recorder into drop mode: traffic is never affected, drops are counted,
- * and exactly one diagnostic line goes to stderr.
+ * never throws; events are batched off the hot path via setImmediate and
+ * sealed into chain records by the store itself (`appendEvents`), under the
+ * store's own exclusive lock — several `mcp-recorder record` processes
+ * normally share one data dir (one wrapper per MCP server), so a batch can
+ * fail transiently (lock contention, a busy database) without being a real
+ * problem. A failed batch is retried with backoff before anything is
+ * dropped; only once every retry has failed does the recorder flip into
+ * drop mode, where traffic is never affected, drops are counted, and
+ * exactly one diagnostic line goes to stderr.
  */
 
-import { makeRecord } from '../chain/hash.js';
 import type { AnyEvent, ChainRecord } from '../schema/events.js';
 import type {
-  ChainHead,
   EvidenceStore,
   RecorderLike,
   RecorderStats,
@@ -21,19 +24,43 @@ export interface RecorderOpts {
   signer: SignerLike | null;
   /** Sign the chain head after every flush (default true). */
   signEveryFlush?: boolean;
+  /** Backoff (ms) before each retry of a failed batch; tests pass [] for none. */
+  retryDelaysMs?: readonly number[];
+}
+
+/**
+ * Backoff before each retry of a failed batch, after the initial attempt —
+ * transient contention (lock wait, a busy database) among several recorder
+ * processes sharing one data dir usually clears within a few ms. The waits
+ * here are asynchronous (they never block forwarding); the stores' own
+ * synchronous waits are kept to ~100ms per attempt for the same reason. The
+ * sum (~5.9s) outlasts the jsonl store's 5s stale-lock reclaim, so a lock
+ * abandoned by a crashed peer costs a delay, not a dropped batch, and it is
+ * covered by stdio.ts's recorder.close() timeout so a session_end still
+ * lands on shutdown even after a full retry run.
+ */
+const RETRY_DELAYS_MS = [10, 25, 50, 100, 250, 500, 1000, 2000, 2000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function logOnce(loggedRef: { v: boolean }, msg: string, err?: unknown): void {
   if (loggedRef.v) return;
   loggedRef.v = true;
   const detail = err instanceof Error ? err.message : err !== undefined ? String(err) : '';
-  process.stderr.write(`[mcp-recorder] ${msg}${detail ? `: ${detail}` : ''}\n`);
+  try {
+    process.stderr.write(`[mcp-recorder] ${msg}${detail ? `: ${detail}` : ''}\n`);
+  } catch {
+    /* even diagnostics are fail-open: a closed stderr must never take the proxy down */
+  }
 }
 
 export class Recorder implements RecorderLike {
   private readonly store: EvidenceStore | null;
   private readonly signer: SignerLike | null;
   private readonly signEveryFlush: boolean;
+  private readonly retryDelaysMs: readonly number[];
 
   private queue: AnyEvent[] = [];
   private flushScheduled = false;
@@ -54,6 +81,7 @@ export class Recorder implements RecorderLike {
     this.store = opts.store;
     this.signer = opts.signer;
     this.signEveryFlush = opts.signEveryFlush ?? true;
+    this.retryDelaysMs = opts.retryDelaysMs ?? RETRY_DELAYS_MS;
   }
 
   /** Hot path: O(1), never throws. */
@@ -98,23 +126,30 @@ export class Recorder implements RecorderLike {
     }
     const store = this.store;
 
-    let batch: ChainRecord[];
-    try {
-      let head: ChainHead = store.head();
-      batch = [];
-      for (const event of events) {
-        const rec = makeRecord(head, event);
-        batch.push(rec);
-        head = { seq: rec.seq, hash: rec.hash };
+    let batch: ChainRecord[] | undefined;
+    let lastErr: unknown;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        batch = store.appendEvents(events);
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt >= this.retryDelaysMs.length) break; // every retry spent
+        await sleep(this.retryDelaysMs[attempt]!);
       }
-      store.append(batch);
-      this.written += batch.length;
-    } catch (err) {
+    }
+
+    if (batch === undefined) {
       this.storeFailed = true;
       this.dropped += events.length;
-      logOnce(this.storeErrorLogged, 'store append failed; recording disabled, dropping events', err);
+      logOnce(
+        this.storeErrorLogged,
+        'store append failed; recording disabled, dropping events',
+        lastErr,
+      );
       return;
     }
+    this.written += batch.length;
 
     if (this.signer && this.signEveryFlush && batch.length > 0) {
       const tip = batch[batch.length - 1];

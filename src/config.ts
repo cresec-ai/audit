@@ -1,10 +1,26 @@
 /**
  * Config resolution: flag > env > default. Produces the RecorderConfig the
- * CLI hands to every other module, and ensures the data directory exists
- * (0o700 — it holds a private signing key).
+ * CLI hands to every other module.
+ *
+ * Two entry points, because record/http and the inspection subcommands have
+ * opposite failure needs:
+ *
+ *   - `resolveConfig()` is STRICT: an invalid --redact/--store value throws.
+ *     Used by verify/query/sessions/ui/export, which have no wrapped-server
+ *     traffic to protect, so failing loudly (exit 2) is correct.
+ *   - `resolveConfigLenient()` NEVER throws: an invalid --redact/--store
+ *     flag or env value is reported as a warning and replaced with its safe
+ *     default (allowlist redaction, automatic store backend). Used by
+ *     record/http, where nothing about recording configuration may prevent
+ *     the wrapped server from being spawned (fail-open).
+ *
+ * Neither function creates the data directory anymore — see `ensureDataDir`.
+ * Record/http create it inside their fail-open init path (a bad --data-dir
+ * degrades to pure passthrough there instead of throwing); the strict
+ * inspection commands create it via whichever store/signer they open.
  */
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ENV } from './types.js';
@@ -13,6 +29,12 @@ import type { RecorderConfig } from './types.js';
 export interface ResolveConfigOpts {
   flags: Record<string, string | boolean | undefined>;
   env: NodeJS.ProcessEnv;
+}
+
+export interface LenientConfigResult {
+  config: RecorderConfig;
+  /** Invalid flag/env values that were ignored in favor of a safe default. */
+  warnings: string[];
 }
 
 function asString(v: string | boolean | undefined): string | undefined {
@@ -29,13 +51,59 @@ function pick(
   return undefined;
 }
 
-export function resolveConfig(opts: ResolveConfigOpts): RecorderConfig {
-  const { flags, env } = opts;
+/** Ensure the data directory exists with private (0o700) permissions — it
+ * holds the ed25519 signing key. */
+export function ensureDataDir(dataDir: string): void {
+  let existed = true;
+  try {
+    statSync(dataDir);
+  } catch {
+    existed = false;
+  }
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  if (!existed || process.platform === 'win32') return;
+  // A directory that already existed is left as the user made it — it may
+  // be shared on purpose (a team evidence dir with group access, a mounted
+  // volume) — but it holds the private signing key and the evidence, so a
+  // group/world-accessible mode gets one warning.
+  try {
+    const mode = statSync(dataDir).mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      process.stderr.write(
+        `[mcp-recorder] warning: data dir ${dataDir} is group/world accessible (mode ${mode.toString(8)}); ` +
+          'it holds the signing key and the evidence — chmod 700 it unless it is shared on purpose\n',
+      );
+    }
+  } catch {
+    /* best effort */
+  }
+}
 
+interface CommonFields {
+  dataDir: string;
+  disabled: boolean;
+  serverName?: string;
+  identityLabel?: string;
+}
+
+function resolveCommon(opts: ResolveConfigOpts): CommonFields {
+  const { flags, env } = opts;
   const dataDirRaw =
     pick(flags['data-dir'], env[ENV.DATA_DIR]) ?? join(homedir(), '.mcp-recorder');
-  const dataDir = resolve(dataDirRaw);
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const out: CommonFields = {
+    dataDir: resolve(dataDirRaw),
+    disabled: env[ENV.DISABLE] === '1',
+  };
+  const serverName = asString(flags['name']);
+  if (serverName !== undefined) out.serverName = serverName;
+  const identityLabel = asString(flags['identity']);
+  if (identityLabel !== undefined) out.identityLabel = identityLabel;
+  return out;
+}
+
+export function resolveConfig(opts: ResolveConfigOpts): RecorderConfig {
+  const { flags, env } = opts;
+  const common = resolveCommon(opts);
 
   const storeRaw = pick(flags['store'], env[ENV.STORE]);
   let storeBackend: 'sqlite' | 'jsonl' | undefined;
@@ -56,14 +124,52 @@ export function resolveConfig(opts: ResolveConfigOpts): RecorderConfig {
   }
 
   const config: RecorderConfig = {
-    dataDir,
+    dataDir: common.dataDir,
     redactMode: redactRaw,
-    disabled: env[ENV.DISABLE] === '1',
+    disabled: common.disabled,
   };
   if (storeBackend !== undefined) config.storeBackend = storeBackend;
-  const serverName = asString(flags['name']);
-  if (serverName !== undefined) config.serverName = serverName;
-  const identityLabel = asString(flags['identity']);
-  if (identityLabel !== undefined) config.identityLabel = identityLabel;
+  if (common.serverName !== undefined) config.serverName = common.serverName;
+  if (common.identityLabel !== undefined) config.identityLabel = common.identityLabel;
   return config;
+}
+
+/** Same resolution as `resolveConfig`, but fail-open: never throws. */
+export function resolveConfigLenient(opts: ResolveConfigOpts): LenientConfigResult {
+  const { flags, env } = opts;
+  const common = resolveCommon(opts);
+  const warnings: string[] = [];
+
+  const storeRaw = pick(flags['store'], env[ENV.STORE]);
+  let storeBackend: 'sqlite' | 'jsonl' | undefined;
+  if (storeRaw !== undefined) {
+    if (storeRaw !== 'sqlite' && storeRaw !== 'jsonl') {
+      warnings.push(
+        `invalid store backend '${storeRaw}' (expected 'sqlite' or 'jsonl'); using automatic selection`,
+      );
+    } else {
+      storeBackend = storeRaw;
+    }
+  }
+
+  const redactRaw = pick(flags['redact'], env[ENV.REDACT]) ?? 'allowlist';
+  let redactMode: 'allowlist' | 'off';
+  if (redactRaw === 'allowlist' || redactRaw === 'off') {
+    redactMode = redactRaw;
+  } else {
+    warnings.push(
+      `invalid redact mode '${redactRaw}' (expected 'allowlist' or 'off'); using 'allowlist'`,
+    );
+    redactMode = 'allowlist';
+  }
+
+  const config: RecorderConfig = {
+    dataDir: common.dataDir,
+    redactMode,
+    disabled: common.disabled,
+  };
+  if (storeBackend !== undefined) config.storeBackend = storeBackend;
+  if (common.serverName !== undefined) config.serverName = common.serverName;
+  if (common.identityLabel !== undefined) config.identityLabel = common.identityLabel;
+  return { config, warnings };
 }

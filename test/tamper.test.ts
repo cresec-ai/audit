@@ -244,6 +244,82 @@ describe('tamper evidence (sqlite)', () => {
     expect(problemAt(result, 'signature_invalid', 6)).toBe(true);
     expect(result.verified_signature).toBeUndefined();
   });
+
+  it('DELETE of every signature row → no_valid_signature (FAIL, not just a warning)', async () => {
+    rawTamper((raw) => {
+      raw.prepare('DELETE FROM signatures').run();
+    });
+
+    const result = await verifyTampered();
+    expect(result.ok).toBe(false);
+    expect(problemAt(result, 'no_valid_signature', 6)).toBe(true);
+    expect(result.verified_signature).toBeUndefined();
+  });
+
+  it('rewritten history re-signed with a FOREIGN key only fails once the legitimate key is pinned', async () => {
+    // Attacker: edit event 3, recompute the chain from genesis, sign the
+    // forged head with a key of their own — identity.key in `dir` is never
+    // touched. This is the strongest forgery: cryptographically genuine,
+    // internally self-consistent, just signed by the wrong hand.
+    const forgedEvent = toolCall(SESSION_A, 33, 'forged_tool'); // built once — reused for both the row and its hash
+    const forgedHash = computeHash(records[1]!.hash, forgedEvent);
+    rawTamper((raw) => {
+      raw.prepare('DELETE FROM records WHERE seq >= 3').run();
+      raw
+        .prepare(
+          'INSERT INTO records (seq, prev_hash, hash, session_id, kind, timestamp, event) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          3,
+          records[1]!.hash,
+          forgedHash,
+          forgedEvent.session_id,
+          forgedEvent.kind,
+          forgedEvent.timestamp,
+          canonicalJson(forgedEvent),
+        );
+      raw.prepare('DELETE FROM signatures').run();
+    });
+
+    // Sign the (shortened, forged) chain with an attacker-controlled key.
+    const attackerDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-tamper-attacker-'));
+    const attacker = await Signer.load(attackerDir);
+    const require = createRequire(import.meta.url);
+    const Database = require('better-sqlite3') as typeof import('better-sqlite3');
+    const raw: RawDb = new Database(join(dir, FILES.SQLITE_DB));
+    try {
+      const sig = await attacker.sign(3, forgedHash);
+      raw
+        .prepare(
+          'INSERT INTO signatures (seq, chain_hash, algo, public_key, signature, signed_at) VALUES (?,?,?,?,?,?)',
+        )
+        .run(sig.seq, sig.chain_hash, sig.algo, sig.public_key, sig.signature, sig.signed_at);
+    } finally {
+      raw.close();
+      rmSync(attackerDir, { recursive: true, force: true });
+    }
+
+    // Unpinned: the forged signature is genuine and self-consistent, so
+    // verify "passes" — signed by the attacker's key instead of the store's.
+    const unpinned = await verifyTampered();
+    expect(unpinned.ok).toBe(true);
+    expect(unpinned.verified_signature?.public_key).toBe(attacker.publicKeyHex);
+
+    // Pinned to the store's OWN key (what `verify` does by reading
+    // identity.pub) — the forgery is caught.
+    const legitimate = await Signer.load(dir);
+    const store = openStore({ dataDir: dir, backend: 'sqlite' });
+    let pinned: VerifyResult;
+    try {
+      pinned = await verifyStore(store, { expectedPublicKeyHex: legitimate.publicKeyHex });
+    } finally {
+      store.close();
+    }
+    expect(pinned.ok).toBe(false);
+    expect(pinned.verified_signature).toBeUndefined();
+    expect(problemAt(pinned, 'signature_invalid', 3)).toBe(true);
+    expect(problemAt(pinned, 'no_valid_signature', 3)).toBe(true);
+  });
 });
 
 /* -------------------------------- jsonl -------------------------------- */
@@ -348,5 +424,48 @@ describe('tamper evidence (jsonl)', () => {
     const result = await verifyTampered();
     expect(result.ok).toBe(false);
     expect(problemAt(result, 'signature_invalid', 6)).toBe(true);
+  });
+
+  it('deleting signatures.jsonl entirely → no_valid_signature (FAIL, not just a warning)', async () => {
+    writeLines(sigsPath, []);
+
+    const result = await verifyTampered();
+    expect(result.ok).toBe(false);
+    expect(problemAt(result, 'no_valid_signature', 6)).toBe(true);
+    expect(result.verified_signature).toBeUndefined();
+  });
+
+  it('rewritten history re-signed with a FOREIGN key only fails once the legitimate key is pinned', async () => {
+    // Attacker: drop event 3 onward, recompute the (shorter) chain, sign the
+    // forged head with a key of their own — identity.key in `dir` untouched.
+    const forgedEvent = toolCall(SESSION_A, 33, 'forged_tool'); // built once, reused for the row + its hash
+    const forgedHash = computeHash(records[1]!.hash, forgedEvent);
+    const forgedRecord: ChainRecord = { seq: 3, prev_hash: records[1]!.hash, hash: forgedHash, event: forgedEvent };
+    writeLines(logPath, [JSON.stringify(records[0]), JSON.stringify(records[1]), JSON.stringify(forgedRecord)]);
+
+    const attackerDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-tamper-attacker-'));
+    const attacker = await Signer.load(attackerDir);
+    const forgedSig = await attacker.sign(3, forgedHash);
+    writeLines(sigsPath, [JSON.stringify(forgedSig)]);
+    rmSync(attackerDir, { recursive: true, force: true });
+
+    // Unpinned: genuine, self-consistent, wrong signer — verify "passes".
+    const unpinned = await verifyTampered();
+    expect(unpinned.ok).toBe(true);
+    expect(unpinned.verified_signature?.public_key).toBe(attacker.publicKeyHex);
+
+    // Pinned to the store's own key — caught.
+    const legitimate = await Signer.load(dir);
+    const store = openStore({ dataDir: dir, backend: 'jsonl' });
+    let pinned: VerifyResult;
+    try {
+      pinned = await verifyStore(store, { expectedPublicKeyHex: legitimate.publicKeyHex });
+    } finally {
+      store.close();
+    }
+    expect(pinned.ok).toBe(false);
+    expect(pinned.verified_signature).toBeUndefined();
+    expect(problemAt(pinned, 'signature_invalid', 3)).toBe(true);
+    expect(problemAt(pinned, 'no_valid_signature', 3)).toBe(true);
   });
 });

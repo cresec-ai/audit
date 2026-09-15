@@ -12,6 +12,7 @@ import type {
   ChainRecord,
   IdentityContext,
   ServerContext,
+  SessionEndEvent,
   SessionStartEvent,
   ToolCallEvent,
 } from '../src/schema/events.js';
@@ -66,6 +67,23 @@ function toolCall(sessionId: string, n: number, tool = 'list_issues'): ToolCallE
     result: { ok: true },
     is_error: false,
     duration_ms: 3,
+  };
+}
+
+function sessionEnd(sessionId: string, n: number): SessionEndEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: sessionId,
+    timestamp: new Date(Date.UTC(2026, 5, 11, 10, 0, n)).toISOString(),
+    kind: 'session_end',
+    identity: IDENTITY,
+    server: SERVER,
+    attributes: {},
+    reason: 'child_exit',
+    child_exit_code: 0,
+    events_recorded: n,
+    events_dropped: 0,
   };
 }
 
@@ -155,16 +173,76 @@ describe.each(backends)('verifyStore (%s)', (backend) => {
     expect(result.problems[0]).toMatchObject({ type: 'unsigned_tail', seq: 6, warning: true });
   });
 
-  it('a never-signed chain verifies ok with only an unsigned_tail warning', async () => {
+  it('a never-signed chain FAILS with no_valid_signature (a chain nobody attests to proves nothing)', async () => {
     const records = seal(sixEvents());
     const store = open();
     store.append(records);
 
     const result = await verifyStore(store);
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
     expect(result.verified_signature).toBeUndefined();
     expect(result.problems).toHaveLength(1);
-    expect(result.problems[0]).toMatchObject({ type: 'unsigned_tail', seq: 6, warning: true });
+    expect(result.problems[0]).toMatchObject({ type: 'no_valid_signature', seq: 6 });
+    expect(result.problems[0]!.warning).not.toBe(true);
+    // Same scenario a corrupt/missing identity.key at record time would
+    // produce (setupProxyRecording falls back to signer=null, so nothing
+    // ever gets signed) — the detail must say plainly what's wrong and how
+    // to proceed, not just "no valid head signature".
+    expect(result.problems[0]!.detail).toContain('no valid signature');
+    expect(result.problems[0]!.detail).toContain('--allow-unsigned');
+  });
+
+  it('--allow-unsigned downgrades a never-signed chain to a warning (ok: true)', async () => {
+    const records = seal(sixEvents());
+    const store = open();
+    store.append(records);
+
+    const result = await verifyStore(store, { allowUnsigned: true });
+    expect(result.ok).toBe(true);
+    expect(result.problems).toHaveLength(1);
+    expect(result.problems[0]).toMatchObject({
+      type: 'no_valid_signature',
+      seq: 6,
+      warning: true,
+    });
+  });
+
+  it('a session_end in the unsigned tail FAILS even behind an otherwise-valid earlier signature', async () => {
+    const signer = await Signer.load(dir);
+    const events = sixEvents();
+    events.push(sessionEnd(SESSION_A, 6));
+    const records = seal(events);
+    const store = open();
+    store.append(records.slice(0, 3));
+    store.addSignature(await signer.sign(3, records[2]!.hash));
+    store.append(records.slice(3)); // seq 4..7, seq 7 is session_end, unsigned
+
+    const result = await verifyStore(store);
+    expect(result.ok).toBe(false);
+    expect(result.verified_signature?.seq).toBe(3);
+    expect(result.problems).toHaveLength(1);
+    expect(result.problems[0]).toMatchObject({ type: 'unsigned_session_end', seq: 7 });
+    expect(result.problems[0]!.warning).not.toBe(true);
+  });
+
+  it('--allow-unsigned downgrades an unsigned session_end tail to a warning (ok: true)', async () => {
+    const signer = await Signer.load(dir);
+    const events = sixEvents();
+    events.push(sessionEnd(SESSION_A, 6));
+    const records = seal(events);
+    const store = open();
+    store.append(records.slice(0, 3));
+    store.addSignature(await signer.sign(3, records[2]!.hash));
+    store.append(records.slice(3));
+
+    const result = await verifyStore(store, { allowUnsigned: true });
+    expect(result.ok).toBe(true);
+    expect(result.problems).toHaveLength(1);
+    expect(result.problems[0]).toMatchObject({
+      type: 'unsigned_session_end',
+      seq: 7,
+      warning: true,
+    });
   });
 
   it('an empty store verifies ok with no problems', async () => {
@@ -261,6 +339,32 @@ describe('verifyRecords', () => {
     expect(bad.ok).toBe(false);
     expect(bad.verified_signature).toBeUndefined();
     expect(bad.problems.some((p) => p.type === 'signature_invalid' && p.seq === 6)).toBe(true);
+  });
+
+  it('a chain rewritten and re-signed with a FRESH (foreign) key only fails once pinned', async () => {
+    // Attacker forges a self-consistent chain from scratch (own genesis
+    // walk) and signs its own head with a key they control — never touching
+    // the legitimate signer's key. Without pinning, the forged signature is
+    // cryptographically genuine and internally consistent, so it "verifies".
+    const events = sixEvents();
+    events[2] = toolCall(SESSION_A, 99, 'FORGED_TOOL');
+    const forged = seal(events);
+    const attacker = await Signer.load(join(dir, 'attacker'));
+    const forgedSig = await attacker.sign(6, forged[5]!.hash);
+
+    const unpinned = await verifyRecords(forged, [forgedSig]);
+    expect(unpinned.ok).toBe(true);
+    expect(unpinned.verified_signature?.public_key).toBe(attacker.publicKeyHex);
+
+    // The legitimate operator's own key (e.g. from identity.pub) rejects it.
+    const legitimate = await Signer.load(join(dir, 'legitimate'));
+    const pinned = await verifyRecords(forged, [forgedSig], {
+      expectedPublicKeyHex: legitimate.publicKeyHex,
+    });
+    expect(pinned.ok).toBe(false);
+    expect(pinned.verified_signature).toBeUndefined();
+    expect(pinned.problems.some((p) => p.type === 'signature_invalid' && p.seq === 6)).toBe(true);
+    expect(pinned.problems.some((p) => p.type === 'no_valid_signature')).toBe(true);
   });
 
   it('a malformed record is reported without aborting the walk', async () => {

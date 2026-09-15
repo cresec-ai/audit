@@ -51,6 +51,18 @@ function escapeJsonForScript(json: string): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
+/**
+ * Escape a value the TYPE SYSTEM says is a number (seq, duration_ms,
+ * bytes_len, ...) before interpolating it into HTML. TypeScript's types are
+ * not a runtime guarantee: a tampered/crafted store is read back with
+ * JSON.parse and cast, so a malicious store could put an HTML-shaped string
+ * where a number is expected. String(n) is a no-op for a real number, but
+ * this still escapes it defensively so that path can never inject markup.
+ */
+function num(n: unknown): string {
+  return escapeHtml(String(n));
+}
+
 function isRedactedRef(value: unknown): value is RedactedRef {
   return (
     typeof value === 'object' &&
@@ -76,13 +88,42 @@ function shortHex(value: string, n = 16): string {
 
 /* ----------------------------- scrubbed tree ---------------------------- */
 
-/** Lock chip for a RedactedRef: short ref visible, full ref in the title. */
+/** sha256:<64 hex> — matches a hashed object key (P1 key redaction). */
+const SHA256_REF_RE = /^sha256:[0-9a-fA-F]{64}$/;
+
+/**
+ * Lock chip for a RedactedRef: short ref visible, full ref in the title.
+ * secret_refs (tokens matched INSIDE this leaf, e.g. an AWS key embedded in
+ * a larger string) are exposed as a space-separated data-secret-refs
+ * attribute so the client-side blast-radius search — a CSS `~=` selector,
+ * which matches one whitespace-separated token exactly — can find them too.
+ */
 function lockChip(ref: RedactedRef): string {
+  const secretRefsAttr =
+    ref.secret_refs !== undefined && ref.secret_refs.length > 0
+      ? ` data-secret-refs="${escapeHtml(ref.secret_refs.join(' '))}"`
+      : '';
   return (
-    `<span class="lock" data-ref="${escapeHtml(ref.ref)}"` +
-    ` title="${escapeHtml(ref.ref)} (len ${ref.len})">` +
-    `\u{1F512} ${escapeHtml(shortRef(ref.ref))} <span class="len">(len ${ref.len})</span></span>`
+    `<span class="lock" data-ref="${escapeHtml(ref.ref)}"${secretRefsAttr}` +
+    ` title="${escapeHtml(ref.ref)} (len ${num(ref.len)})">` +
+    `\u{1F512} ${escapeHtml(shortRef(ref.ref))} <span class="len">(len ${num(ref.len)})</span></span>`
   );
+}
+
+/**
+ * Render an object key: a hashed key (P1 — object keys are redacted too)
+ * gets the same lock-chip treatment as a value, with data-ref set so the
+ * blast-radius search finds a needle that was used as a KEY, not just a
+ * value leaf.
+ */
+function renderKey(k: string): string {
+  if (SHA256_REF_RE.test(k)) {
+    return (
+      `<span class="key lock" data-ref="${escapeHtml(k)}" title="${escapeHtml(k)} (hashed key)">` +
+      `\u{1F512} ${escapeHtml(JSON.stringify(shortRef(k)))}</span>`
+    );
+  }
+  return `<span class="key">${escapeHtml(JSON.stringify(k))}</span>`;
 }
 
 /** Render a Scrubbed tree as pretty-printed JSON HTML with lock chips. */
@@ -93,7 +134,7 @@ function renderTree(value: Scrubbed, indent = 0): string {
     return `<span class="str">${escapeHtml(JSON.stringify(value))}</span>`;
   }
   if (typeof value === 'number' || typeof value === 'boolean') {
-    return `<span class="lit">${String(value)}</span>`;
+    return `<span class="lit">${escapeHtml(String(value))}</span>`;
   }
   const pad = '  '.repeat(indent);
   const inner = '  '.repeat(indent + 1);
@@ -105,10 +146,7 @@ function renderTree(value: Scrubbed, indent = 0): string {
   const keys = Object.keys(value);
   if (keys.length === 0) return '{}';
   const items = keys.map(
-    (k) =>
-      inner +
-      `<span class="key">${escapeHtml(JSON.stringify(k))}</span>: ` +
-      renderTree(value[k] as Scrubbed, indent + 1),
+    (k) => inner + renderKey(k) + ': ' + renderTree(value[k] as Scrubbed, indent + 1),
   );
   return '{\n' + items.join(',\n') + '\n' + pad + '}';
 }
@@ -145,7 +183,7 @@ function renderSessionStart(seq: number, e: SessionStartEvent): string {
     .filter((s) => s !== '')
     .map(escapeHtml)
     .join(' · ');
-  return `<article class="event card start" data-seq="${seq}">
+  return `<article class="event card start" data-seq="${num(seq)}">
   <div class="card-head"><span class="kind tag-start">SESSION START</span>${timeTag(e.timestamp)}</div>
   <dl>
     <dt>command</dt><dd><code>${escapeHtml(e.server.command)}</code> <span class="dim">(${escapeHtml(e.server.transport)})</span></dd>
@@ -159,13 +197,13 @@ function renderSessionStart(seq: number, e: SessionStartEvent): string {
 function renderInitialize(seq: number, e: InitializeEvent): string {
   const client = `${e.client_name ?? 'unknown client'}${e.client_version !== undefined ? ' ' + e.client_version : ''}`;
   const server = `${e.server_name ?? 'unknown server'}${e.server_version !== undefined ? ' ' + e.server_version : ''}`;
-  return `<article class="event card see" data-seq="${seq}">
+  return `<article class="event card see" data-seq="${num(seq)}">
   <div class="card-head"><span class="kind tag-see">SEE</span> handshake ${timeTag(e.timestamp)}</div>
   <div class="body">${escapeHtml(client)} ⇄ ${escapeHtml(server)}${
     e.protocol_version !== undefined
       ? ` <span class="dim">· protocol ${escapeHtml(e.protocol_version)}</span>`
       : ''
-  } <span class="dim">· ${e.duration_ms} ms</span></div>
+  } <span class="dim">· ${num(e.duration_ms)} ms</span></div>
 </article>`;
 }
 
@@ -176,7 +214,7 @@ function renderToolCall(seq: number, e: ToolCallEvent): string {
   let errorInfo = '';
   if (e.error !== undefined) {
     const bits: string[] = [];
-    if (e.error.code !== undefined) bits.push(`code ${e.error.code}`);
+    if (e.error.code !== undefined) bits.push(`code ${num(e.error.code)}`);
     if (e.error.type !== undefined) bits.push(escapeHtml(e.error.type));
     if (e.error.message_ref !== undefined) {
       bits.push(
@@ -187,12 +225,12 @@ function renderToolCall(seq: number, e: ToolCallEvent): string {
     }
     errorInfo = ` <span class="err-info">${bits.join(' · ')}</span>`;
   }
-  return `<article class="event card act" data-seq="${seq}" data-result-hash="${escapeHtml(e.result_hash)}">
+  return `<article class="event card act" data-seq="${num(seq)}" data-result-hash="${escapeHtml(e.result_hash)}">
   <div class="card-head act-head">
     <span class="kind tag-act">ACT</span>
     <span class="tool">${escapeHtml(e.tool)}</span>
     ${genAiBadge}${errorBadge}
-    <span class="dur">${e.duration_ms} ms</span>
+    <span class="dur">${num(e.duration_ms)} ms</span>
     ${timeTag(e.timestamp)}
   </div>
   <div class="sub">args <span class="dim">· request ${escapeHtml(String(e.request_id))}</span></div>
@@ -207,25 +245,27 @@ function renderToolCall(seq: number, e: ToolCallEvent): string {
 
 function renderRpc(seq: number, e: RpcEvent): string {
   const errorBadge = e.is_error ? ' <span class="badge err">error</span>' : '';
-  return `<article class="event row rpc" data-seq="${seq}" data-result-hash="${escapeHtml(e.result_hash)}">
+  return `<article class="event row rpc" data-seq="${num(seq)}" data-result-hash="${escapeHtml(e.result_hash)}">
   <span class="kind tag-rpc">RPC</span> <code>${escapeHtml(e.method)}</code>
-  <span class="dim">· request ${escapeHtml(String(e.request_id))} · ${e.duration_ms} ms · result <code title="${escapeHtml(e.result_hash)}">${escapeHtml(shortRef(e.result_hash))}</code></span>${errorBadge}
+  <span class="dim">· request ${escapeHtml(String(e.request_id))} · ${num(e.duration_ms)} ms · result <code title="${escapeHtml(e.result_hash)}">${escapeHtml(shortRef(e.result_hash))}</code></span>${errorBadge}
   ${timeTag(e.timestamp)}
+  <pre class="tree">${renderTree(e.params)}</pre>
 </article>`;
 }
 
 function renderNotification(seq: number, e: NotificationEvent): string {
   const arrow = e.direction === 'client_to_server' ? '→' : '←';
-  return `<article class="event row notif" data-seq="${seq}">
+  return `<article class="event row notif" data-seq="${num(seq)}">
   <span class="kind tag-notif">NOTIFY</span> ${arrow} <code>${escapeHtml(e.method)}</code>
   ${timeTag(e.timestamp)}
+  <pre class="tree">${renderTree(e.params)}</pre>
 </article>`;
 }
 
 function renderProtocolError(seq: number, e: ProtocolErrorEvent): string {
-  return `<article class="event row proto" data-seq="${seq}">
+  return `<article class="event row proto" data-seq="${num(seq)}">
   <span class="kind tag-proto">PROTOCOL</span> ${escapeHtml(e.reason)}
-  <span class="dim">· ${escapeHtml(e.direction)} · ${e.bytes_len} bytes · line <code title="${escapeHtml(e.line_hash)}">${escapeHtml(shortRef(e.line_hash))}</code></span>
+  <span class="dim">· ${escapeHtml(e.direction)} · ${num(e.bytes_len)} bytes · line <code title="${escapeHtml(e.line_hash)}">${escapeHtml(shortRef(e.line_hash))}</code></span>
   ${timeTag(e.timestamp)}
 </article>`;
 }
@@ -234,10 +274,10 @@ function renderSessionEnd(seq: number, e: SessionEndEvent): string {
   const exit =
     e.child_exit_code === undefined || e.child_exit_code === null
       ? ''
-      : ` · exit ${e.child_exit_code}`;
-  return `<article class="event card end" data-seq="${seq}">
+      : ` · exit ${num(e.child_exit_code)}`;
+  return `<article class="event card end" data-seq="${num(seq)}">
   <div class="card-head"><span class="kind tag-end">SESSION END</span>${timeTag(e.timestamp)}</div>
-  <div class="body">reason ${escapeHtml(e.reason)}${exit} · recorded ${e.events_recorded} · dropped ${e.events_dropped}</div>
+  <div class="body">reason ${escapeHtml(e.reason)}${exit} · recorded ${num(e.events_recorded)} · dropped ${num(e.events_dropped)}</div>
 </article>`;
 }
 
@@ -260,7 +300,7 @@ function renderEvent(record: ChainRecord): string {
       return renderSessionEnd(record.seq, e);
     default:
       // Future kinds: render an inert row rather than dropping evidence.
-      return `<article class="event row" data-seq="${record.seq}"><span class="kind">${escapeHtml(
+      return `<article class="event row" data-seq="${num(record.seq)}"><span class="kind">${escapeHtml(
         (e as AnyEvent).kind,
       )}</span> ${timeTag((e as AnyEvent).timestamp)}</article>`;
   }
@@ -277,17 +317,17 @@ function integrityBanner(verify: VerifyResult): string {
             shortHex(sig.public_key),
           )}</code> at ${escapeHtml(sig.signed_at)}`
         : 'head unsigned';
-    return `<div class="banner ok">✔ chain intact, ${verify.checked_events} events, ${signed}</div>`;
+    return `<div class="banner ok">✔ chain intact, ${num(verify.checked_events)} events, ${signed}</div>`;
   }
   const items = verify.problems
     .map(
       (p) =>
-        `<li><code>${escapeHtml(p.type)}</code> at seq ${p.seq}: ${escapeHtml(p.detail)}${
+        `<li><code>${escapeHtml(p.type)}</code> at seq ${num(p.seq)}: ${escapeHtml(p.detail)}${
           p.warning === true ? ' <span class="dim">(warning)</span>' : ''
         }</li>`,
     )
     .join('\n');
-  return `<div class="banner bad">✘ integrity check FAILED — ${verify.problems.length} problem(s)
+  return `<div class="banner bad">✘ integrity check FAILED — ${num(verify.problems.length)} problem(s)
 <ul>${items}</ul></div>`;
 }
 
@@ -301,9 +341,9 @@ function sessionPicker(sessions: SessionSummary[]): string {
   <td>${escapeHtml(s.started_at)}</td>
   <td>${escapeHtml(s.server_name)}</td>
   <td><code title="${escapeHtml(s.identity_fingerprint)}">${escapeHtml(shortHex(s.identity_fingerprint))}</code></td>
-  <td class="num">${s.event_count}</td>
-  <td class="num">${s.tool_call_count}</td>
-  <td class="num${s.error_count > 0 ? ' has-errors' : ''}">${s.error_count}</td>
+  <td class="num">${num(s.event_count)}</td>
+  <td class="num">${num(s.tool_call_count)}</td>
+  <td class="num${s.error_count > 0 ? ' has-errors' : ''}">${num(s.error_count)}</td>
 </tr>`;
     })
     .join('\n');
@@ -437,7 +477,7 @@ const PAGE_JS = `
       var hex = '';
       for (var i = 0; i < arr.length; i++) hex += arr[i].toString(16).padStart(2, '0');
       var ref = 'sha256:' + hex;
-      var sel = '[data-ref="' + ref + '"], [data-result-hash="' + ref + '"]';
+      var sel = '[data-ref="' + ref + '"], [data-result-hash="' + ref + '"], [data-secret-refs~="' + ref + '"]';
       var hits = document.querySelectorAll(sel);
       var seen = {};
       var events = 0;

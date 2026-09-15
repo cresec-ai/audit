@@ -70,6 +70,14 @@ export interface EvidenceStore {
   readonly path: string;
   head(): ChainHead;
   append(records: ChainRecord[]): void;
+  /**
+   * Seal raw events into chain records and append them, all under the
+   * store's own exclusive lock (the head is read INSIDE that lock, so this
+   * is safe to call from multiple processes sharing one data dir — unlike
+   * `append`, which trusts a head read by the caller). Returns the sealed
+   * records in the order they were written.
+   */
+  appendEvents(events: AnyEvent[]): ChainRecord[];
   addSignature(sig: HeadSignature): void;
   latestSignature(): HeadSignature | null;
   signatures(): HeadSignature[];
@@ -155,7 +163,22 @@ export type VerifyProblemType =
   | 'signature_chain_mismatch'
   | 'truncated_after_signature'
   | 'unsigned_tail'
-  | 'malformed_record';
+  | 'malformed_record'
+  /** Chain has events but not one valid (crypto-verified, correctly-linked,
+   *  correctly-keyed) signature attests any of it. Not a warning by default
+   *  — a chain nobody can be shown to have signed proves nothing. */
+  | 'no_valid_signature'
+  /** The unsigned suffix (see 'unsigned_tail') contains a session_end event.
+   *  The recorder signs on every flush, including the session_end flush, so
+   *  this is a stronger signal than a plain crash mid-session. */
+  | 'unsigned_session_end'
+  /** Bundle mode only (`verify --bundle`): manifest.json's declared range /
+   *  event_count / head_hash / signature don't match what events.jsonl and
+   *  public_key.pem actually contain. A bundle is a sealed, self-declared
+   *  artifact — any mismatch here means the bundle was hand-edited after
+   *  export (e.g. records appended past the signed head) and is an
+   *  unconditional failure, never a warning. */
+  | 'bundle_manifest_mismatch';
 
 export interface VerifyProblem {
   type: VerifyProblemType;
