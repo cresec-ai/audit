@@ -6,11 +6,18 @@
  * hashing it the exact same way and walking the chain for matching refs.
  *
  * Match locations, in preference order (one match per event):
- *   ref         — a RedactedRef leaf whose ref equals sha256(needle)
+ *   ref         — a RedactedRef leaf whose ref equals sha256(needle), OR whose
+ *                 secret_refs contains sha256(needle) (a token embedded in a
+ *                 larger leaf), OR an object KEY that was itself hashed to
+ *                 sha256(needle)
  *   result_hash — the event's result_hash equals sha256(needle)
  *   credential  — an identity credential fingerprint equals sha256(needle)
  *   name        — tool / method / server.name equals the needle (case-insensitive)
  *   plain       — a plain string leaf contains the needle (case-sensitive)
+ *
+ * A `ref` miss is not proof of absence: secret_refs only covers tokens that
+ * matched a known alwaysPatterns shape, and a plain-string miss is limited
+ * to whatever wasn't itself redacted.
  */
 
 import { sha256Ref } from '../chain/hash.js';
@@ -72,7 +79,16 @@ function walkTree(
   if (value === null || typeof value !== 'object') return;
   if (isRedactedRef(value)) {
     // RedactedRefs are atomic leaves: compare the ref, never their fields.
-    if (hits.ref === undefined && value.ref === needleHash) hits.ref = path;
+    if (hits.ref === undefined) {
+      if (value.ref === needleHash) {
+        hits.ref = path;
+      } else if (Array.isArray(value.secret_refs)) {
+        // A secret embedded INSIDE a larger leaf (e.g. "KEY=AKIA...\n"):
+        // the whole-leaf ref differs, but a matched token's hash is here.
+        const idx = value.secret_refs.indexOf(needleHash);
+        if (idx !== -1) hits.ref = `${path}.secret_refs[${idx}]`;
+      }
+    }
     return;
   }
   if (Array.isArray(value)) {
@@ -84,6 +100,12 @@ function walkTree(
   }
   const rec = value as Record<string, unknown>;
   for (const key of Object.keys(rec)) {
+    // An object KEY may itself have been hashed (P1 key redaction): a key
+    // that literally equals sha256(needle) means the needle was used as a
+    // key at this location, even though it's never a leaf VALUE.
+    if (hits.ref === undefined && key === needleHash) {
+      hits.ref = path + pathSegment(key) + '#key';
+    }
     walkTree(rec[key], path + pathSegment(key), needle, needleHash, hits);
     if (hits.ref !== undefined && hits.plain !== undefined) return;
   }

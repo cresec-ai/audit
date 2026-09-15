@@ -28,6 +28,15 @@ export interface RedactedRef {
   ref: Sha256Ref;
   /** Length of the original string in UTF-16 code units. */
   len: number;
+  /**
+   * Hashes of secret-shaped tokens (alwaysPatterns matches) found EMBEDDED
+   * within this leaf, e.g. an AWS key inside "AWS_ACCESS_KEY_ID=AKIA...\n".
+   * De-duplicated, capped at 8, excludes any hash equal to `ref` itself.
+   * Optional and additive (v1). A miss against `secret_refs` is NOT proof a
+   * value never appeared here — only alwaysPatterns-shaped tokens are
+   * captured this way; see docs/event-schema.md.
+   */
+  secret_refs?: Sha256Ref[];
 }
 
 /** JSON tree after edge redaction: structure preserved, sensitive leaves replaced. */

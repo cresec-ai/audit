@@ -6,10 +6,30 @@
  * by `RedactedRef`s (unsalted SHA-256 + length) unless the policy explicitly
  * allows them through. `scrub()` NEVER throws — a redaction failure must
  * degrade to "hash more", never to "record less" or "break traffic".
+ *
+ * The allowlist is POSITION- and VALUE-aware (P0 fix): a key being allowed
+ * is not enough — the value must also belong to a known structural
+ * vocabulary (an MCP content `type`, a `role`, a log `level`, ...), and
+ * `name` only passes at `tools[*].name` / `prompts[*].name` in list results.
+ * Everything else, including a bare `{name: ...}` / `{code: ...}` /
+ * `{status: ...}` anywhere else in the tree, is hashed. `code`, `status`,
+ * `kind` and `tool` were dropped from the allowlist entirely: no structural
+ * vocabulary for them is safe to define, so they always hash.
+ *
+ * `scrubToolArguments()` goes further still: under a tool_call's
+ * `arguments` subtree NOTHING passes, in ANY mode — every string leaf is
+ * hashed regardless of key or position. Arguments are the most
+ * attacker/user-controlled data the proxy ever sees, so this is a
+ * deliberately absolute rule, not merely "whatever the vocabulary allows".
  */
 
 import { sha256Ref } from '../chain/hash.js';
-import type { RedactedRef, Scrubbed, Sha256Ref } from '../schema/events.js';
+import type {
+  CredentialFingerprint,
+  RedactedRef,
+  Scrubbed,
+  Sha256Ref,
+} from '../schema/events.js';
 import type { RedactionPolicy, RedactorLike } from '../types.js';
 
 /** Literal stored (hashed) for function/symbol leaves. */
@@ -18,10 +38,42 @@ const UNSERIALIZABLE = '[unserializable]';
 const CIRCULAR = '[circular]';
 
 /**
- * Charset a string must satisfy to pass the allowlist: word chars plus a
- * small set of structural punctuation (paths, mime types, method names, ...).
+ * Charset a string must satisfy to pass under a CUSTOM (non-default) allowed
+ * key that has no dedicated structural-vocabulary rule below. Kept only for
+ * backward compatibility with callers who extend `allowKeys` via policy
+ * overrides; none of the shipped default keys use this fallback.
  */
 const STRUCTURAL_CHARSET = /^[\w .,@()\/:+#-]*$/;
+
+/** MCP content-block `type` values (text/image/audio/resource/...). */
+const CONTENT_TYPES = new Set(['text', 'image', 'audio', 'resource', 'resource_link']);
+/** MCP message `role` values. */
+const ROLES = new Set(['user', 'assistant']);
+/** MCP logging `level` values (RFC 5424 syslog severities). */
+const LOG_LEVELS = new Set([
+  'debug',
+  'info',
+  'notice',
+  'warning',
+  'error',
+  'critical',
+  'alert',
+  'emergency',
+]);
+const MIME_TYPE_RE = /^[\w.+-]+\/[\w.+-]+$/;
+const PROTOCOL_VERSION_RE = /^\d{4}-\d{2}-\d{2}$/;
+const METHOD_RE = /^[a-z]+(\/[a-zA-Z_]+)*$/;
+/** `name` value shape, valid ONLY at tools[*].name / prompts[*].name. */
+const LIST_NAME_RE = /^[\w.-]{1,64}$/;
+/** Array keys whose elements' own `name` field may pass (list results). */
+const LIST_ARRAY_KEYS = new Set(['tools', 'prompts']);
+
+/** Object-key shape that may survive un-hashed (subject to alwaysPatterns too). */
+const KEY_IDENT_RE = /^[A-Za-z_$][\w$-]{0,63}$/;
+
+/** Cap on `RedactedRef.secret_refs` — de-duplicated hashes of tokens matched
+ *  by alwaysPatterns INSIDE a larger leaf (not the whole-leaf ref itself). */
+const MAX_SECRET_REFS = 8;
 
 /**
  * Secret shapes hashed in EVERY mode. None of these carry the /g flag on
@@ -52,19 +104,9 @@ const ALWAYS_PATTERNS: RegExp[] = [
 
 export const DEFAULT_POLICY: RedactionPolicy = {
   mode: 'allowlist',
-  allowKeys: [
-    'type',
-    'name',
-    'kind',
-    'method',
-    'mimeType',
-    'role',
-    'protocolVersion',
-    'level',
-    'status',
-    'tool',
-    'code',
-  ],
+  // 'code', 'status', 'kind', 'tool' were dropped (P0): no structural
+  // vocabulary can safely bound their values, so they always hash now.
+  allowKeys: ['type', 'name', 'method', 'mimeType', 'role', 'protocolVersion', 'level'],
   maxAllowedStringLen: 64,
   alwaysPatterns: ALWAYS_PATTERNS,
   maxDepth: 32,
@@ -84,6 +126,17 @@ export function looksSecret(
     if (re.test(s)) return true;
   }
   return false;
+}
+
+/** Per-recursion-step context threaded through walk(). */
+interface WalkCtx {
+  /**
+   * Set to the enclosing array's own key for exactly ONE hop: from an array
+   * (e.g. "tools") to its element objects' OWN direct string children. Used
+   * only to validate `name` at `tools[*].name` / `prompts[*].name`; it must
+   * never survive a second hop (tools[*].inputSchema.name must NOT pass).
+   */
+  arrayKey?: string;
 }
 
 export class Redactor implements RedactorLike {
@@ -113,7 +166,7 @@ export class Redactor implements RedactorLike {
   /** Redact a JSON tree per policy. Never throws; worst case returns a ref. */
   scrub(value: unknown): Scrubbed {
     try {
-      return this.walk(value, undefined, 0, new Set());
+      return this.walk(value, undefined, 0, new Set(), {});
     } catch {
       // Should be unreachable; absolute backstop so scrub can never throw.
       return this.stringifyRef(value);
@@ -127,6 +180,7 @@ export class Redactor implements RedactorLike {
     key: string | undefined,
     depth: number,
     ancestors: Set<object>,
+    ctx: WalkCtx,
   ): Scrubbed {
     if (value === null || value === undefined) return null;
     switch (typeof value) {
@@ -134,9 +188,9 @@ export class Redactor implements RedactorLike {
       case 'boolean':
         return value;
       case 'string':
-        return this.scrubString(value, key);
+        return this.scrubString(value, key, ctx);
       case 'bigint':
-        return this.scrubString(String(value), key);
+        return this.scrubString(String(value), key, ctx);
       case 'function':
       case 'symbol':
         return this.refOf(UNSERIALIZABLE);
@@ -158,15 +212,26 @@ export class Redactor implements RedactorLike {
       if (Array.isArray(obj)) {
         const out: Scrubbed[] = [];
         for (const el of obj) {
-          // Array elements have no object key → never allow-listed.
-          out.push(this.walk(el, undefined, depth + 1, ancestors));
+          // Array elements have no object key of their own, but they DO
+          // inherit this array's key as `arrayKey` for one hop (so
+          // tools[*].name can be validated by the element's own walk).
+          out.push(this.walk(el, undefined, depth + 1, ancestors, { arrayKey: key }));
         }
         return out;
       }
       const rec = obj as Record<string, unknown>;
-      const out: { [k: string]: Scrubbed } = {};
+      // Object.create(null): a literal `__proto__` key must become a real
+      // own property, never silently set the prototype (P2).
+      const out: { [k: string]: Scrubbed } = Object.create(null);
       for (const k of Object.keys(rec)) {
-        out[k] = this.walk(rec[k], k, depth + 1, ancestors);
+        const v = rec[k];
+        // arrayKey is only meaningful for a direct string/bigint child (the
+        // one place it can still be consumed by scrubString); anything else
+        // (a nested object/array) must NOT inherit it further — that would
+        // let e.g. tools[*].inputSchema.name pass, which is out of scope.
+        const childCtx: WalkCtx =
+          typeof v === 'string' || typeof v === 'bigint' ? { arrayKey: ctx.arrayKey } : {};
+        out[this.scrubKey(k)] = this.walk(v, k, depth + 1, ancestors, childCtx);
       }
       return out;
     } finally {
@@ -174,24 +239,95 @@ export class Redactor implements RedactorLike {
     }
   }
 
-  private scrubString(v: string, key: string | undefined): Scrubbed {
+  /**
+   * Object keys are redacted too (P1): maps keyed by emails, usernames,
+   * file paths, header names, or a secret-shaped string must not land in
+   * clear, and a hashed key lets `query` find it too.
+   */
+  private scrubKey(k: string): string {
+    if (KEY_IDENT_RE.test(k) && !looksSecret(k, this.policy.alwaysPatterns)) return k;
+    return this.hashString(k);
+  }
+
+  private scrubString(v: string, key: string | undefined, ctx: WalkCtx): Scrubbed {
     // alwaysPatterns fire in EVERY mode.
     if (looksSecret(v, this.policy.alwaysPatterns)) return this.refOf(v);
     if (this.policy.mode === 'off') return v;
     // allowlist mode: a string passes only when ALL gates hold.
-    if (
-      key !== undefined &&
-      this.allowKeySet.has(key) &&
-      v.length <= this.policy.maxAllowedStringLen &&
-      STRUCTURAL_CHARSET.test(v)
-    ) {
-      return v;
-    }
+    if (key === undefined || !this.allowKeySet.has(key)) return this.refOf(v);
+    if (v.length > this.policy.maxAllowedStringLen) return this.refOf(v);
+    if (this.passesVocabulary(key, v, ctx)) return v;
     return this.refOf(v);
   }
 
+  /**
+   * Value-side gate for an allow-listed key: the value must belong to a
+   * known structural vocabulary, not merely "short and harmless-looking".
+   */
+  private passesVocabulary(key: string, v: string, ctx: WalkCtx): boolean {
+    switch (key) {
+      case 'type':
+        return CONTENT_TYPES.has(v);
+      case 'role':
+        return ROLES.has(v);
+      case 'level':
+        return LOG_LEVELS.has(v);
+      case 'mimeType':
+        return MIME_TYPE_RE.test(v);
+      case 'protocolVersion':
+        return PROTOCOL_VERSION_RE.test(v);
+      case 'method':
+        return METHOD_RE.test(v);
+      case 'name':
+        // Only tools[*].name / prompts[*].name in list results.
+        return ctx.arrayKey !== undefined && LIST_ARRAY_KEYS.has(ctx.arrayKey) && LIST_NAME_RE.test(v);
+      default:
+        // A custom key added via a policy override: best-effort fallback to
+        // the previous generic charset gate (not part of the frozen
+        // vocabulary above, which covers every DEFAULT_POLICY key).
+        return STRUCTURAL_CHARSET.test(v);
+    }
+  }
+
   private refOf(original: string): RedactedRef {
-    return { redacted: true, ref: this.hashString(original), len: original.length };
+    const ref = this.hashString(original);
+    const out: RedactedRef = { redacted: true, ref, len: original.length };
+    const secretRefs = this.extractSecretRefs(original, ref);
+    if (secretRefs !== undefined) out.secret_refs = secretRefs;
+    return out;
+  }
+
+  /**
+   * Blast radius miss fix (P1): when alwaysPatterns match tokens EMBEDDED in
+   * a larger leaf ("AWS_ACCESS_KEY_ID=AKIA...\n"), record the hash of each
+   * matched token too, so `query` can find a credential even when it never
+   * appeared as a whole leaf by itself. Capped and de-duplicated; excludes
+   * any token whose hash already equals the leaf's own `ref` (no point
+   * duplicating the primary ref).
+   */
+  private extractSecretRefs(v: string, wholeRef: Sha256Ref): Sha256Ref[] | undefined {
+    if (v.length < 8) return undefined; // shortest pattern is longer than this
+    const found: Sha256Ref[] = [];
+    const seen = new Set<string>([wholeRef]);
+    for (const re of this.policy.alwaysPatterns) {
+      const flags = re.flags.includes('g') ? re.flags : re.flags + 'g';
+      const g = new RegExp(re.source, flags);
+      let m: RegExpExecArray | null;
+      while ((m = g.exec(v)) !== null) {
+        const token = m[0];
+        if (token.length > 0) {
+          const tref = this.hashString(token);
+          if (!seen.has(tref)) {
+            seen.add(tref);
+            found.push(tref);
+            if (found.length >= MAX_SECRET_REFS) return found;
+          }
+        } else {
+          g.lastIndex++; // never loop forever on a zero-length match
+        }
+      }
+    }
+    return found.length > 0 ? found : undefined;
   }
 
   /** Collapse an arbitrary value to the ref of its JSON serialization. */
@@ -205,4 +341,147 @@ export class Redactor implements RedactorLike {
     }
     return this.refOf(s);
   }
+}
+
+/* -------------------------------------------------------------------- */
+/* tool_call.arguments lockdown (P0)                                    */
+/* -------------------------------------------------------------------- */
+
+function isRedactedRefLike(value: unknown): value is RedactedRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { redacted?: unknown }).redacted === true &&
+    typeof (value as { ref?: unknown }).ref === 'string'
+  );
+}
+
+/** Sweep an already-scrubbed tree and hash any surviving plain string leaf.
+ *  Object keys were already handled by the first `scrub()` pass; this only
+ *  ever touches string VALUES. */
+function lockdownStrings(redactor: RedactorLike, value: Scrubbed): Scrubbed {
+  if (typeof value === 'string') {
+    return { redacted: true, ref: redactor.hashString(value), len: value.length };
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (isRedactedRefLike(value)) return value; // already opaque; keep as-is
+  if (Array.isArray(value)) return value.map((el) => lockdownStrings(redactor, el));
+  const out: { [k: string]: Scrubbed } = Object.create(null);
+  const rec = value as { [k: string]: Scrubbed };
+  for (const k of Object.keys(rec)) out[k] = lockdownStrings(redactor, rec[k]);
+  return out;
+}
+
+/**
+ * Redact a tool_call's `arguments` tree. Stronger than `scrub()`: under
+ * `arguments` NOTHING passes, in ANY mode (including 'off') — every string
+ * leaf becomes a RedactedRef regardless of key or position. Arguments are
+ * the most attacker/user-controlled data the proxy ever sees (an agent can
+ * be tricked into calling a tool with anything as `name`/`code`/`status`/
+ * ...), so this is a deliberately absolute rule rather than "whatever the
+ * structural vocabulary allows". Implemented as `scrub()` (for its key
+ * hashing, secret detection, depth/cycle guards, and secret_refs) plus a
+ * sweep that hashes whatever plain strings are still standing — it only
+ * needs the public RedactorLike surface, so it works with any RedactorLike.
+ */
+export function scrubToolArguments(redactor: RedactorLike, value: unknown): Scrubbed {
+  return lockdownStrings(redactor, redactor.scrub(value));
+}
+
+/* -------------------------------------------------------------------- */
+/* argv scrubbing (P1) — ServerContext.command                           */
+/* -------------------------------------------------------------------- */
+
+/**
+ * Kept in sync with (but intentionally separate from) stdio.ts's own
+ * CREDENTIAL_NAME_RE, which fingerprints env var names — argv flag names
+ * use the identical shape.
+ */
+const CREDENTIAL_FLAG_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
+
+export interface ScrubbedArgv {
+  /** argv.join(' ') with secret-looking elements replaced by sha256:<hex>. */
+  command: string;
+  /** Fingerprints of every replaced/stripped element, so `query` still finds them. */
+  fingerprints: CredentialFingerprint[];
+}
+
+/** '--token' / '-t' -> 'token' / 't'; anything else -> undefined. */
+function flagName(arg: string): string | undefined {
+  const m = /^--?([A-Za-z][\w-]*)$/.exec(arg);
+  return m?.[1];
+}
+
+/** A URL carrying userinfo: strip it, keep scheme+host+path. Undefined if
+ *  `s` isn't a URL, or is one without userinfo. */
+function stripUrlUserinfo(s: string): { stripped: string; userinfo: string } | undefined {
+  let url: URL;
+  try {
+    url = new URL(s);
+  } catch {
+    return undefined;
+  }
+  if (!url.username && !url.password) return undefined;
+  const userinfo = url.password ? `${url.username}:${url.password}` : url.username;
+  return { stripped: `${url.protocol}//${url.host}${url.pathname}`, userinfo };
+}
+
+/**
+ * Wrapped command argv leak fix (P1): `ServerContext.command` is stamped on
+ * every event, rendered by replay, and shipped in export bundles, so a raw
+ * `argv.join(' ')` leaks `--api-key sk-...`, `--token ...`, and DSNs like
+ * `postgres://user:pass@host` verbatim. Scrubs each element:
+ *   - looks secret-shaped (looksSecret / alwaysPatterns) -> hashed whole
+ *   - is a URL with userinfo -> userinfo stripped, scheme+host+path kept
+ *   - is (or follows) a flag whose name looks credential-ish -> hashed whole
+ * Every replaced/stripped piece is also recorded as a CredentialFingerprint
+ * so a blast-radius `query` for the leaked value still finds it.
+ */
+export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv {
+  const fingerprints: CredentialFingerprint[] = [];
+  const out: string[] = [];
+
+  const fingerprint = (name: string, value: string): Sha256Ref => {
+    const ref = redactor.hashString(value);
+    fingerprints.push({ name, ref });
+    return ref;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const el = argv[i]!;
+
+    // --flag=value half carrying a credential-ish flag name.
+    const eq = el.indexOf('=');
+    if (eq > 0 && el.startsWith('-')) {
+      const fname = flagName(el.slice(0, eq));
+      if (fname !== undefined && CREDENTIAL_FLAG_RE.test(fname)) {
+        out.push(el.slice(0, eq + 1) + fingerprint(fname, el.slice(eq + 1)));
+        continue;
+      }
+    }
+
+    // A standalone value following a credential-ish flag (previous element).
+    const prevName = i > 0 ? flagName(argv[i - 1]!) : undefined;
+    if (prevName !== undefined && CREDENTIAL_FLAG_RE.test(prevName) && !el.startsWith('-')) {
+      out.push(fingerprint(prevName, el));
+      continue;
+    }
+
+    if (looksSecret(el)) {
+      out.push(fingerprint(`argv[${i}]`, el));
+      continue;
+    }
+
+    const urlHit = stripUrlUserinfo(el);
+    if (urlHit !== undefined) {
+      fingerprint(`argv[${i}]`, urlHit.userinfo);
+      out.push(urlHit.stripped);
+      continue;
+    }
+
+    out.push(el);
+  }
+
+  return { command: out.join(' '), fingerprints };
 }

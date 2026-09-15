@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { canonicalJson, sha256Ref } from '../src/chain/hash.js';
 import type { RedactedRef, Scrubbed } from '../src/schema/events.js';
-import { DEFAULT_POLICY, Redactor, looksSecret } from '../src/redact/redactor.js';
+import {
+  DEFAULT_POLICY,
+  Redactor,
+  looksSecret,
+  scrubArgv,
+  scrubToolArguments,
+} from '../src/redact/redactor.js';
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -72,18 +78,68 @@ describe('allowlist mode gates', () => {
     expect(DEFAULT_POLICY.mode).toBe('allowlist');
   });
 
-  it('allow-listed key with structural short value passes', () => {
-    expect(redactor.scrub({ name: 'read_file' })).toEqual({ name: 'read_file' });
+  it('dropped keys (code, status, kind, tool) never pass, regardless of value', () => {
+    for (const key of ['code', 'status', 'kind', 'tool']) {
+      const out = redactor.scrub({ [key]: 'harmless' }) as Record<string, Scrubbed>;
+      expect(isRedactedRef(out[key]!), `expected "${key}" to be redacted`).toBe(true);
+    }
   });
 
-  it('allow-listed key with value longer than maxAllowedStringLen is redacted', () => {
-    const long = 'word '.repeat(14).trim(); // 69 chars, structural charset, no secret shape
+  it('allow-listed key passes only when the value matches its structural vocabulary', () => {
+    expect(redactor.scrub({ type: 'text' })).toEqual({ type: 'text' });
+    expect(redactor.scrub({ type: 'resource_link' })).toEqual({ type: 'resource_link' });
+    expect(redactor.scrub({ role: 'assistant' })).toEqual({ role: 'assistant' });
+    expect(redactor.scrub({ level: 'warning' })).toEqual({ level: 'warning' });
+    expect(redactor.scrub({ mimeType: 'text/plain' })).toEqual({ mimeType: 'text/plain' });
+    expect(redactor.scrub({ protocolVersion: '2025-03-26' })).toEqual({
+      protocolVersion: '2025-03-26',
+    });
+    expect(redactor.scrub({ method: 'resources/read' })).toEqual({ method: 'resources/read' });
+  });
+
+  it('allow-listed key with a value outside the vocabulary is redacted', () => {
+    // 'type' is allow-listed, but 'json' is not an MCP content-block type.
+    const out = redactor.scrub({ type: 'json' }) as { type: Scrubbed };
+    expect(isRedactedRef(out.type)).toBe(true);
+    // 'role' only admits user/assistant.
+    const role = redactor.scrub({ role: 'system' }) as { role: Scrubbed };
+    expect(isRedactedRef(role.role)).toBe(true);
+    // 'method' must be lowercase-slash-shaped.
+    const method = redactor.scrub({ method: 'Tools/Call' }) as { method: Scrubbed };
+    expect(isRedactedRef(method.method)).toBe(true);
+  });
+
+  it('a long value longer than maxAllowedStringLen is redacted even if vocabulary-shaped', () => {
+    const long = 'a/' + 'b'.repeat(70); // matches METHOD_RE's shape, but far over 64 chars
     expect(long.length).toBeGreaterThan(64);
-    const out = redactor.scrub({ name: long }) as { name: Scrubbed };
-    expect(isRedactedRef(out.name)).toBe(true);
-    const ref = out.name as RedactedRef;
+    const out = redactor.scrub({ method: long }) as { method: Scrubbed };
+    expect(isRedactedRef(out.method)).toBe(true);
+    const ref = out.method as RedactedRef;
     expect(ref.ref).toBe(sha256Ref(long));
     expect(ref.len).toBe(long.length);
+  });
+
+  it('name passes ONLY at tools[*].name / prompts[*].name in list results', () => {
+    expect(redactor.scrub({ tools: [{ name: 'read_file' }] })).toEqual({
+      tools: [{ name: 'read_file' }],
+    });
+    expect(redactor.scrub({ prompts: [{ name: 'summarize' }] })).toEqual({
+      prompts: [{ name: 'summarize' }],
+    });
+    // Bare top-level `name` (the P0 leak shape) is NOT a list result.
+    const bare = redactor.scrub({ name: 'read_file' }) as { name: Scrubbed };
+    expect(isRedactedRef(bare.name)).toBe(true);
+    // Nested one hop too far — tools[*].inputSchema.name — must NOT pass.
+    const nested = redactor.scrub({
+      tools: [{ name: 'read_file', inputSchema: { name: 'not-the-tool-name' } }],
+    }) as { tools: Array<{ name: Scrubbed; inputSchema: { name: Scrubbed } }> };
+    expect(nested.tools[0]!.name).toBe('read_file');
+    expect(isRedactedRef(nested.tools[0]!.inputSchema.name)).toBe(true);
+    // An array keyed something else entirely never grants the exemption.
+    const wrongArray = redactor.scrub({ items: [{ name: 'read_file' }] }) as {
+      items: Array<{ name: Scrubbed }>;
+    };
+    expect(isRedactedRef(wrongArray.items[0]!.name)).toBe(true);
   });
 
   it('top-level string has no key and is always redacted', () => {
@@ -93,8 +149,8 @@ describe('allowlist mode gates', () => {
   });
 
   it('array-element strings have no key and are always redacted', () => {
-    const out = redactor.scrub({ name: ['read_file'] }) as { name: Scrubbed[] };
-    expect(isRedactedRef(out.name[0]!)).toBe(true);
+    const out = redactor.scrub({ tools: ['read_file'] }) as { tools: Scrubbed[] };
+    expect(isRedactedRef(out.tools[0]!)).toBe(true);
   });
 
   it('non-allow-listed key is redacted even when the value looks harmless', () => {
@@ -105,14 +161,20 @@ describe('allowlist mode gates', () => {
     expect(ref.len).toBe('/etc/passwd'.length);
   });
 
-  it('non-structural charset is redacted even under an allow-listed key', () => {
-    const out = redactor.scrub({ name: 'why? "quotes" & ampersands' }) as { name: Scrubbed };
-    expect(isRedactedRef(out.name)).toBe(true);
+  it('non-structural charset is redacted even at a valid tools[*].name position', () => {
+    const out = redactor.scrub({ tools: [{ name: 'why? "quotes" & ampersands' }] }) as {
+      tools: Array<{ name: Scrubbed }>;
+    };
+    expect(isRedactedRef(out.tools[0]!.name)).toBe(true);
   });
 
-  it('secret shape under an allow-listed key is still redacted', () => {
-    const out = redactor.scrub({ name: SECRETS.aws }) as { name: Scrubbed };
-    expect(isRedactedRef(out.name)).toBe(true);
+  it('secret shape under an allow-listed key is still redacted, position notwithstanding', () => {
+    const bare = redactor.scrub({ name: SECRETS.aws }) as { name: Scrubbed };
+    expect(isRedactedRef(bare.name)).toBe(true);
+    const positioned = redactor.scrub({ tools: [{ name: SECRETS.aws }] }) as {
+      tools: Array<{ name: Scrubbed }>;
+    };
+    expect(isRedactedRef(positioned.tools[0]!.name)).toBe(true);
   });
 });
 
@@ -132,8 +194,14 @@ describe('non-string leaves', () => {
   });
 
   it('bigint is stringified then treated as a string', () => {
-    // 'code' is allow-listed, short, structural → passes as the string form
-    expect(redactor.scrub({ code: 42n })).toEqual({ code: '42' });
+    // Even under an allow-listed key, a bigint's digit-only string form
+    // never matches any structural vocabulary (role/type/level/...), so it
+    // always hashes — there is no key that lets a bare number through.
+    const roleOut = redactor.scrub({ role: 42n }) as { role: Scrubbed };
+    expect(isRedactedRef(roleOut.role)).toBe(true);
+    expect((roleOut.role as RedactedRef).ref).toBe(sha256Ref('42'));
+    expect((roleOut.role as RedactedRef).len).toBe(2);
+
     const out = redactor.scrub({ count: 123n }) as { count: Scrubbed };
     expect(isRedactedRef(out.count)).toBe(true);
     expect((out.count as RedactedRef).ref).toBe(sha256Ref('123'));
@@ -201,11 +269,11 @@ describe('depth bombs and cycles never throw, never leak', () => {
   });
 
   it('shared (non-circular) references are scrubbed normally, not flagged circular', () => {
-    const shared = { name: 'shared_node' };
+    const shared = { mimeType: 'text/plain' };
     const redactor = new Redactor();
     const out = redactor.scrub({ a: shared, b: shared }) as { a: Scrubbed; b: Scrubbed };
-    expect(out.a).toEqual({ name: 'shared_node' });
-    expect(out.b).toEqual({ name: 'shared_node' });
+    expect(out.a).toEqual({ mimeType: 'text/plain' });
+    expect(out.b).toEqual({ mimeType: 'text/plain' });
   });
 });
 
@@ -254,5 +322,235 @@ describe('looksSecret', () => {
     expect(looksSecret('secret-123', sticky)).toBe(true);
     expect(looksSecret('secret-123', sticky)).toBe(true);
     expect(looksSecret('secret-123', sticky)).toBe(true);
+  });
+});
+
+/* ------------------------------ key redaction --------------------------- */
+
+describe('object keys are redacted too (P1)', () => {
+  const redactor = new Redactor();
+
+  it('an identifier-shaped, non-secret key is kept as-is', () => {
+    const out = redactor.scrub({ user_id: 'x' }) as Record<string, Scrubbed>;
+    expect(Object.keys(out)).toEqual(['user_id']);
+  });
+
+  it('a non-identifier key (email, path, header line) is hashed to sha256:<hex>', () => {
+    // Hyphenated identifiers (e.g. plain header NAMES) are allowed by the
+    // key-shape regex on purpose — '@', '/', ':' and spaces are not.
+    for (const key of ['alice@corp.example.com', '/etc/passwd', 'X-My-Header: value']) {
+      const out = redactor.scrub({ [key]: 'v' }) as Record<string, Scrubbed>;
+      const outKeys = Object.keys(out);
+      expect(outKeys).toHaveLength(1);
+      expect(outKeys[0]).toBe(sha256Ref(key));
+      expect(outKeys[0]).not.toBe(key);
+    }
+  });
+
+  it('a secret-shaped key is hashed even though it is a valid identifier', () => {
+    // AKIA... has no punctuation, so it WOULD pass the identifier regex —
+    // alwaysPatterns must still catch it.
+    const out = redactor.scrub({ [SECRETS.aws]: true }) as Record<string, Scrubbed>;
+    const outKeys = Object.keys(out);
+    expect(outKeys).toEqual([sha256Ref(SECRETS.aws)]);
+  });
+
+  it('secret-shaped keys are hashed in "off" mode too', () => {
+    const off = new Redactor({ mode: 'off' });
+    const out = off.scrub({ [SECRETS.aws]: true }) as Record<string, Scrubbed>;
+    expect(Object.keys(out)).toEqual([sha256Ref(SECRETS.aws)]);
+  });
+
+  it('a literal "__proto__" key survives as a real own property, not the prototype', () => {
+    // Simulate a real wire message: JSON.parse uses CreateDataProperty, so
+    // __proto__ lands as a genuine own key (unlike an object literal, where
+    // `{__proto__: x}` sets the prototype instead — that is a fixture bug,
+    // not a Redactor bug, and is NOT what reaches scrub() from the wire).
+    const input = JSON.parse('{"__proto__":{"hidden":"value"}}') as unknown;
+    expect(Object.prototype.hasOwnProperty.call(input, '__proto__')).toBe(true);
+
+    const out = redactor.scrub(input) as Record<string, Scrubbed>;
+    expect(Object.prototype.hasOwnProperty.call(out, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(out)).toBeNull();
+
+    // And it survives a JSON round-trip (JSON.parse is always safe here).
+    const roundTripped = JSON.parse(JSON.stringify(out)) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(roundTripped, '__proto__')).toBe(true);
+  });
+
+  it('queryStore-style consumers can find a needle used only as a key', () => {
+    // redact.test.ts only asserts the redactor's own output shape; the
+    // corresponding blast-radius behavior is covered in query.test.ts.
+    const out = redactor.scrub({ 'alice@corp.example.com': { role: 'admin' } }) as Record<
+      string,
+      Scrubbed
+    >;
+    expect(Object.keys(out)[0]).toBe(sha256Ref('alice@corp.example.com'));
+  });
+});
+
+/* ------------------------------ secret_refs ------------------------------ */
+
+describe('secret_refs: tokens embedded inside a larger leaf (P1 blast-radius miss)', () => {
+  const redactor = new Redactor();
+
+  it('an embedded AWS key produces a secret_refs entry distinct from the whole-leaf ref', () => {
+    const leaf = `AWS_ACCESS_KEY_ID=${SECRETS.aws}\n`;
+    const out = redactor.scrub({ body: leaf }) as { body: RedactedRef };
+    expect(out.body.redacted).toBe(true);
+    expect(out.body.ref).toBe(sha256Ref(leaf)); // whole-leaf ref unchanged
+    expect(out.body.secret_refs).toBeDefined();
+    expect(out.body.secret_refs).toContain(sha256Ref(SECRETS.aws));
+  });
+
+  it('a leaf that IS exactly the secret gets no redundant secret_refs entry', () => {
+    const out = redactor.scrub({ key: SECRETS.aws }) as { key: RedactedRef };
+    expect(out.key.ref).toBe(sha256Ref(SECRETS.aws));
+    // The whole-leaf ref already covers this; no redundant secret_refs.
+    expect(out.key.secret_refs).toBeUndefined();
+  });
+
+  it('multiple distinct embedded tokens are each captured, de-duplicated and capped', () => {
+    const leaf = `here is the key: ${SECRETS.aws} and again: ${SECRETS.aws} and also ${SECRETS.github}`;
+    const out = redactor.scrub({ text: leaf }) as { text: RedactedRef };
+    expect(out.text.secret_refs).toBeDefined();
+    const refs = out.text.secret_refs!;
+    expect(refs).toContain(sha256Ref(SECRETS.aws));
+    expect(refs).toContain(sha256Ref(SECRETS.github));
+    // de-duplicated: the repeated AWS key only appears once.
+    expect(refs.filter((r) => r === sha256Ref(SECRETS.aws))).toHaveLength(1);
+  });
+
+  it('a plain leaf with nothing secret-shaped inside has no secret_refs', () => {
+    const out = redactor.scrub({ path: '/etc/passwd' }) as { path: RedactedRef };
+    expect(out.path.secret_refs).toBeUndefined();
+  });
+});
+
+/* --------------------------- scrubToolArguments -------------------------- */
+
+describe('scrubToolArguments: nothing passes under tool_call.arguments (P0)', () => {
+  it('hashes every string leaf regardless of key, in allowlist mode', () => {
+    const redactor = new Redactor();
+    const out = scrubToolArguments(redactor, {
+      name: 'John Smith',
+      code: 'cat /etc/shadow',
+      status: 'fired for misconduct',
+      type: 'text', // even a normally-passing vocabulary value is hashed here
+      nested: { role: 'user', mimeType: 'text/plain' },
+      list: ['a', 'b'],
+    }) as Record<string, unknown>;
+
+    function assertAllStringsRedacted(v: unknown): void {
+      if (typeof v === 'string') throw new Error('found a raw string leaf: ' + v);
+      if (v === null || typeof v !== 'object') return;
+      if ((v as RedactedRef).redacted === true) return;
+      for (const child of Array.isArray(v) ? v : Object.values(v as object)) {
+        assertAllStringsRedacted(child);
+      }
+    }
+    assertAllStringsRedacted(out);
+
+    const name = out.name as RedactedRef;
+    expect(name.redacted).toBe(true);
+    expect(name.ref).toBe(sha256Ref('John Smith'));
+    const nested = out.nested as { role: RedactedRef; mimeType: RedactedRef };
+    expect(nested.role.ref).toBe(sha256Ref('user'));
+    expect(nested.mimeType.ref).toBe(sha256Ref('text/plain'));
+  });
+
+  it('hashes every string leaf even in "off" mode — arguments are always locked', () => {
+    const off = new Redactor({ mode: 'off' });
+    const out = scrubToolArguments(off, { greeting: 'hello world' }) as {
+      greeting: RedactedRef;
+    };
+    expect(out.greeting.redacted).toBe(true);
+    expect(out.greeting.ref).toBe(sha256Ref('hello world'));
+  });
+
+  it('object keys are still hashed under arguments, same as scrub()', () => {
+    const redactor = new Redactor();
+    const out = scrubToolArguments(redactor, {
+      'alice@corp.example.com': { role: 'admin' },
+    }) as Record<string, unknown>;
+    expect(Object.keys(out)).toEqual([sha256Ref('alice@corp.example.com')]);
+  });
+
+  it('a secret embedded in an argument still yields secret_refs', () => {
+    const redactor = new Redactor();
+    const out = scrubToolArguments(redactor, {
+      body: `AWS_ACCESS_KEY_ID=${SECRETS.aws}\n`,
+    }) as { body: RedactedRef };
+    expect(out.body.secret_refs).toContain(sha256Ref(SECRETS.aws));
+  });
+
+  it('numbers and booleans still pass through (only strings are locked down)', () => {
+    const redactor = new Redactor();
+    const out = scrubToolArguments(redactor, { n: 42, b: true, z: null }) as Record<
+      string,
+      unknown
+    >;
+    expect(out).toEqual({ n: 42, b: true, z: null });
+  });
+});
+
+/* ------------------------------- scrubArgv -------------------------------- */
+
+describe('scrubArgv: wrapped command argv leak fix (P1)', () => {
+  const redactor = new Redactor();
+
+  it('leaves an ordinary argv untouched', () => {
+    const argv = ['npx', '-y', '@modelcontextprotocol/server-filesystem', '/Users/me/projects'];
+    const out = scrubArgv(argv, redactor);
+    expect(out.command).toBe(argv.join(' '));
+    expect(out.fingerprints).toEqual([]);
+  });
+
+  it('hashes a --flag=value credential half and fingerprints it', () => {
+    const out = scrubArgv(['cmd', '--api-key=sk-live-ABCDEFGHIJKLMNOP'], redactor);
+    expect(out.command).not.toContain('sk-live-ABCDEFGHIJKLMNOP');
+    expect(out.command).toMatch(/^cmd --api-key=sha256:[0-9a-f]{64}$/);
+    expect(out.fingerprints).toHaveLength(1);
+    expect(out.fingerprints[0]).toEqual({
+      name: 'api-key',
+      ref: sha256Ref('sk-live-ABCDEFGHIJKLMNOP'),
+    });
+  });
+
+  it('hashes a standalone value following a --token flag and fingerprints it', () => {
+    const out = scrubArgv(['cmd', '--token', 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'], redactor);
+    expect(out.command).not.toContain('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456');
+    expect(out.command).toBe(`cmd --token ${sha256Ref('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456')}`);
+    expect(out.fingerprints).toEqual([
+      { name: 'token', ref: sha256Ref('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456') },
+    ]);
+  });
+
+  it('does not consume the next flag as a value when a credential flag has none', () => {
+    const out = scrubArgv(['cmd', '--token', '--verbose'], redactor);
+    expect(out.command).toBe('cmd --token --verbose');
+    expect(out.fingerprints).toEqual([]);
+  });
+
+  it('strips userinfo from a DSN-style URL, keeping scheme+host+path', () => {
+    const dsn = 'postgres://admin:S3cretPassw0rd@db.internal/prod';
+    const out = scrubArgv(['cmd', dsn], redactor);
+    expect(out.command).toBe('cmd postgres://db.internal/prod');
+    expect(out.command).not.toContain('S3cretPassw0rd');
+    expect(out.fingerprints).toEqual([
+      { name: 'argv[1]', ref: sha256Ref('admin:S3cretPassw0rd') },
+    ]);
+  });
+
+  it('hashes a whole element that looks secret on its own (no flag involved)', () => {
+    const out = scrubArgv(['cmd', SECRETS.aws], redactor);
+    expect(out.command).toBe(`cmd ${sha256Ref(SECRETS.aws)}`);
+    expect(out.fingerprints).toEqual([{ name: 'argv[1]', ref: sha256Ref(SECRETS.aws) }]);
+  });
+
+  it('a blast-radius query can find the leaked value via the fingerprint ref', () => {
+    const out = scrubArgv(['cmd', '--password', 'hunter2hunter2'], redactor);
+    const needleHash = sha256Ref('hunter2hunter2');
+    expect(out.fingerprints.some((f) => f.ref === needleHash)).toBe(true);
   });
 });

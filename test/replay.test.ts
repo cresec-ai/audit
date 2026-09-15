@@ -7,7 +7,7 @@ import { openStore } from '../src/store/index.js';
 import { Redactor } from '../src/redact/redactor.js';
 import { renderTimelineHtml, MAX_EMBED_EVENTS } from '../src/replay/render.js';
 import { serveUi } from '../src/replay/serve.js';
-import type { ChainHead, EvidenceStore, VerifyResult } from '../src/types.js';
+import type { ChainHead, EvidenceStore, SessionSummary, VerifyResult } from '../src/types.js';
 import type {
   AnyEvent,
   ChainRecord,
@@ -432,3 +432,148 @@ describe('serveUi', () => {
     await expect(handle.close()).resolves.toBeUndefined();
   });
 });
+
+/* --------------------- P1: rpc/notification params visible -------------- */
+
+describe('renderTimelineHtml renders rpc/notification params (P1 blast-radius gap)', () => {
+  let dir: string;
+  let store: EvidenceStore;
+  const EMAIL_KEY = 'alice@corp.example.com';
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-replay-params-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    const redactor = new Redactor();
+    const rpcWithParams: RpcEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:02.000Z'),
+      kind: 'rpc',
+      method: 'resources/read',
+      request_id: 9,
+      params: redactor.scrub({ uri: SECRET, users: { [EMAIL_KEY]: { role: 'admin' } } }),
+      result_hash: sha256Ref('{}'),
+      is_error: false,
+      duration_ms: 3,
+    };
+    const notifWithParams: NotificationEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:03.000Z'),
+      kind: 'notification',
+      method: 'notifications/message',
+      direction: 'server_to_client',
+      params: redactor.scrub({ data: SECRET }),
+    };
+    store.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z'), rpcWithParams, notifWithParams]));
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('an rpc params RedactedRef is present in the HTML as a matchable lock chip', () => {
+    const html = renderTimelineHtml(store);
+    expect(html).toContain(`data-ref="${sha256Ref(SECRET)}"`);
+  });
+
+  it('a hashed object KEY inside params is rendered with data-ref too', () => {
+    const html = renderTimelineHtml(store);
+    expect(html).toContain(`data-ref="${sha256Ref(EMAIL_KEY)}"`);
+    expect(html).not.toContain(EMAIL_KEY);
+  });
+});
+
+/* -------------------- P2: numeric-field interpolation is escaped --------- */
+
+describe('render.ts escapes fields the TYPE SYSTEM merely claims are numeric', () => {
+  const XSS = '1"><script>alert(1)</script>';
+
+  /** A minimal EvidenceStore over hand-built (possibly type-lying) records —
+   *  simulates reading back a tampered on-disk store, which JSON.parse
+   *  happily deserializes without enforcing the declared TS types. */
+  function mockStore(records: ChainRecord[]): EvidenceStore {
+    return {
+      backend: 'jsonl',
+      path: '/fake/evidence.jsonl',
+      head: () => ({ seq: records.length, hash: GENESIS_HASH }),
+      append: () => undefined,
+      addSignature: () => undefined,
+      latestSignature: () => null,
+      signatures: () => [],
+      iterate: () => records,
+      count: () => records.length,
+      sessions: (): SessionSummary[] => [],
+      close: () => undefined,
+    };
+  }
+
+  function record(event: AnyEvent): ChainRecord {
+    return { seq: 1, prev_hash: GENESIS_HASH, hash: 'a'.repeat(64), event };
+  }
+
+  it('an rpc.duration_ms that is actually a string is escaped, not injected raw', () => {
+    const evilEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      kind: 'rpc',
+      method: 'tools/list',
+      request_id: 1,
+      params: {},
+      result_hash: sha256Ref('{}'),
+      is_error: false,
+      duration_ms: XSS,
+    } as unknown as RpcEvent;
+    const html = renderTimelineHtml(mockStore([record(evilEvent)]), { sessionId: SESSION_A });
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain(escapeHtmlLike(XSS));
+  });
+
+  it('a protocol_error.bytes_len that is actually a string is escaped', () => {
+    const evilEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      kind: 'protocol_error',
+      direction: 'server_to_client',
+      reason: 'oversized',
+      bytes_len: XSS,
+      line_hash: sha256Ref('x'),
+    } as unknown as ProtocolErrorEvent;
+    const html = renderTimelineHtml(mockStore([record(evilEvent)]), { sessionId: SESSION_A });
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain(escapeHtmlLike(XSS));
+  });
+
+  it('a session_end.events_recorded that is actually a string is escaped', () => {
+    const evilEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      kind: 'session_end',
+      reason: 'child_exit',
+      child_exit_code: 0,
+      events_recorded: XSS,
+      events_dropped: 0,
+    } as unknown as SessionEndEvent;
+    const html = renderTimelineHtml(mockStore([record(evilEvent)]), { sessionId: SESSION_A });
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain(escapeHtmlLike(XSS));
+  });
+
+  it('a tampered seq (data-seq attribute context) is escaped, never breaks out of the attribute', () => {
+    const evilEvent: NotificationEvent = {
+      ...base(SESSION_A, '2026-06-11T10:00:00.000Z'),
+      kind: 'notification',
+      method: 'notifications/progress',
+      direction: 'server_to_client',
+      params: {},
+    };
+    const evilRecord = { ...record(evilEvent), seq: '1"><script>alert(1)</script>' } as unknown as ChainRecord;
+    const html = renderTimelineHtml(mockStore([evilRecord]), { sessionId: SESSION_A });
+    expect(html).not.toContain('<script>alert(1)</script>');
+  });
+});
+
+/** Mirrors render.ts's private escapeHtml() so tests can assert the exact
+ *  escaped form without exporting an internal. */
+function escapeHtmlLike(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}

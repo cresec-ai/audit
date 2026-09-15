@@ -30,6 +30,7 @@ import type {
   ToolCallEvent,
 } from '../schema/events.js';
 import { SCHEMA } from '../schema/events.js';
+import { scrubArgv } from '../redact/redactor.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
 import { LineScanner, type ScannedLine } from './framing.js';
 
@@ -174,6 +175,22 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     tapError(err);
   }
 
+  // Wrapped command argv leak fix (P1): a raw argv.join(' ') stamped on every
+  // event verbatim would leak `--api-key sk-...` / `--token ...` / DSNs with
+  // userinfo. scrubArgv() hashes credential-shaped elements and strips URL
+  // userinfo; every replaced piece is also fingerprinted so `query` finds it.
+  let scrubbedCommand = opts.command.join(' ');
+  try {
+    const scrubbedArgv = scrubArgv(opts.command, redactor);
+    scrubbedCommand = scrubbedArgv.command;
+    for (const fp of scrubbedArgv.fingerprints) {
+      if (credentialFingerprints.length >= 32) break;
+      credentialFingerprints.push(fp);
+    }
+  } catch (err) {
+    tapError(err);
+  }
+
   // Mutable bits learned from the initialize handshake.
   let clientName: string | undefined;
   let clientVersion: string | undefined;
@@ -196,7 +213,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   const currentServer = (): ServerContext => {
     const server: ServerContext = {
       name: opts.serverName || learnedServerName || initialServerName,
-      command: opts.command.join(' '),
+      command: scrubbedCommand,
       transport: 'stdio',
     };
     if (learnedServerVersion !== undefined) server.version = learnedServerVersion;

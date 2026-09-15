@@ -147,7 +147,9 @@ describe('queryStore (blast radius)', () => {
         sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z', IDENTITY_WITH_CRED),
         toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'create_issue', {
           api_key: SECRET,
-          name: 'probe-target',
+          // Vocabulary-passing structural value (P0: bare `name` no longer
+          // passes anywhere under tool_call.args) — still a 'plain' probe.
+          mimeType: 'text/x-probe-target',
           title: 'hello world',
         }),
         sessionEnd(SESSION_A, '2026-06-11T10:00:02.000Z'),
@@ -238,12 +240,12 @@ describe('queryStore (blast radius)', () => {
   });
 
   it('matches an allow-listed plain string leaf as plain', () => {
-    const result = queryStore(store, 'probe-target');
+    const result = queryStore(store, 'x-probe-target');
     expect(result.matches).toHaveLength(1);
     expect(result.matches[0]).toMatchObject({
       seq: 2,
       matched_on: 'plain',
-      path: '$.args.name',
+      path: '$.args.mimeType',
     });
 
     // case-sensitive substring semantics
@@ -279,5 +281,67 @@ describe('queryStore (blast radius)', () => {
     const result = queryStore(store, '');
     expect(result.matches).toEqual([]);
     expect(result.sessions).toEqual([]);
+  });
+});
+
+/* --------------------- hashed keys & secret_refs (P1) -------------------- */
+
+describe('queryStore finds needles hashed as KEYS or embedded via secret_refs', () => {
+  const EMAIL_KEY = 'alice@corp.example.com';
+  const EMBEDDED_AWS = 'AKIAIOSFODNN7EXAMPLE';
+  const SESSION_C = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+
+  let dir: string;
+  let store: EvidenceStore;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-query-keys-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    store.append(
+      seal([
+        sessionStart(SESSION_C, '2026-06-12T09:00:00.000Z', IDENTITY),
+        // The needle appears ONLY as an object key (P1 key redaction) — a
+        // map keyed by email, never as a value leaf anywhere in the tree.
+        toolCall(SESSION_C, '2026-06-12T09:00:01.000Z', 'list_users', {
+          users: { [EMAIL_KEY]: { role: 'admin' } },
+        }),
+        // The needle appears embedded INSIDE a larger leaf, not as a whole
+        // leaf by itself (P1 blast-radius miss / secret_refs).
+        toolCall(SESSION_C, '2026-06-12T09:00:02.000Z', 'http_post', {
+          body: `AWS_ACCESS_KEY_ID=${EMBEDDED_AWS}\nregion=us-east-1\n`,
+        }),
+        sessionEnd(SESSION_C, '2026-06-12T09:00:03.000Z'),
+      ]),
+    );
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finds a needle that was only ever used as an object key', () => {
+    const result = queryStore(store, EMAIL_KEY);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({
+      seq: 2,
+      kind: 'tool_call',
+      name: 'list_users',
+      matched_on: 'ref',
+    });
+    // the path marks it as a key hit, not a value leaf.
+    expect(result.matches[0]!.path).toContain('#key');
+  });
+
+  it('finds a secret embedded inside a larger leaf via secret_refs', () => {
+    const result = queryStore(store, EMBEDDED_AWS);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({
+      seq: 3,
+      kind: 'tool_call',
+      name: 'http_post',
+      matched_on: 'ref',
+    });
+    expect(result.matches[0]!.path).toContain('secret_refs');
   });
 });
