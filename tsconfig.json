@@ -9,6 +9,7 @@
     "strict": true,
     "declaration": true,
     "sourceMap": true,
+    "newLine": "lf",
     "esModuleInterop": true,
     "isolatedModules": true,
     "resolveJsonModule": true,
