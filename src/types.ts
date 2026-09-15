@@ -46,11 +46,38 @@ export interface SessionSummary {
   session_id: string;
   started_at: string;
   ended_at?: string;
+  /**
+   * `server.name` of the session's first event. For a proxy session that is
+   * the one wrapped server; for a hook-captured session it is the client
+   * (`claude-code`) — the MCP servers its tool calls went to are counted in
+   * `server_count` and stamped on each event's own `server.name`.
+   */
   server_name: string;
   identity_fingerprint: string;
   event_count: number;
+  /**
+   * Tool CALLS, not `tool_call` events. A proxy-captured call is one
+   * request+response-correlated event (no `phase`); a hook-captured call is
+   * a `phase: 'pre'` event plus, only when the tool ran to completion, a
+   * `phase: 'post'` event sharing its `request_id`. Only the `pre` half is
+   * counted, so a call that never completed still counts exactly once.
+   */
   tool_call_count: number;
+  /**
+   * `tool_call` / `rpc` events with `is_error: true`, whichever phase — a
+   * failed hook call carries exactly one such event (the denied `pre`, or
+   * the failing `post`), so this too is per call.
+   */
   error_count: number;
+  /**
+   * Additive, optional: the number of distinct `server.name` values across
+   * the session's events. 1 for a proxy session (one wrapped server); a
+   * hook session spanning ClickUp + GitHub + local servers counts each of
+   * them plus the client's own session-level events (`claude-code`). Both
+   * store backends always set it; it is optional only so a summary produced
+   * by an older reader of this contract still type-checks.
+   */
+  server_count?: number;
 }
 
 export interface IterateOpts {

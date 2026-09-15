@@ -314,6 +314,69 @@ function seedManyMatchingEvents(dataDir: string, needle: string, count: number):
   }
 }
 
+/**
+ * Seed a jsonl store with one hook-captured Claude Code session (the shape
+ * `mcp-recorder hook` records — `source: 'hook'`, `phase`, the MCP server on
+ * `server.name`): a session_start, then three calls that went to two
+ * different servers, one of which never completed (pre without post).
+ */
+function seedHookSession(dataDir: string, sessionId: string): void {
+  const hookServer = (name: string): ServerContext => ({
+    name,
+    command: 'hook:claude-code',
+    transport: 'stdio',
+  });
+  const call = (
+    i: number,
+    server: string,
+    tool: string,
+    requestId: string,
+    phase: 'pre' | 'post',
+  ): ToolCallEvent => ({
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+    kind: 'tool_call',
+    identity: FIXTURE_IDENTITY,
+    server: hookServer(server),
+    attributes: {},
+    source: 'hook',
+    tool,
+    request_id: requestId,
+    args: { task_id: { redacted: true, ref: sha256Ref('abc123'), len: 6 } },
+    result_hash: sha256Ref(phase === 'pre' ? 'null' : '{}'),
+    result: phase === 'pre' ? null : {},
+    is_error: false,
+    duration_ms: phase === 'pre' ? 0 : 1,
+    phase,
+  });
+  const events: AnyEvent[] = [
+    {
+      ...fixtureSessionStart(sessionId, new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString()),
+      server: hookServer('claude-code'),
+      source: 'hook',
+    },
+    call(1, 'ClickUp', 'clickup_get_task', 'toolu_1', 'pre'),
+    call(2, 'ClickUp', 'clickup_get_task', 'toolu_1', 'post'),
+    call(3, 'github', 'pull_request_read', 'toolu_2', 'pre'),
+    call(4, 'github', 'pull_request_read', 'toolu_2', 'post'),
+    call(5, 'ClickUp', 'clickup_get_list', 'toolu_3', 'pre'), // never completed
+  ];
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records = events.map((event) => {
+      const record = makeRecord(head, event);
+      head = { seq: record.seq, hash: record.hash };
+      return record;
+    });
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
 function waitMs(ms: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
@@ -388,6 +451,7 @@ describe('mcp-recorder CLI', () => {
     const sessionsHuman = await runCli(['sessions', '--data-dir', dataDir]);
     expect(sessionsHuman.code).toBe(0);
     expect(sessionsHuman.stdout).toContain('SESSION');
+    expect(sessionsHuman.stdout).toContain('SERVERS');
 
     // --- query for the planted probe value ----------------------------------
     const query = await runCli(['query', PROBE, '--data-dir', dataDir]);
@@ -441,6 +505,56 @@ describe('mcp-recorder CLI', () => {
       expect(existsSync(join(dataDir, f))).toBe(false);
     }
   }, 120_000);
+
+  it('sessions: a hook-captured session shows one row per session, calls counted once, and a SERVERS column', async () => {
+    const dataDir = tmpDir('mcp-rec-sessions-hook-');
+    const sessionId = 'cccccccc-0000-4000-8000-000000000000';
+    seedHookSession(dataDir, sessionId);
+
+    const human = await runCli(['sessions', '--data-dir', dataDir]);
+    expect(human.code).toBe(0);
+    const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
+    const headers = headerLine!.trim().split(/\s+/);
+    expect(headers).toEqual([
+      'SESSION',
+      'STARTED',
+      'ENDED',
+      'SERVER',
+      'SERVERS',
+      'EVENTS',
+      'TOOL_CALLS',
+      'ERRORS',
+    ]);
+    expect(rowLines).toHaveLength(1);
+    const cells = rowLines[0]!.trim().split(/\s+/);
+    const cell = (name: string): string => cells[headers.indexOf(name)]!;
+    expect(cell('SESSION')).toBe('cccccccc');
+    expect(cell('SERVER')).toBe('claude-code'); // the first event's server: the client itself
+    expect(cell('SERVERS')).toBe('3'); // claude-code + ClickUp + github
+    expect(cell('EVENTS')).toBe('6'); // session_start + 5 tool_call events
+    expect(cell('TOOL_CALLS')).toBe('3'); // 2 pre+post pairs + 1 lone pre = 3 calls, not 5
+    expect(cell('ERRORS')).toBe('0');
+
+    const json = await runCli(['sessions', '--data-dir', dataDir, '--json']);
+    expect(json.code).toBe(0);
+    const list = JSON.parse(json.stdout) as Array<{
+      session_id: string;
+      server_name: string;
+      server_count: number;
+      event_count: number;
+      tool_call_count: number;
+      error_count: number;
+    }>;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      session_id: sessionId,
+      server_name: 'claude-code',
+      server_count: 3,
+      event_count: 6,
+      tool_call_count: 3,
+      error_count: 0,
+    });
+  }, 60_000);
 
   it('export on an empty store exits 1', async () => {
     const dataDir = tmpDir('mcp-rec-empty-');

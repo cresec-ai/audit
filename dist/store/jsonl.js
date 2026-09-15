@@ -579,33 +579,53 @@ export class JsonlStore {
         this.syncRecords();
         return this.records.length;
     }
+    /**
+     * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL
+     * — test/store.test.ts runs the same fixtures through both backends; the
+     * counting rules are spelled out on SessionSummary (src/types.ts).
+     */
     sessions() {
         this.syncRecords();
         const byId = new Map();
         for (const record of this.records) {
             const ev = record.event;
-            let summary = byId.get(ev.session_id);
-            if (summary === undefined) {
+            let entry = byId.get(ev.session_id);
+            if (entry === undefined) {
                 // First record of the session in seq order — same semantics as the
                 // sqlite backend's "first event JSON of the session" subquery.
-                summary = {
-                    session_id: ev.session_id,
-                    started_at: ev.timestamp,
-                    server_name: ev.server?.name ?? '',
-                    identity_fingerprint: ev.identity?.fingerprint ?? '',
-                    event_count: 0,
-                    tool_call_count: 0,
-                    error_count: 0,
+                entry = {
+                    summary: {
+                        session_id: ev.session_id,
+                        started_at: ev.timestamp,
+                        server_name: ev.server?.name ?? '',
+                        identity_fingerprint: ev.identity?.fingerprint ?? '',
+                        event_count: 0,
+                        tool_call_count: 0,
+                        error_count: 0,
+                        server_count: 0,
+                    },
+                    servers: new Set(),
                 };
-                byId.set(ev.session_id, summary);
+                byId.set(ev.session_id, entry);
             }
+            const { summary, servers } = entry;
             if (ev.timestamp < summary.started_at)
                 summary.started_at = ev.timestamp;
             summary.event_count += 1;
-            if (ev.kind === 'tool_call')
+            // One per CALL: a proxy event (no phase) or a hook 'pre' event; the
+            // hook 'post' twin (same request_id) is the same call, and a lone pre
+            // (the call never completed) still counts once.
+            if (ev.kind === 'tool_call' && (ev.phase === undefined || ev.phase === 'pre')) {
                 summary.tool_call_count += 1;
+            }
+            // is_error on any phase: a failed hook call carries exactly one such
+            // event (a denied pre, or a failing post).
             if ((ev.kind === 'tool_call' || ev.kind === 'rpc') && ev.is_error) {
                 summary.error_count += 1;
+            }
+            if (typeof ev.server?.name === 'string') {
+                servers.add(ev.server.name);
+                summary.server_count = servers.size;
             }
             if (ev.kind === 'session_end') {
                 if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {
@@ -613,7 +633,7 @@ export class JsonlStore {
                 }
             }
         }
-        return [...byId.values()];
+        return [...byId.values()].map((entry) => entry.summary);
     }
     close() {
         // Nothing to release: writes are flushed synchronously per append, and

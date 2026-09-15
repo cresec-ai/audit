@@ -152,6 +152,26 @@ Every hook-sourced event carries the additive `source: "hook"` field so it's
 always distinguishable from a proxy-captured one — see
 [docs/event-schema.md](event-schema.md#hook-sourced-events-additive).
 
+**How `sessions` counts a hook session.** All of one Claude Code session's
+hook events — whichever MCP servers its tool calls went to — share that
+session's `session_id`, so they land in one `sessions` row (the per-server
+detail stays on each event's `server.name`, which `query`, `ui` and
+`export` all show). In that row:
+
+- `TOOL_CALLS` (`tool_call_count`) is the number of **calls**, not of
+  `tool_call` events: each call counts once, on its PreToolUse event, and
+  its PostToolUse twin (same `request_id`) is the same call. A call whose
+  PostToolUse never fired still counts once.
+- `ERRORS` (`error_count`) counts events with `is_error: true` whichever
+  phase — a policy-denied PreToolUse, or a PostToolUse that reported an
+  error — so it is per call too: a failed call has exactly one such event.
+- `SERVER` is the session's first event's `server.name`, which for a hook
+  session is the client itself (`claude-code`); `SERVERS` (additive
+  `server_count` in `--json`) is the number of distinct `server.name`
+  values in the session, so a session that called ClickUp, GitHub and a
+  local server is visible as such (`claude-code` plus each of them). A
+  proxy session always reads `1` there.
+
 **MCP tool names.** Claude Code presents an MCP tool to hooks as
 `mcp__<server>__<tool>` (e.g. `mcp__ClickUp__clickup_get_task`). This is
 split: `tool` is recorded as the bare underlying name (`clickup_get_task` —

@@ -102,16 +102,35 @@ interface SessionRow {
   event_count: number;
   tool_call_count: number;
   error_count: number;
+  server_count: number;
 }
 
+/**
+ * Per-session aggregate. Must stay in step with JsonlStore.sessions() —
+ * test/store.test.ts runs the same fixtures through both backends.
+ *
+ * tool_call_count counts CALLS, not tool_call events: a proxy-captured call
+ * is one event with no `phase`, while `mcp-recorder hook` records a call as
+ * a `phase: 'pre'` event plus (only when the tool ran to completion) a
+ * `phase: 'post'` event sharing its request_id. Counting the pre half only
+ * gives one per call either way, and a lone pre (the call never completed)
+ * still counts once. error_count counts is_error on any phase: a failed hook
+ * call has exactly one such event (the denied pre, or the failing post).
+ * server_count is the number of distinct server.name values in the session
+ * — 1 for a proxy session, several for a hook session that spanned servers.
+ */
 const SESSIONS_SQL = `
 SELECT
   r.session_id                                          AS session_id,
   MIN(r.timestamp)                                      AS started_at,
   MAX(CASE WHEN r.kind = 'session_end' THEN r.timestamp END) AS ended_at,
   COUNT(*)                                              AS event_count,
-  SUM(CASE WHEN r.kind = 'tool_call' THEN 1 ELSE 0 END) AS tool_call_count,
+  SUM(CASE WHEN r.kind = 'tool_call'
+            AND (json_extract(r.event, '$.phase') IS NULL
+                 OR json_extract(r.event, '$.phase') = 'pre')
+           THEN 1 ELSE 0 END)                           AS tool_call_count,
   SUM(CASE WHEN json_extract(r.event, '$.is_error') = 1 THEN 1 ELSE 0 END) AS error_count,
+  COUNT(DISTINCT json_extract(r.event, '$.server.name')) AS server_count,
   (SELECT json_extract(f.event, '$.server.name')
      FROM records f WHERE f.session_id = r.session_id ORDER BY f.seq LIMIT 1) AS server_name,
   (SELECT json_extract(f.event, '$.identity.fingerprint')
@@ -373,6 +392,7 @@ export class SqliteStore implements EvidenceStore {
         event_count: row.event_count,
         tool_call_count: row.tool_call_count,
         error_count: row.error_count,
+        server_count: row.server_count,
       };
       if (row.ended_at !== null) summary.ended_at = row.ended_at;
       return summary;

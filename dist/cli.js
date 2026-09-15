@@ -758,11 +758,15 @@ async function cmdSessions(flags) {
             out('no sessions recorded');
             return;
         }
-        out(formatTable(['SESSION', 'STARTED', 'ENDED', 'SERVER', 'EVENTS', 'TOOL_CALLS', 'ERRORS'], sessions.map((s) => [
+        out(formatTable(['SESSION', 'STARTED', 'ENDED', 'SERVER', 'SERVERS', 'EVENTS', 'TOOL_CALLS', 'ERRORS'], sessions.map((s) => [
             id8(s.session_id),
             s.started_at,
             s.ended_at ?? '(open)',
             s.server_name,
+            // Distinct server.name values in the session: 1 for a proxy
+            // session, more for a hook session whose calls spanned servers
+            // (SERVER is only the first event's — 'claude-code' for a hook).
+            s.server_count === undefined ? '' : String(s.server_count),
             String(s.event_count),
             String(s.tool_call_count),
             String(s.error_count),
