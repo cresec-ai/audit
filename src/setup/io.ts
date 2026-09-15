@@ -28,8 +28,23 @@ export function detectIndent(raw: string): string {
   return indent.length >= 4 ? '    ' : '  ';
 }
 
+/** The line ending a JSON file uses, so a rewrite keeps it: Windows-side
+ * configs (the ones `setup` finds from WSL) are often CRLF. */
+export function detectEol(raw: string): '\n' | '\r\n' {
+  return raw.includes('\r\n') ? '\r\n' : '\n';
+}
+
 export function sidecarPath(configPath: string): string {
   return configPath + SIDECAR_SUFFIX;
+}
+
+/** Strip a leading UTF-8 BOM (U+FEFF), if present, before handing text to
+ * `JSON.parse` — common on config files written by Windows tools (e.g. a
+ * Windows-side client config found from WSL, see src/setup/wsl.ts), which
+ * `JSON.parse` otherwise rejects outright. Writes in this module never add
+ * one back (`atomicWriteFile`/`writeJsonAtomic` emit plain UTF-8). */
+export function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 function backupPathFor(configPath: string, now: Date): string {
@@ -43,8 +58,8 @@ export function atomicWriteFile(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
-export function writeJsonAtomic(path: string, value: unknown, indent: string): void {
-  atomicWriteFile(path, JSON.stringify(value, null, indent) + '\n');
+export function writeJsonAtomic(path: string, value: unknown, indent: string, eol: '\n' | '\r\n' = '\n'): void {
+  atomicWriteFile(path, JSON.stringify(value, null, indent).split('\n').join(eol) + eol);
 }
 
 /**
@@ -64,7 +79,7 @@ export function writeBackup(configPath: string): string {
 export function readSidecarStrict(configPath: string): SetupSidecar | undefined {
   const p = sidecarPath(configPath);
   if (!existsSync(p)) return undefined;
-  return JSON.parse(readFileSync(p, 'utf8')) as SetupSidecar;
+  return JSON.parse(stripBom(readFileSync(p, 'utf8'))) as SetupSidecar;
 }
 
 export function writeSidecarAtomic(configPath: string, sidecar: SetupSidecar, indent: string): void {

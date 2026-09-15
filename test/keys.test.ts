@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { createPublicKey, verify as nodeVerify } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import * as ed from '@noble/ed25519';
+import { spawnTsx } from './helpers/tsx.js';
 import { Signer, publicKeyPem, publicKeyHexFromPem } from '../src/chain/keys.js';
 import { signedPayload, sha256Hex } from '../src/chain/hash.js';
 import { FILES } from '../src/types.js';
@@ -15,8 +15,6 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const HEX128 = /^[0-9a-f]{128}$/;
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-/** Local tsx binary (a devDependency): avoids depending on a global PATH `npx`. */
-const TSX_BIN = join(TEST_DIR, '..', 'node_modules', '.bin', 'tsx');
 const LOAD_SIGNER_FIXTURE = join(TEST_DIR, 'fixtures', 'load-signer.ts');
 
 interface ChildResult {
@@ -43,7 +41,7 @@ interface SpawnedSigner {
  * their Signer.load calls as tightly as the OS will schedule them.
  */
 function spawnSigner(dataDir: string): SpawnedSigner {
-  const child = spawn(TSX_BIN, [LOAD_SIGNER_FIXTURE, dataDir], {
+  const child = spawnTsx([LOAD_SIGNER_FIXTURE, dataDir], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -97,7 +95,8 @@ describe('Signer', () => {
     expect(readFileSync(join(nested, FILES.PUBLIC_KEY), 'utf8').trim()).toBe(signer.publicKeyHex);
   });
 
-  it('private key file is mode 0600', async () => {
+  // File modes are a POSIX concept; Windows reports 0o666 for every file.
+  it.skipIf(process.platform === 'win32')('private key file is mode 0600', async () => {
     await Signer.load(dir);
     const mode = statSync(join(dir, FILES.PRIVATE_KEY)).mode & 0o777;
     expect(mode).toBe(0o600);
@@ -145,8 +144,8 @@ describe('Signer', () => {
     const chainHash = sha256Hex('head-7');
     const sig = await signer.sign(7, chainHash);
     const payload = signedPayload(7, chainHash);
-    // Sync ed.verify, not verifyAsync — this whole suite proves the Node 18
-    // (no globalThis.crypto) path, and verifyAsync needs crypto.subtle.
+    // Sync ed.verify, not verifyAsync — this whole suite proves the
+    // no-globalThis.crypto path, and verifyAsync needs crypto.subtle.
     // sha512Sync is wired by src/chain/keys.ts's module-level side effect.
     const ok = ed.verify(sig.signature, payload, sig.public_key);
     expect(ok).toBe(true);
@@ -256,13 +255,13 @@ describe('Signer', () => {
     expect(() => publicKeyHexFromPem('not a pem at all')).toThrow();
   });
 
-  describe('Node >= 18.17 without a WebCrypto global', () => {
-    // globalThis.crypto is a default global from Node 19 on; on the declared
-    // minimum (18.17) it is undefined unless the process was started with
-    // --experimental-global-webcrypto. @noble/ed25519 v2's ASYNC entry
-    // points (getPublicKeyAsync/signAsync/utils.randomPrivateKey) read
-    // globalThis.crypto and throw when it's missing — this suite proves
-    // Signer never calls them (see src/chain/keys.ts's sync-only contract).
+  describe('without a WebCrypto global', () => {
+    // globalThis.crypto can be absent (a runtime started with
+    // --no-experimental-global-webcrypto, hardened embedders). @noble/ed25519
+    // v2's ASYNC entry points (getPublicKeyAsync/signAsync/
+    // utils.randomPrivateKey) read globalThis.crypto and throw when it's
+    // missing — this suite proves Signer never calls them (see
+    // src/chain/keys.ts's sync-only invariant).
     let hadCrypto: boolean;
     let original: Crypto | undefined;
 

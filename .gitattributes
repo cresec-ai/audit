@@ -1,0 +1,19 @@
+# Normalize line endings to LF in the repository and on checkout, so text
+# files stay LF even when checked out on Windows (git core.autocrlf differs
+# across machines/CI and we don't want to depend on it).
+* text=auto eol=lf
+
+# Common binaries: never touch line endings, and mark them explicitly so a
+# future text file added under similar extensions doesn't get normalized by
+# accident.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.woff binary
+*.woff2 binary

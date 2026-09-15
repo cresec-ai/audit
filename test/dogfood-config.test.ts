@@ -71,46 +71,53 @@ describe('.mcp.json dogfood config', () => {
     expect(fsEntry!.args.at(-1)).toBe('.');
   });
 
-  it('the wrapper records a session end to end (dependencies present, data dir from env)', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-dogfood-'));
-    try {
-      const child = spawn(
-        'sh',
-        ['scripts/dogfood-wrap.sh', '--name', 'dogfood-test', '--', 'node', ECHO_SERVER],
-        { cwd: ROOT, env: { ...process.env, MCP_RECORDER_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] },
-      );
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      child.stdout.on('data', (c: string) => (stdout += c));
-      child.stderr.on('data', (c: string) => (stderr += c));
-      child.stdin.write(
-        JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', clientInfo: { name: 'dogfood', version: '1' }, capabilities: {} } }) + '\n',
-      );
-      child.stdin.write(
-        JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { hello: 'world' } } }) + '\n',
-      );
-      // Wait for both replies, then close the client side as a real client would.
-      const deadline = Date.now() + 20_000;
-      while (Date.now() < deadline && (stdout.match(/"id":2/g) ?? []).length === 0) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      child.stdin.end();
-      const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
-      expect(code, stderr).toBe(0);
-      expect(stdout).toContain('"id":1');
-      expect(stdout).toContain('"id":2');
-      expect(stderr).toContain('(0 dropped)');
+  // scripts/dogfood-wrap.sh is a POSIX shell script, spawned here via `sh` —
+  // there is no `sh` on a stock Windows install, and the wrapper script
+  // itself is not portable to it. Out of this unit's file scope (scripts/**).
+  it.skipIf(process.platform === 'win32')(
+    'the wrapper records a session end to end (dependencies present, data dir from env)',
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-dogfood-'));
+      try {
+        const child = spawn(
+          'sh',
+          ['scripts/dogfood-wrap.sh', '--name', 'dogfood-test', '--', 'node', ECHO_SERVER],
+          { cwd: ROOT, env: { ...process.env, MCP_RECORDER_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (c: string) => (stdout += c));
+        child.stderr.on('data', (c: string) => (stderr += c));
+        child.stdin.write(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', clientInfo: { name: 'dogfood', version: '1' }, capabilities: {} } }) + '\n',
+        );
+        child.stdin.write(
+          JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { hello: 'world' } } }) + '\n',
+        );
+        // Wait for both replies, then close the client side as a real client would.
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline && (stdout.match(/"id":2/g) ?? []).length === 0) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        child.stdin.end();
+        const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+        expect(code, stderr).toBe(0);
+        expect(stdout).toContain('"id":1');
+        expect(stdout).toContain('"id":2');
+        expect(stderr).toContain('(0 dropped)');
 
-      const store = openStoreReadOnly({ dataDir });
-      const sessions = store.sessions();
-      store.close();
-      expect(sessions).toHaveLength(1);
-      expect(sessions[0]!.server_name).toBe('dogfood-test');
-      expect(sessions[0]!.tool_call_count).toBe(1);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
+        const store = openStoreReadOnly({ dataDir });
+        const sessions = store.sessions();
+        store.close();
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]!.server_name).toBe('dogfood-test');
+        expect(sessions[0]!.tool_call_count).toBe(1);
+      } finally {
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 });

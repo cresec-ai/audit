@@ -6,15 +6,15 @@
  * is embedded in every HeadSignature and exported (as SPKI PEM) in evidence
  * bundles so a stranger can verify with nothing but node:crypto / openssl.
  *
- * Node >= 18.17 note: this module deliberately uses ONLY the SYNC @noble/
- * ed25519 API (getPublicKey / sign, both wired to sha512Sync below) and
- * node:crypto's randomBytes for key generation. The v2 ASYNC entry points
+ * Invariant: this module deliberately uses ONLY the SYNC @noble/ed25519 API
+ * (getPublicKey / sign, both wired to sha512Sync below) and node:crypto's
+ * randomBytes for key generation, so signing never depends on
+ * globalThis.crypto being present. The v2 ASYNC entry points
  * (getPublicKeyAsync / signAsync / utils.randomPrivateKey) go through
- * globalThis.crypto.subtle / globalThis.crypto.getRandomValues, which Node
- * only defines as a default global from v19 on — on bare Node 18.17 (the
- * package's declared minimum) globalThis.crypto is undefined unless the
- * process was started with --experimental-global-webcrypto, so those calls
- * throw and `record`/`export` fail. Keep this file on the sync API.
+ * globalThis.crypto.subtle / getRandomValues, which can be absent or
+ * disabled (--no-experimental-global-webcrypto, hardened embedders) — then
+ * those calls throw and `record`/`export` fail. Keep this file on the sync
+ * API; test/keys.test.ts proves it with the global removed.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -90,8 +90,8 @@ export class Signer implements SignerLike {
       priv = readPrivateKey(privPath);
     } else {
       // node:crypto.randomBytes, not ed.utils.randomPrivateKey() — the noble
-      // helper reads globalThis.crypto.getRandomValues, absent by default on
-      // Node 18 (see the module doc comment above).
+      // helper reads globalThis.crypto.getRandomValues, which may be absent
+      // (see the module doc comment above).
       const candidate = new Uint8Array(nodeRandomBytes(32));
       try {
         writeFileSync(privPath, ed.etc.bytesToHex(candidate) + '\n', { flag: 'wx', mode: 0o600 });
@@ -143,7 +143,7 @@ export class Signer implements SignerLike {
   async sign(seq: number, chainHash: string): Promise<HeadSignature> {
     const payload = signedPayload(seq, chainHash);
     // Sync ed.sign (sha512Sync is wired above) — not signAsync, which needs
-    // globalThis.crypto.subtle and would throw on bare Node 18.
+    // globalThis.crypto.subtle and throws when that global is absent.
     const signature = ed.sign(payload, this.#privateKey);
     return {
       seq,

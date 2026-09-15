@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { spawnTsx } from './helpers/tsx.js';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -13,23 +13,31 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
  * on loaded CI runners for reasons unrelated to the proxy.
  */
 describe('latency bench (smoke)', () => {
-  it('runs --smoke --no-gate end to end and reports the added p50 latency', async () => {
-    let stderr = '';
-    const code = await new Promise<number>((resolveCode) => {
-      const child = spawn('npx', ['tsx', 'bench/latency.ts', '--smoke', '--no-gate'], {
-        cwd: ROOT,
-        stdio: ['ignore', 'ignore', 'pipe'],
+  // bench/latency.ts itself shells out via `spawn('npx', ['tsx', ...])` to
+  // launch the wrapped harness — that's outside this unit's file scope
+  // (bench/**), and unlike the test-side spawns above it isn't portable to
+  // Windows as-is (npx is a .cmd shim there). Skip until bench/latency.ts
+  // gets the same process.execPath + resolved-tsx-CLI treatment.
+  it.skipIf(process.platform === 'win32')(
+    'runs --smoke --no-gate end to end and reports the added p50 latency',
+    async () => {
+      let stderr = '';
+      const code = await new Promise<number>((resolveCode) => {
+        const child = spawnTsx(['bench/latency.ts', '--smoke', '--no-gate'], {
+          cwd: ROOT,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        child.stderr!.setEncoding('utf8');
+        child.stderr!.on('data', (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on('error', () => resolveCode(1));
+        child.on('close', (c) => resolveCode(c ?? 1));
       });
-      child.stderr!.setEncoding('utf8');
-      child.stderr!.on('data', (chunk: string) => {
-        stderr += chunk;
-      });
-      child.on('error', () => resolveCode(1));
-      child.on('close', (c) => resolveCode(c ?? 1));
-    });
-    process.stderr.write(stderr);
-    expect(code).toBe(0);
-    expect(stderr).toMatch(/p50 added latency = [0-9.]+ms/);
-    expect(stderr).toMatch(/recorded \d+ events \(0 dropped\)/);
-  });
+      process.stderr.write(stderr);
+      expect(code).toBe(0);
+      expect(stderr).toMatch(/p50 added latency = [0-9.]+ms/);
+      expect(stderr).toMatch(/recorded \d+ events \(0 dropped\)/);
+    },
+  );
 });
