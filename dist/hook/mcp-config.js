@@ -43,6 +43,16 @@
  * `{}`. The hook records the same event either way, just without `url`.
  * `env`, `readFile` and `glob` are injectable so tests never touch the
  * real `/tmp` or the real environment.
+ *
+ * TRUST. What this returns is ASSERTED by a file, never observed on the
+ * wire: the hook sends nothing anywhere. In a cloud session `/tmp` is
+ * world-writable and the hook runs as the same user as the agent, so an
+ * agent with Bash can rewrite, shadow (a name that sorts first) or delete
+ * `/tmp/mcp-config-*.json`; `MCP_RECORDER_MCP_CONFIG` names a path in that
+ * same environment and changes nothing about that. Consumers therefore
+ * treat `url` as the config file's claim about the server, and the policy
+ * alias built from `host` is DENY-ONLY (src/hook/policy.ts): a forged file
+ * can add a deny or make one miss, never turn a deny into an allow.
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -59,10 +69,20 @@ export const MCP_CONFIG_MAX_BYTES = 4 * 1024 * 1024;
  *  pathological `/tmp` (or env value) cannot turn a hook invocation into a
  *  directory walk. */
 export const MCP_CONFIG_MAX_FILES = 16;
-/** A recorded origin URL longer than this is dropped (host kept): defense in
- *  depth against a config file stuffing arbitrary text into every event
- *  through a URL, mirroring `structuralString`'s cap on wire-level strings. */
+/** An origin URL longer than this (after scrubbing) is not usable: the whole
+ *  origin — `url` AND `host`, so "no url, no alias" always holds — is
+ *  dropped, and `originFromEntryUrl` falls back to the relay exactly as for
+ *  a non-http `mcp_url`. Defense in depth against a config file stuffing
+ *  arbitrary text into every event through a URL, mirroring
+ *  `structuralString`'s cap on wire-level strings. */
 export const MAX_ORIGIN_URL_LEN = 2048;
+/** A path segment recorded verbatim must be a short vocabulary token —
+ *  `v2`, `ccr-sessions`, `github`, `mcp`; everything else (readable free
+ *  text, percent-encoded bytes, anything over 32 chars) is replaced by its
+ *  `sha256:` ref, in addition to the secret/opaque rules below. Mirrors
+ *  `structuralString`'s caps: the file is agent-writable (see TRUST above),
+ *  so no readable text it chooses may reach the store through a path. */
+const PATH_VOCAB_RE = /^[A-Za-z0-9._-]{1,32}$/;
 function isPlainObject(v) {
     return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
@@ -132,20 +152,26 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  `ccr-sessions`, `github`, `mcp` are untouched. */
 const OPAQUE_TOKEN_RE = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_-]{16,}$/;
 function isOpaqueSegment(seg) {
-    return UUID_RE.test(seg) || OPAQUE_TOKEN_RE.test(seg) || looksSecret(seg);
+    return UUID_RE.test(seg) || OPAQUE_TOKEN_RE.test(seg) || looksSecret(seg) || !PATH_VOCAB_RE.test(seg);
 }
 /**
  * The recorded form of an origin URL. Same rules the http proxy applies to
  * its `--target` before stamping it on events (docs/event-schema.md,
  * "`command` target-URL handling"), plus the opaque-token rule above:
  *  - userinfo (`user:pass@`) is stripped;
- *  - every path segment that is secret-shaped OR an opaque identifier (a
- *    UUID, a cloud session id) is replaced in place by its `sha256:<hex>`
- *    ref — computed exactly like every other redacted value (`sha256Ref`),
- *    so a blast-radius `query` for a session id still finds the event;
+ *  - every path segment that is secret-shaped, an opaque identifier (a
+ *    UUID, a cloud session id) or not a short vocabulary token
+ *    (`PATH_VOCAB_RE`) is replaced in place by its `sha256:<hex>` ref —
+ *    computed exactly like every other redacted value (`sha256Ref`), so a
+ *    blast-radius `query` for a session id still finds the event;
  *  - the query string and fragment are dropped unconditionally (any single
  *    parameter can be a bearer credential — `?api_key=…`);
- *  - only http(s) URLs qualify; anything else yields undefined.
+ *  - only http(s) URLs qualify, and a scrubbed URL longer than
+ *    `MAX_ORIGIN_URL_LEN` is not usable either; both yield undefined.
+ * Unlike the http proxy's `--target`, the stripped pieces are NOT
+ * fingerprinted (`identity.credential_fingerprints`): the proxy fingerprints
+ * a credential it goes on to send, while the hook sends nothing — a
+ * credential sitting in this file is dropped, not attested.
  * The hostname is never altered: it is the whole point (the policy alias).
  */
 export function scrubOriginUrl(u) {
@@ -165,11 +191,10 @@ export function scrubOriginUrl(u) {
     clean.pathname = segments.join('/');
     clean.search = '';
     clean.hash = '';
-    const origin = { host: clean.hostname };
     const url = clean.toString();
-    if (url.length <= MAX_ORIGIN_URL_LEN)
-        origin.url = url;
-    return origin;
+    if (url.length > MAX_ORIGIN_URL_LEN)
+        return undefined;
+    return { host: clean.hostname, url };
 }
 /** The origin of one config entry's `url`: the decoded `mcp_url` query
  *  parameter (the vendor endpoint behind an Anthropic relay) when it is a

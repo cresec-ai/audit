@@ -145,7 +145,7 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
-| `url` | `string?` | Additive, optional (schema stays v1); hook-sourced. Where the server actually is, when `mcp-recorder hook` could resolve it from the MCP config file Claude Code was started with (`MCP_RECORDER_MCP_CONFIG`, else `/tmp/mcp-config-*.json` in a cloud session): the vendor endpoint behind an Anthropic-hosted connector's relay (the relay URL's decoded `mcp_url`, e.g. `https://mcp.clickup.com/mcp`), else the config entry's own URL. Scrubbed exactly like the http transport's target URL below — userinfo stripped, query string and fragment dropped — plus every path segment that is secret-shaped **or an opaque identifier** (a UUID, a cloud session id such as `cse_...`) is replaced in place by its `sha256:<hex>` ref, so a relay URL never carries the session id. Undefined when unresolved, and on every proxy-captured event (the http proxy records its target in `command`). See [Hook-sourced events](#hook-sourced-events-additive) and [docs/hooks.md](hooks.md#cloud-sessions-uuid-server-names-and-serverurl). |
+| `url` | `string?` | Additive, optional (schema stays v1); hook-sourced, on `tool_call` events only. Where the server named by `name` is, **as asserted by the MCP config file `mcp-recorder hook` found** (`MCP_RECORDER_MCP_CONFIG`, else `/tmp/mcp-config-*.json` in a cloud session) — not observed on the wire; that file is writable by the agent running under the hook, see [docs/hooks.md](hooks.md#cloud-sessions-uuid-server-names-and-serverurl). The value is the vendor endpoint behind an Anthropic-hosted connector's relay (the relay URL's decoded `mcp_url`, e.g. `https://mcp.clickup.com/mcp`), else the config entry's own URL. Scrubbed like the http transport's target URL below — userinfo stripped, query string and fragment dropped — but the stripped pieces are dropped **without** `credential_fingerprints` (the hook never sends them), and more strictly on the path: every segment that is secret-shaped, **an opaque identifier** (a UUID, a cloud session id such as `cse_...`) **or not a short vocabulary token** (`[A-Za-z0-9._-]{1,32}`) is replaced in place by its `sha256:<hex>` ref, so a relay URL never carries the session id and no free text from the file reaches the store. A scrubbed URL over 2048 characters is not recorded at all. Undefined when unresolved, on session-level hook events (`session_start`/`session_end`/the Stop notification, whose `name` is the client), and on every proxy-captured event (the http proxy records its target in `command`). See [Hook-sourced events](#hook-sourced-events-additive). |
 
 **`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
 `--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`
@@ -367,13 +367,13 @@ field:
   PostToolUse event whose `tool_response` is shaped `{isError: true}` (the
   MCP CallToolResult convention) sets `is_error: true` and the
   `'tool_error'` *attribute* only, with no `error` object.
-- **`ServerContext.url`** — the resolved endpoint of the MCP server a
-  hook-sourced `tool_call` went to (see the `ServerContext` table above
-  for the value and its scrubbing), set on both halves of the call and on
-  the `session_start` emitted by the first event of a session (whose
-  `server.name` stays the client name — it records which endpoint the
-  session opened on). `server.name` itself is always what Claude Code calls
-  the server — in a cloud session an opaque UUID like
+- **`ServerContext.url`** — the endpoint of the MCP server a hook-sourced
+  `tool_call` went to, as the MCP config file the hook found asserts it
+  (see the `ServerContext` table above for the value, its scrubbing and
+  its trust), set on both halves of the call and on nothing else: a
+  session-level event names the client itself, so it carries no vendor
+  URL. `server.name` itself is always what Claude Code calls the server —
+  in a cloud session an opaque UUID like
   `47d587b8-3fb9-42e9-b596-f8b25371248c` (cloud dogfood 3, surprise 2) —
   so that it matches Claude Code's own hook matchers and transcripts;
   `url` is what makes such an event self-describing. Absent when the

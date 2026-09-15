@@ -117,9 +117,23 @@ interface SessionRow {
  * never arrived) still counts once. error_count counts is_error on any
  * phase: a failed hook call has exactly one such event (the denied pre, or
  * the failing post — a PostToolUseFailure, or a PostToolUse response shaped
- * `{isError: true}`).
- * server_count is the number of distinct server.name values in the session
- * — 1 for a proxy session, several for a hook session that spanned servers.
+ * `{isError: true}`). A post whose pre was never recorded (the hook
+ * installed mid-call) is therefore counted in error_count but not in
+ * tool_call_count.
+ * server_count is the number of distinct server.name values over the
+ * session's tool_call events ONLY — the servers actually called. Counting
+ * every event would read 2 for a plain proxy session recorded without
+ * --name (server.name is the argv-derived basename until the initialize
+ * handshake and the learned serverInfo.name after it — review of the
+ * integrated change), and would count the client's own session-level
+ * events (`claude-code`) as a server in a hook session. 1 for a proxy
+ * session with or without --name, 0 for a session that never called a
+ * tool, and the number of MCP servers called for a hook session.
+ *
+ * Non-conforming records are read the same way jsonl.ts reads them: an
+ * explicit `phase: null` counts as a call like an absent phase, a
+ * server.name that is not a JSON string is not a server, and is_error only
+ * counts on tool_call/rpc events.
  */
 const SESSIONS_SQL = `
 SELECT
@@ -131,8 +145,11 @@ SELECT
             AND (json_extract(r.event, '$.phase') IS NULL
                  OR json_extract(r.event, '$.phase') = 'pre')
            THEN 1 ELSE 0 END)                           AS tool_call_count,
-  SUM(CASE WHEN json_extract(r.event, '$.is_error') = 1 THEN 1 ELSE 0 END) AS error_count,
-  COUNT(DISTINCT json_extract(r.event, '$.server.name')) AS server_count,
+  SUM(CASE WHEN r.kind IN ('tool_call', 'rpc')
+            AND json_extract(r.event, '$.is_error') = 1 THEN 1 ELSE 0 END) AS error_count,
+  COUNT(DISTINCT CASE WHEN r.kind = 'tool_call'
+                       AND json_type(r.event, '$.server.name') = 'text'
+                      THEN json_extract(r.event, '$.server.name') END) AS server_count,
   (SELECT json_extract(f.event, '$.server.name')
      FROM records f WHERE f.session_id = r.session_id ORDER BY f.seq LIMIT 1) AS server_name,
   (SELECT json_extract(f.event, '$.identity.fingerprint')

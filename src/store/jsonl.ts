@@ -633,16 +633,25 @@ export class JsonlStore implements EvidenceStore {
       summary.event_count += 1;
       // One per CALL: a proxy event (no phase) or a hook 'pre' event; the
       // hook 'post' twin (same request_id) is the same call, and a lone pre
-      // (the call never completed) still counts once.
-      if (ev.kind === 'tool_call' && (ev.phase === undefined || ev.phase === 'pre')) {
+      // (the call never completed) still counts once. An explicit
+      // `phase: null` reads as "no phase", exactly as SQL's `IS NULL` does.
+      if (
+        ev.kind === 'tool_call' &&
+        (ev.phase === undefined || ev.phase === null || ev.phase === 'pre')
+      ) {
         summary.tool_call_count += 1;
       }
       // is_error on any phase: a failed hook call carries exactly one such
-      // event (a denied pre, or a failing post).
-      if ((ev.kind === 'tool_call' || ev.kind === 'rpc') && ev.is_error) {
+      // event (a denied pre, or a failing post). A post whose pre was never
+      // recorded is an error here but not a call above.
+      if ((ev.kind === 'tool_call' || ev.kind === 'rpc') && ev.is_error === true) {
         summary.error_count += 1;
       }
-      if (typeof ev.server?.name === 'string') {
+      // Distinct servers actually CALLED: tool_call events only, so a proxy
+      // session recorded without --name (argv basename before the initialize
+      // handshake, learned serverInfo.name after) reads 1, not 2, and a hook
+      // session does not count its own claude-code session-level events.
+      if (ev.kind === 'tool_call' && typeof ev.server?.name === 'string') {
         servers.add(ev.server.name);
         summary.server_count = servers.size;
       }

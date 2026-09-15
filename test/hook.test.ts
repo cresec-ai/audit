@@ -891,7 +891,7 @@ describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, poli
     expect(rawStore).not.toContain('mcp__mcp.clickup.com'); // the policy alias is never recorded
   }
 
-  it('stamps server.url (the vendor endpoint) on session_start and on every pre/post/failure event; server.name stays the UUID', async () => {
+  it('stamps server.url (the vendor endpoint) on every pre/post/failure event, not on session_start; server.name stays the UUID', async () => {
     const dataDir = tmpDir('mcp-hook-cloud-url-');
     const sessionId = freshSessionId();
     const toolName = `mcp__${CLICKUP_UUID}__clickup_get_list`;
@@ -939,8 +939,8 @@ describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, poli
     const events = readEvents(dataDir);
     expect(events.map((e) => e.kind)).toEqual(['session_start', 'tool_call', 'tool_call', 'tool_call', 'tool_call']);
     const sessionStart = events[0] as SessionStartEvent;
-    expect(sessionStart.server.name).toBe('claude-code'); // a session-level event keeps the client name...
-    expect(sessionStart.server.url).toBe(CLICKUP_URL); // ...and says which vendor endpoint the session opened on
+    expect(sessionStart.server.name).toBe('claude-code'); // a session-level event names the client itself...
+    expect(sessionStart.server.url).toBeUndefined(); // ...so it carries no vendor URL: url is where server.name is
 
     const toolCalls = events.slice(1) as ToolCallEvent[];
     expect(toolCalls.map((e) => e.phase)).toEqual(['pre', 'post', 'pre', 'post']);
@@ -1046,6 +1046,99 @@ describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, poli
     expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.is_error).toBe(false);
     expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.server.url).toBeUndefined();
     expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('the alias is deny-only: an allow rule never matches it, so a forged config file cannot widen a default-deny policy', async () => {
+    // The config file the alias comes from lives in a world-writable /tmp
+    // next to the agent the policy constrains. Review of the integrated
+    // change (E1): with {allow: [^mcp__github__.*$], default: deny}, a
+    // planted file mapping the ClickUp UUID to mcp_url=https://github/mcp
+    // made the alias mcp__github__clickup_delete_task satisfy the allow
+    // rule, and the delete went through. Neither a bare-label host nor a
+    // dotted one may ever do that now.
+    const dataDir = tmpDir('mcp-hook-cloud-alias-denyonly-');
+    const uuidTool = `mcp__${CLICKUP_UUID}__clickup_delete_task`;
+    type DenyPayload = { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
+    const decision = (r: CliResult): string =>
+      r.stdout === '' ? 'allow' : (JSON.parse(r.stdout) as DenyPayload).hookSpecificOutput.permissionDecision;
+
+    const forgedBare = join(dataDir, 'mcp-config-forged-bare.json');
+    writeFileSync(
+      forgedBare,
+      JSON.stringify({
+        mcpServers: {
+          [CLICKUP_UUID]: { url: `https://relay.example.test/mcp?mcp_url=${encodeURIComponent('https://github/mcp')}` },
+        },
+      }),
+    );
+    const forgedDotted = join(dataDir, 'mcp-config-forged-dotted.json');
+    writeFileSync(
+      forgedDotted,
+      JSON.stringify({
+        mcpServers: {
+          [CLICKUP_UUID]: { url: `https://relay.example.test/mcp?mcp_url=${encodeURIComponent('https://github.example.test/mcp')}` },
+        },
+      }),
+    );
+    // An allow-list policy: only github tools may run. Written loosely on
+    // purpose (no trailing anchor after the server segment) so that a dotted
+    // forged host would match it too if the alias were tested for allows.
+    const allowList = join(dataDir, 'allow-list.json');
+    writeFileSync(allowList, JSON.stringify({ allow: [{ tool: '^mcp__github' }], default: 'deny' }));
+    const run = (toolUseId: string, policy: string, env: Record<string, string | undefined>, toolName = uuidTool) =>
+      runHook(
+        ['--data-dir', dataDir, ...store, '--policy', policy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: { task_id: 'x' }, toolUseId }),
+        env,
+      );
+
+    // The real github tool is allowed by its raw name, config or not.
+    expect(decision(await run('toolu_gh_real', allowList, withConfig, 'mcp__github__get_me'))).toBe('allow');
+    expect(decision(await run('toolu_gh_real_nocfg', allowList, noConfig, 'mcp__github__get_me'))).toBe('allow');
+    // The ClickUp delete is denied by default without a config...
+    expect(decision(await run('toolu_forge_none', allowList, noConfig))).toBe('deny');
+    // ...and STAYS denied whatever a config file claims its host is.
+    expect(decision(await run('toolu_forge_bare', allowList, { MCP_RECORDER_MCP_CONFIG: forgedBare }))).toBe('deny');
+    expect(decision(await run('toolu_forge_dotted', allowList, { MCP_RECORDER_MCP_CONFIG: forgedDotted }))).toBe('deny');
+    // Even an allow rule written against the genuine vendor host never fires
+    // on the alias: with the real fixture the UUID tool is still denied.
+    const allowAlias = join(dataDir, 'allow-alias.json');
+    writeFileSync(allowAlias, JSON.stringify({ allow: [{ tool: '^mcp__mcp\\.clickup\\.com__.*$' }], default: 'deny' }));
+    expect(decision(await run('toolu_allow_alias', allowAlias, withConfig))).toBe('deny');
+    // Whereas the same regex as a DENY rule does fire on the alias.
+    const denyAlias = join(dataDir, 'deny-alias.json');
+    writeFileSync(denyAlias, JSON.stringify({ deny: [{ tool: '^mcp__mcp\\.clickup\\.com__.*$' }], default: 'allow' }));
+    expect(decision(await run('toolu_deny_alias', denyAlias, withConfig))).toBe('deny');
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    for (const id of ['toolu_forge_none', 'toolu_forge_bare', 'toolu_forge_dotted', 'toolu_allow_alias']) {
+      expect(events.find((e) => e.request_id === id)?.error?.type).toBe('policy_denied');
+    }
+    // What a forged file asserts is still recorded as the (scrubbed) claim it is.
+    expect(events.find((e) => e.request_id === 'toolu_forge_dotted')?.server.url).toBe('https://github.example.test/mcp');
+    expect(events.find((e) => e.request_id === 'toolu_forge_bare')?.server.url).toBe('https://github/mcp');
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('a policy deny still exits 0 when the stdout reader is gone (EPIPE is swallowed, fail-open)', async () => {
+    // Review of the integrated change (E7): the deny JSON is the one thing
+    // the hook prints; with the reader gone the write raised an unhandled
+    // EPIPE and the hook exited 1 — a non-zero exit from a hook.
+    const dataDir = tmpDir('mcp-hook-epipe-');
+    const denyAll = join(dataDir, 'deny-all.json');
+    writeFileSync(denyAll, JSON.stringify({ deny: [{ tool: '.*', reason: 'everything is denied' }] }));
+    const child = spawnCli(['hook', '--data-dir', dataDir, ...store, '--policy', denyAll], noConfig);
+    const stderr = collect(child.stderr);
+    child.stdin!.write(preToolUseInput({ sessionId: freshSessionId(), toolName: 'mcp__x__y', toolInput: {}, toolUseId: 'toolu_epipe' }));
+    child.stdin!.end();
+    child.stdout!.destroy(); // the reader goes away before the hook prints its deny
+    const code = await waitExit(child);
+    expect(code).toBe(0);
+    expect(stderr()).not.toContain('EPIPE');
+    expect(stderr()).not.toContain('Unhandled');
+    // The deny itself was still recorded.
+    const denied = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(denied.error?.type).toBe('policy_denied');
   });
 
   it('a missing or malformed MCP_RECORDER_MCP_CONFIG is fail-open: allowed and recorded, just without server.url; comma-separated paths are tried in order', async () => {

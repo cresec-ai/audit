@@ -943,21 +943,24 @@ async function cmdSessions(flags: Flags): Promise<void> {
       out('no sessions recorded');
       return;
     }
+    // SERVERS is appended LAST so every column that existed before it keeps
+    // its position for anyone who split this table by column index; `--json`
+    // is the stable machine interface (README).
     out(
       formatTable(
-        ['SESSION', 'STARTED', 'ENDED', 'SERVER', 'SERVERS', 'EVENTS', 'TOOL_CALLS', 'ERRORS'],
+        ['SESSION', 'STARTED', 'ENDED', 'SERVER', 'EVENTS', 'TOOL_CALLS', 'ERRORS', 'SERVERS'],
         sessions.map((s) => [
           id8(s.session_id),
           s.started_at,
           s.ended_at ?? '(open)',
           s.server_name,
-          // Distinct server.name values in the session: 1 for a proxy
-          // session, more for a hook session whose calls spanned servers
-          // (SERVER is only the first event's — 'claude-code' for a hook).
-          s.server_count === undefined ? '' : String(s.server_count),
           String(s.event_count),
           String(s.tool_call_count),
           String(s.error_count),
+          // Distinct server.name values over the session's tool_call events:
+          // 1 for a proxy session, the number of servers called for a hook
+          // session (SERVER is only the first event's — 'claude-code' there).
+          s.server_count === undefined ? '' : String(s.server_count),
         ]),
       ),
     );
@@ -1517,6 +1520,19 @@ function readStdinText(stream: NodeJS.ReadStream): Promise<string> {
 async function cmdHook(flags: Flags, positionals: string[]): Promise<void> {
   if (positionals[0] === 'install') {
     return cmdHookInstall(flags);
+  }
+  // Fail-open on stdout too. The one thing this command ever prints is a
+  // policy deny; if the reader is gone by then (Claude Code killed the hook,
+  // or a `| head` in a manual test), the write raises EPIPE asynchronously
+  // and an unhandled stream error would exit 1 — a non-zero exit from a
+  // hook is exactly what must never happen here. Unlike `guardStdoutEpipe`
+  // (which rethrows non-EPIPE errors), every stdout error is swallowed.
+  try {
+    process.stdout.on('error', () => {
+      /* fail-open */
+    });
+  } catch {
+    /* fail-open */
   }
   // Fail-open, ALWAYS: nothing below may throw or leave a non-zero exit
   // code — this command is spawned fresh by Claude Code for every

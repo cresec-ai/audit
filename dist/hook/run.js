@@ -143,9 +143,13 @@ export async function runHook(stdinText, opts) {
         // connectors are named by opaque UUIDs (mcp__47d587b8-…__clickup_get_list),
         // and that file is the only place the UUID maps to a vendor endpoint. The
         // resolved URL is stamped as the additive `server.url`; the host also
-        // forms the policy alias `mcp__<host>__<tool>`. `server.name` stays what
-        // Claude Code calls the server (the UUID), so it matches Claude Code's
-        // own matchers and transcripts. Fail-open: `{}` when nothing resolves.
+        // forms the policy alias `mcp__<host>__<tool>`, which is tested against
+        // DENY rules only (that file is writable by the agent under policy — see
+        // the TRUST note in mcp-config.ts and `evaluatePolicy`). `server.name`
+        // stays what Claude Code calls the server (the UUID), so it matches
+        // Claude Code's own matchers and transcripts. Fail-open: `{}` when
+        // nothing resolves, and no alias for a host that is not a plausible
+        // dotted hostname (`hostAliasToolName`).
         const origin = parsed !== undefined && parsed.isMcp ? resolveServerOrigin(parsed.server) : {};
         const policyAlias = parsed !== undefined && parsed.isMcp && origin.host !== undefined
             ? hostAliasToolName(origin.host, parsed.tool)
@@ -185,12 +189,12 @@ export async function runHook(stdinText, opts) {
         // store) even though this particular string is a local constant, never
         // attacker/remote controlled — defense in depth, and it costs nothing.
         const scrubbedCommand = scrubArgv([`hook:${opts.clientName}`], setup.redactor).command;
+        // Session-level events (session_start, session_end, the Stop
+        // notification) carry the client's own ServerContext and nothing else:
+        // `url` is "where the server named by server.name is", and the server
+        // named here is claude-code itself, so it never carries a vendor URL
+        // (every tool_call event does).
         const baseServer = { name: opts.clientName, command: scrubbedCommand, transport: 'stdio' };
-        // The session_start emitted by the first hook event of a session carries
-        // the origin of that first event's server too (when it resolved), so the
-        // evidence says up front which vendor endpoint the session opened on.
-        // Its `name` stays the client name: it is a session-level event.
-        const sessionStartServer = origin.url !== undefined ? { ...baseServer, url: origin.url } : baseServer;
         const base = (kind, attributes, server = baseServer) => ({
             schema: SCHEMA,
             event_id: randomUUID(),
@@ -208,7 +212,7 @@ export async function runHook(stdinText, opts) {
             if (firstEventOfSession) {
                 const cwd = typeof input.cwd === 'string' ? input.cwd : process.cwd();
                 const sessionStart = {
-                    ...base('session_start', { 'rpc.system': 'hook' }, sessionStartServer),
+                    ...base('session_start', { 'rpc.system': 'hook' }),
                     kind: 'session_start',
                     proxy_version: opts.proxyVersion,
                     cwd,

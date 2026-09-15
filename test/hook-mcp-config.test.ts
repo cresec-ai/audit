@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { sha256Ref } from '../src/chain/hash.js';
 import {
   CLOUD_MCP_CONFIG_GLOB,
+  MAX_ORIGIN_URL_LEN,
   MCP_CONFIG_MAX_BYTES,
   originFromEntryUrl,
   resolveServerOrigin,
@@ -193,6 +194,36 @@ describe('originFromEntryUrl', () => {
   it('an mcp_url with a non-http scheme falls back to the relay URL', () => {
     const origin = originFromEntryUrl('https://relay.example.test/mcp?mcp_url=ftp%3A%2F%2Fvendor.example.test%2Fx');
     expect(origin).toEqual({ host: 'relay.example.test', url: 'https://relay.example.test/mcp' });
+  });
+
+  it('a path segment that is not a short vocabulary token is hashed: no readable text from the (agent-writable) file reaches the store', () => {
+    const free = 'readable-free-text-readable-free-text-readable-free-text';
+    const origin = originFromEntryUrl(`https://relay.example.test/mcp?mcp_url=${encodeURIComponent(`https://vendor.example.test/v2/${free}/some%20words/end`)}`);
+    expect(origin).toEqual({
+      host: 'vendor.example.test',
+      url: `https://vendor.example.test/v2/${sha256Ref(free)}/${sha256Ref('some%20words')}/end`,
+    });
+    // Vocabulary tokens (short, [A-Za-z0-9._-]) survive: that is what the real relay paths are made of.
+    expect(originFromEntryUrl('https://api.anthropic.com/v2/ccr-sessions/x/github/mcp')?.url).toBe(
+      'https://api.anthropic.com/v2/ccr-sessions/x/github/mcp',
+    );
+    // The 32-char boundary, with a token that is not hex-shaped (a 32+ hex
+    // run is already a "digest" to looksSecret and hashed on that ground).
+    const at32 = 'segment-'.repeat(4);
+    expect(at32).toHaveLength(32);
+    expect(originFromEntryUrl(`https://h.example/${at32}`)?.url).toBe(`https://h.example/${at32}`);
+    expect(originFromEntryUrl(`https://h.example/${at32}s`)?.url).toBe(`https://h.example/${sha256Ref(`${at32}s`)}`);
+  });
+
+  it('a scrubbed URL over the length cap is not usable at all — url and host go together (no url, no alias) — and an oversized mcp_url falls back to the relay', () => {
+    const longHost = `${'h'.repeat(MAX_ORIGIN_URL_LEN)}.example`;
+    expect(originFromEntryUrl(`https://${longHost}/mcp`)).toBeUndefined();
+    // Hashing keeps it in step: sha256 refs are 71 chars each, so enough
+    // free-text segments push a short URL past the cap after scrubbing.
+    const manySegments = Array.from({ length: 40 }, (_, i) => `free text segment ${i}`).map(encodeURIComponent).join('/');
+    expect(originFromEntryUrl(`https://h.example/${manySegments}`)).toBeUndefined();
+    const relay = `https://relay.example.test/mcp?mcp_url=${encodeURIComponent(`https://${longHost}/mcp`)}`;
+    expect(originFromEntryUrl(relay)).toEqual({ host: 'relay.example.test', url: 'https://relay.example.test/mcp' });
   });
 });
 

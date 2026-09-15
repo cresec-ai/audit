@@ -254,8 +254,9 @@ function hookStop(timestamp: string): NotificationEvent {
  *   3. github pull_request_read:       pre + post with is_error (failing post)
  *   4. ClickUp delete_task:            pre denied by policy (is_error, no post)
  *   5. corp-notes list_notes:          pre + post (completed)
- * — so a correct summary reads 5 calls, 2 errors, and 4 distinct servers
- * (claude-code for the session-level events, ClickUp, github, corp-notes).
+ * — so a correct summary reads 5 calls, 2 errors, and 3 distinct servers
+ * called (ClickUp, github, corp-notes; the claude-code session-level events
+ * are not a server the session called).
  */
 function hookSessionEvents(): AnyEvent[] {
   const t = (s: number) => `2026-09-15T21:02:${String(s).padStart(2, '0')}.000Z`;
@@ -494,8 +495,75 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     // Exactly one is_error event per failed call: the denied pre and the
     // failing post. The lone pre with no post is NOT an error here.
     expect(hook.error_count).toBe(2);
-    // claude-code (session-level events) + ClickUp + github + corp-notes.
-    expect(hook.server_count).toBe(4);
+    // The servers the session's tool calls went to: ClickUp + github +
+    // corp-notes. The claude-code session_start/Stop events are not one.
+    expect(hook.server_count).toBe(3);
+  });
+
+  it('sessions() counts a proxy session recorded without --name as one server, and a session with no tool call as zero', () => {
+    // Without --name the proxy stamps the argv-derived basename on the
+    // events before the initialize handshake and the learned serverInfo.name
+    // after it (src/proxy/stdio.ts), so counting distinct names over EVERY
+    // event read 2 for the README's plain `record -- <server>` form (review
+    // of the integrated change). Only the servers actually called count.
+    const MIXED = '44444444-4444-4444-8444-444444444444';
+    const NO_CALLS = '55555555-5555-4555-8555-555555555555';
+    const named = (ev: AnyEvent, name: string): AnyEvent => ({ ...ev, server: { ...ev.server, name } });
+    const store = open();
+    store.append(
+      seal([
+        named(sessionStart(MIXED, '2026-09-15T22:10:28.020Z'), 'echo-server.cjs'),
+        named(toolCall(MIXED, '2026-09-15T22:10:28.050Z', 'echo', { requestId: 2 }), 'echo-server'),
+        named(toolCall(MIXED, '2026-09-15T22:10:28.060Z', 'echo', { requestId: 3 }), 'echo-server'),
+        named(sessionEnd(MIXED, '2026-09-15T22:10:28.072Z'), 'echo-server'),
+        sessionStart(NO_CALLS, '2026-09-15T22:11:00.000Z'),
+        sessionEnd(NO_CALLS, '2026-09-15T22:11:01.000Z'),
+      ]),
+    );
+    const sessions = store.sessions();
+    const mixed = sessions.find((s) => s.session_id === MIXED)!;
+    expect(mixed.server_name).toBe('echo-server.cjs'); // SERVER stays the first event's name
+    expect(mixed.server_count).toBe(1);
+    expect(mixed.tool_call_count).toBe(2);
+    const noCalls = sessions.find((s) => s.session_id === NO_CALLS)!;
+    expect(noCalls.server_count).toBe(0);
+    expect(noCalls.tool_call_count).toBe(0);
+  });
+
+  it('sessions() reads non-conforming records the same way on both backends', () => {
+    // Shapes no writer of ours produces, pinned so the two backends cannot
+    // drift apart on them: an explicit `phase: null` (a call, like an
+    // absent phase), a server.name that is not a string (not a server),
+    // and is_error on a kind that is neither tool_call nor rpc (not an
+    // error).
+    const ODD = '66666666-6666-4666-8666-666666666666';
+    const t = (s: number) => `2026-09-15T22:12:${String(s).padStart(2, '0')}.000Z`;
+    const phaseNull = { ...toolCall(ODD, t(1), 'a', { requestId: 1 }), phase: null } as unknown as AnyEvent;
+    const numericName = {
+      ...toolCall(ODD, t(2), 'b', { requestId: 2 }),
+      server: { ...SERVER, name: 42 },
+    } as unknown as AnyEvent;
+    const erroringNotification = {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: ODD,
+      timestamp: t(3),
+      kind: 'notification',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: {},
+      method: 'notifications/message',
+      direction: 'server_to_client',
+      params: {},
+      is_error: true,
+    } as unknown as AnyEvent;
+    const store = open();
+    store.append(seal([sessionStart(ODD, t(0)), phaseNull, numericName, erroringNotification]));
+    const odd = store.sessions().find((s) => s.session_id === ODD)!;
+    expect(odd.event_count).toBe(4);
+    expect(odd.tool_call_count).toBe(2); // phase null and the numeric-name call both count as calls
+    expect(odd.server_count).toBe(1); // github-mcp; 42 is not a server name
+    expect(odd.error_count).toBe(0); // is_error on a notification is not an error
   });
 
   it('signatures round-trip in insertion order', () => {

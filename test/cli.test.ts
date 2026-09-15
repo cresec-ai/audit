@@ -444,7 +444,7 @@ describe('mcp-recorder CLI', () => {
     // --- sessions -----------------------------------------------------------
     const sessions = await runCli(['sessions', '--data-dir', dataDir, '--json']);
     expect(sessions.code).toBe(0);
-    const list = JSON.parse(sessions.stdout) as Array<{ tool_call_count: number }>;
+    const list = JSON.parse(sessions.stdout) as Array<{ tool_call_count: number; server_count: number }>;
     expect(list).toHaveLength(1);
     expect(list[0]!.tool_call_count).toBe(1);
 
@@ -452,6 +452,14 @@ describe('mcp-recorder CLI', () => {
     expect(sessionsHuman.code).toBe(0);
     expect(sessionsHuman.stdout).toContain('SESSION');
     expect(sessionsHuman.stdout).toContain('SERVERS');
+    // Recorded without --name: server.name is the argv basename before the
+    // initialize handshake and the learned name after it, yet the session
+    // wrapped ONE server and must read so (review of the integrated change).
+    const [sessionsHeader, sessionsRow] = sessionsHuman.stdout.trim().split('\n');
+    const sessionsHeaders = sessionsHeader!.trim().split(/\s+/);
+    const sessionsCells = sessionsRow!.trim().split(/\s+/);
+    expect(sessionsCells[sessionsHeaders.indexOf('SERVERS')]).toBe('1');
+    expect(list[0]!.server_count).toBe(1);
 
     // --- query for the planted probe value ----------------------------------
     const query = await runCli(['query', PROBE, '--data-dir', dataDir]);
@@ -515,22 +523,24 @@ describe('mcp-recorder CLI', () => {
     expect(human.code).toBe(0);
     const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
     const headers = headerLine!.trim().split(/\s+/);
+    // SERVERS is the LAST column: every column that existed before it keeps
+    // its position.
     expect(headers).toEqual([
       'SESSION',
       'STARTED',
       'ENDED',
       'SERVER',
-      'SERVERS',
       'EVENTS',
       'TOOL_CALLS',
       'ERRORS',
+      'SERVERS',
     ]);
     expect(rowLines).toHaveLength(1);
     const cells = rowLines[0]!.trim().split(/\s+/);
     const cell = (name: string): string => cells[headers.indexOf(name)]!;
     expect(cell('SESSION')).toBe('cccccccc');
     expect(cell('SERVER')).toBe('claude-code'); // the first event's server: the client itself
-    expect(cell('SERVERS')).toBe('3'); // claude-code + ClickUp + github
+    expect(cell('SERVERS')).toBe('2'); // the servers called: ClickUp + github (claude-code is not one)
     expect(cell('EVENTS')).toBe('6'); // session_start + 5 tool_call events
     expect(cell('TOOL_CALLS')).toBe('3'); // 2 pre+post pairs + 1 lone pre = 3 calls, not 5
     expect(cell('ERRORS')).toBe('0');
@@ -549,7 +559,7 @@ describe('mcp-recorder CLI', () => {
     expect(list[0]).toMatchObject({
       session_id: sessionId,
       server_name: 'claude-code',
-      server_count: 3,
+      server_count: 2,
       event_count: 6,
       tool_call_count: 3,
       error_count: 0,
