@@ -227,17 +227,33 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   every other JSON-RPC message is forwarded unchanged, like record mode.
   Four consequences worth knowing: a `tools/call` sent as a notification (no
   `id`) is forwarded unevaluated, since no response could be synthesized for
-  it and MCP servers do not execute tool notifications; a `hold` rule matched
-  inside a JSON-RPC batch is treated as `deny` (batching was removed from MCP
-  in 2025-06-18; allowed and denied batch elements are answered individually);
-  a single line larger than 32 MiB cannot be parsed, so it crosses unchanged
-  and unevaluated and is recorded as `protocol_error` `oversized`, exactly as
-  in record mode; and synthesized deny/hold responses ride the
-  server-to-client stream, so they are never spliced into the middle of a
-  server line and may be ordered after one that was already in flight.
+  it and MCP servers do not execute tool notifications — but a `tools/call`
+  *request* is always evaluated, and one whose `params.name` is missing or is
+  not a string is evaluated as the tool name `""`, so `mcp.default` (and any
+  rule whose tool glob matches an empty string) decides it; a `hold` rule
+  matched inside a JSON-RPC batch is treated as `deny` (batching was removed
+  from MCP in 2025-06-18; allowed and denied batch elements are answered
+  individually, and when the server answers a forwarded batch with an array,
+  every element that answers a `tools/call` goes through the boundary filter,
+  with `max_scan_bytes` applied to the whole batch line); a single line larger
+  than 32 MiB cannot be parsed, so it crosses unchanged and unevaluated and is
+  recorded as `protocol_error` `oversized`, exactly as in record mode; and
+  synthesized deny/hold responses ride the server-to-client stream, so they are
+  never spliced into the middle of a server line and may be ordered after one
+  that was already in flight — an approved hold is released into the
+  client-to-server stream the same way, after any client line still streaming
+  through.
 - It does not enforce `egress` rules (the sidecar does; see
   [docs/policy.md](policy.md)).
 - It does not hide denied tools from `tools/list` (v1).
+- It parks at most 256 held calls at once; a hold-matching call beyond that
+  is refused as a deny ("too many pending holds") rather than buffered
+  without bound.
+- It does not park a hold once the session has started shutting down: a
+  hold-matching `tools/call` that arrives while the proxy is winding down is
+  refused immediately, recorded with `outcome: session_end` and no
+  `approval_id`, and no hold file is written — a hold can never outlive the
+  session that created it.
 - It is stdio-only in v1; `mcp-recorder http --policy` is rejected.
 - Recording stays fail-open even in gateway mode: a store failure never
   turns into a deny. Enforcement, on the other hand, fails closed — a policy

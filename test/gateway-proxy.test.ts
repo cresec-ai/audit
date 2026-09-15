@@ -27,7 +27,7 @@ import { blockedText, deniedText, oversizeBlockedText } from '../src/gateway/bou
 import type { LoadedPolicy } from '../src/policy/load.js';
 import type { Policy, PolicyInput } from '../src/policy/types.js';
 import { validatePolicyObject } from '../src/policy/validate.js';
-import { runStdioProxy } from '../src/proxy/stdio.js';
+import { MAX_HOLDS, runStdioProxy } from '../src/proxy/stdio.js';
 import { queryStore } from '../src/query/touched.js';
 import { Redactor } from '../src/redact/redactor.js';
 import type {
@@ -72,6 +72,13 @@ class FakeStore implements EvidenceStore {
   readonly path = ':memory:';
   records: ChainRecord[] = [];
   sigs: HeadSignature[] = [];
+  /**
+   * Injectable delay/failure hook: runs before every `appendEvents`
+   * attempt. Throwing makes the Recorder retry with its normal backoff,
+   * which is how a test gets a real asynchronous window inside finalize()'s
+   * `await recorder.flush()` (used by the session-end hold regression).
+   */
+  beforeAppend: ((events: AnyEvent[]) => void) | null = null;
 
   head(): ChainHead {
     const last = this.records[this.records.length - 1];
@@ -90,6 +97,7 @@ class FakeStore implements EvidenceStore {
     }
   }
   appendEvents(events: AnyEvent[]): ChainRecord[] {
+    this.beforeAppend?.(events);
     let head = this.head();
     const sealed: ChainRecord[] = [];
     for (const event of events) {
@@ -268,9 +276,10 @@ function startProxy(
     env?: NodeJS.ProcessEnv;
     stdout?: Writable;
     holdStore?: HoldStore;
+    store?: FakeStore;
   } = {},
 ): Session {
-  const store = new FakeStore();
+  const store = opts.store ?? new FakeStore();
   const recorder = new Recorder({ store, signer: null });
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -1061,17 +1070,23 @@ describe('gateway: JSON-RPC batches', () => {
 
 describe('gateway: framing, EPIPE and shutdown', () => {
   it('a server line that arrives in pieces is never split by a synthesized response (both lines intact)', async () => {
-    // Server: replies to id 1 in two halves 300 ms apart, then exits on stdin end.
+    // Server: on its first stdin line it writes the first half of the reply to id 1 and announces
+    // that on stderr; it completes the line only once a line containing "go" arrives, so the window
+    // in which the server line is open is controlled by the test, not by a wall-clock timer.
     const script =
-      "process.stdin.once('data',()=>{process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"half\":');" +
-      "setTimeout(()=>process.stdout.write('1}}\\n'),300);});process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.exit(0),350));";
+      "let sent=false;process.stdin.on('data',(d)=>{const t=String(d);" +
+      "if(!sent){sent=true;process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"half\":');process.stderr.write('half-sent\\n');return;}" +
+      "if(t.includes('go'))process.stdout.write('1}}\\n');});" +
+      "process.stdin.on('end',()=>setTimeout(()=>process.exit(0),350));";
     const s = startProxy(standardPolicy(), { command: [process.execPath, '-e', script] });
     s.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-    await sleep(120); // the first half is inside the proxy (a line under the cap is forwarded whole, on its newline)
-    expect(s.out.raw()).toBe('');
+    await waitFor(() => s.err.raw().includes('half-sent'), 'first half sent');
+    await sleep(50); // stdout and stderr are separate pipes: let the half land in the proxy's scanner
+    expect(s.out.raw()).toBe(''); // a line under the cap is forwarded whole, on its newline
     s.send(toolsCall(2, 'delete_it', {})); // denied: synthesized while the server line is open
     await sleep(100);
     expect(s.out.raw()).toBe(''); // deferred: nothing goes out while the server is mid-line
+    s.send({ jsonrpc: '2.0', method: 'notifications/go' }); // forwarded; the server completes its line
     await waitFor(() => s.responded(1)() && s.responded(2)(), 'server line, then the deny');
     const lines = s.out.lines();
     expect(lines).toHaveLength(2);
@@ -1172,10 +1187,10 @@ describe('gateway: framing, EPIPE and shutdown', () => {
     s.sendRaw(bytes.subarray(2 * third).toString('latin1'));
     // While the oversized RESPONSE is streaming through (it is forwarded piecewise, so the client
     // holds a partial line), a denied call's synthesized line must wait for that line to complete.
-    await waitFor(() => s.out.raw().length > 1024 * 1024, 'huge echo streaming', 25_000);
+    await waitFor(() => s.out.raw().length > 1024 * 1024, 'huge echo streaming', 120_000);
     s.send(toolsCall(4, 'delete_mid_stream', {}));
-    await waitFor(() => s.out.raw().length > bytes.length, 'huge echo back', 25_000);
-    await waitFor(() => s.responded(2)() && s.responded(4)(), 'huge response + deferred deny parseable', 25_000);
+    await waitFor(() => s.out.raw().length > bytes.length, 'huge echo back', 120_000);
+    await waitFor(() => s.responded(2)() && s.responded(4)(), 'huge response + deferred deny parseable', 120_000);
     const res = s.response(2).result as { content: { text: string }[] };
     expect(res.content[0]!.text.length).toBe(JSON.stringify({ pad }).length);
     const ids = s.out.lines().map((l) => parseLine(l)?.id);
@@ -1193,9 +1208,9 @@ describe('gateway: framing, EPIPE and shutdown', () => {
     expect(errs[0]!.bytes_len).toBe(bytes.length - 1);
     expect(decisions(s.events()).map((d) => d.request_id)).toEqual([4]);
     expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([4, 3]);
-  }, 60_000);
+  }, 180_000); // 32 MiB each way through a real child: slow on a loaded 2-vCPU runner
 
-  it('a tools/call notification (no id) and a tools/call without a name are forwarded unevaluated', async () => {
+  it('a tools/call notification (no id) is forwarded unevaluated; one without a name is evaluated as the empty tool name (allowed by this policy default)', async () => {
     const s = startProxy(standardPolicy());
     await handshake(s);
     s.send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'delete_x', arguments: {} } });
@@ -1209,5 +1224,366 @@ describe('gateway: framing, EPIPE and shutdown', () => {
     expect(call.tool).toBe('');
     expect(call.gateway).toMatchObject({ decision: 'allow' });
     expect(s.events().some((e) => e.kind === 'notification' && e.method === 'tools/call')).toBe(true);
+  });
+});
+
+/* ------------------ adversarial-review regressions (F1-F9) --------------- */
+
+/** An AWS access key id — matches the recorder's own `alwaysPatterns`. */
+const AWS_KEY = 'AKIA1234567890ABCDEF';
+/** What the boundary filter leaves in place of it. */
+const AWS_MARKER = `[redacted:sha256:${sha256Ref(AWS_KEY).slice('sha256:'.length, 'sha256:'.length + 16)}]`;
+
+/** Write a scripted stdio server into a temp dir and return its argv. */
+function scriptServer(body: string): string[] {
+  const dir = newDataDir();
+  const file = join(dir, 'server.cjs');
+  writeFileSync(file, body);
+  return [process.execPath, file];
+}
+
+/**
+ * A line-framed scripted server whose `handle(msg, line)` body is `body`
+ * (`send(message)` writes one line, `answer(id, text)` writes a tools/call
+ * result, `line` is the exact request line without its newline).
+ */
+function lineServer(body: string): string[] {
+  return scriptServer(
+    [
+      "'use strict';",
+      "let buf = '';",
+      "process.stdin.setEncoding('utf8');",
+      "const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n');",
+      "const answer = (id, text) => send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });",
+      'const handle = (msg, line) => {',
+      body,
+      '};',
+      "process.stdin.on('data', (c) => {",
+      '  buf += c;',
+      '  let i;',
+      "  while ((i = buf.indexOf('\\n')) !== -1) {",
+      '    const line = buf.slice(0, i);',
+      '    buf = buf.slice(i + 1);',
+      '    let msg;',
+      '    try { msg = JSON.parse(line); } catch { continue; }',
+      '    handle(msg, line);',
+      '  }',
+      '});',
+      "process.stdin.on('end', () => process.exit(0));",
+    ].join('\n'),
+  );
+}
+
+/** Cheap hold-file count (holdStore.list() re-reads every file, which is slow at 256). */
+function holdFileCount(dataDir: string): number {
+  try {
+    return readdirSync(join(dataDir, 'holds')).filter((n) => n.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+}
+
+describe('gateway: adversarial regressions', () => {
+  it('F1: a batch ANSWER is filtered element by element; every tool_call carries a boundary report', async () => {
+    const s = startProxy(ALLOW_SCAN, {
+      command: lineServer(`
+  if (Array.isArray(msg)) {
+    send(msg.filter((m) => m && m.id !== undefined).map((m, k) => ({
+      jsonrpc: '2.0',
+      id: m.id,
+      result: { content: [{ type: 'text', text: k === 0 ? 'aws=${AWS_KEY} tail' : 'clean' }] },
+    })));
+    return;
+  }
+  if (msg && msg.id !== undefined) answer(msg.id, 'ok');
+`),
+    });
+    s.send([toolsCall(10, 'echo', { a: 1 }), toolsCall(11, 'echo', { b: 2 })]);
+    await waitFor(() => s.out.raw().includes('"id":11'), 'the batch answer');
+    s.stdin.end();
+    await s.done;
+
+    // The client got ONE array back, with the secret-shaped token redacted.
+    const lines = s.out.lines();
+    expect(lines).toHaveLength(1);
+    const delivered = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } }[];
+    expect(delivered.map((r) => r.id)).toEqual([10, 11]);
+    expect(delivered[0]!.result.content[0]!.text).toBe(`aws=${AWS_MARKER} tail`);
+    expect(delivered[1]!.result.content[0]!.text).toBe('clean');
+    expect(s.out.raw()).not.toContain(AWS_KEY);
+
+    const calls = new Map(toolCalls(s.events()).map((c) => [c.request_id, c]));
+    expect([...calls.keys()]).toEqual([10, 11]);
+    const rawTen = { content: [{ type: 'text', text: `aws=${AWS_KEY} tail` }] };
+    // result_hash stays the RAW server result; the delivered variant is hashed additively.
+    expect(calls.get(10)!.result_hash).toBe(sha256Ref(canonicalJson(rawTen)));
+    expect(calls.get(10)!.gateway!.boundary).toMatchObject({ scanned: true, action: 'redact', secrets_found: 1, injection_found: 0 });
+    expect(calls.get(10)!.gateway!.boundary!.secret_refs).toContain(sha256Ref(AWS_KEY));
+    expect(calls.get(10)!.gateway!.boundary!.delivered_result_hash).toBe(sha256Ref(canonicalJson(delivered[0]!.result)));
+    expect(calls.get(11)!.result_hash).toBe(sha256Ref(canonicalJson({ content: [{ type: 'text', text: 'clean' }] })));
+    expect(calls.get(11)!.gateway!.boundary).toMatchObject({ scanned: true, action: 'none', secrets_found: 0 });
+    expect(calls.get(11)!.gateway!.boundary!.delivered_result_hash).toBeUndefined();
+    expect(s.events().filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    expect(s.err.raw()).toContain('gateway: redacted tool result of tools/call "echo"');
+    assertNoLeak(s, AWS_KEY);
+    assertChainIntact(s.store);
+  });
+
+  it('F2: a flood of server->client requests cannot evict the gateway tools/call, so its result is still filtered', async () => {
+    const s = startProxy(ALLOW_SCAN, {
+      command: lineServer(`
+  if (!msg || msg.id === undefined) return;
+  let out = '';
+  for (let k = 0; k < 10001; k++) out += JSON.stringify({ jsonrpc: '2.0', id: 'ping-' + k, method: 'ping' }) + '\\n';
+  out += JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'aws=${AWS_KEY} tail' }] } }) + '\\n';
+  process.stdout.write(out);
+`),
+    });
+    s.send(toolsCall(2, 'echo', { a: 1 }));
+    await waitFor(() => s.out.raw().includes('"id":2,'), 'the answer after the ping flood', 30_000);
+    s.stdin.end();
+    await s.done;
+
+    const answer = s.response(2);
+    expect((answer.result as { content: { text: string }[] }).content[0]!.text).toBe(`aws=${AWS_MARKER} tail`);
+    expect(s.out.raw()).not.toContain(AWS_KEY);
+    // The eviction really happened — it just never picked the gateway entry.
+    expect(s.err.raw()).toContain('pending request map exceeded 10000 entries');
+    const call = toolCalls(s.events()).find((c) => c.request_id === 2)!;
+    expect(call.gateway!.boundary).toMatchObject({ scanned: true, action: 'redact', secrets_found: 1 });
+    expect(call.gateway!.boundary!.delivered_result_hash).toBe(sha256Ref(canonicalJson(answer.result)));
+    expect(call.result_hash).toBe(sha256Ref(canonicalJson({ content: [{ type: 'text', text: `aws=${AWS_KEY} tail` }] })));
+    expect(
+      s.events().filter((e): e is ProtocolErrorEvent => e.kind === 'protocol_error' && e.reason === 'orphan_response'),
+    ).toHaveLength(0);
+    assertNoLeak(s, AWS_KEY);
+  }, 60_000);
+
+  it('F2b: an ORPHAN tools/call result is still boundary-filtered before it reaches the client', async () => {
+    // Nothing was ever requested: the server volunteers a tools/call-shaped result.
+    const s = startProxy(ALLOW_SCAN, {
+      command: lineServer(`
+  if (!msg || msg.id === undefined) return;
+  send({ jsonrpc: '2.0', id: 'never-asked', result: { content: [{ type: 'text', text: 'aws=${AWS_KEY} tail' }] } });
+  answer(msg.id, 'ok');
+`),
+    });
+    s.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    await waitFor(s.responded('never-asked'), 'the orphan result');
+    const orphan = s.response('never-asked');
+    expect((orphan.result as { content: { text: string }[] }).content[0]!.text).toBe(`aws=${AWS_MARKER} tail`);
+    s.stdin.end();
+    await s.done;
+    expect(s.out.raw()).not.toContain(AWS_KEY);
+    const errs = s.events().filter((e): e is ProtocolErrorEvent => e.kind === 'protocol_error');
+    expect(errs.map((e) => [e.direction, e.reason])).toEqual([['server_to_client', 'orphan_response']]);
+    expect(s.err.raw()).toContain('gateway: boundary-filtered a tool result with no pending request (id never-asked)');
+    assertNoLeak(s, AWS_KEY);
+  });
+
+  it('F3: a hold that would start after finalize() began is refused as session_end, leaves no hold file, and session_end stays last', async () => {
+    const store = new FakeStore();
+    const s = startProxy(standardPolicy(), {
+      store,
+      // Answers nothing, exits on its own while the client is still open.
+      command: [process.execPath, '-e', 'process.stdin.resume(); setTimeout(() => process.exit(0), 150);'],
+    });
+    let stalls = 0;
+    store.beforeAppend = (events) => {
+      // The unanswered sweep runs INSIDE finalize(), immediately before the
+      // flush it awaits: that batch marks the window this bug lives in.
+      if (!events.some((e) => e.kind === 'rpc' && e.error?.type === 'unanswered')) return;
+      if (stalls === 0) s.stdin.write(JSON.stringify(toolsCall(3, 'send_mail', { x: 1 })) + '\n');
+      if (stalls++ < 4) throw new Error('store busy (test)'); // the Recorder retries: ~185 ms of window
+    };
+    s.send({ jsonrpc: '2.0', id: 9, method: 'tools/list' }); // never answered -> sealed as unanswered
+    expect(await s.done).toBe(0);
+    expect(stalls).toBeGreaterThan(0);
+
+    expect(holdFiles(s.dataDir)).toHaveLength(0); // no hold file, no live poller
+    const result = s.response(3).result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain('session_end');
+    expect(result.content[0]!.text).toBe(
+      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'session_end (hold not started)' }),
+    );
+
+    const events = s.events();
+    const decision = decisions(events).find((d) => d.request_id === 3)!;
+    expect(decision).toMatchObject({ decision: 'hold', outcome: 'session_end', rule_id: 'needs-human', waited_ms: 0 });
+    expect(decision.approval_id).toBeUndefined();
+    const call = toolCalls(events).find((c) => c.request_id === 3)!;
+    expect(call.is_error).toBe(true);
+    expect(call.error?.type).toBe('policy_denied');
+    expect(call.gateway).toMatchObject({ decision: 'hold', outcome: 'session_end', rule_id: 'needs-human' });
+    expect(events.indexOf(decision)).toBeLessThan(events.indexOf(call));
+    expect(events[events.length - 1]!.kind).toBe('session_end');
+    expect(s.err.raw()).toContain('gateway: session ending; tools/call "send_mail" refused instead of held');
+    assertChainIntact(s.store);
+  });
+
+  it('F4: an approved hold is never spliced into an oversized client line still streaming through', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)), {
+      // Reports the exact byte length of every line it managed to parse.
+      command: lineServer("  if (msg && msg.id !== undefined) answer(msg.id, 'len=' + Buffer.byteLength(line));"),
+    });
+    const held = JSON.stringify(toolsCall(3, 'send_mail', { n: 1 }));
+    s.sendRaw(held + '\n');
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    const [pending] = s.holdStore.list();
+
+    const line = Buffer.from(JSON.stringify(toolsCall(2, 'echo', { pad: 'p'.repeat(32 * 1024 * 1024) })) + '\n');
+    const half = Math.floor(line.length / 2);
+    s.stdin.write(line.subarray(0, half));
+    await sleep(250); // a partial (oversized) client line is now in flight
+    s.holdStore.decide(pending!.approval_id, 'approved', 'alice');
+    await sleep(250);
+    expect(s.responded(3)()).toBe(false); // deferred behind the line, not spliced into it
+    s.stdin.write(line.subarray(half));
+    await waitFor(() => s.responded(2)() && s.responded(3)(), 'the oversized line, then the held one', 30_000);
+    s.stdin.end();
+    await s.done;
+
+    const ids = s.out.lines().map((l) => parseLine(l)?.id);
+    expect(ids.indexOf(2)).toBeGreaterThanOrEqual(0);
+    expect(ids.indexOf(2)).toBeLessThan(ids.indexOf(3));
+    expect((s.response(2).result as { content: { text: string }[] }).content[0]!.text).toBe(`len=${line.length - 1}`);
+    expect((s.response(3).result as { content: { text: string }[] }).content[0]!.text).toBe(`len=${Buffer.byteLength(held)}`);
+    for (const l of s.out.lines()) expect(parseLine(l)).toBeDefined();
+    const call = toolCalls(s.events()).find((c) => c.request_id === 3)!;
+    expect(call.is_error).toBe(false);
+    expect(call.gateway).toMatchObject({ decision: 'hold', outcome: 'approved', approval_id: pending!.approval_id });
+  }, 90_000);
+
+  it('F5: the holds map is bounded at MAX_HOLDS; the next hold-matching call is denied fail-closed', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)));
+    await handshake(s);
+    for (let i = 0; i < MAX_HOLDS; i++) s.send(toolsCall(`h${i}`, 'send_mail', { i }));
+    await waitFor(() => holdFileCount(s.dataDir) === MAX_HOLDS, `${MAX_HOLDS} pending holds`, 30_000);
+    s.send(toolsCall('over', 'send_mail', { last: true }));
+    await waitFor(s.responded('over'), 'the deny beyond the cap');
+
+    const result = s.response('over').result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toBe(
+      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'too many pending holds' }),
+    );
+    expect(holdFileCount(s.dataDir)).toBe(MAX_HOLDS); // no hold file for the refused call
+    expect(s.err.raw()).toContain(`gateway: ${MAX_HOLDS} holds already pending; denying tools/call "send_mail"`);
+    s.stdin.end();
+    await s.done;
+
+    const decision = decisions(s.events()).find((d) => d.request_id === 'over')!;
+    expect(decision).toMatchObject({ decision: 'deny', rule_id: 'needs-human' });
+    expect(decision.outcome).toBeUndefined();
+    expect(decision.approval_id).toBeUndefined();
+    const call = toolCalls(s.events()).find((c) => c.request_id === 'over')!;
+    expect(call.gateway).toEqual({ decision: 'deny', rule_id: 'needs-human' });
+    // Every parked hold is still accounted for: refusing the 257th changed nothing about them.
+    expect(decisions(s.events()).filter((d) => d.outcome === 'session_end')).toHaveLength(MAX_HOLDS);
+  }, 90_000);
+
+  it('F6: a synthesized line is never glued onto an unterminated final server line', async () => {
+    const partial = '{"jsonrpc":"2.0","id":9,"result":{"half":';
+    const s = startProxy(standardPolicy(), {
+      command: [
+        process.execPath,
+        '-e',
+        `process.stdin.resume(); process.stdout.write(${JSON.stringify(partial)}); setTimeout(() => process.exit(0), 250);`,
+      ],
+    });
+    s.send(toolsCall(2, 'send_mail', {})); // parked until the session ends
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    expect(await s.done).toBe(0);
+
+    const raw = s.out.raw();
+    expect(raw.startsWith(`${partial}\n`)).toBe(true); // the partial line, then ONE inserted newline
+    const deny = parseLine(raw.slice(partial.length + 1).trim())!;
+    expect(deny).toBeDefined();
+    expect(deny.id).toBe(2);
+    expect((deny.result as { content: { text: string }[] }).content[0]!.text).toContain('was abandoned at session end');
+    expect(s.out.lines().filter((l) => parseLine(l) !== undefined)).toHaveLength(1);
+    expect(
+      s.events().some((e): e is ProtocolErrorEvent => e.kind === 'protocol_error' && e.reason === 'unparseable'),
+    ).toBe(true);
+    s.stdin.end();
+  });
+
+  it('F7: a throw inside policy evaluation still stamps the real args_hash', async () => {
+    const s = startProxy(ALLOW_SCAN);
+    await handshake(s);
+    const args = { x: 1, nested: { deep: [1, 2, 3] } };
+    s.send(toolsCall(2, 'explode_on_evaluate', args));
+    await waitFor(s.responded(2), 'the fail-closed deny');
+    s.stdin.end();
+    await s.done;
+    const decision = decisions(s.events())[0]!;
+    expect(decision).toMatchObject({ decision: 'deny', tool: 'explode_on_evaluate', request_id: 2 });
+    expect(decision.args_hash).toBe(sha256Ref(canonicalJson(args)));
+    expect(decision.args_hash).not.toBe(sha256Ref(canonicalJson(null)));
+  });
+
+  it('F8: a tools/call with an id but no usable name is evaluated as the tool name "" (mcp.default applies)', async () => {
+    const s = startProxy(
+      loadedPolicy({ version: 1, mcp: { default: 'deny', rules: [{ id: 'echo-ok', match: { tool: 'echo' }, action: 'allow' }] } }),
+    );
+    await handshake(s);
+    s.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { arguments: { a: 1 } } });
+    s.send({ jsonrpc: '2.0', id: 3, method: 'tools/call' }); // no params at all
+    s.send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 42 } }); // name not a string
+    await waitFor(() => [2, 3, 4].every((id) => s.responded(id)()), 'three denies');
+    for (const id of [2, 3, 4]) {
+      const result = s.response(id).result as { isError: boolean; content: { text: string }[] };
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toBe(deniedText({ tool: '' }));
+    }
+    s.stdin.end();
+    await s.done;
+    const events = s.events();
+    expect(decisions(events).map((d) => [d.request_id, d.decision, d.tool])).toEqual([
+      [2, 'deny', ''],
+      [3, 'deny', ''],
+      [4, 'deny', ''],
+    ]);
+    expect(decisions(events)[0]!.args_hash).toBe(sha256Ref(canonicalJson({ a: 1 })));
+    const call = toolCalls(events).find((c) => c.request_id === 2)!;
+    expect(call.tool).toBe('');
+    expect(call.gateway).toEqual({ decision: 'deny' });
+    expect(call.error?.type).toBe('policy_denied');
+    // The server never saw any of them (echo-server would have answered with its own result).
+    expect(toolCalls(events).every((c) => c.is_error)).toBe(true);
+  });
+
+  it('F9: a hostile decided_by in a hold file never reaches an event verbatim', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)));
+    await handshake(s);
+    const huge = 'u'.repeat(100_000);
+    s.send(toolsCall(2, 'send_a', {}));
+    s.send(toolsCall(3, 'send_b', {}));
+    await waitFor(() => s.holdStore.list().length === 2, 'two hold files');
+    const byTool = new Map(s.holdStore.list().map((h) => [h.tool, h]));
+    const plant = (id: string, decidedBy: unknown): void => {
+      const file = join(s.dataDir, 'holds', `${id}.json`);
+      const rec = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+      rec['status'] = 'approved';
+      rec['decided_at'] = new Date().toISOString();
+      rec['decided_by'] = decidedBy;
+      writeFileSync(file, JSON.stringify(rec));
+    };
+    plant(byTool.get('send_a')!.approval_id, huge);
+    plant(byTool.get('send_b')!.approval_id, { name: 'mallory' });
+    await waitFor(() => s.responded(2)() && s.responded(3)(), 'both forwarded after approval');
+    s.stdin.end();
+    await s.done;
+
+    const byId = new Map(decisions(s.events()).map((d) => [d.request_id, d]));
+    expect(byId.get(2)!.approver).toBe(sha256Ref(huge)); // capped to its sha256 ref
+    expect(byId.get(3)!.approver).toBeUndefined(); // not a string: ignored outright
+    const blob = JSON.stringify(s.events());
+    expect(blob).not.toContain(huge.slice(0, 64));
+    expect(blob).not.toContain('mallory');
+    const calls = new Map(toolCalls(s.events()).map((c) => [c.request_id, c]));
+    expect(calls.get(2)!.gateway).toMatchObject({ decision: 'hold', outcome: 'approved' });
+    expect(calls.get(3)!.gateway).toMatchObject({ decision: 'hold', outcome: 'approved' });
   });
 });

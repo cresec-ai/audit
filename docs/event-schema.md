@@ -339,8 +339,9 @@ exactly as before (canonical JSON drops nothing that was never there).
 | `decision` | `'allow' \| 'deny' \| 'hold'` | What the policy decided for the request. |
 | `rule_id` | `string?` | The rule that matched; absent when the section's `default` applied. An explicit id already matches the `structuralString` identifier shape and is kept as-is, and so is an auto-assigned `rule[<index>]`; only an off-shape id would be stored as its `sha256:<hex>` reference. |
 | `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled' \| 'session_end'?` | Holds only: how the hold was resolved (`session_end` = the proxy shut down while the call was still held). |
-| `approval_id` | `string?` | Holds only: the UUID the operator saw in `mcp-recorder holds`. |
-| `boundary` | `BoundaryReport?` | Present when the result went through the tool-result boundary filter (every `allow`ed and `approved` call whose server answered). |
+| `approval_id` | `string?` | Holds only. Absent when the call was refused before a hold file existed (see `policy_decision`). |
+| `waited_ms` | `number?` | Holds only: how long the call was parked before it was resolved. |
+| `boundary` | `BoundaryReport?` | Present when the result went through the tool-result boundary filter: every `allow`ed and `approved` call whose server answered, including answers delivered inside a JSON-RPC batch array. |
 
 ### `BoundaryReport`
 
@@ -370,9 +371,9 @@ everything the gateway ever refused or paused.
 | `rule_id` | `string?` | Matching rule id (capped identifier); absent when `mcp.default` applied. |
 | `policy_hash` | `Sha256Ref` | SHA-256 of the exact bytes of the policy file in force. |
 | `args_hash` | `Sha256Ref` | `sha256:<hex>` of the canonical JSON of the raw `params.arguments` — never the arguments themselves. |
-| `approval_id` | `string?` | Holds only. |
+| `approval_id` | `string?` | Holds only: the UUID the operator saw in `mcp-recorder holds`. Absent when the call was refused before a hold file ever existed — a hold-matching `tools/call` that arrives while the proxy is already shutting down is recorded as `outcome: 'session_end'` with no approval id. |
 | `waited_ms` | `number?` | Holds only: how long the call was parked. |
-| `approver` | `string?` | Holds only: the OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one. |
+| `approver` | `string?` | Holds only: the OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one **as a string**. Capped exactly like any identifier copied off the wire (`structuralString`): a value longer than 128 characters or outside the identifier shape is stored as its `sha256:<hex>` reference, and a non-string `decided_by` is ignored entirely. |
 
 Attributes on a `policy_decision`: `gen_ai.tool.name`, `gen_ai.tool.call.id`,
 `mcp.method.name`, `rpc.system`, `cresec.policy.decision`, and

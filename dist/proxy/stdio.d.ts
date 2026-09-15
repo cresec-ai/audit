@@ -19,14 +19,20 @@
  *    timeout, `notifications/cancelled` or shutdown). Every other line is
  *    forwarded byte-for-byte (oversized and unparseable lines included).
  *  - server->client: run the boundary filter over the result of a
- *    tools/call the gateway saw; forward the original bytes when nothing
- *    changed, else the re-serialized message.
+ *    tools/call the gateway saw — element by element when the server
+ *    answers a batch with a JSON-RPC array, and over an uncorrelated
+ *    ("orphan") result that still looks like a tool result; forward the
+ *    original bytes when nothing changed, else the re-serialized message.
  * Enforcement fails CLOSED (an evaluation throw or an unwritable hold is a
- * deny); recording stays fail-open exactly as in record mode. Known v1
- * limits, on purpose: a `hold` inside a JSON-RPC batch is treated as deny,
- * a `tools/call` without an id (a notification) is forwarded unevaluated,
- * and a line over the 32 MiB tap cap cannot be parsed so it is forwarded
- * unchanged and recorded as `protocol_error` — as in record mode.
+ * deny); recording stays fail-open exactly as in record mode. Every
+ * `tools/call` REQUEST (one carrying an id) is evaluated, including one
+ * whose `params.name` is missing or not a string: it is evaluated as the
+ * tool name '' so the section default — and any glob matching the empty
+ * string — applies. Known v1 limits, on purpose: a `hold` inside a
+ * JSON-RPC batch is treated as deny, a `tools/call` without an id (a
+ * notification) is forwarded unevaluated, and a line over the 32 MiB tap
+ * cap cannot be parsed so it is forwarded unchanged and recorded as
+ * `protocol_error` — as in record mode.
  */
 import { type Readable, type Writable } from 'node:stream';
 import type { GatewayOptions } from '../gateway/options.js';
@@ -49,4 +55,12 @@ export interface StdioProxyOpts {
      */
     gateway?: GatewayOptions;
 }
+/**
+ * Gateway mode: cap on concurrently parked holds. The map is keyed by
+ * request id and only shrinks when a hold is resolved, so a client that
+ * fires hold-matching calls it never answers for would otherwise grow it
+ * without bound. Beyond the cap a hold-matching call is refused (deny),
+ * fail-closed — documented in docs/gateway.md.
+ */
+export declare const MAX_HOLDS = 256;
 export declare function runStdioProxy(opts: StdioProxyOpts): Promise<number>;

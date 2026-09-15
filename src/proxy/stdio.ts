@@ -19,14 +19,20 @@
  *    timeout, `notifications/cancelled` or shutdown). Every other line is
  *    forwarded byte-for-byte (oversized and unparseable lines included).
  *  - server->client: run the boundary filter over the result of a
- *    tools/call the gateway saw; forward the original bytes when nothing
- *    changed, else the re-serialized message.
+ *    tools/call the gateway saw — element by element when the server
+ *    answers a batch with a JSON-RPC array, and over an uncorrelated
+ *    ("orphan") result that still looks like a tool result; forward the
+ *    original bytes when nothing changed, else the re-serialized message.
  * Enforcement fails CLOSED (an evaluation throw or an unwritable hold is a
- * deny); recording stays fail-open exactly as in record mode. Known v1
- * limits, on purpose: a `hold` inside a JSON-RPC batch is treated as deny,
- * a `tools/call` without an id (a notification) is forwarded unevaluated,
- * and a line over the 32 MiB tap cap cannot be parsed so it is forwarded
- * unchanged and recorded as `protocol_error` — as in record mode.
+ * deny); recording stays fail-open exactly as in record mode. Every
+ * `tools/call` REQUEST (one carrying an id) is evaluated, including one
+ * whose `params.name` is missing or not a string: it is evaluated as the
+ * tool name '' so the section default — and any glob matching the empty
+ * string — applies. Known v1 limits, on purpose: a `hold` inside a
+ * JSON-RPC batch is treated as deny, a `tools/call` without an id (a
+ * notification) is forwarded unevaluated, and a line over the 32 MiB tap
+ * cap cannot be parsed so it is forwarded unchanged and recorded as
+ * `protocol_error` — as in record mode.
  */
 
 import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
@@ -134,15 +140,19 @@ interface HoldEntry extends GatewayCall {
 /** How a hold ended without the call being forwarded (or after being forwarded, for the record). */
 interface HoldResolution {
   outcome: HoldOutcome;
-  approvalId: string;
+  /** Absent only when the call was refused BEFORE a hold file existed (session_end). */
+  approvalId?: string;
   waitedMs: number;
   approver?: string;
 }
 
-type ToolsCallRequest = Record<string, unknown> & {
-  id: string | number;
-  params: Record<string, unknown> & { name: string };
-};
+/**
+ * A `tools/call` REQUEST: it carries an id, so a response can be
+ * synthesized for it. `params`/`params.name` are deliberately NOT part of
+ * the shape — a request without a usable name is still evaluated (as the
+ * tool name ''), never waved through; see `toolsCallParts`.
+ */
+type ToolsCallRequest = Record<string, unknown> & { id: string | number };
 
 const NL = 0x0a;
 /** Explicit rule ids (`ID_PATTERN`) and the auto-assigned `rule[<i>]` survive as-is. */
@@ -239,10 +249,20 @@ function isRpcId(v: unknown): v is string | number {
   return typeof v === 'string' || typeof v === 'number';
 }
 
-/** A `tools/call` REQUEST (has an id) naming a tool — the only thing the policy evaluates. */
+/** A `tools/call` REQUEST (has an id) — the only thing the policy evaluates. */
 function isToolsCallRequest(msg: unknown): msg is ToolsCallRequest {
-  if (!isPlainObject(msg) || msg.method !== 'tools/call' || !isRpcId(msg.id)) return false;
-  return isPlainObject(msg.params) && typeof msg.params.name === 'string';
+  return isPlainObject(msg) && msg.method === 'tools/call' && isRpcId(msg.id);
+}
+
+/**
+ * The `params` object and tool name of a `tools/call` request. A missing or
+ * non-string `params.name` (and a non-object `params`) yields '': the call
+ * is evaluated like any other, so `mcp.default` applies and tool globs match
+ * as they do for an empty string, instead of crossing unevaluated.
+ */
+function toolsCallParts(msg: ToolsCallRequest): { params: Record<string, unknown>; name: string } {
+  const params = isPlainObject(msg.params) ? msg.params : {};
+  return { params, name: typeof params.name === 'string' ? params.name : '' };
 }
 
 function asBuffer(chunk: unknown): Buffer {
@@ -258,6 +278,18 @@ const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
 const RUNNER_BARE_FLAGS = new Set(['-y', '--yes', '-q', '--quiet']);
 const RUNNER_VALUE_FLAGS = new Set(['-p', '--package']);
 const MAX_PENDING = 10_000;
+/**
+ * Gateway mode: cap on concurrently parked holds. The map is keyed by
+ * request id and only shrinks when a hold is resolved, so a client that
+ * fires hold-matching calls it never answers for would otherwise grow it
+ * without bound. Beyond the cap a hold-matching call is refused (deny),
+ * fail-closed — documented in docs/gateway.md.
+ */
+export const MAX_HOLDS = 256;
+/** Reason a call is refused instead of held because the cap above is reached. */
+const TOO_MANY_HOLDS_REASON = 'too many pending holds';
+/** Reason a call is refused instead of held because finalize() already began. */
+const SESSION_END_HOLD_REASON = 'session_end (hold not started)';
 // Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
 // contended store delays session_end rather than losing it.
 const CLOSE_TIMEOUT_MS = 8_000;
@@ -481,6 +513,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   let s2cTransform: Transform | undefined;
   /** Gateway mode: set once the client's read end is gone; synthesized writes stop. */
   let clientGone = false;
+  /**
+   * Gateway mode: set at the TOP of finalize(), before the holds are
+   * resolved. From then on a `tools/call` that would be parked is refused
+   * instead — a hold started after finalize() began would never be
+   * resolved (its file would stay pending, its poller would outlive the
+   * session, and nothing would be recorded for the call).
+   */
+  let sessionClosing = false;
   /** Gateway mode: resolve every parked hold as `session_end` (idempotent). */
   let resolveAllHolds: (() => void) | undefined;
 
@@ -574,15 +614,35 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   // stream from the request that opened them.
   const pending = new Map<string, PendingEntry>();
   let pendingEvictWarned = false;
-  const registerPending = (key: string, entry: PendingEntry): void => {
-    if (pending.size >= MAX_PENDING) {
-      const oldest = pending.keys().next().value as string | undefined;
-      if (oldest !== undefined) pending.delete(oldest);
-      if (!pendingEvictWarned) {
-        pendingEvictWarned = true;
-        diag(`pending request map exceeded ${MAX_PENDING} entries; evicting oldest`);
+  /**
+   * Make room for one entry. A gateway-forwarded `tools/call` is the entry
+   * the s2c side MUST still find: its response carries the tool result the
+   * boundary filter has to scan before the client sees it, and its
+   * `tool_call` event. So the OLDEST NON-GATEWAY entry is evicted first —
+   * a flood of server->client requests (10 000 `ping`s, say) can no longer
+   * push an in-flight gateway call out of the map and let its result cross
+   * unfiltered. Only when every entry is a gateway call does the oldest one
+   * go. The scan is O(n) in the worst case, which needs MAX_PENDING
+   * concurrent gateway tool calls to reach at all; the common case stops at
+   * the first entry.
+   */
+  const evictOnePending = (): void => {
+    let victim: string | undefined;
+    for (const [key, entry] of pending) {
+      if (entry.gateway === undefined) {
+        victim = key;
+        break;
       }
     }
+    if (victim === undefined) victim = pending.keys().next().value as string | undefined;
+    if (victim !== undefined) pending.delete(victim);
+    if (!pendingEvictWarned) {
+      pendingEvictWarned = true;
+      diag(`pending request map exceeded ${MAX_PENDING} entries; evicting oldest`);
+    }
+  };
+  const registerPending = (key: string, entry: PendingEntry): void => {
+    if (pending.size >= MAX_PENDING) evictOnePending();
     pending.set(key, entry);
   };
 
@@ -850,8 +910,22 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const holds = new Map<string, HoldEntry>();
     /** Synthesized client lines waiting for the server's partial line to complete. */
     const deferredClientWrites: Buffer[] = [];
+    /** Approved hold lines waiting for a partially forwarded client line to complete. */
+    const deferredServerWrites: Buffer[] = [];
     let c2sOpen = true;
     let s2cState: 'open' | 'ending' | 'ended' = 'open';
+    /** One shared '\n' for the line terminators the gateway has to insert. */
+    const NEWLINE = Buffer.from('\n');
+    /**
+     * True while everything forwarded to the client so far ended a line.
+     * A server that dies mid-line leaves an UNTERMINATED line behind (the
+     * s2c flush path forwards it as-is, byte-for-byte); a synthesized line
+     * glued onto it would make both unparseable, so one '\n' is emitted
+     * first. Same idea for the server side (`serverAtLineStart`) when a
+     * parked hold is released after an unterminated client line.
+     */
+    let clientAtLineStart = true;
+    let serverAtLineStart = true;
 
     /** Recording-side work stays fail-open: a throw is logged once, traffic unaffected. */
     const guarded = (fn: () => void): void => {
@@ -909,22 +983,35 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
           deferredClientWrites.push(bytes);
           return;
         }
-        try {
-          s2c.push(bytes);
-        } catch {
-          /* fail-open */
-        }
+        emitToClient(bytes, (out) => {
+          try {
+            s2c.push(out);
+          } catch {
+            /* fail-open */
+          }
+        });
         return;
       }
       if (s2cState === 'ending') {
         deferredClientWrites.push(bytes);
         return;
       }
-      try {
-        proxyStdout.write(bytes);
-      } catch {
-        /* fail-open */
+      emitToClient(bytes, (out) => {
+        try {
+          proxyStdout.write(out);
+        } catch {
+          /* fail-open */
+        }
+      });
+    };
+    /** Emit one synthesized line, terminating an unfinished server line first. */
+    const emitToClient = (bytes: Buffer, write: (out: Buffer) => void): void => {
+      if (!clientAtLineStart) {
+        clientAtLineStart = true;
+        write(NEWLINE);
       }
+      if (bytes.length > 0) clientAtLineStart = bytes[bytes.length - 1] === NL;
+      write(bytes);
     };
     const flushDeferred = (): void => {
       if (deferredClientWrites.length === 0) return;
@@ -933,35 +1020,53 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
     /* ---- policy evaluation (fail-closed) ---- */
 
+    /** The fail-closed decision for a throw anywhere on the evaluation path. */
+    const evaluationFailed = (err: unknown): McpDecision => ({
+      action: 'deny',
+      matched: false,
+      reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
+    });
+
     const evaluate = (rawTool: string, args: unknown): { decision: McpDecision; argsHash: string } => {
+      // The canonical JSON gets its OWN guard: when it succeeds, args_hash
+      // is the real hash of the arguments even if the evaluation that
+      // follows blows up (the deny is recorded, the evidence still points
+      // at the exact arguments). Only a canonicalJson/sha256Ref throw — a
+      // hostile args tree — falls back to the hash of `null`.
+      let canonical: string;
+      let argsHash: string;
       try {
-        const canonical = canonicalJson(args);
+        canonical = canonicalJson(args);
+        argsHash = sha256Ref(canonical);
+      } catch (err) {
+        return { decision: evaluationFailed(err), argsHash: NULL_RESULT_HASH };
+      }
+      try {
         const decision = evaluateMcp(loaded.policy, {
           server: currentServer().name,
           tool: rawTool,
           args,
           argsBytes: Buffer.byteLength(canonical),
         });
-        return { decision, argsHash: sha256Ref(canonical) };
+        return { decision, argsHash };
       } catch (err) {
         // evaluateMcp never throws by contract; anything else on this path
-        // (a hostile args tree, a broken server name) still denies.
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          decision: { action: 'deny', matched: false, reason: `policy evaluation error: ${message}` },
-          argsHash: NULL_RESULT_HASH,
-        };
+        // (a broken server name, a poisoned policy object) still denies.
+        return { decision: evaluationFailed(err), argsHash };
       }
     };
 
     const buildCall = (msg: ToolsCallRequest): { call: GatewayCall; action: McpDecision['action'] } => {
-      const args: unknown = msg.params.arguments ?? {};
-      const { decision, argsHash } = evaluate(msg.params.name, args);
+      const { params, name } = toolsCallParts(msg);
+      const args: unknown = params.arguments ?? {};
+      const { decision, argsHash } = evaluate(name, args);
       const call: GatewayCall = {
         id: msg.id,
-        params: msg.params,
-        rawTool: msg.params.name,
-        tool: structuralString(msg.params.name, 'identifier'),
+        params,
+        rawTool: name,
+        // '' stays '': structuralString would hash the empty string, and ''
+        // is what a nameless call's tool_call event has always carried.
+        tool: name === '' ? '' : structuralString(name, 'identifier'),
         args,
         argsHash,
       };
@@ -1001,7 +1106,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       if (call.ruleId !== undefined) ev.rule_id = call.ruleId;
       if (hold !== undefined) {
         ev.outcome = hold.outcome;
-        ev.approval_id = hold.approvalId;
+        if (hold.approvalId !== undefined) ev.approval_id = hold.approvalId;
         ev.waited_ms = hold.waitedMs;
         if (hold.approver !== undefined) ev.approver = hold.approver;
       }
@@ -1014,7 +1119,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       if (call.ruleId !== undefined) out.rule_id = call.ruleId;
       if (hold !== undefined) {
         out.outcome = hold.outcome;
-        out.approval_id = hold.approvalId;
+        if (hold.approvalId !== undefined) out.approval_id = hold.approvalId;
         out.waited_ms = hold.waitedMs;
       }
       return out;
@@ -1053,7 +1158,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       const input: Parameters<typeof deniedText>[0] = { tool: call.rawTool };
       if (call.rawRuleId !== undefined) input.ruleId = call.rawRuleId;
       if (call.reason !== undefined) input.reason = call.reason;
-      if (hold !== undefined) {
+      if (hold !== undefined && hold.approvalId !== undefined) {
         input.approvalId = hold.approvalId;
         input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
       }
@@ -1065,9 +1170,13 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       return response;
     };
 
-    const denyCall = (call: GatewayCall, hold?: HoldResolution): void => {
+    const denyCall = (call: GatewayCall, hold?: HoldResolution, diagLine?: string): void => {
       const response = synthesizeDeny(call, hold);
       writeToClient(Buffer.from(JSON.stringify(response) + '\n'));
+      if (diagLine !== undefined) {
+        diag(diagLine); // a caller-specific line REPLACES the generic one
+        return;
+      }
       if (hold === undefined) {
         diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
       }
@@ -1102,15 +1211,23 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         approvalId: entry.approvalId,
         waitedMs: round2(performance.now() - entry.t0),
       };
-      if (decided?.decided_by !== undefined) resolution.approver = decided.decided_by;
+      // The hold file is operator-writable and only structurally checked:
+      // `decided_by` is whatever it says. Anything but a string is ignored,
+      // and a string is capped like any identifier copied off the wire, so
+      // an over-long or off-shape value lands as its sha256 ref instead of
+      // stamping arbitrary text on an event.
+      const decidedBy: unknown = decided?.decided_by;
+      if (typeof decidedBy === 'string') {
+        resolution.approver = structuralString(decidedBy, 'identifier');
+      }
       if (status === 'timeout' || status === 'cancelled' || status === 'session_end') {
         holdStore.finalize(entry.approvalId, status);
       }
       const forward = status === 'approved' || (status === 'timeout' && mcp.hold.on_timeout === 'allow');
-      if (forward && c2sOpen && !clientGone) {
+      if (forward && c2sOpen && !clientGone && !sessionClosing) {
         guarded(() => recordPolicyDecision(entry, resolution));
         registerCall(entry, gatewayOutcomeFor(entry, resolution));
-        forwardC2s(entry.raw);
+        forwardHeldC2s(entry.raw);
         diag(`gateway: hold ${entry.approvalId} ${status}; forwarding tools/call "${entry.tool}" after ${resolution.waitedMs} ms`);
         return;
       }
@@ -1120,6 +1237,17 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     };
 
     const startHold = (call: GatewayCall, raw: Buffer): void => {
+      if (holds.size >= MAX_HOLDS) {
+        // Fail closed: the holds map is bounded, so a client that parks
+        // holds nobody ever resolves cannot grow it without limit.
+        denyCall(
+          { ...call, reason: TOO_MANY_HOLDS_REASON },
+          undefined,
+          `gateway: ${MAX_HOLDS} holds already pending; denying tools/call "${call.tool}"` +
+            ` (rule ${call.ruleId ?? 'default'})`,
+        );
+        return;
+      }
       const timeoutMs = mcp.hold.timeout_ms;
       let created: HoldRecord;
       try {
@@ -1186,6 +1314,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       transform(chunk, _enc, cb) {
         try {
           c2sSplitter.chunk(asBuffer(chunk));
+          // A chunk boundary is where a client line can have just ended:
+          // a released hold goes out right after it, never inside it.
+          if (!c2sSplitter.hasPartialLine()) flushDeferredC2s();
         } catch (err) {
           tapError(err);
         }
@@ -1197,6 +1328,11 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // synchronously (never await here, or the server never sees EOF).
         try {
           c2sSplitter.end();
+        } catch (err) {
+          tapError(err);
+        }
+        try {
+          flushDeferredC2s();
         } catch (err) {
           tapError(err);
         }
@@ -1213,7 +1349,31 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const forwardC2s = (bytes: Buffer): void => {
       // Once the client's read end is gone the server is being wound down
       // (child.stdin ended by the EPIPE handler): nothing more goes to it.
-      if (c2sOpen && !clientGone) c2s.push(bytes);
+      if (!c2sOpen || clientGone) return;
+      if (bytes.length > 0) serverAtLineStart = bytes[bytes.length - 1] === NL;
+      c2s.push(bytes);
+    };
+
+    /**
+     * A parked hold re-entering the client->server stream. The splitter
+     * streams an OVERSIZED line's bytes through as they arrive, so pushing
+     * a held request while one is in flight would splice it into the middle
+     * of that line — exactly what the s2c side avoids for synthesized
+     * responses. Defer it to the end of the current line instead (and
+     * terminate an unfinished one first, for the trailing line `end()`
+     * forwards without a '\n').
+     */
+    const forwardHeldC2s = (bytes: Buffer): void => {
+      if (c2sSplitter.hasPartialLine()) {
+        deferredServerWrites.push(bytes);
+        return;
+      }
+      if (!serverAtLineStart) forwardC2s(NEWLINE);
+      forwardC2s(bytes);
+    };
+    const flushDeferredC2s = (): void => {
+      if (deferredServerWrites.length === 0) return;
+      for (const bytes of deferredServerWrites.splice(0)) forwardHeldC2s(bytes);
     };
 
     const c2sToolsCall = (msg: ToolsCallRequest, raw: Buffer): void => {
@@ -1225,6 +1385,19 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       }
       if (action === 'deny') {
         denyCall(call);
+        return;
+      }
+      if (sessionClosing) {
+        // finalize() has already resolved every parked hold: a new one
+        // would leave a pending hold file and a live poller behind and
+        // would never be recorded. Refuse it now, with the same outcome a
+        // hold parked a moment earlier gets.
+        denyCall(
+          { ...call, reason: SESSION_END_HOLD_REASON },
+          { outcome: 'session_end', waitedMs: 0 },
+          `gateway: session ending; tools/call "${call.tool}" refused instead of held` +
+            ` (rule ${call.ruleId ?? 'default'})`,
+        );
         return;
       }
       startHold(call, raw);
@@ -1305,7 +1478,101 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     /* ---- server -> client ---- */
 
     const forwardS2c = (bytes: Buffer): void => {
+      if (bytes.length > 0) clientAtLineStart = bytes[bytes.length - 1] === NL;
       s2c.push(bytes);
+    };
+
+    /** A result shaped like a tools/call result (MCP content blocks). */
+    const looksLikeToolResult = (msg: Record<string, unknown>): boolean => {
+      const result = msg['result'];
+      return isPlainObject(result) && Array.isArray(result['content']);
+    };
+
+    /**
+     * Whether one server->client message must go through the boundary
+     * filter, and the tool name for the diagnostic. Must be called for
+     * EVERY element BEFORE handleResponse deletes the pending entry.
+     */
+    const boundaryTarget = (
+      msg: Record<string, unknown>,
+    ): { kind: 'correlated' | 'orphan'; tool: string } | undefined => {
+      const id: unknown = msg['id'];
+      if (!isRpcId(id) || !('result' in msg || 'error' in msg)) return undefined;
+      const entry = pending.get(pendingKey('c2s:', id));
+      if (entry !== undefined) {
+        return entry.method === 'tools/call' ? { kind: 'correlated', tool: entry.toolName ?? '' } : undefined;
+      }
+      // Fail closed for the BOUNDARY: a result the gateway can no longer
+      // correlate (its pending entry was evicted, or the server answered a
+      // request it was never sent) is still scanned before the client sees
+      // it. Recording is unchanged — handleResponse records the usual
+      // protocol_error orphan_response.
+      return looksLikeToolResult(msg) ? { kind: 'orphan', tool: '' } : undefined;
+    };
+
+    /**
+     * Run the boundary filter over one response message. `rawBytes` is the
+     * byte length of the whole LINE the message arrived on; for a batch
+     * that is the length of the entire array, so `max_scan_bytes` keeps
+     * applying to the line as it crossed the wire (docs/gateway.md).
+     */
+    const filterResult = (
+      msg: Record<string, unknown>,
+      rawBytes: number,
+      tool: string,
+    ): { message: unknown; changed: boolean; report: BoundaryReport } => {
+      const outcome = applyBoundary(msg, mcp.boundary, boundaryDeps, { rawBytes });
+      const report: BoundaryReport = { ...outcome.report };
+      if (outcome.changed) {
+        const delivered = isPlainObject(outcome.message) ? outcome.message['result'] : null;
+        report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+        diag(
+          `gateway: ${report.action === 'block' ? 'blocked' : 'redacted'} tool result of tools/call "${tool}"` +
+            ` (${report.secrets_found} secret-shaped, ${report.injection_found} injection marker(s))`,
+        );
+      }
+      return { message: outcome.message, changed: outcome.changed, report };
+    };
+
+    /**
+     * A JSON-RPC BATCH answer. A spec-compliant server answers a batch the
+     * gateway forwarded with an ARRAY, so every element that answers a
+     * tools/call must be filtered individually — otherwise the whole array
+     * would cross unscanned and its tool_call events would carry no
+     * boundary report. The array is re-serialized only when at least one
+     * element changed; an untouched batch still crosses byte-for-byte.
+     */
+    const s2cBatch = (batch: unknown[], raw: Buffer, line: ScannedLine): void => {
+      const out: unknown[] = [...batch];
+      const reports = new Map<number, BoundaryReport>();
+      let changed = false;
+      let orphans = 0;
+      batch.forEach((el, index) => {
+        if (!isPlainObject(el)) return;
+        const target = boundaryTarget(el);
+        if (target === undefined) return;
+        const filtered = filterResult(el, line.bytesLen, target.tool);
+        if (filtered.changed) {
+          changed = true;
+          out[index] = filtered.message;
+        }
+        if (target.kind === 'orphan') orphans++;
+        reports.set(index, filtered.report);
+      });
+      forwardS2c(changed ? Buffer.from(JSON.stringify(out) + '\n') : raw);
+      if (orphans > 0) {
+        diag(`gateway: boundary-filtered ${orphans} batched tool result(s) with no pending request`);
+      }
+      guarded(() => {
+        batch.forEach((el, index) => {
+          const report = reports.get(index);
+          if (report === undefined) {
+            handleMessage(el, 'server_to_client', line);
+            return;
+          }
+          handleResponse(el as Record<string, unknown>, 'server_to_client', line, report);
+        });
+      });
     };
 
     const s2cLine = (line: ScannedLine): void => {
@@ -1323,24 +1590,25 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         guarded(() => protocolError('server_to_client', 'unparseable', line.bytesLen, line.lineHashHex));
         return;
       }
-      if (isPlainObject(msg) && isRpcId(msg.id) && ('result' in msg || 'error' in msg)) {
+      if (Array.isArray(msg)) {
+        s2cBatch(msg, raw, line);
+        return;
+      }
+      if (isPlainObject(msg)) {
         // Look the request up BEFORE handleResponse deletes it.
-        const entry = pending.get(pendingKey('c2s:', msg.id));
-        if (entry !== undefined && entry.method === 'tools/call') {
-          const outcome = applyBoundary(msg, mcp.boundary, boundaryDeps, { rawBytes: line.bytesLen });
-          const report: BoundaryReport = { ...outcome.report };
-          if (outcome.changed) {
-            forwardS2c(Buffer.from(JSON.stringify(outcome.message) + '\n'));
-            const delivered = isPlainObject(outcome.message) ? outcome.message.result : null;
-            report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+        const target = boundaryTarget(msg);
+        if (target !== undefined) {
+          const filtered = filterResult(msg, line.bytesLen, target.tool);
+          forwardS2c(filtered.changed ? Buffer.from(JSON.stringify(filtered.message) + '\n') : raw);
+          if (target.kind === 'orphan') {
+            // The id is the server's, so it is capped like any other
+            // protocol string before it reaches a diagnostic line.
             diag(
-              `gateway: ${report.action === 'block' ? 'blocked' : 'redacted'} tool result of tools/call "${entry.toolName ?? ''}"` +
-                ` (${report.secrets_found} secret-shaped, ${report.injection_found} injection marker(s))`,
+              'gateway: boundary-filtered a tool result with no pending request' +
+                ` (id ${structuralString(String(msg['id']), 'identifier')})`,
             );
-          } else {
-            forwardS2c(raw);
           }
-          guarded(() => handleResponse(msg, 'server_to_client', line, report));
+          guarded(() => handleResponse(msg as Record<string, unknown>, 'server_to_client', line, filtered.report));
           return;
         }
       }
@@ -1501,6 +1769,10 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     ): Promise<void> => {
       if (finished) return;
       finished = true;
+      // Gateway mode: from here on a tools/call that would be HELD is
+      // refused synchronously instead (see c2sToolsCall) — a hold started
+      // after this point could never be resolved.
+      sessionClosing = true;
       removeSignalHandlers();
       try {
         // Gateway mode: a call still held when the session ends is refused
@@ -1518,6 +1790,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         await recorder.flush();
       } catch {
         /* recorder is fail-open; flush never rejects, but be safe */
+      }
+      try {
+        // The flush above is the one place finalize() yields: anything that
+        // parked a hold in that window is resolved here, before session_end
+        // seals the session.
+        resolveAllHolds?.();
+      } catch (err) {
+        tapError(err);
       }
       try {
         const stats = recorder.stats();

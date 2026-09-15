@@ -265,7 +265,7 @@ the evidence chain hashes.
 | --- | --- | --- |
 | `allow` | yes, byte-for-byte unchanged | the server's real result (after the boundary filter) |
 | `deny` | **no** | a tool result with `isError: true` whose text names the rule and reason |
-| `hold` | only after `mcp-recorder approve <id>` | on approval, the real result; on deny/timeout/cancel, an `isError` result naming the approval id and outcome |
+| `hold` | only after `mcp-recorder approve <id>` | on approval, the real result; on deny/timeout/cancel, an `isError` result naming the approval id and outcome; when the hold could not be started at all (unwritable hold file, 256 holds already pending, or the session already shutting down) an `isError` result naming that reason instead |
 
 A denial is a *tool error*, not a JSON-RPC protocol error, so clients keep
 the session alive and the model can explain itself or try something else.
@@ -286,8 +286,12 @@ gateway is where approvals get an identity.
 
 ## The tool-result boundary filter
 
-Every `tools/call` result that the gateway saw the request for is scanned
-before it reaches the client:
+Every `tools/call` result is scanned before it reaches the client — the ones
+the gateway saw the request for, each element of a batch array answering such
+requests, and any result the gateway can no longer correlate (its request was
+evicted, or the server volunteered one) that still carries `result.content`
+blocks. That last case is scanned fail-closed and still recorded as
+`protocol_error` `orphan_response`, exactly as in record mode:
 
 - **Secrets.** Spans matching the recorder's `alwaysPatterns` — the very same
   regexes that produce `secret_refs` in recorded events (AWS keys, GitHub and
@@ -312,6 +316,8 @@ before it reaches the client:
   blobs, images and `structuredContent` are not scanned in v1.
 - **Size.** A result line larger than `max_scan_bytes` is not scanned and
   `on_oversize` decides (`flag` or `block`). The event records `scanned: false`.
+  For a batch answer the comparison uses the length of the whole array line, so
+  an oversized batch is skipped (or blocked) as a unit.
 
 When nothing changes, the server's bytes are forwarded untouched. When the
 filter rewrites a result, the event keeps `result`/`result_hash` for the raw
