@@ -85,6 +85,7 @@ npx @edut/mcp-recorder ui                # HTML replay timeline in your browser
 npx @edut/mcp-recorder verify            # prove the record is intact
 npx @edut/mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
 npx @edut/mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
+npx @edut/mcp-recorder verify --bundle evidence.zip   # what the stranger runs (or `node verify.cjs` inside the bundle)
 ```
 
 ---
@@ -131,19 +132,21 @@ mcp-recorder [record] [options] -- <server command...>
 | Command | What it does |
 | --- | --- |
 | `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. |
-| `mcp-recorder verify [--json] [--bundle PATH]` | Re-walk the hash chain and check head signatures — for the local store, or for an exported bundle with `--bundle`. |
-| `mcp-recorder query <needle> [--json]` | Blast radius: hash the needle and find every event and session that touched that value. |
-| `mcp-recorder sessions [--json]` | List recorded sessions: server, identity, event/tool-call/error counts. |
-| `mcp-recorder ui [--port P] [--out FILE] [--no-open]` | Serve the HTML replay timeline (or write it to a file with `--out`). |
-| `mcp-recorder export [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. |
+| `mcp-recorder verify [--data-dir D] [--store sqlite\|jsonl] [--bundle PATH] [--json]` | Re-walk the hash chain and check head signatures — for the local store, or for an exported bundle with `--bundle` (accepts either form `export` produces: a `.zip` or a bundle directory). |
+| `mcp-recorder query <needle> [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--json]` | Blast radius: hash the needle and find every event and session that touched that value. `--session` accepts a unique id prefix, the same short id `sessions` prints. |
+| `mcp-recorder sessions [--data-dir D] [--store sqlite\|jsonl] [--json]` | List recorded sessions: server, identity, event/tool-call/error counts. |
+| `mcp-recorder ui [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--port P] [--out FILE] [--no-open]` | Serve the HTML replay timeline (or write it to a file with `--out`). Opens your default browser to the served URL unless `--no-open` is set, `--out` is used, or the host looks headless. |
+| `mcp-recorder export [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. `--session` accepts a unique id prefix, the same short id `sessions` prints. |
 | `mcp-recorder http --target URL [--port P]` | Recording proxy for HTTP-transport MCP servers. |
+
+`--help`/`-h` and `--version`/`-V` work on every invocation.
 
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `MCP_RECORDER_DATA_DIR` | Override the data directory (default `~/.mcp-recorder`). |
-| `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: try sqlite, fall back to jsonl). |
+| `MCP_RECORDER_STORE` | `sqlite` or `jsonl` (default: whichever evidence file already exists in the data dir wins; on a fresh data dir, sqlite when available, else jsonl). |
 | `MCP_RECORDER_REDACT` | `allowlist` (default) or `off`. Secret-shaped values are hashed in every mode. |
 | `MCP_RECORDER_DISABLE` | `1` → pure passthrough, no recording. |
 

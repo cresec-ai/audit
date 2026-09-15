@@ -1,10 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { GENESIS_HASH, computeHash, makeRecord, sha256Hex, sha256Ref } from '../src/chain/hash.js';
-import { openStore, isSqliteAvailable } from '../src/store/index.js';
+import { openStore, openStoreReadOnly, isSqliteAvailable } from '../src/store/index.js';
 import { verifyStore } from '../src/verify/verify.js';
 import { ENV, FILES } from '../src/types.js';
 import type { ChainHead, EvidenceStore } from '../src/types.js';
@@ -622,6 +630,128 @@ describe('openStore backend resolution', () => {
     delete process.env[ENV.STORE];
     const store = openStore({ dataDir: dir });
     expect(store.backend).toBe(isSqliteAvailable() ? 'sqlite' : 'jsonl');
+    store.close();
+  });
+});
+
+/* ------------------- prefers whichever backend file exists ------------------- */
+
+describe('openStore prefers an already-existing evidence file', () => {
+  let dir: string;
+  const savedEnv = process.env[ENV.STORE];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-existing-backend-'));
+    delete process.env[ENV.STORE];
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV.STORE];
+    else process.env[ENV.STORE] = savedEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('an existing evidence.jsonl wins over sqlite availability (no backend forced)', () => {
+    expect(isSqliteAvailable()).toBe(true); // the interesting case: sqlite IS available
+
+    const seeded = openStore({ dataDir: dir, backend: 'jsonl' });
+    seeded.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    seeded.close();
+    expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(true);
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+
+    // No --store, no env: auto-detection must not silently pick sqlite and
+    // "lose" the existing jsonl chain.
+    const reopened = openStore({ dataDir: dir });
+    expect(reopened.backend).toBe('jsonl');
+    expect(reopened.count()).toBe(1);
+    reopened.close();
+    expect(existsSync(join(dir, FILES.SQLITE_DB))).toBe(false);
+  });
+
+  it('warns on stderr and prefers sqlite when both evidence files exist', () => {
+    const sq = openStore({ dataDir: dir, backend: 'sqlite' });
+    sq.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    sq.close();
+    // A second, independent jsonl file shows up in the same data dir (e.g. a
+    // native-module availability flip caused a later run to fall back).
+    const jl = openStore({ dataDir: dir, backend: 'jsonl' });
+    jl.append(seal([sessionStart(SESSION_B, '2026-06-11T11:00:00.000Z')]));
+    jl.close();
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const store = openStore({ dataDir: dir });
+      expect(store.backend).toBe('sqlite');
+      expect(store.count()).toBe(1); // the sqlite chain's own single event
+      expect(
+        stderrSpy.mock.calls.some(
+          (call) =>
+            String(call[0]).includes('both') &&
+            String(call[0]).includes(FILES.SQLITE_DB) &&
+            String(call[0]).includes(FILES.JSONL_LOG),
+        ),
+      ).toBe(true);
+      store.close();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('fails loudly (not a silent jsonl fallback) when evidence.db exists but better-sqlite3 cannot load', async () => {
+    const sq = openStore({ dataDir: dir, backend: 'sqlite' });
+    sq.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    sq.close();
+
+    vi.resetModules();
+    vi.doMock('../src/store/sqlite.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/store/sqlite.js')>();
+      return { ...actual, isSqliteAvailable: () => false };
+    });
+    try {
+      const { openStore: openStoreWithMockedSqlite } = await import('../src/store/index.js');
+      expect(() => openStoreWithMockedSqlite({ dataDir: dir })).toThrow(
+        /evidence\.db exists but better-sqlite3 cannot load/,
+      );
+      // And it must not have started a second (empty) chain in jsonl instead.
+      expect(existsSync(join(dir, FILES.JSONL_LOG))).toBe(false);
+    } finally {
+      vi.doUnmock('../src/store/sqlite.js');
+      vi.resetModules();
+    }
+  });
+});
+
+/* --------------------- openStoreReadOnly: no side-effect files -------------------- */
+
+describe('openStoreReadOnly (used by inspection commands)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-readonly-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('opening an empty data dir creates no evidence files', () => {
+    expect(isSqliteAvailable()).toBe(true); // the case that used to create evidence.db
+    const store = openStoreReadOnly({ dataDir: dir });
+    expect(store.count()).toBe(0);
+    expect(store.sessions()).toEqual([]);
+    store.close();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('still opens an existing store normally (no behavior change when data exists)', () => {
+    const seeded = openStore({ dataDir: dir, backend: 'jsonl' });
+    seeded.append(seal([sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z')]));
+    seeded.close();
+
+    const store = openStoreReadOnly({ dataDir: dir });
+    expect(store.backend).toBe('jsonl');
+    expect(store.count()).toBe(1);
     store.close();
   });
 });

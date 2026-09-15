@@ -1,8 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  createWriteStream,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { inflateRawSync } from 'node:zlib';
+import yazl from 'yazl';
 import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Signer } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
@@ -18,6 +29,8 @@ import type {
   ToolCallEvent,
 } from '../src/schema/events.js';
 import { SCHEMA } from '../src/schema/events.js';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -112,6 +125,42 @@ function runVerifyCjs(
     encoding: 'utf8',
   });
   return { status: result.status, stdout: result.stdout };
+}
+
+/**
+ * Minimal standalone ZIP entry reader (central directory -> local header ->
+ * stored/deflate data), independent of anything in src/. yauzl is not
+ * installed (see the note below), so this is what closes the "rely on dir
+ * mode for content-level checks" gap: it proves the .zip exportBundle writes
+ * actually decodes back to the same bytes as dir mode, not just that some
+ * non-trivial file exists.
+ */
+function readZipEntry(zipPath: string, name: string): Buffer {
+  const buf = readFileSync(zipPath);
+  const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  expect(eocd).toBeGreaterThanOrEqual(0);
+  const totalEntries = buf.readUInt16LE(eocd + 10);
+  let pos = buf.readUInt32LE(eocd + 16);
+  for (let i = 0; i < totalEntries; i++) {
+    expect(buf.readUInt32LE(pos)).toBe(0x02014b50); // central dir signature
+    const method = buf.readUInt16LE(pos + 10);
+    const compressedSize = buf.readUInt32LE(pos + 20);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const commentLen = buf.readUInt16LE(pos + 32);
+    const localHeaderOffset = buf.readUInt32LE(pos + 42);
+    const entryName = buf.toString('utf8', pos + 46, pos + 46 + nameLen);
+    pos += 46 + nameLen + extraLen + commentLen;
+    if (entryName !== name) continue;
+
+    expect(buf.readUInt32LE(localHeaderOffset)).toBe(0x04034b50); // local header signature
+    const localNameLen = buf.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLen = buf.readUInt16LE(localHeaderOffset + 28);
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+    const compressed = buf.subarray(dataStart, dataStart + compressedSize);
+    return method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed);
+  }
+  throw new Error(`entry ${name} not found in ${zipPath}`);
 }
 
 /* -------------------------------- suite -------------------------------- */
@@ -334,11 +383,18 @@ describe('exportBundle', () => {
     });
 
     expect(manifest.event_count).toBe(10);
-    // yauzl is not installed; assert the artifact exists and has substance,
-    // and rely on dir mode (same entries) for content-level checks.
     expect(existsSync(zipPath)).toBe(true);
     expect(statSync(zipPath).size).toBeGreaterThan(500);
     expect(existsSync(join(bundleDir, BUNDLE_FILES.MANIFEST))).toBe(true);
+
+    // yauzl is not installed, so decode the .zip's entries directly (see
+    // readZipEntry above) and confirm they match dir mode byte-for-byte —
+    // not just "some non-trivial file exists".
+    for (const name of Object.values(BUNDLE_FILES)) {
+      const fromZip = readZipEntry(zipPath, name);
+      const fromDir = readFileSync(join(bundleDir, name));
+      expect(fromZip.equals(fromDir), `${name} should round-trip through the zip`).toBe(true);
+    }
   });
 
   it('rejects an export with no destination, an empty store, and an unknown session', async () => {
@@ -370,4 +426,50 @@ describe('exportBundle', () => {
       emptyStore.close();
     }
   });
+
+  it('export --out .zip, then `mcp-recorder verify --bundle` on it: PASS; a tampered .zip: FAIL', async () => {
+    const zipPath = join(dir, 'evidence.zip');
+    await exportBundle({ store, zipPath, toolVersion: '0.1.0-test', signer });
+
+    const ok = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', zipPath], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
+    expect(ok.status).toBe(0);
+    expect(ok.stdout).toContain('PASS');
+
+    // Tamper by rebuilding the zip with one doctored event, same shape as
+    // the directory-mode tamper test above.
+    const eventsBuf = readZipEntry(zipPath, BUNDLE_FILES.EVENTS);
+    const lines = eventsBuf
+      .toString('utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '');
+    const record = JSON.parse(lines[4]!) as ChainRecord;
+    (record.event as ToolCallEvent).tool = 'doctored_tool';
+    lines[4] = JSON.stringify(record);
+
+    const tamperedZip = join(dir, 'evidence-tampered.zip');
+    const zf = new yazl.ZipFile();
+    for (const name of Object.values(BUNDLE_FILES)) {
+      const data = name === BUNDLE_FILES.EVENTS ? Buffer.from(lines.join('\n') + '\n', 'utf8') : readZipEntry(zipPath, name);
+      zf.addBuffer(data, name);
+    }
+    await new Promise<void>((res, reject) => {
+      const out = createWriteStream(tamperedZip);
+      out.on('close', res);
+      out.on('error', reject);
+      zf.outputStream.on('error', reject);
+      zf.outputStream.pipe(out);
+      zf.end();
+    });
+
+    const bad = spawnSync('npx', ['tsx', 'src/cli.ts', 'verify', '--bundle', tamperedZip], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
+    expect(bad.status).toBe(1);
+    expect(bad.stdout).toContain('FAIL');
+    expect(bad.stdout).toMatch(/hash_mismatch\s+5\b/); // pinpoints the doctored record at seq 5
+  }, 30_000);
 });

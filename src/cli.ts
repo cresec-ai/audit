@@ -10,21 +10,23 @@
  * failed / nothing to export, 2 usage or unexpected error.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { inflateRawSync } from 'node:zlib';
 
 import { Recorder } from './capture/recorder.js';
 import { Signer, publicKeyHexFromPem } from './chain/keys.js';
 import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
-import { exportBundle } from './export/bundle.js';
+import { BUNDLE_FILES, exportBundle } from './export/bundle.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
 import { queryStore } from './query/touched.js';
 import { Redactor } from './redact/redactor.js';
 import { renderTimelineHtml } from './replay/render.js';
 import { serveUi } from './replay/serve.js';
-import { openStore } from './store/index.js';
+import { openStore, openStoreReadOnly } from './store/index.js';
 import type { AnyEvent, ChainRecord } from './schema/events.js';
 import type {
   BundleManifest,
@@ -50,17 +52,18 @@ Usage:
   mcp-recorder [record] [flags] -- <server command...>
       transparent stdio proxy: forwards bytes unchanged, records redacted events
   mcp-recorder verify   [--data-dir D] [--bundle PATH] [--public-key K] [--allow-unsigned] [--json]
-      verify the hash chain + head signatures (exit 1 on failure)
-      by default pins to <data-dir>/identity.pub (store mode) or the
-      bundle's own manifest key (bundle mode); --public-key overrides
-      either with a key obtained out of band (64-hex, or a path to a
-      hex or PEM file)
+      verify the hash chain + head signatures (exit 1 on failure); --bundle
+      accepts a .zip or a bundle directory. By default pins to
+      <data-dir>/identity.pub (store mode) or the bundle's own manifest key
+      (bundle mode); --public-key overrides either with a key obtained out
+      of band (64-hex, or a path to a hex or PEM file)
   mcp-recorder query    <needle> [--data-dir D] [--session ID] [--json]
       blast radius: trace a value through the evidence chain
   mcp-recorder sessions [--data-dir D] [--json]
       list recorded sessions
   mcp-recorder ui       [--data-dir D] [--session ID] [--port N] [--out FILE] [--no-open]
-      replay timeline (local web UI, or --out FILE for a static page)
+      replay timeline (local web UI, opened in your browser unless --no-open
+      or --out is given; or --out FILE for a static page)
   mcp-recorder export   [--data-dir D] [--session ID] [--out FILE.zip] [--dir DIR]
       signed evidence bundle a stranger can verify with plain Node.js
   mcp-recorder http     --target URL [--port N] [flags]
@@ -68,17 +71,21 @@ Usage:
   mcp-recorder --help | --version
 
 Flags:
-  --data-dir D   evidence directory (default ~/.mcp-recorder; env MCP_RECORDER_DATA_DIR)
-  --store B      evidence backend: sqlite | jsonl     (env MCP_RECORDER_STORE)
-  --redact M     redaction mode: allowlist | off      (env MCP_RECORDER_REDACT)
-  --name NAME    logical server name stamped on events
-  --identity L   operator identity label stamped on events
-  --public-key K pin verify to this ed25519 key instead of the default
-                 (64-hex, or a path to a file holding hex or a PEM)
+  --data-dir D    evidence directory (default ~/.mcp-recorder; env MCP_RECORDER_DATA_DIR)
+  --store B       evidence backend: sqlite | jsonl     (env MCP_RECORDER_STORE)
+  --redact M      redaction mode: allowlist | off      (env MCP_RECORDER_REDACT)
+  --name NAME     logical server name stamped on events
+  --identity L    operator identity label stamped on events
+  --session ID    select a session (query / ui / export); a unique prefix of
+                   the id works too, same as the ids 'sessions' prints
+  --public-key K  pin verify to this ed25519 key instead of the default
+                   (64-hex, or a path to a file holding hex or a PEM)
   --allow-unsigned
-                 verify: downgrade an unsigned chain/tail to a warning
-                 instead of a failure (still reported, never silent)
-  --json         machine-readable output (verify / query / sessions)
+                   verify: downgrade an unsigned chain/tail to a warning
+                   instead of a failure (still reported, never silent)
+  --json          machine-readable output (verify / query / sessions)
+  --help, -h      show this help and exit
+  --version, -V   show the version and exit
 
 Environment:
   MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded
@@ -197,12 +204,87 @@ function id8(id: string): string {
   return id.slice(0, 8);
 }
 
-function openConfiguredStore(config: RecorderConfig): EvidenceStore {
-  return openStore(
+/**
+ * `readOnly: true` (used by the inspection commands — verify/query/sessions/
+ * ui/export) resolves the backend without ever creating a store file as a
+ * side effect of merely looking: on a data dir where nothing has recorded
+ * yet, it returns an empty store instead of the write path's "create
+ * whichever backend is available" behavior (see src/store/index.ts).
+ */
+function openConfiguredStore(config: RecorderConfig, opts: { readOnly?: boolean } = {}): EvidenceStore {
+  const storeOpts =
     config.storeBackend !== undefined
       ? { dataDir: config.dataDir, backend: config.storeBackend }
-      : { dataDir: config.dataDir },
-  );
+      : { dataDir: config.dataDir };
+  return opts.readOnly === true ? openStoreReadOnly(storeOpts) : openStore(storeOpts);
+}
+
+/**
+ * Resolve `--session` against the store's session list: an exact id, or a
+ * unique prefix of the kind `sessions`/`query`/run summaries print (8 chars
+ * onward). An ambiguous or unmatched prefix is a usage error (exit 2) that
+ * names the candidates, rather than export's exact-match ENOTFOUND or
+ * query's silent zero matches.
+ */
+function resolveSessionId(store: EvidenceStore, raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const sessions = store.sessions();
+  const exact = sessions.find((s) => s.session_id === raw);
+  if (exact !== undefined) return exact.session_id;
+  const matches = sessions.filter((s) => s.session_id.startsWith(raw));
+  if (matches.length === 1) return matches[0]!.session_id;
+  if (matches.length > 1) {
+    err(
+      `--session '${raw}' is ambiguous — it matches ${matches.length} sessions: ` +
+        matches.map((s) => id8(s.session_id)).join(', '),
+    );
+  }
+  err(`--session '${raw}' matches no recorded session`);
+}
+
+/**
+ * Quiet exit on EPIPE (e.g. `mcp-recorder verify | head -1`) instead of the
+ * default uncaught-exception stack trace — the reader going away early isn't
+ * a failure of the command that was writing to it.
+ */
+function guardStdoutEpipe(): void {
+  process.stdout.on('error', (cause: NodeJS.ErrnoException) => {
+    if (cause.code === 'EPIPE') process.exit(0);
+    throw cause;
+  });
+}
+
+/**
+ * Best-effort browser open for `ui`'s served URL. Fire-and-forget: never
+ * awaited, and any failure (missing opener, spawn error) is swallowed — it
+ * must never affect the command's behavior or exit code. Skipped outright on
+ * a headless Linux host (no DISPLAY/WAYLAND_DISPLAY), since spawning
+ * xdg-open there has nothing to open and would just error.
+ */
+function tryOpenBrowser(url: string): void {
+  if (
+    process.platform !== 'darwin' &&
+    process.platform !== 'win32' &&
+    process.env.DISPLAY === undefined &&
+    process.env.WAYLAND_DISPLAY === undefined
+  ) {
+    return;
+  }
+  const [cmd, args]: [string, string[]] =
+    process.platform === 'darwin'
+      ? ['open', [url]]
+      : process.platform === 'win32'
+        ? ['cmd', ['/c', 'start', '""', url]]
+        : ['xdg-open', [url]];
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    child.on('error', () => {
+      /* best-effort: no opener available on this host — nothing to do */
+    });
+    child.unref();
+  } catch {
+    /* best-effort: never fatal to the ui command */
+  }
 }
 
 /** Wrap a recorder so the CLI learns the session id of the first event. */
@@ -401,32 +483,193 @@ function printVerifyHuman(result: VerifyResult, source: string, pinned?: PinnedK
 }
 
 /**
- * `pinOpts.expectedPublicKeyHex`, when passed, overrides the tautological
- * default of pinning to the bundle's own manifest key — that only proves the
- * bundle is internally self-consistent, not that it came from anyone in
- * particular. A third party who obtained the real key out of band should
- * pass it via --public-key instead.
+ * Bundle pinning: by default a bundle is checked against its own manifest
+ * key, which only proves it is internally self-consistent — an attacker who
+ * forged the whole bundle ships a matching key. A third party who obtained
+ * the real key out of band passes it via --public-key, which overrides that
+ * default; --allow-unsigned is threaded through as well.
  */
-async function verifyBundleDir(
-  dirPath: string,
-  pinOpts: Pick<VerifyOpts, 'expectedPublicKeyHex' | 'allowUnsigned'> = {},
-): Promise<{ result: VerifyResult; source: string; pinnedPublicKeyHex: string }> {
-  const dir = resolve(dirPath);
-  const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as BundleManifest;
-  if (manifest.bundle !== 'edut.mcp-recorder.bundle.v1') {
-    err(`unrecognized bundle id in ${join(dir, 'manifest.json')}: ${String(manifest.bundle)}`);
+type BundlePinOpts = Pick<VerifyOpts, 'expectedPublicKeyHex' | 'allowUnsigned'>;
+
+interface BundleVerification {
+  result: VerifyResult;
+  source: string;
+  pinnedPublicKeyHex: string;
+}
+
+/* ----------------------------- minimal ZIP reader ----------------------------
+ * `export --out FILE.zip` writes bundles with yazl (stored or DEFLATE entries,
+ * no zip64, no encryption, single disk — see src/export/bundle.ts). This is
+ * just enough of the ZIP format to read one of those back: walk the central
+ * directory (authoritative — never trust local headers alone for sizes), then
+ * pull each wanted entry's bytes from its local header and inflate if needed.
+ * No new dependency: node:zlib's inflateRawSync covers DEFLATE.
+ */
+
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_DIR_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_HEADER_SIGNATURE = 0x04034b50;
+const ZIP_EOCD_SIZE = 22;
+const ZIP_MAX_COMMENT = 0xffff;
+
+/** Scan backward from EOF for the End Of Central Directory record. */
+function findZipEndOfCentralDirectory(buf: Buffer): number {
+  const scanBack = Math.min(buf.length, ZIP_EOCD_SIZE + ZIP_MAX_COMMENT);
+  const floor = buf.length - scanBack;
+  for (let i = buf.length - ZIP_EOCD_SIZE; i >= floor; i--) {
+    if (buf.readUInt32LE(i) === ZIP_EOCD_SIGNATURE) return i;
   }
-  const records = readFileSync(join(dir, 'events.jsonl'), 'utf8')
+  return -1;
+}
+
+function inflateZipEntry(buf: Buffer, localHeaderOffset: number, method: number, compressedSize: number, name: string): Buffer {
+  if (
+    localHeaderOffset < 0 ||
+    localHeaderOffset + 30 > buf.length ||
+    buf.readUInt32LE(localHeaderOffset) !== ZIP_LOCAL_HEADER_SIGNATURE
+  ) {
+    err(`malformed ZIP: bad local file header for ${name}`);
+  }
+  const nameLen = buf.readUInt16LE(localHeaderOffset + 26);
+  const extraLen = buf.readUInt16LE(localHeaderOffset + 28);
+  const dataStart = localHeaderOffset + 30 + nameLen + extraLen;
+  if (dataStart + compressedSize > buf.length) {
+    err(`malformed ZIP: ${name} data runs past the end of the file`);
+  }
+  const compressed = buf.subarray(dataStart, dataStart + compressedSize);
+  if (method === 0) return Buffer.from(compressed);
+  if (method === 8) {
+    try {
+      return inflateRawSync(compressed);
+    } catch (cause) {
+      err(`malformed ZIP: cannot inflate ${name}: ${(cause as Error).message}`);
+    }
+  }
+  err(`unsupported ZIP compression method ${method} for ${name} (only stored/deflate are supported)`);
+}
+
+/** Extract the bytes of each `wanted` entry from a .zip buffer, by name. */
+function readZipEntries(buf: Buffer, wanted: readonly string[]): Map<string, Buffer> {
+  const eocd = findZipEndOfCentralDirectory(buf);
+  if (eocd === -1) err('not a valid ZIP file (no end-of-central-directory record found)');
+  const totalEntries = buf.readUInt16LE(eocd + 10);
+  const centralDirOffset = buf.readUInt32LE(eocd + 16);
+  if (totalEntries === 0xffff || centralDirOffset === 0xffffffff) {
+    err('ZIP64 bundles are not supported by verify --bundle');
+  }
+
+  const remaining = new Set(wanted);
+  const found = new Map<string, Buffer>();
+  let pos = centralDirOffset;
+  for (let i = 0; i < totalEntries && remaining.size > 0; i++) {
+    if (pos + 46 > buf.length || buf.readUInt32LE(pos) !== ZIP_CENTRAL_DIR_SIGNATURE) {
+      err('malformed ZIP central directory');
+    }
+    const method = buf.readUInt16LE(pos + 10);
+    const compressedSize = buf.readUInt32LE(pos + 20);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const commentLen = buf.readUInt16LE(pos + 32);
+    const localHeaderOffset = buf.readUInt32LE(pos + 42);
+    const name = buf.toString('utf8', pos + 46, pos + 46 + nameLen);
+    pos += 46 + nameLen + extraLen + commentLen;
+
+    if (!remaining.has(name)) continue;
+    found.set(name, inflateZipEntry(buf, localHeaderOffset, method, compressedSize, name));
+    remaining.delete(name);
+  }
+  return found;
+}
+
+/* ------------------------------- bundle reading ------------------------------- */
+
+const BUNDLE_REQUIRED_FILES = [BUNDLE_FILES.MANIFEST, BUNDLE_FILES.EVENTS, BUNDLE_FILES.PUBLIC_KEY] as const;
+
+function assertBundleId(manifest: BundleManifest, where: string): void {
+  if (manifest.bundle !== 'edut.mcp-recorder.bundle.v1') {
+    err(`unrecognized bundle id in ${where}: ${String(manifest.bundle)}`);
+  }
+}
+
+function parseEventsJsonl(text: string): ChainRecord[] {
+  return text
     .split('\n')
     .filter((line) => line.trim() !== '')
     .map((line) => JSON.parse(line) as ChainRecord);
+}
+
+async function verifyManifestAgainst(
+  manifest: BundleManifest,
+  records: ChainRecord[],
+  pinOpts: BundlePinOpts,
+): Promise<{ result: VerifyResult; pinnedPublicKeyHex: string }> {
   const pinnedPublicKeyHex = pinOpts.expectedPublicKeyHex ?? manifest.signature.public_key;
   const result = await verifyRecords(records, [manifest.signature], {
     baseHash: manifest.base_hash,
     expectedPublicKeyHex: pinnedPublicKeyHex,
     ...(pinOpts.allowUnsigned !== undefined ? { allowUnsigned: pinOpts.allowUnsigned } : {}),
   });
+  return { result, pinnedPublicKeyHex };
+}
+
+async function verifyBundleFromDir(dir: string, pinOpts: BundlePinOpts): Promise<BundleVerification> {
+  const manifestPath = join(dir, BUNDLE_FILES.MANIFEST);
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as BundleManifest;
+  assertBundleId(manifest, manifestPath);
+  const records = parseEventsJsonl(readFileSync(join(dir, BUNDLE_FILES.EVENTS), 'utf8'));
+  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(manifest, records, pinOpts);
   return { result, source: `bundle ${dir}`, pinnedPublicKeyHex };
+}
+
+async function verifyBundleFromZip(
+  zipPath: string,
+  buf: Buffer,
+  pinOpts: BundlePinOpts,
+): Promise<BundleVerification> {
+  const entries = readZipEntries(buf, BUNDLE_REQUIRED_FILES);
+  const missing = BUNDLE_REQUIRED_FILES.filter((name) => !entries.has(name));
+  if (missing.length > 0) {
+    err(
+      `${zipPath} is not a valid evidence bundle (missing ${missing.join(', ')} — ` +
+        'expected the .zip produced by `mcp-recorder export`)',
+    );
+  }
+  const manifest = JSON.parse(entries.get(BUNDLE_FILES.MANIFEST)!.toString('utf8')) as BundleManifest;
+  assertBundleId(manifest, `${zipPath} (${BUNDLE_FILES.MANIFEST})`);
+  const records = parseEventsJsonl(entries.get(BUNDLE_FILES.EVENTS)!.toString('utf8'));
+  const { result, pinnedPublicKeyHex } = await verifyManifestAgainst(manifest, records, pinOpts);
+  return { result, source: `bundle ${zipPath}`, pinnedPublicKeyHex };
+}
+
+/**
+ * Read a bundle for `verify --bundle PATH`: either form `export` produces —
+ * a plain directory, or the default `.zip` (sniffed by its `PK` magic, not
+ * by file extension, so a renamed bundle still works). Anything else gets a
+ * helpful error instead of the raw ENOTDIR/ENOENT a fs call would throw.
+ */
+async function verifyBundleDir(
+  bundlePath: string,
+  pinOpts: BundlePinOpts = {},
+): Promise<BundleVerification> {
+  const resolved = resolve(bundlePath);
+  let stat;
+  try {
+    stat = statSync(resolved);
+  } catch {
+    err(`--bundle ${resolved} does not exist`);
+  }
+  if (stat.isDirectory()) return verifyBundleFromDir(resolved, pinOpts);
+  if (stat.isFile()) {
+    const buf = readFileSync(resolved);
+    if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b /* 'PK' */) {
+      return verifyBundleFromZip(resolved, buf, pinOpts);
+    }
+    err(
+      `--bundle ${resolved} is not a recognized evidence bundle ` +
+        '(expected a directory or a .zip produced by `mcp-recorder export`)',
+    );
+  }
+  err(`--bundle ${resolved} is neither a file nor a directory`);
 }
 
 async function cmdVerify(flags: Flags): Promise<void> {
@@ -435,6 +678,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
   const explicitPublicKeyHex =
     publicKeyFlag !== undefined ? resolvePublicKeyArg(publicKeyFlag) : undefined;
 
+  guardStdoutEpipe();
   let result: VerifyResult;
   let source: string;
   let pinned: PinnedKey | undefined;
@@ -457,7 +701,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
     };
   } else {
     const config = resolveConfig({ flags, env: process.env });
-    const store = openConfiguredStore(config);
+    const store = openConfiguredStore(config, { readOnly: true });
     try {
       let expectedPublicKeyHex = explicitPublicKeyHex;
       let pinSource = '--public-key';
@@ -494,11 +738,12 @@ async function cmdVerify(flags: Flags): Promise<void> {
 }
 
 async function cmdQuery(flags: Flags, positionals: string[]): Promise<void> {
+  guardStdoutEpipe();
   const needle = positionals[0] ?? err('query: missing <needle> argument');
   const config = resolveConfig({ flags, env: process.env });
-  const store = openConfiguredStore(config);
+  const store = openConfiguredStore(config, { readOnly: true });
   try {
-    const sessionId = asStr(flags.session);
+    const sessionId = resolveSessionId(store, asStr(flags.session));
     const result = queryStore(store, needle, sessionId !== undefined ? { sessionId } : {});
     if (flags.json === true) {
       out(JSON.stringify(result, null, 2));
@@ -527,8 +772,9 @@ async function cmdQuery(flags: Flags, positionals: string[]): Promise<void> {
 }
 
 async function cmdSessions(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
-  const store = openConfiguredStore(config);
+  const store = openConfiguredStore(config, { readOnly: true });
   try {
     const sessions = store.sessions();
     if (flags.json === true) {
@@ -559,11 +805,12 @@ async function cmdSessions(flags: Flags): Promise<void> {
 }
 
 async function cmdUi(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
-  const store = openConfiguredStore(config);
-  const sessionId = asStr(flags.session);
-  const outFile = asStr(flags.out);
+  const store = openConfiguredStore(config, { readOnly: true });
   try {
+    const sessionId = resolveSessionId(store, asStr(flags.session));
+    const outFile = asStr(flags.out);
     const verify = await verifyStore(store);
     if (outFile !== undefined) {
       const html = renderTimelineHtml(store, {
@@ -581,8 +828,8 @@ async function cmdUi(flags: Flags): Promise<void> {
       port,
       ...(sessionId !== undefined ? { sessionId } : {}),
     });
-    // --no-open accepted for compat; we never spawn a browser, only print.
     diag(`replay UI at ${ui.url} (Ctrl-C to stop)`);
+    if (flags['no-open'] !== true) tryOpenBrowser(ui.url);
     await waitForShutdownSignal();
     await ui.close();
   } finally {
@@ -599,8 +846,9 @@ function exportTimestamp(now: Date): string {
 }
 
 async function cmdExport(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
-  const store = openConfiguredStore(config);
+  const store = openConfiguredStore(config, { readOnly: true });
   try {
     if (store.count() === 0) {
       diag('error: nothing to export — the evidence store is empty');
@@ -613,7 +861,7 @@ async function cmdExport(flags: Flags): Promise<void> {
       (dirPath === undefined
         ? `./mcp-recorder-bundle-${exportTimestamp(new Date())}.zip`
         : undefined);
-    const sessionId = asStr(flags.session);
+    const sessionId = resolveSessionId(store, asStr(flags.session));
     const signer = await Signer.load(config.dataDir);
 
     const manifest = await exportBundle({

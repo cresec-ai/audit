@@ -10,7 +10,14 @@ import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Signer, publicKeyPem } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
 import { SCHEMA } from '../src/schema/events.js';
-import type { AnyEvent, ChainRecord } from '../src/schema/events.js';
+import type {
+  AnyEvent,
+  ChainRecord,
+  IdentityContext,
+  ServerContext,
+  SessionStartEvent,
+  ToolCallEvent,
+} from '../src/schema/events.js';
 import type { ChainHead } from '../src/types.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -43,6 +50,32 @@ function spawnCli(args: string[], env: Record<string, string | undefined> = {}):
   });
   cleanups.push(() => {
     if (child.exitCode === null) child.kill('SIGKILL');
+  });
+  return child;
+}
+
+/**
+ * Like spawnCli, but detached into its own process group so cleanup can kill
+ * the WHOLE npx -> sh -> node(tsx) -> node(loader) tree it creates. A signal
+ * to just the top pid (what spawnCli's cleanup does) does not reliably reach
+ * a long-running server like `ui` down that chain — only a full process-group
+ * kill does. Use this for any test that starts `ui` without `--out`.
+ */
+function spawnCliDetached(args: string[], env: Record<string, string | undefined> = {}): ChildProcess {
+  const child = spawn('npx', ['tsx', 'src/cli.ts', ...args], {
+    cwd: ROOT,
+    env: { ...process.env, MCP_RECORDER_DISABLE: undefined, ...env },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
+  });
+  cleanups.push(() => {
+    if (child.pid !== undefined) {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        /* whole tree already gone */
+      }
+    }
   });
   return child;
 }
@@ -171,6 +204,116 @@ async function driveSession(child: ChildProcess): Promise<void> {
   expect(JSON.stringify(call.result)).toContain(PROBE);
 
   child.stdin!.end();
+}
+
+/* --------------------- direct-store fixtures (no proxy) ------------------- *
+ * A few tests below need session ids/event volumes the recorder's random
+ * uuids can't guarantee (a shared 8-char prefix; thousands of matching rows),
+ * so they seed a jsonl store directly with sealed ChainRecords, same as
+ * test/store.test.ts and test/export.test.ts do — then drive the real CLI
+ * against that data dir.
+ */
+
+const FIXTURE_IDENTITY: IdentityContext = { fingerprint: sha256Ref('cli-fixture-identity') };
+const FIXTURE_SERVER: ServerContext = {
+  name: 'fixture-server',
+  command: 'node fixture.js',
+  transport: 'stdio',
+};
+
+let fixtureEventCounter = 0;
+function fixtureEventId(): string {
+  return `00000000-0000-4000-8000-${(fixtureEventCounter++).toString(16).padStart(12, '0')}`;
+}
+
+function fixtureSessionStart(sessionId: string, timestamp: string): SessionStartEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp,
+    kind: 'session_start',
+    identity: FIXTURE_IDENTITY,
+    server: FIXTURE_SERVER,
+    attributes: {},
+    proxy_version: '0.1.0',
+    cwd: '/tmp',
+    redaction_mode: 'allowlist',
+  };
+}
+
+/** Seed a jsonl store with one session_start event per given (deterministic) session id. */
+function seedSessions(dataDir: string, sessionIds: string[]): void {
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records = sessionIds.map((id, i) => {
+      const record = makeRecord(
+        head,
+        fixtureSessionStart(id, new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString()),
+      );
+      head = { seq: record.seq, hash: record.hash };
+      return record;
+    });
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
+/** Seed a jsonl store with `count` tool_call events that all match `needle`. */
+function seedManyMatchingEvents(dataDir: string, needle: string, count: number): void {
+  const needleHash = sha256Ref(needle);
+  const sessionId = 'bbbbbbbb-0000-4000-8000-000000000000';
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records: ChainRecord[] = [];
+    for (let i = 0; i < count; i++) {
+      const event: ToolCallEvent = {
+        schema: SCHEMA,
+        event_id: fixtureEventId(),
+        session_id: sessionId,
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, i)).toISOString(),
+        kind: 'tool_call',
+        identity: FIXTURE_IDENTITY,
+        server: FIXTURE_SERVER,
+        attributes: {},
+        tool: 'probe_tool',
+        request_id: i,
+        args: { note: { redacted: true, ref: needleHash, len: needle.length } },
+        result_hash: sha256Ref('{}'),
+        result: {},
+        is_error: false,
+        duration_ms: 1,
+      };
+      const record = makeRecord(head, event);
+      head = { seq: record.seq, hash: record.hash };
+      records.push(record);
+    }
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolveWait) => setTimeout(resolveWait, ms));
+}
+
+/** Poll `getText()` until it matches `pattern`, for tests that watch a growing stderr buffer. */
+async function waitForMatch(
+  getText: () => string,
+  pattern: RegExp,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const start = Date.now();
+  while (!pattern.test(getText())) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`timed out waiting for ${String(pattern)} in: ${getText()}`);
+    }
+    await waitMs(25);
+  }
 }
 
 /* --------------------------------- tests -------------------------------- */
@@ -483,4 +626,216 @@ describe('mcp-recorder CLI', () => {
     expect(wrong.code).toBe(1);
     expect(wrong.stdout).toContain('FAIL');
   }, 60_000);
+});
+
+describe('--session prefix resolution (export / query / ui)', () => {
+  // Deterministic ids so two of them share an 8-char (and beyond) prefix —
+  // real recorded session ids are random uuids and won't collide like this.
+  const SESSION_SHARED_A = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const SESSION_SHARED_B = 'aaaaaaab-2222-4222-8222-222222222222';
+  const SESSION_UNIQUE = 'ffffffff-3333-4333-8333-333333333333';
+
+  function seededDataDir(): string {
+    const dataDir = tmpDir('mcp-rec-session-prefix-');
+    seedSessions(dataDir, [SESSION_SHARED_A, SESSION_SHARED_B, SESSION_UNIQUE]);
+    return dataDir;
+  }
+
+  it('a unique id prefix (the 8 chars `sessions` prints) resolves for export / query / ui', async () => {
+    const dataDir = seededDataDir();
+
+    const bundleDir = join(dataDir, 'bundle');
+    const exported = await runCli([
+      'export',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'ffffffff',
+      '--dir',
+      bundleDir,
+    ]);
+    expect(exported.code).toBe(0);
+    const manifest = JSON.parse(readFileSync(join(bundleDir, 'manifest.json'), 'utf8')) as {
+      session_id: string;
+    };
+    expect(manifest.session_id).toBe(SESSION_UNIQUE);
+
+    const query = await runCli([
+      'query',
+      'anything',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'ffffffff',
+    ]);
+    expect(query.code).toBe(0); // resolves fine even when the needle itself has 0 matches
+
+    const htmlPath = join(dataDir, 'replay.html');
+    const ui = await runCli([
+      'ui',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'ffffffff',
+      '--out',
+      htmlPath,
+    ]);
+    expect(ui.code).toBe(0);
+    expect(existsSync(htmlPath)).toBe(true);
+  }, 60_000);
+
+  it('an exact full session id still works (unchanged behavior)', async () => {
+    const dataDir = seededDataDir();
+    const query = await runCli(['query', 'anything', '--data-dir', dataDir, '--session', SESSION_UNIQUE]);
+    expect(query.code).toBe(0);
+  }, 60_000);
+
+  it('an ambiguous --session prefix exits 2 and lists the candidates', async () => {
+    const dataDir = seededDataDir();
+
+    const exported = await runCli([
+      'export',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'aaaaaaa',
+      '--dir',
+      join(dataDir, 'bundle'),
+    ]);
+    expect(exported.code).toBe(2);
+    expect(exported.stderr).toContain('ambiguous');
+    expect(exported.stderr).toContain('aaaaaaaa');
+    expect(exported.stderr).toContain('aaaaaaab');
+
+    const query = await runCli(['query', 'x', '--data-dir', dataDir, '--session', 'aaaaaaa']);
+    expect(query.code).toBe(2);
+    expect(query.stderr).toContain('ambiguous');
+
+    const ui = await runCli([
+      'ui',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'aaaaaaa',
+      '--out',
+      join(dataDir, 'replay.html'),
+    ]);
+    expect(ui.code).toBe(2);
+    expect(ui.stderr).toContain('ambiguous');
+  }, 60_000);
+
+  it('a --session with no match exits 2 with a clear message (query: not a silent 0 matches)', async () => {
+    const dataDir = seededDataDir();
+
+    const query = await runCli(['query', 'x', '--data-dir', dataDir, '--session', 'deadbeef']);
+    expect(query.code).toBe(2);
+    expect(query.stderr).toContain('matches no recorded session');
+    expect(query.stdout).toBe(''); // no "0 matches across 0 sessions" success-shaped output
+
+    const exported = await runCli([
+      'export',
+      '--data-dir',
+      dataDir,
+      '--session',
+      'deadbeef',
+      '--dir',
+      join(dataDir, 'bundle'),
+    ]);
+    expect(exported.code).toBe(2);
+    expect(exported.stderr).toContain('matches no recorded session');
+  }, 60_000);
+});
+
+describe('inspection commands: EPIPE handling', () => {
+  it('a reader that closes early (e.g. `| head -1`) exits quietly, no crash stack trace', async () => {
+    const dataDir = tmpDir('mcp-rec-epipe-');
+    // Big enough that the CLI is still writing when the reader goes away —
+    // small output can finish before a `head`-style reader even closes.
+    seedManyMatchingEvents(dataDir, 'epipe-needle', 4000);
+
+    const child = spawnCli(['query', 'epipe-needle', '--data-dir', dataDir]);
+    const stderrText = collect(child.stderr);
+
+    await new Promise<void>((resolveData) => {
+      child.stdout!.once('data', () => {
+        // Closing our read end mid-write is exactly what `| head -1` does
+        // once it has read what it wants.
+        child.stdout!.destroy();
+        resolveData();
+      });
+    });
+
+    const code = await waitExit(child);
+    const stderrOut = stderrText();
+    expect(stderrOut).not.toMatch(/EPIPE/);
+    expect(stderrOut).not.toMatch(/Emitted 'error' event/i);
+    expect(stderrOut).not.toMatch(/at WriteStream/);
+    expect(code).toBe(0);
+  }, 60_000);
+});
+
+describe('ui: best-effort browser open', () => {
+  /** A fake `xdg-open` on PATH that just touches a marker file when run. */
+  function makeFakeOpener(): { binDir: string; marker: string } {
+    const binDir = tmpDir('mcp-rec-fake-opener-bin-');
+    const marker = join(tmpDir('mcp-rec-fake-opener-marker-'), 'opened');
+    writeFileSync(join(binDir, 'xdg-open'), `#!/bin/sh\ntouch '${marker}'\nexit 0\n`, {
+      mode: 0o755,
+    });
+    return { binDir, marker };
+  }
+
+  it('spawns the platform opener for the served URL by default (a display is present)', async () => {
+    const dataDir = tmpDir('mcp-rec-ui-open-');
+    const { binDir, marker } = makeFakeOpener();
+    const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      DISPLAY: ':99',
+    });
+    const stderrText = collect(child.stderr);
+    await waitForMatch(stderrText, /replay UI at http/);
+    await waitMs(1000);
+    expect(existsSync(marker)).toBe(true);
+  }, 30_000);
+
+  it('--no-open never spawns the opener, even with a display present', async () => {
+    const dataDir = tmpDir('mcp-rec-ui-noopen-');
+    const { binDir, marker } = makeFakeOpener();
+    const child = spawnCliDetached(['ui', '--data-dir', dataDir, '--no-open'], {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      DISPLAY: ':99',
+    });
+    const stderrText = collect(child.stderr);
+    await waitForMatch(stderrText, /replay UI at http/);
+    await waitMs(1000);
+    expect(existsSync(marker)).toBe(false);
+  }, 30_000);
+
+  it('--out never spawns the opener (there is no server to open)', async () => {
+    const dataDir = tmpDir('mcp-rec-ui-outnoopen-');
+    const { binDir, marker } = makeFakeOpener();
+    const res = await runCli(['ui', '--data-dir', dataDir, '--out', join(dataDir, 'replay.html')], {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      DISPLAY: ':99',
+    });
+    expect(res.code).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+  }, 30_000);
+
+  it('does not hang on a headless host (no DISPLAY) and never spawns an opener', async () => {
+    const dataDir = tmpDir('mcp-rec-ui-headless-');
+    const { binDir, marker } = makeFakeOpener();
+    const started = Date.now();
+    const child = spawnCliDetached(['ui', '--data-dir', dataDir], {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      DISPLAY: undefined,
+      WAYLAND_DISPLAY: undefined,
+    });
+    const stderrText = collect(child.stderr);
+    await waitForMatch(stderrText, /replay UI at http/);
+    // The server came up promptly — nothing blocked on a (nonexistent) opener.
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await waitMs(1000);
+    expect(existsSync(marker)).toBe(false);
+  }, 30_000);
 });
