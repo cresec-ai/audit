@@ -111,11 +111,13 @@ interface SessionRow {
  *
  * tool_call_count counts CALLS, not tool_call events: a proxy-captured call
  * is one event with no `phase`, while `mcp-recorder hook` records a call as
- * a `phase: 'pre'` event plus (only when the tool ran to completion) a
- * `phase: 'post'` event sharing its request_id. Counting the pre half only
- * gives one per call either way, and a lone pre (the call never completed)
- * still counts once. error_count counts is_error on any phase: a failed hook
- * call has exactly one such event (the denied pre, or the failing post).
+ * a `phase: 'pre'` event plus (once PostToolUse or PostToolUseFailure fired
+ * for it) a `phase: 'post'` event sharing its request_id. Counting the pre
+ * half only gives one per call either way, and a lone pre (the post half
+ * never arrived) still counts once. error_count counts is_error on any
+ * phase: a failed hook call has exactly one such event (the denied pre, or
+ * the failing post — a PostToolUseFailure, or a PostToolUse response shaped
+ * `{isError: true}`).
  * server_count is the number of distinct server.name values in the session
  * — 1 for a proxy session, several for a hook session that spanned servers.
  */

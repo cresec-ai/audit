@@ -47,9 +47,10 @@ export interface SessionSummary {
     /**
      * Tool CALLS, not `tool_call` events. A proxy-captured call is one
      * request+response-correlated event (no `phase`); a hook-captured call is
-     * a `phase: 'pre'` event plus, only when the tool ran to completion, a
-     * `phase: 'post'` event sharing its `request_id`. Only the `pre` half is
-     * counted, so a call that never completed still counts exactly once.
+     * a `phase: 'pre'` event plus, once Claude Code fired PostToolUse or
+     * PostToolUseFailure for it, a `phase: 'post'` event sharing its
+     * `request_id`. Only the `pre` half is counted, so a call whose post half
+     * never arrived still counts exactly once.
      */
     tool_call_count: number;
     /**

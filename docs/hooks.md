@@ -162,11 +162,14 @@ detail stays on each event's `server.name`, which `query`, `ui` and
 
 - `TOOL_CALLS` (`tool_call_count`) is the number of **calls**, not of
   `tool_call` events: each call counts once, on its PreToolUse event, and
-  its PostToolUse twin (same `request_id`) is the same call. A call whose
-  PostToolUse never fired still counts once.
+  its `post` twin (the PostToolUse or PostToolUseFailure event sharing its
+  `request_id`) is the same call. A call whose post half never fired
+  (Claude Code killed mid-call, a container reclaimed — see **Pending
+  markers** above) still counts once.
 - `ERRORS` (`error_count`) counts events with `is_error: true` whichever
-  phase — a policy-denied PreToolUse, or a PostToolUse that reported an
-  error — so it is per call too: a failed call has exactly one such event.
+  phase — a policy-denied PreToolUse, a PostToolUseFailure, or a
+  PostToolUse whose response was shaped `{isError: true}` — so it is per
+  call too: a failed call has exactly one such event.
 - `SERVER` is the session's first event's `server.name`, which for a hook
   session is the client itself (`claude-code`); `SERVERS` (additive
   `server_count` in `--json`) is the number of distinct `server.name`
