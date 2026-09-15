@@ -344,11 +344,30 @@ policy.yaml: invalid
 `.yaml`, `.yml` and `.json` files are accepted. Duplicate YAML keys are an
 error. The validator is the shipped JSON Schema plus a few semantic checks
 the schema language can't express (unique ids, the RE2 subset, ranges). A
-file that exists but does not parse is reported as invalid (exit 1, one error
-at pointer `/`); exit 2 is reserved for a file that cannot be read at all.
+file that exists but does not parse is reported as invalid (exit 1, one
+error whose JSON `path` is the RFC 6901 root pointer — the empty string `""`
+— which the human listing renders as `/`); exit 2 is reserved for a file
+that cannot be read at all.
+
+A **valid** policy can still carry a warning, printed after the `valid` line
+and leaving the exit code at 0:
+
+```sh
+mcp-recorder policy validate egress-only.yaml
+# /abs/egress-only.yaml: valid (0 mcp rules, 3 egress rules)
+#   warning: no "mcp" section — nothing for the gateway to enforce (record --policy and setup --policy will refuse it)
+```
+
+A policy with no `mcp` section is valid (the top level requires one of
+`mcp`/`egress`) and compiles fine for the sidecar, but `mcp-recorder record
+--policy` and `mcp-recorder setup --policy` **refuse it with exit 2** —
+there is nothing for the stdio gateway to enforce, and silently allowing
+everything is not an option. Validate-in-CI catches everything else; this
+warning is how it catches that too.
 
 `--json` prints `{ "path", "valid": true, "name"?, "hash", "source",
-"mcp_rules", "egress_rules" }` for a valid file and
+"mcp_rules", "egress_rules", "warnings" }` for a valid file (`warnings` is an
+array of strings, empty when there is nothing to say) and
 `{ "path", "valid": false, "errors": [{ "path", "message", "keyword" }] }`
 otherwise, so a CI step can fail on `valid` and show the pointers.
 
@@ -432,7 +451,14 @@ See [docs/event-schema.md](event-schema.md) for the exact fields.
 ## Limitations (v1)
 
 - Gateway mode is available for the stdio transport. `mcp-recorder http
-  --policy` is rejected with a clear error for now.
+  --policy` is rejected with a clear error (exit 2) for now. `mcp-recorder
+  http` **ignores** an exported `MCP_RECORDER_POLICY` instead of refusing to
+  start, printing `http: MCP_RECORDER_POLICY ignored — gateway mode is
+  available for the stdio transport only` on stderr and recording as usual,
+  so the variable can stay exported in a shell that also runs stdio servers.
+- A policy without an `mcp` section is valid, and `policy validate` exits 0
+  (with a warning), but `record --policy` and `setup --policy` refuse it with
+  exit 2 — the gateway would have nothing to enforce.
 - `egress` rules are validated and compiled but not enforced by
   `mcp-recorder`.
 - Denied tools are not hidden from `tools/list`; the model may still attempt

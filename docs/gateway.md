@@ -80,6 +80,10 @@ mcp-recorder setup --client claude-desktop --policy ~/.mcp-recorder/policy.yaml 
 mcp-recorder setup --client claude-desktop --policy ~/.mcp-recorder/policy.yaml
 ```
 
+Servers a previous `setup` run already wrapped in plain record mode are
+updated in place (they are listed as `updated policy on: ...`), so this
+really does apply the policy to every stdio server in the config.
+
 or edit one entry by hand — Claude Desktop / Claude Code / Cursor all take
 the same shape:
 
@@ -104,6 +108,14 @@ Fully quit and restart the client — MCP servers only launch on startup.
 If the policy file is missing or invalid the recorder exits with code 2
 before the server starts, and the client shows the server as failed. A
 broken policy never silently turns into "allow everything".
+
+A policy that is *valid* but carries no `mcp` section — an `egress`-only file,
+which the schema accepts because it is meaningful to the sidecar — is refused
+the same way: `record --policy` and `setup --policy` exit 2 with ``policy
+has no `mcp` section — nothing for the gateway to enforce``, because there is
+nothing for the stdio gateway to apply. `mcp-recorder policy validate` still
+exits 0 for such a file (it is a valid policy) but prints a warning line
+saying exactly that, so the two commands never disagree silently.
 
 ## 3. Watch it work (3 minutes)
 
@@ -209,9 +221,18 @@ jobs:
         with: { name: mcp-evidence, path: evidence.zip }
 ```
 
+The `policy validate` step exits 0 for an `egress`-only policy (with the
+warning line above) while the run step would exit 2 on it — read the
+validate step's output, or grep the policy for an `mcp:` section, if your
+runner's policy is generated rather than hand-written.
+
 `MCP_RECORDER_POLICY=/path/to/policy.yaml` is honoured by `record` when
 `--policy` is not given, which is convenient when the client's config is
-generated and you cannot edit its argv.
+generated and you cannot edit its argv. Exporting it in a shell is safe:
+`mcp-recorder http` ignores the variable (it prints
+`http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio
+transport only` on stderr and records as usual); only an explicit
+`http --policy` is an error.
 
 To ship the same policy to the Cresec control plane (the hosted gateway and
 the sidecar consume Rego through its OPA bundle endpoint):
@@ -254,7 +275,9 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   refused immediately, recorded with `outcome: session_end` and no
   `approval_id`, and no hold file is written — a hold can never outlive the
   session that created it.
-- It is stdio-only in v1; `mcp-recorder http --policy` is rejected.
+- It is stdio-only in v1; `mcp-recorder http --policy` is rejected (exit 2),
+  and `http` ignores an exported `MCP_RECORDER_POLICY` with a one-line note
+  on stderr rather than refusing to start.
 - Recording stays fail-open even in gateway mode: a store failure never
   turns into a deny. Enforcement, on the other hand, fails closed — a policy
   that cannot be evaluated denies, and a hold that cannot be written is a

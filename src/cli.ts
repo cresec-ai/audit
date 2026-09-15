@@ -143,8 +143,9 @@ Usage:
       claude-desktop this also finds a Microsoft Store (MSIX) install when
       the ordinary %APPDATA%\\Claude\\... config doesn't exist. --policy FILE
       validates the policy and bakes '--policy <absolute path>' into every
-      wrapped entry (gateway mode). Inside WSL, when the resolved config
-      belongs to a Windows-side client, --wrapper wsl is auto-selected
+      wrapped entry (gateway mode) — entries an earlier run already wrapped
+      are updated in place and reported separately. Inside WSL, when the
+      resolved config belongs to a Windows-side client, --wrapper wsl is auto-selected
       (spawns the wrapped server via wsl.exe so a Windows client can actually
       launch it) unless --wrapper is given.
       --bridge NAME=URL turns a remote MCP connector (one Claude Desktop
@@ -160,7 +161,8 @@ Flags:
   --name NAME     logical server name stamped on events
   --identity L    operator identity label stamped on events
   --policy FILE   record: policy.yaml to enforce (gateway mode; env MCP_RECORDER_POLICY)
-                   setup: bake '--policy <absolute FILE>' into every wrapped entry
+                   setup: bake '--policy <absolute FILE>' into every wrapped entry,
+                   already-wrapped ones included
                    (stdio only: 'http --policy' is rejected)
   --target T      policy compile: output target, only 'rego' (default)
                    http: the upstream MCP server URL
@@ -191,6 +193,7 @@ Environment:
   MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded — and no gateway
                            enforcement either (it is the kill switch)
   MCP_RECORDER_POLICY=F    same as 'record --policy F' when the flag is absent
+                           ('http' ignores it — gateway mode is stdio only)
 `;
 
 const FLAG_DEFS = {
@@ -644,10 +647,19 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
 async function cmdHttp(flags: Flags): Promise<void> {
   const targetUrl = asStr(flags.target) ?? err('http: --target URL is required');
   const port = parsePort(flags.port);
-  // Gateway mode is stdio-only in v1. Refusing (rather than ignoring the
-  // flag) keeps an operator from believing enforcement is on when it is not.
-  if (resolvePolicyPath(flags, process.env) !== undefined) {
-    err('http: gateway mode is available for the stdio transport only (drop --policy / MCP_RECORDER_POLICY)');
+  // Gateway mode is stdio-only in v1. An EXPLICIT --policy is refused
+  // (rather than ignored) so an operator never believes enforcement is on
+  // when it is not. MCP_RECORDER_POLICY, on the other hand, is an
+  // environment-wide setting — the very pattern docs/gateway.md recommends
+  // for stdio servers — and refusing it would make `http` unusable in any
+  // shell that exports it. It is ignored instead, out loud.
+  const policyFlag = asStr(flags.policy);
+  if (policyFlag !== undefined && policyFlag !== '') {
+    err('http: gateway mode is available for the stdio transport only (drop --policy)');
+  }
+  const envPolicy = process.env[ENV.POLICY];
+  if (envPolicy !== undefined && envPolicy !== '') {
+    diag('http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio transport only');
   }
   installUncaughtExceptionGuard();
   // Lenient: nothing about recording configuration may prevent the proxy
@@ -1284,6 +1296,24 @@ function printPolicyInvalid(path: string, errors: readonly PolicyError[], jsonOu
   for (const line of indentedPolicyErrors(errors)) out(line);
 }
 
+/**
+ * Non-fatal things worth saying about a VALID policy. Today there is exactly
+ * one: a policy the schema accepts (an `egress`-only file is valid — the
+ * top level requires one of `mcp`/`egress`, not both) that the stdio gateway
+ * has nothing to enforce, so `record --policy` and `setup --policy` refuse
+ * it with exit 2. `policy validate` still exits 0 — the file IS valid, and
+ * the sidecar consumes its `egress` section — but saying nothing here is how
+ * a CI step that validates a policy passes while every wrapped server
+ * refuses to start.
+ */
+function policyWarnings(loaded: LoadedPolicy): string[] {
+  if (loaded.policy.mcp !== undefined) return [];
+  return [
+    'no "mcp" section — nothing for the gateway to enforce ' +
+      '(record --policy and setup --policy will refuse it)',
+  ];
+}
+
 function policyRuleCounts(loaded: LoadedPolicy): { mcp: number; egress: number } {
   return {
     mcp: loaded.policy.mcp?.rules.length ?? 0,
@@ -1313,6 +1343,7 @@ async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
       return;
     }
     const counts = policyRuleCounts(read.loaded);
+    const warnings = policyWarnings(read.loaded);
     if (jsonOut) {
       out(
         JSON.stringify(
@@ -1324,6 +1355,7 @@ async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
             source: read.loaded.source,
             mcp_rules: counts.mcp,
             egress_rules: counts.egress,
+            warnings,
           },
           null,
           2,
@@ -1332,6 +1364,7 @@ async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
       return;
     }
     out(`${path}: valid (${counts.mcp} mcp rules, ${counts.egress} egress rules)`);
+    for (const w of warnings) out(`  warning: ${w}`);
     return;
   }
 
@@ -1531,6 +1564,10 @@ interface SetupJsonResult {
   wrapped: string[];
   skipped: SkipEntry[];
   already_wrapped: string[];
+  /** Entries that were already wrapped and had `--policy <path>` baked into
+   * their existing recorder arguments by this run (`setup --policy` only).
+   * Always empty without `--policy`. */
+  updated: string[];
   /** Same notices the human output prints (e.g. which env var names a
    * `--wrapper wsl` entry forwards via WSLENV, or a bridged server's
    * one-time OAuth pre-authorization tip). */
@@ -1551,9 +1588,17 @@ function printSetupHuman(configPath: string, backup: string | null, plan: WrapPl
       const entry = plan.next[name]!;
       out(`  ${name}: ${entry.command} ${(entry.args ?? []).map((a) => JSON.stringify(a)).join(' ')}`);
     }
-  } else {
+  } else if (plan.updated.length === 0) {
     out('');
     out('nothing to wrap');
+  }
+  if (plan.updated.length > 0) {
+    out('');
+    out(`updated policy on: ${plan.updated.join(', ')}`);
+    for (const name of plan.updated) {
+      const entry = plan.next[name]!;
+      out(`  ${name}: ${entry.command} ${(entry.args ?? []).map((a) => JSON.stringify(a)).join(' ')}`);
+    }
   }
   if (plan.alreadyWrapped.length > 0) {
     out('');
@@ -1572,7 +1617,7 @@ function printSetupHuman(configPath: string, backup: string | null, plan: WrapPl
     out('');
     out(`backup: ${backup}`);
   }
-  if (!dryRun && plan.wrapped.length > 0) {
+  if (!dryRun && (plan.wrapped.length > 0 || plan.updated.length > 0)) {
     out('');
     out('Fully quit and restart your MCP client to pick up this change');
     out('(Claude Desktop: quit from the menu bar / tray icon — closing the window is not enough).');
@@ -1597,6 +1642,7 @@ function printSetupResult(
       wrapped: plan.wrapped,
       skipped: plan.skipped,
       already_wrapped: plan.alreadyWrapped,
+      updated: plan.updated,
       notes: plan.notes,
       bridged: [...bridged],
     };
@@ -1752,6 +1798,8 @@ async function cmdSetup(flags: Flags): Promise<void> {
   // exit 2 at launch (record --policy fails closed), which is a worse place
   // to discover a typo. Ignored on --undo. Only the flag counts here, never
   // MCP_RECORDER_POLICY: setup writes a config, it does not run a recorder.
+  // It also reaches entries an earlier run already wrapped (planWrap's
+  // `updated`), so "apply this policy to every server" really is every one.
   const policyFlag = asStr(flags.policy);
   let policyPath: string | undefined;
   if (!isUndo && policyFlag !== undefined && policyFlag !== '') {
@@ -1897,7 +1945,7 @@ async function cmdSetup(flags: Flags): Promise<void> {
     return;
   }
 
-  if (plan.wrapped.length === 0) {
+  if (plan.wrapped.length === 0 && plan.updated.length === 0) {
     // Idempotent: every candidate was already wrapped (or filtered/skipped)
     // — report it, but never touch the file (no new backup, no sidecar).
     printSetupResult(configPath, null, plan, jsonOut, false, bridgedNames);
@@ -1906,24 +1954,30 @@ async function cmdSetup(flags: Flags): Promise<void> {
 
   // Validate any existing sidecar BEFORE writing anything, so a corrupt
   // sidecar aborts cleanly (exit 2, config untouched) instead of partially
-  // applying the wrap.
-  let existingSidecar: SetupSidecar;
-  try {
-    existingSidecar = readSidecarStrict(configPath) ?? { version: 1, wrapped: {} };
-  } catch (cause) {
-    const msg = cause instanceof Error ? cause.message : String(cause);
-    diag(`error: ${sidecarPath(configPath)} exists but is not valid JSON: ${msg}`);
-    process.exitCode = 2;
-    return;
-  }
-  for (const name of plan.wrapped) {
-    if (!(name in existingSidecar.wrapped)) existingSidecar.wrapped[name] = plan.originals[name]!;
+  // applying the wrap. Only entries wrapped for the FIRST time this run have
+  // an original to record: a `--policy` update rewrites the recorder's own
+  // arguments on an entry the sidecar already holds the original for, so it
+  // leaves the sidecar strictly alone (never creating one, which would
+  // otherwise turn a later `--undo` into a no-op).
+  let existingSidecar: SetupSidecar | undefined;
+  if (plan.wrapped.length > 0) {
+    try {
+      existingSidecar = readSidecarStrict(configPath) ?? { version: 1, wrapped: {} };
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      diag(`error: ${sidecarPath(configPath)} exists but is not valid JSON: ${msg}`);
+      process.exitCode = 2;
+      return;
+    }
+    for (const name of plan.wrapped) {
+      if (!(name in existingSidecar.wrapped)) existingSidecar.wrapped[name] = plan.originals[name]!;
+    }
   }
 
   const backup = writeBackup(configPath);
   root.mcpServers = plan.next;
   writeJsonAtomic(configPath, root, indent, eol);
-  writeSidecarAtomic(configPath, existingSidecar, indent);
+  if (existingSidecar !== undefined) writeSidecarAtomic(configPath, existingSidecar, indent);
 
   printSetupResult(configPath, backup, plan, jsonOut, false, bridgedNames);
 }

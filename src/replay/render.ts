@@ -217,9 +217,31 @@ function gatewayBadgeClass(decision: unknown): string {
 }
 
 /**
- * "redacted 2 secrets · flagged 1 injection marker" — a one-line summary of
- * what the boundary filter did to a tool result. Every count goes through
- * num() (a tampered store may put markup where a number belongs).
+ * One count as the boundary report claims it: `2 secrets`, `1 injection
+ * marker`. Returns undefined for a real zero (nothing to say). A tampered
+ * store can put a non-number here, and reporting that as "0 findings" would
+ * be a lie, so a non-numeric value is rendered as-is — through num(), which
+ * escapes it.
+ */
+function boundaryCount(value: unknown, singular: string, plural: string): string | undefined {
+  const n = Number(value);
+  if (Number.isFinite(n)) return n > 0 ? `${num(value)} ${n === 1 ? singular : plural}` : undefined;
+  return typeof value === 'string' ? `${num(value)} ${plural}` : undefined;
+}
+
+/**
+ * "redact · 2 secrets · 1 injection marker" — a one-line summary of what the
+ * boundary filter did to a tool result.
+ *
+ * The stored `action` is the MAXIMUM over both finding families, not a
+ * per-family fact: under the default policy (secrets: redact, injection:
+ * flag) a result holding one of each is stored as `action: 'redact'` even
+ * though the injection marker was only flagged. So the action is named ONCE
+ * and the counts follow it plainly — attaching the verb to each count would
+ * claim work the filter never did. `block` is the one action that covers
+ * everything (the whole result was replaced), and it reads as `blocked`.
+ * Every count goes through num() (a tampered store may put markup where a
+ * number belongs) and the action through escapeHtml() for the same reason.
  */
 function boundarySummary(boundary: GatewayOutcome['boundary']): string {
   if (boundary === undefined) return '';
@@ -227,22 +249,18 @@ function boundarySummary(boundary: GatewayOutcome['boundary']): string {
     const why = boundary.error !== undefined ? `error ${escapeHtml(boundary.error)}` : 'oversize';
     return `not scanned (${why})` + (boundary.action === 'block' ? ' · blocked' : '');
   }
-  const bits: string[] = [];
-  const verb =
-    boundary.action === 'redact'
-      ? 'redacted'
+  const action =
+    boundary.action === 'none'
+      ? 'scanned'
       : boundary.action === 'block'
         ? 'blocked'
-        : boundary.action === 'flag'
-          ? 'flagged'
-          : 'found';
-  const secrets = Number(boundary.secrets_found);
-  const injections = Number(boundary.injection_found);
-  if (secrets > 0) bits.push(`${verb} ${num(boundary.secrets_found)} secret${secrets === 1 ? '' : 's'}`);
-  if (injections > 0) {
-    bits.push(`${verb} ${num(boundary.injection_found)} injection marker${injections === 1 ? '' : 's'}`);
-  }
-  if (bits.length === 0) return 'scanned clean';
+        : escapeHtml(String(boundary.action));
+  const bits: string[] = [action];
+  const secrets = boundaryCount(boundary.secrets_found, 'secret', 'secrets');
+  const injections = boundaryCount(boundary.injection_found, 'injection marker', 'injection markers');
+  if (secrets !== undefined) bits.push(secrets);
+  if (injections !== undefined) bits.push(injections);
+  if (bits.length === 1) bits.push('0 findings');
   return bits.join(' · ');
 }
 
@@ -281,7 +299,11 @@ function gatewayBadges(gw: GatewayOutcome | undefined): string {
 function renderPolicyDecision(seq: number, e: PolicyDecisionEvent): string {
   const cls = gatewayBadgeClass(e.decision);
   const bits: string[] = [`request ${escapeHtml(String(e.request_id))}`];
-  bits.push(e.rule_id !== undefined ? `rule ${escapeHtml(e.rule_id)}` : 'policy default');
+  // No rule_id does NOT mean "the configured default applied": the emitter
+  // also omits it for a fail-closed evaluation-error deny (reason "policy
+  // evaluation error: ..."), and for a tools/call refused before any rule was
+  // consulted. State the fact instead of inferring the cause.
+  bits.push(e.rule_id !== undefined ? `rule ${escapeHtml(e.rule_id)}` : 'no rule matched');
   if (e.outcome !== undefined) bits.push(`outcome ${escapeHtml(String(e.outcome))}`);
   if (e.waited_ms !== undefined) bits.push(`waited ${num(e.waited_ms)} ms`);
   if (e.approval_id !== undefined) bits.push(`hold <code>${escapeHtml(String(e.approval_id))}</code>`);

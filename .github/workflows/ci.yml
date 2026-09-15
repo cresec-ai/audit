@@ -10,6 +10,12 @@ jobs:
   test:
     name: test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    # MCP_RECORDER_REQUIRE_OPA=1 turns the OPA suites' "no opa binary, skip
+    # myself" path into a hard failure, so a broken setup-opa step below can
+    # never quietly switch the policy-to-Rego parity gate off. Linux only:
+    # the Windows job installs no OPA and is expected to skip those suites.
+    env:
+      MCP_RECORDER_REQUIRE_OPA: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -29,11 +35,16 @@ jobs:
       - name: Install OPA (policy-to-Rego parity tests)
         # The Rego emitted by `mcp-recorder policy compile` is evaluated with
         # a real OPA and compared against the TypeScript engine; without an
-        # `opa` binary those tests skip themselves, so this step is what makes
-        # them run for real in CI.
+        # `opa` binary those tests would skip themselves, so this step plus
+        # MCP_RECORDER_REQUIRE_OPA above is what makes them run for real.
         uses: open-policy-agent/setup-opa@v2
         with:
-          version: latest
+          # Pinned, NOT `latest`: the parity suite asserts `opa fmt` would not
+          # reformat the emitted Rego, so a formatter change in a new OPA
+          # release would break main with no code change. This is the version
+          # the checked-in goldens were generated and verified with — bump it
+          # deliberately, in the same commit as a golden refresh.
+          version: 1.20.2
       - name: Typecheck
         run: npm run typecheck
       - name: Lint

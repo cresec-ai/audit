@@ -157,6 +157,16 @@ async function readResponse(reader: LineReader, id: number, timeoutMs = 20_000):
   throw new Error(`no response with id ${id}`);
 }
 
+/** Poll until `get()` contains `needle` (used for a long-running child's stderr). */
+async function waitForText(get: () => string, needle: string, timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (get().includes(needle)) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`timed out waiting for ${JSON.stringify(needle)}; saw: ${get()}`);
+}
+
 function writePolicy(dir: string, name: string, text: string): string {
   const path = join(dir, name);
   writeFileSync(path, text);
@@ -182,7 +192,12 @@ const INITIALIZE = {
   },
 };
 
-/** Where `opa` lives, if anywhere (same lookup as test/policy-rego.test.ts). */
+/**
+ * Where `opa` lives, if anywhere (same lookup as test/policy-rego.test.ts),
+ * and the same CI guard: locally a missing binary is a skip, but CI sets
+ * MCP_RECORDER_REQUIRE_OPA=1 (.github/workflows/ci.yml) so a broken
+ * setup-opa step fails loudly instead of quietly dropping the check.
+ */
 function findOpa(): string | undefined {
   const candidates = [process.env.OPA_BIN, 'opa', '/home/user/go/bin/opa'].filter(
     (c): c is string => c !== undefined && c !== '',
@@ -221,6 +236,20 @@ const VALID_POLICY = [
   '    - id: careful',
   '      match: { tool: "delete_*" }',
   '      action: hold',
+  'egress:',
+  '  default: deny',
+  '  rules:',
+  '    - id: gh',
+  '      match: { host: api.github.com, methods: [GET] }',
+  '      action: allow',
+  '',
+].join('\n');
+
+/** Valid (the top level requires one of `mcp`/`egress`), but nothing the
+ * stdio gateway can enforce — `record --policy` / `setup --policy` exit 2. */
+const EGRESS_ONLY_POLICY = [
+  'version: 1',
+  'name: egress-only',
   'egress:',
   '  default: deny',
   '  rules:',
@@ -316,6 +345,46 @@ describe('mcp-recorder policy validate', () => {
     expect(JSON.parse(res.stdout)).toMatchObject({ valid: true, source: 'json', mcp_rules: 0, egress_rules: 0 });
   }, 30_000);
 
+  it('a valid policy with no `mcp` section still exits 0, with a warning line after the valid line', async () => {
+    const dir = tmpDir('mcp-rec-pol-');
+    const path = writePolicy(dir, 'policy.yaml', EGRESS_ONLY_POLICY);
+    const res = await runCli(['policy', 'validate', path]);
+    expect(res.code).toBe(0);
+    const lines = res.stdout.trimEnd().split('\n');
+    expect(lines[0]).toBe(`${resolve(path)}: valid (0 mcp rules, 1 egress rules)`);
+    expect(lines[1]).toBe(
+      '  warning: no "mcp" section — nothing for the gateway to enforce ' +
+        '(record --policy and setup --policy will refuse it)',
+    );
+    expect(lines).toHaveLength(2);
+    expect(res.stderr).toBe('');
+
+    // and the warning tells the truth: the same file is refused by record
+    const server = markerServer(dir);
+    const refused = await runCli(['record', '--data-dir', join(dir, 'data'), '--policy', path, '--', ...server.command]);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('no `mcp` section');
+  }, 60_000);
+
+  it('--json carries the same warning in "warnings" (an empty array when there is nothing to say)', async () => {
+    const dir = tmpDir('mcp-rec-pol-');
+    const egressOnly = writePolicy(dir, 'egress-only.yaml', EGRESS_ONLY_POLICY);
+    const res = await runCli(['policy', 'validate', egressOnly, '--json']);
+    expect(res.code).toBe(0);
+    const parsed = JSON.parse(res.stdout) as { valid: boolean; mcp_rules: number; warnings: string[] };
+    expect(parsed).toMatchObject({ valid: true, mcp_rules: 0, egress_rules: 1 });
+    expect(parsed.warnings).toEqual([
+      'no "mcp" section — nothing for the gateway to enforce ' +
+        '(record --policy and setup --policy will refuse it)',
+    ]);
+
+    const ok = writePolicy(dir, 'policy.yaml', VALID_POLICY);
+    const clean = await runCli(['policy', 'validate', ok, '--json']);
+    expect(clean.code).toBe(0);
+    expect((JSON.parse(clean.stdout) as { warnings: string[] }).warnings).toEqual([]);
+    expect((await runCli(['policy', 'validate', ok])).stdout).not.toContain('warning');
+  }, 60_000);
+
   it('an unreadable file exits 2 with the usual "[mcp-recorder] error:" line', async () => {
     const dir = tmpDir('mcp-rec-pol-');
     const res = await runCli(['policy', 'validate', join(dir, 'missing.yaml')]);
@@ -392,6 +461,9 @@ describe('mcp-recorder policy compile', () => {
 
     const opa = findOpa();
     if (opa === undefined) {
+      if (process.env.MCP_RECORDER_REQUIRE_OPA === '1') {
+        throw new Error('opa required by CI (MCP_RECORDER_REQUIRE_OPA=1) but not found');
+      }
       console.warn('[gateway-cli.test] no opa binary (OPA_BIN / PATH / /home/user/go/bin/opa); skipping opa check');
       return;
     }
@@ -684,11 +756,31 @@ describe('record --policy: startup is fail-closed', () => {
     const res = await runCli(['http', '--target', 'http://127.0.0.1:1/mcp', '--policy', policy, '--data-dir', join(dir, 'data')]);
     expect(res.code).toBe(2);
     expect(res.stderr).toContain('stdio transport only');
-    const viaEnv = await runCli(['http', '--target', 'http://127.0.0.1:1/mcp', '--data-dir', join(dir, 'data')], {
-      MCP_RECORDER_POLICY: policy,
-    });
-    expect(viaEnv.code).toBe(2);
-    expect(viaEnv.stderr).toContain('stdio transport only');
+  }, 60_000);
+
+  it('http IGNORES MCP_RECORDER_POLICY (one stderr note) and records as usual', async () => {
+    // Exporting MCP_RECORDER_POLICY in a shell is the pattern docs/gateway.md
+    // recommends for stdio servers; it must not make `http` unusable.
+    const dir = tmpDir('mcp-rec-gw-http-env-');
+    const policy = writePolicy(dir, 'policy.yaml', VALID_POLICY);
+    const child = spawnCli(
+      ['http', '--target', 'http://127.0.0.1:1/mcp', '--port', '0', '--data-dir', join(dir, 'data')],
+      { MCP_RECORDER_POLICY: policy },
+    );
+    const stderrText = collect(child.stderr);
+    const exited = waitExit(child);
+    await waitForText(stderrText, 'http proxy listening at');
+
+    const note = stderrText()
+      .split('\n')
+      .filter((l) => l.includes('MCP_RECORDER_POLICY'));
+    expect(note).toEqual([
+      '[mcp-recorder] http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio transport only',
+    ]);
+    expect(stderrText()).not.toContain('stdio transport only (drop --policy)');
+
+    child.kill('SIGINT');
+    expect(await exited).toBe(0);
   }, 60_000);
 });
 
@@ -840,6 +932,76 @@ describe('record --policy e2e [needs proxy gateway]', () => {
     const bundleVerify = await runCli(['verify', '--bundle', bundleDir]);
     expect(bundleVerify.code).toBe(0);
     expect(bundleVerify.stdout).toContain('PASS');
+  }, 240_000);
+
+  it('MCP_RECORDER_POLICY alone (no --policy) really enforces: deny + policy_decision + session_start.policy', async () => {
+    const dir = tmpDir('mcp-rec-gw-env-e2e-');
+    const dataDir = join(dir, 'data');
+    const policy = writePolicy(
+      dir,
+      'policy.yaml',
+      [
+        'version: 1',
+        'name: from-env',
+        'mcp:',
+        '  default: allow',
+        '  rules:',
+        '    - id: no-secret-notes',
+        '      match: { tool: echo, args: { note: "^denied-" } }',
+        '      action: deny',
+        '      reason: notes starting with denied- are off limits',
+        '',
+      ].join('\n'),
+    );
+    const DENIED_NOTE = 'denied-from-env-7c1d';
+    const ALLOWED_NOTE = 'allowed-from-env-3b9f';
+
+    const child = spawnCli(['record', '--data-dir', dataDir, '--store', 'jsonl', '--', 'node', ECHO_SERVER], {
+      MCP_RECORDER_POLICY: policy,
+    });
+    const reader = lineReader(child.stdout!);
+    collect(child.stderr);
+    const send = (msg: unknown): void => {
+      child.stdin!.write(JSON.stringify(msg) + '\n');
+    };
+
+    send(INITIALIZE);
+    expect((await readResponse(reader, 1)).result).toBeDefined();
+
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { note: DENIED_NOTE } } });
+    const denied = await readResponse(reader, 2);
+    expect((denied.result as { isError?: boolean }).isError).toBe(true);
+    const deniedText = JSON.stringify(denied.result);
+    expect(deniedText).toContain('no-secret-notes');
+    expect(deniedText).toContain('notes starting with denied- are off limits');
+    expect(deniedText).not.toContain(DENIED_NOTE);
+
+    // a non-matching call still goes through untouched
+    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { note: ALLOWED_NOTE } } });
+    expect(JSON.stringify((await readResponse(reader, 3)).result)).toContain(ALLOWED_NOTE);
+
+    child.stdin!.end();
+    expect(await waitExit(child)).toBe(0);
+
+    const records = readJsonl(dataDir);
+    const start = records[0]!.event;
+    expect(start.kind === 'session_start' && start.policy?.hash).toBe(loadPolicyFile(policy).hash);
+    expect(start.kind === 'session_start' && start.policy?.name).toBe('from-env');
+
+    const decisions = records.filter(
+      (r): r is ChainRecord & { event: PolicyDecisionEvent } => r.event.kind === 'policy_decision',
+    );
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]!.event).toMatchObject({ decision: 'deny', tool: 'echo', request_id: 2, rule_id: 'no-secret-notes' });
+    expect(decisions[0]!.event.args_hash).toBe(sha256Ref(JSON.stringify({ note: DENIED_NOTE })));
+
+    const denyCall = records
+      .map((r) => r.event)
+      .find((e): e is ToolCallEvent => e.kind === 'tool_call' && e.request_id === 2);
+    expect(denyCall!.is_error).toBe(true);
+    expect(denyCall!.gateway).toMatchObject({ decision: 'deny', rule_id: 'no-secret-notes' });
+    expect(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8')).not.toContain(DENIED_NOTE);
+    expect((await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl'])).code).toBe(0);
   }, 240_000);
 
   it('a held call is parked until `approve` runs in a second CLI process, then forwarded', async () => {

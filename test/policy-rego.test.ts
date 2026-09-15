@@ -2,6 +2,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
 import { afterAll, describe, expect, it } from 'vitest';
 import { sha256Hex } from '../src/chain/hash.js';
 import {
@@ -307,6 +309,29 @@ function findOpa(): string | undefined {
   return undefined;
 }
 
+/**
+ * The exact message a required-but-missing OPA must produce. Kept as a
+ * constant so the workflow-shape test below can assert on it verbatim.
+ */
+export const OPA_REQUIRED_MESSAGE = 'opa required by CI (MCP_RECORDER_REQUIRE_OPA=1) but not found';
+
+/** MCP_RECORDER_REQUIRE_OPA is a strict '1' flag: nothing else turns it on. */
+export function opaRequired(value: string | undefined): boolean {
+  return value === '1';
+}
+
+/**
+ * The parity gate cannot be switched off by accident. Locally a missing
+ * `opa` binary is a skip (nobody has to install OPA to run the suite), but
+ * CI sets MCP_RECORDER_REQUIRE_OPA=1 (.github/workflows/ci.yml, Linux job):
+ * there a missing binary means the setup-opa step broke, and skipping would
+ * silently drop the TypeScript-vs-Rego parity check.
+ */
+export function opaOrFail(found: string | undefined, required: boolean): string | undefined {
+  if (found === undefined && required) throw new Error(OPA_REQUIRED_MESSAGE);
+  return found;
+}
+
 /** The full decision object as OPA returns it (the broker's `allow`/`deny_reason` plus the policy keys). */
 interface OpaDecision {
   allow: boolean;
@@ -389,13 +414,23 @@ const CASES: Array<McpCase | EgressCase> = [
   { kind: 'egress', fixture: 'empty.json', note: 'default deny: no rules', input: egressIn('h', 'GET', '/', 0) },
 ];
 
-describe('OPA parity (skipped when no opa binary is available)', () => {
-  const opa = findOpa();
-  if (opa === undefined) {
+describe('OPA parity (skipped when no opa binary is available, required in CI)', () => {
+  const found = findOpa();
+  if (found === undefined) {
+    const required = opaRequired(process.env.MCP_RECORDER_REQUIRE_OPA);
+    if (required) {
+      // Reported as one failing test rather than a collection error, so the
+      // CI log names the gate that was about to be skipped.
+      it('opa parity is required in CI', () => {
+        opaOrFail(undefined, required);
+      });
+      return;
+    }
     console.warn('[policy-rego.test] no opa binary found (set OPA_BIN, or put `opa` on PATH); skipping OPA parity tests');
     it.skip('opa parity', () => {});
     return;
   }
+  const opa: string = found;
   const tmp = mkdtempSync(join(tmpdir(), 'mcp-recorder-rego-'));
   afterAll(() => rmSync(tmp, { recursive: true, force: true }));
   const dirs = new Map<string, string>();
@@ -590,5 +625,73 @@ describe('OPA parity (skipped when no opa binary is available)', () => {
       const opaInput = { host: c.input.host, method: c.input.method, path: c.input.path, body_bytes: c.input.bodyBytes };
       expect(opaEval(opa, dir, 'data.cresec.egress.decision', opaInput)).toEqual(asOpa(ts));
     }
+  });
+});
+
+/* ------------- the parity gate cannot be silently switched off ------------
+ * B4/B5. The suites above skip themselves when no `opa` binary is found,
+ * which is right locally and wrong in CI: a broken setup-opa step would turn
+ * the TypeScript-vs-Rego parity check off without failing anything.
+ */
+
+interface CiWorkflow {
+  jobs: Record<
+    string,
+    {
+      'runs-on'?: string;
+      env?: Record<string, string>;
+      steps?: { name?: string; uses?: string; with?: Record<string, string> }[];
+    }
+  >;
+}
+
+describe('CI cannot silently skip the OPA parity gate (B4, B5)', () => {
+  const CI_YML = fileURLToPath(new URL('../.github/workflows/ci.yml', import.meta.url));
+  const ci = parseYaml(readFileSync(CI_YML, 'utf8')) as CiWorkflow;
+
+  it('opaOrFail throws the CI message when the binary is required and missing, and skips otherwise', () => {
+    expect(OPA_REQUIRED_MESSAGE).toBe('opa required by CI (MCP_RECORDER_REQUIRE_OPA=1) but not found');
+    expect(() => opaOrFail(undefined, true)).toThrow(OPA_REQUIRED_MESSAGE);
+    // Not required: the local skip is preserved, exactly as before.
+    expect(opaOrFail(undefined, false)).toBeUndefined();
+    // A binary that WAS found is returned untouched, required or not.
+    expect(opaOrFail('/usr/bin/opa', true)).toBe('/usr/bin/opa');
+    expect(opaOrFail('/usr/bin/opa', false)).toBe('/usr/bin/opa');
+    // Only a literal '1' arms the gate; nothing else does.
+    expect(opaRequired('1')).toBe(true);
+    for (const v of [undefined, '', '0', 'true', 'yes', '11']) expect(opaRequired(v)).toBe(false);
+  });
+
+  it('the Linux test job sets MCP_RECORDER_REQUIRE_OPA=1 and the Windows job does not', () => {
+    expect(ci.jobs['test']?.env?.['MCP_RECORDER_REQUIRE_OPA']).toBe('1');
+    expect(ci.jobs['test']?.['runs-on']).toBe('ubuntu-latest');
+    // Windows installs no OPA, so requiring it there would fail every build.
+    expect(ci.jobs['test-windows']?.env?.['MCP_RECORDER_REQUIRE_OPA']).toBeUndefined();
+    const winSteps = ci.jobs['test-windows']?.steps ?? [];
+    expect(winSteps.some((s) => (s.uses ?? '').startsWith('open-policy-agent/setup-opa'))).toBe(false);
+  });
+
+  it('every suite that looks for an `opa` binary honours the flag (no new silent skip)', () => {
+    const testDir = fileURLToPath(new URL('.', import.meta.url));
+    const usesOpa = readdirSync(testDir)
+      .filter((f) => f.endsWith('.test.ts'))
+      .filter((f) => readFileSync(join(testDir, f), 'utf8').includes('function findOpa('));
+    expect(usesOpa.sort()).toEqual(['gateway-cli.test.ts', 'policy-rego.test.ts']);
+    for (const f of usesOpa) {
+      const text = readFileSync(join(testDir, f), 'utf8');
+      expect(text, `${f} self-skips without honouring MCP_RECORDER_REQUIRE_OPA`).toContain('MCP_RECORDER_REQUIRE_OPA');
+      expect(text, `${f} must use the exact CI message`).toContain(OPA_REQUIRED_MESSAGE);
+    }
+  });
+
+  it('setup-opa is pinned to an exact version, never `latest`', () => {
+    const step = (ci.jobs['test']?.steps ?? []).find((s) => (s.uses ?? '').startsWith('open-policy-agent/setup-opa'));
+    expect(step, 'the Linux test job must install OPA').toBeDefined();
+    const version = step!.with?.['version'];
+    // `opa fmt --fail` is asserted against the emitted Rego above, so an
+    // unpinned OPA would break main on a formatter change with no code change.
+    expect(version).toBeDefined();
+    expect(version).not.toBe('latest');
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });

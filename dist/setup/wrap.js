@@ -113,6 +113,55 @@ export function buildWrappedEntry(name, original, opts) {
     const args = opts.wrapper === 'npx' ? recorderArgs : [opts.localWrapperPath, ...recorderArgs];
     return { ...original, command, args };
 }
+/**
+ * Where an already-wrapped entry's own recorder arguments end: the index of
+ * the `--` that separates them from the wrapped server's argv. Searched from
+ * the `record` marker, never blindly from the array's start, for the same
+ * reason {@link structuralUnwrap} does it: a `--` inside the WRAPPED
+ * server's argv (or a `wsl.exe -d <distro> -e ...` prefix) must never be
+ * mistaken for the recorder's separator. Returns -1 when there is none —
+ * an entry this function cannot read is one the caller must leave alone.
+ */
+function recorderArgsEnd(args) {
+    const recordIdx = args.indexOf('record');
+    return args.indexOf('--', recordIdx === -1 ? 0 : recordIdx);
+}
+/**
+ * Rewrite an ALREADY-wrapped entry so its recorder arguments carry
+ * `--policy <policyPath>`: replacing the value of an existing `--policy`
+ * (both the `--policy X` pair and the `--policy=X` spelling a hand edit may
+ * use) or, when there is none, inserting the pair immediately before the
+ * `--` that closes the recorder's own arguments. Everything else — the
+ * wrapper form, `--name`, `--data-dir`, the wrapped server's argv, `env`,
+ * `cwd` — is left exactly as it was.
+ *
+ * Returns undefined when the entry has no readable recorder-args segment
+ * (no `args` array, or no `--` separator), so the caller can leave such an
+ * entry untouched rather than guess at its shape.
+ */
+export function withPolicyArg(entry, policyPath) {
+    const args = entry.args;
+    if (!Array.isArray(args))
+        return undefined;
+    const sepIdx = recorderArgsEnd(args);
+    if (sepIdx === -1)
+        return undefined;
+    const head = args.slice(0, sepIdx);
+    const tail = args.slice(sepIdx); // the '--' separator and the server argv
+    const pairIdx = head.indexOf('--policy');
+    if (pairIdx !== -1) {
+        // head.slice(pairIdx + 2) is [] when '--policy' was the last argument
+        // (a value-less flag), so this inserts the missing value instead.
+        return { ...entry, args: [...head.slice(0, pairIdx + 1), policyPath, ...head.slice(pairIdx + 2), ...tail] };
+    }
+    // (a client config is external JSON: an element need not really be a
+    // string, whatever the type says)
+    const eqIdx = head.findIndex((a) => typeof a === 'string' && a.startsWith('--policy='));
+    if (eqIdx !== -1) {
+        return { ...entry, args: [...head.slice(0, eqIdx), `--policy=${policyPath}`, ...head.slice(eqIdx + 1), ...tail] };
+    }
+    return { ...entry, args: [...head, '--policy', policyPath, ...tail] };
+}
 const BRIDGE_NAME_RE = /^[A-Za-z0-9_.-]+$/;
 /**
  * Parse `--bridge NAME=URL[,NAME=URL...]` values into `{name, url}` specs.
@@ -187,14 +236,15 @@ export function isSameBridgeEntry(entry, url) {
         return false;
     return keysA.every((k) => JSON.stringify(entry[k]) === JSON.stringify(wanted[k]));
 }
-/** Decide, for every entry in `servers`, whether it gets wrapped, skipped, or
- * is already wrapped — and build the replacement map. Order of entries in
- * `next` follows `servers`' own key order. */
+/** Decide, for every entry in `servers`, whether it gets wrapped, skipped,
+ * policy-updated, or is already wrapped — and build the replacement map.
+ * Order of entries in `next` follows `servers`' own key order. */
 export function planWrap(servers, opts) {
     const next = { ...servers };
     const wrapped = [];
     const skipped = [];
     const alreadyWrapped = [];
+    const updated = [];
     const originals = {};
     const notes = [];
     for (const [name, entry] of Object.entries(servers)) {
@@ -212,6 +262,21 @@ export function planWrap(servers, opts) {
             continue;
         }
         if (isAlreadyWrapped(entry, opts.localWrapperPath)) {
+            // `--policy` must reach servers an EARLIER `setup` run already wrapped
+            // too: "apply this policy to every server in the config" is the whole
+            // point of the flag, and leaving those entries in plain record mode
+            // would silently give a partial gateway. Only the recorder's own args
+            // are rewritten (the wrapper form and the wrapped server's argv stay
+            // put), and only when that actually changes something — an entry that
+            // already carries this exact policy is left alone, so a second
+            // identical run writes nothing at all. Without --policy, nothing here
+            // is ever touched, exactly as before.
+            const repl = opts.policyPath !== undefined ? withPolicyArg(entry, opts.policyPath) : undefined;
+            if (repl !== undefined && JSON.stringify(repl.args) !== JSON.stringify(entry.args)) {
+                next[name] = repl;
+                updated.push(name);
+                continue;
+            }
             alreadyWrapped.push(name);
             continue;
         }
@@ -224,7 +289,7 @@ export function planWrap(servers, opts) {
                 '(wsl.exe only forwards Windows env vars listed there)');
         }
     }
-    return { next, wrapped, skipped, alreadyWrapped, originals, notes };
+    return { next, wrapped, skipped, alreadyWrapped, updated, originals, notes };
 }
 /**
  * `setup --undo` fallback when the sidecar file is missing: strip a
@@ -245,14 +310,11 @@ export function structuralUnwrap(entry) {
     const args = entry.args;
     if (!Array.isArray(args))
         return undefined;
-    // Search for the "--" that closes the recorder's OWN args starting from
-    // the "record" marker, not blindly the array's first "--": a prefix with
-    // extra leading flags (wsl.exe's "-d <distro> -e ...") still parses
-    // correctly this way, and — more importantly — a "--" that happens to
-    // appear inside the wrapped server's OWN argv can never be mistaken for
-    // the recorder's separator (it always comes after "record", never before).
-    const recordIdx = args.indexOf('record');
-    const sepIdx = args.indexOf('--', recordIdx === -1 ? 0 : recordIdx);
+    // Everything before that "--" is the recorder's own prefix and goes away
+    // wholesale — including a "--policy <path>" pair baked in by
+    // `setup --policy` (see {@link withPolicyArg}), which therefore needs no
+    // special handling here.
+    const sepIdx = recorderArgsEnd(args);
     if (sepIdx === -1)
         return undefined;
     const prefix = [entry.command, ...args.slice(0, sepIdx)].filter((p) => typeof p === 'string');
