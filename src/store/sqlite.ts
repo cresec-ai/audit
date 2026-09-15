@@ -153,9 +153,17 @@ export class SqliteStore implements EvidenceStore {
     // forwarding), so it is kept very short: write transactions here take
     // microseconds, and the recorder retries a busy batch asynchronously
     // with ~6s of non-blocking backoff (src/capture/recorder.ts).
-    this.db.pragma('busy_timeout = 100');
+    // Opening: several processes starting at once all race to switch the
+    // journal mode and create the schema, which takes real time on a slow
+    // machine. This happens once, before any traffic flows, so a generous
+    // synchronous wait is fine here — a failure at this point would disable
+    // recording for the whole session.
+    this.db.pragma('busy_timeout = 10000');
     this.db.pragma('journal_mode = WAL');
     this.db.exec(DDL);
+    // Steady state: appends must never stall forwarding, so the wait is
+    // short and the recorder retries asynchronously instead.
+    this.db.pragma('busy_timeout = 100');
 
     this.headStmt = this.db.prepare<[], HeadRow>(
       'SELECT seq, hash FROM records ORDER BY seq DESC LIMIT 1',
