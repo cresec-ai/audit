@@ -108,34 +108,65 @@ export interface SpawnPlan {
 }
 
 /**
- * Escapes one command-line token for a `cmd.exe /d /s /c "<line>"` verbatim
- * invocation. This is cross-spawn's well-established algorithm
- * (https://github.com/moxystudio/node-cross-spawn), reproduced here to avoid
- * taking on the dependency: double any backslashes that immediately precede
- * a double quote (so they don't escape it once we add our own closing
- * quote), then escape the quote itself with a backslash; double any
- * backslashes that fall right at the end of the string for the same reason;
- * wrap the whole token in double quotes (so cmd.exe's tokenizer treats it as
- * one argument even when it contains spaces); then caret-escape the cmd.exe
- * metacharacters `()%!^"<>&|` (this also re-escapes the quotes just added,
- * which is intentional and matches cross-spawn — the token is parsed once by
- * cmd.exe's own command-line lexer and needs to survive that before the
- * quotes it wraps mean anything to the target program).
- *
- * NOTE (same limitation as cross-spawn): this cannot make `%VAR%` expansion
- * by cmd.exe fully safe — cmd.exe expands `%...%` sequences in an argument
- * even when it's quoted, before the target program ever sees it. argv here
- * comes from the operator's own trusted client config (the same JSON that
- * already names the binary to run), not from anything a remote MCP peer
- * controls, so this is an accepted, documented gap rather than a hardened
- * boundary.
+ * cmd.exe metacharacters, cross-spawn's set: everything cmd.exe's own lexer
+ * would otherwise act on, INCLUDING the space — that is what lets an
+ * unquoted command path such as `C:\Program Files\nodejs\npx.cmd` stay
+ * one token once each space is caret-escaped.
  */
-function escapeCmdArg(arg: string): string {
+const CMD_META_CHARS_RE = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * Escapes the command itself (the resolved `.cmd`/`.bat` path) for a
+ * `cmd.exe /d /s /c "<line>"` invocation: normalize the path, then
+ * caret-escape its metacharacters. It is deliberately NOT quoted — a `^ `
+ * escaped space keeps the path one token in cmd.exe's command-name lexer,
+ * which is how cross-spawn launches `C:\Program Files\nodejs\npm.cmd`.
+ */
+function escapeCmdCommand(command: string): string {
+  return pathWin32.normalize(command).replace(CMD_META_CHARS_RE, '^$1');
+}
+
+/**
+ * Escapes one argument for the same invocation. This is cross-spawn's
+ * well-established algorithm (https://github.com/moxystudio/node-cross-spawn),
+ * reproduced here to avoid taking on the dependency:
+ *
+ *   1. double every backslash run that immediately precedes a double quote,
+ *      then escape that quote with a backslash (the MSVCRT argv rules the
+ *      target program will apply);
+ *   2. double a trailing backslash run for the same reason (a closing quote
+ *      is about to follow it);
+ *   3. wrap the whole token in double quotes, so a space inside it does not
+ *      split the argument;
+ *   4. caret-escape every cmd.exe metacharacter (this also escapes the quotes
+ *      just added, which is intentional: cmd.exe's lexer consumes the carets
+ *      and hands the target the quoted form).
+ *
+ * Every target that reaches this code path is a batch file, and a batch
+ * file re-parses its own parameters: the `%*` / `%1` substitution inside
+ * `npx.cmd` runs the text through cmd.exe's lexer a SECOND time. So step 4
+ * is applied twice — the first pass turns `^^^"` back into `^"`, the batch
+ * file's own pass turns that into a literal `"`. With a single pass, an
+ * argument containing a double quote reaches the batch file as a bare `"`,
+ * toggles cmd.exe's quote mode mid-line and swallows everything after it.
+ * (cross-spawn applies the second pass only to npm's `node_modules/.bin`
+ * shims because it cannot tell what else it is launching; here the branch is
+ * taken only for `.cmd`/`.bat` files, so it always applies.)
+ *
+ * NOTE (same limitation as cross-spawn): `%VAR%` expansion by cmd.exe cannot
+ * be made fully safe — cmd.exe expands `%...%` in phase 1, before any caret
+ * is honoured, quoted or not. argv here comes from the operator's own
+ * trusted client config (the same JSON that already names the binary to
+ * run), not from anything a remote MCP peer controls, so this is an
+ * accepted, documented gap rather than a hardened boundary.
+ */
+function escapeCmdArg(arg: string, doubleEscapeMetaChars: boolean): string {
   let out = String(arg);
   out = out.replace(/(\\*)"/g, '$1$1\\"');
   out = out.replace(/(\\*)$/, '$1$1');
   out = `"${out}"`;
-  out = out.replace(/([()%!^"<>&|])/g, '^$1');
+  out = out.replace(CMD_META_CHARS_RE, '^$1');
+  if (doubleEscapeMetaChars) out = out.replace(CMD_META_CHARS_RE, '^$1');
   return out;
 }
 
@@ -173,7 +204,7 @@ export function planSpawn(
     return { file: resolved, args, options: { windowsHide: true } };
   }
 
-  const escapedLine = [resolved, ...args].map(escapeCmdArg).join(' ');
+  const escapedLine = [escapeCmdCommand(resolved), ...args.map((a) => escapeCmdArg(a, true))].join(' ');
   return {
     file: comspec(env),
     args: ['/d', '/s', '/c', `"${escapedLine}"`],

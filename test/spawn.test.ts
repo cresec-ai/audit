@@ -171,51 +171,70 @@ describe('planSpawn', () => {
   describe('escaping (cross-spawn algorithm) inside the built command line', () => {
     const lineFor = (argv: string[], env: NodeJS.ProcessEnv = {}): string =>
       planSpawn(argv, env, 'win32').args[3]!;
+    /** The command line minus planSpawn's own outer pair of plain quotes. */
+    const innerFor = (argv: string[]): string => lineFor(argv).slice(1, -1);
 
-    it('quotes an argument containing a space', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'hello world']);
-      // caret-escaped quotes wrap the token: ^"hello world^"
-      expect(line).toContain('^"hello world^"');
+    // Every argument is escaped TWICE (see escapeCmdArg): once for the
+    // cmd.exe that launches the .cmd/.bat file, once for the batch file's own
+    // re-parse of %* / %1. So a wrapped token reads ^^^"...^^^" on the wire:
+    // pass one turns ^^^" into ^", the batch file's pass turns ^" into ".
+
+    it('quotes an argument containing a space (space is a cmd.exe metacharacter too)', () => {
+      expect(innerFor(['C:\\tools\\run.cmd', 'hello world'])).toBe(
+        'C:\\tools\\run.cmd ^^^"hello^^^ world^^^"',
+      );
     });
 
     it('escapes an embedded double quote with a backslash', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'say "hi"']);
-      expect(line).toContain('say \\^"hi\\^"');
+      expect(innerFor(['C:\\tools\\run.cmd', 'say "hi"'])).toBe(
+        'C:\\tools\\run.cmd ^^^"say^^^ \\^^^"hi\\^^^"^^^"',
+      );
     });
 
     it('doubles a trailing backslash so it does not escape the closing quote', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'C:\\path\\']);
-      // trailing backslash doubled, then wrapped/caret-escaped: ^"C:\path\\^"
-      expect(line).toContain('^"C:\\path\\\\^"');
+      expect(innerFor(['C:\\tools\\run.cmd', 'C:\\path\\'])).toBe(
+        'C:\\tools\\run.cmd ^^^"C:\\path\\\\^^^"',
+      );
     });
 
     it('doubles backslashes that immediately precede a quote', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'a\\"b']);
-      // \" -> the backslash run before the quote is doubled, then the quote escaped
-      expect(line).toContain('a\\\\\\^"b');
+      // a\"b -> the backslash run before the quote is doubled, then the quote escaped: a\\\"b
+      expect(innerFor(['C:\\tools\\run.cmd', 'a\\"b'])).toBe(
+        'C:\\tools\\run.cmd ^^^"a\\\\\\^^^"b^^^"',
+      );
     });
 
-    it('caret-escapes every cmd.exe metacharacter: ( ) % ! ^ " < > & |', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'a&b|c%d^e<f>g(h)i!j']);
-      expect(line).toContain('^&');
-      expect(line).toContain('^|');
-      expect(line).toContain('^%');
-      expect(line).toContain('^^');
-      expect(line).toContain('^<');
-      expect(line).toContain('^>');
-      expect(line).toContain('^(');
-      expect(line).toContain('^)');
-      expect(line).toContain('^!');
+    it('caret-escapes every cmd.exe metacharacter, twice: ( ) [ ] % ! ^ " ` < > & | ; , space * ?', () => {
+      const line = innerFor(['C:\\tools\\run.cmd', 'a&b|c%d^e<f>g(h)i!j[k]l`m;n,o*p?q']);
+      for (const ch of ['&', '|', '%', '<', '>', '(', ')', '!', '[', ']', '`', ';', ',', '*', '?']) {
+        expect(line).toContain(`^^^${ch}`);
+      }
+      // a literal caret in the argument: escaped once (^^), then that pair escaped again (^^^^)
+      expect(line).toContain('d^^^^e');
+      expect(line).toBe(
+        'C:\\tools\\run.cmd ^^^"a^^^&b^^^|c^^^%d^^^^e^^^<f^^^>g^^^(h^^^)i^^^!j^^^[k^^^]l^^^`m^^^;n^^^,o^^^*p^^^?q^^^"',
+      );
+    });
+
+    it('an empty argument survives as an empty quoted token', () => {
+      expect(innerFor(['C:\\tools\\run.cmd', '', 'x'])).toBe('C:\\tools\\run.cmd ^^^"^^^" ^^^"x^^^"');
+    });
+
+    it('does not quote the command; a space in its path is caret-escaped so it stays one token', () => {
+      // `C:\Program Files\nodejs\npx.cmd` is the default global npm shim
+      // location on Windows — the case this must get right.
+      expect(innerFor(['C:\\Program Files\\nodejs\\npx.cmd', '-y', 'pkg'])).toBe(
+        'C:\\Program^ Files\\nodejs\\npx.cmd ^^^"-y^^^" ^^^"pkg^^^"',
+      );
+    });
+
+    it('normalizes the command path (forward slashes, dot segments) before escaping it', () => {
+      expect(innerFor(['C:/tools/./run.cmd'])).toBe('C:\\tools\\run.cmd');
     });
 
     it('joins the resolved command and every escaped argument with spaces, in order', () => {
-      const line = lineFor(['C:\\tools\\run.cmd', 'first', 'second arg']);
-      // Strip the outer wrapping quotes added by planSpawn itself.
-      const inner = line.slice(1, -1);
-      const parts = inner.split(' ');
-      expect(parts[0]).toBe('^"C:\\tools\\run.cmd^"');
-      expect(parts).toContain('^"first^"');
-      expect(inner).toContain('^"second arg^"');
+      const inner = innerFor(['C:\\tools\\run.cmd', 'first', 'second arg']);
+      expect(inner).toBe('C:\\tools\\run.cmd ^^^"first^^^" ^^^"second^^^ arg^^^"');
     });
   });
 });
