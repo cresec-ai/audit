@@ -144,8 +144,8 @@ describe('Signer', () => {
     const chainHash = sha256Hex('head-7');
     const sig = await signer.sign(7, chainHash);
     const payload = signedPayload(7, chainHash);
-    // Sync ed.verify, not verifyAsync — this whole suite proves the Node 18
-    // (no globalThis.crypto) path, and verifyAsync needs crypto.subtle.
+    // Sync ed.verify, not verifyAsync — this whole suite proves the
+    // no-globalThis.crypto path, and verifyAsync needs crypto.subtle.
     // sha512Sync is wired by src/chain/keys.ts's module-level side effect.
     const ok = ed.verify(sig.signature, payload, sig.public_key);
     expect(ok).toBe(true);
@@ -255,13 +255,13 @@ describe('Signer', () => {
     expect(() => publicKeyHexFromPem('not a pem at all')).toThrow();
   });
 
-  describe('Node >= 18.17 without a WebCrypto global', () => {
-    // globalThis.crypto is a default global from Node 19 on; on the declared
-    // minimum (18.17) it is undefined unless the process was started with
-    // --experimental-global-webcrypto. @noble/ed25519 v2's ASYNC entry
-    // points (getPublicKeyAsync/signAsync/utils.randomPrivateKey) read
-    // globalThis.crypto and throw when it's missing — this suite proves
-    // Signer never calls them (see src/chain/keys.ts's sync-only contract).
+  describe('without a WebCrypto global', () => {
+    // globalThis.crypto can be absent (a runtime started with
+    // --no-experimental-global-webcrypto, hardened embedders). @noble/ed25519
+    // v2's ASYNC entry points (getPublicKeyAsync/signAsync/
+    // utils.randomPrivateKey) read globalThis.crypto and throw when it's
+    // missing — this suite proves Signer never calls them (see
+    // src/chain/keys.ts's sync-only invariant).
     let hadCrypto: boolean;
     let original: Crypto | undefined;
 

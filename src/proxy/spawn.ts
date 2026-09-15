@@ -114,6 +114,7 @@ export interface SpawnPlan {
  * one token once each space is caret-escaped.
  */
 const CMD_META_CHARS_RE = /([()\][%!^"`<>&|;, *?])/g;
+const LINE_BREAK_RE = /[\r\n]/;
 
 /**
  * Escapes the command itself (the resolved `.cmd`/`.bat` path) for a
@@ -122,7 +123,7 @@ const CMD_META_CHARS_RE = /([()\][%!^"`<>&|;, *?])/g;
  * escaped space keeps the path one token in cmd.exe's command-name lexer,
  * which is how cross-spawn launches `C:\Program Files\nodejs\npm.cmd`.
  */
-function escapeCmdCommand(command: string): string {
+export function escapeCmdCommand(command: string): string {
   return pathWin32.normalize(command).replace(CMD_META_CHARS_RE, '^$1');
 }
 
@@ -158,16 +159,43 @@ function escapeCmdCommand(command: string): string {
  * is honoured, quoted or not. argv here comes from the operator's own
  * trusted client config (the same JSON that already names the binary to
  * run), not from anything a remote MCP peer controls, so this is an
- * accepted, documented gap rather than a hardened boundary.
+ * accepted, documented gap rather than a hardened boundary. Line breaks are
+ * the one control character that cannot be tolerated even so, and planSpawn
+ * refuses them (see LINE_BREAK_RE there).
  */
-function escapeCmdArg(arg: string, doubleEscapeMetaChars: boolean): string {
-  let out = String(arg);
-  out = out.replace(/(\\*)"/g, '$1$1\\"');
-  out = out.replace(/(\\*)$/, '$1$1');
-  out = `"${out}"`;
+export function escapeCmdArg(arg: string, doubleEscapeMetaChars: boolean): string {
+  let out = `"${escapeBackslashRuns(String(arg))}"`;
   out = out.replace(CMD_META_CHARS_RE, '^$1');
   if (doubleEscapeMetaChars) out = out.replace(CMD_META_CHARS_RE, '^$1');
   return out;
+}
+
+/**
+ * Steps 1 and 2 of escapeCmdArg as a single linear scan: a run of
+ * backslashes directly before a double quote is doubled and the quote
+ * escaped (`\\\"` for one backslash + quote); a run at the very end is
+ * doubled too, because the caller appends a closing quote right after it;
+ * every other backslash is literal. Written as a loop on purpose — the
+ * regex form of this rule, `/(\\*)"/g`, backtracks quadratically on a long
+ * run of backslashes with no quote after it (cross-spawn's CVE-2024-21538).
+ */
+function escapeBackslashRuns(arg: string): string {
+  let out = '';
+  let run = 0;
+  for (let i = 0; i < arg.length; i++) {
+    const ch = arg[i]!;
+    if (ch === '\\') {
+      run++;
+      continue;
+    }
+    if (ch === '"') {
+      out += '\\'.repeat(run * 2) + '\\"';
+    } else {
+      out += '\\'.repeat(run) + ch;
+    }
+    run = 0;
+  }
+  return out + '\\'.repeat(run * 2);
 }
 
 function comspec(env: NodeJS.ProcessEnv): string {
@@ -184,6 +212,7 @@ function comspec(env: NodeJS.ProcessEnv): string {
  * `windowsVerbatimArguments: true` (Node must not re-quote arguments we
  * already escaped ourselves). Any other resolved file (an actual `.exe`/
  * `.com`, or a script Windows can exec directly) is spawned as-is, no shell.
+ * Throws when a token bound for cmd.exe contains a line break (unescapable).
  */
 export function planSpawn(
   argv: string[],
@@ -204,6 +233,19 @@ export function planSpawn(
     return { file: resolved, args, options: { windowsHide: true } };
   }
 
+  // A line break cannot be escaped for cmd.exe at all: the lexer ends the
+  // command there and runs whatever follows as a second command. Refuse the
+  // launch outright (this throws before anything is spawned or recorded;
+  // the CLI reports it as a plain error) rather than risk it.
+  const tokens = [resolved, ...args];
+  const broken = tokens.findIndex((t) => LINE_BREAK_RE.test(t));
+  if (broken !== -1) {
+    throw new Error(
+      `refusing to launch ${command} through cmd.exe: argument ${broken} contains a line break ` +
+        '(cmd.exe would run the text after it as a separate command)',
+    );
+  }
+
   const escapedLine = [escapeCmdCommand(resolved), ...args.map((a) => escapeCmdArg(a, true))].join(' ');
   return {
     file: comspec(env),
@@ -220,8 +262,11 @@ export function planSpawn(
  * is an implementation detail of how the process gets started, not a change
  * to what was actually configured.
  */
-export function spawnWrapped(argv: string[], env: NodeJS.ProcessEnv): ChildProcessWithoutNullStreams {
-  const plan = planSpawn(argv, env, process.platform);
+export function spawnWrapped(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  plan: SpawnPlan = planSpawn(argv, env, process.platform),
+): ChildProcessWithoutNullStreams {
   return spawn(plan.file, plan.args, {
     stdio: ['pipe', 'pipe', 'pipe'] as const,
     env,
@@ -262,6 +307,21 @@ export function withNodeDirOnPath(
   };
 }
 
+/** Kill the process tree rooted at `pid` with `taskkill /T /F`. True only
+ * when taskkill ran AND reported success — `spawnSync` does not throw when
+ * the binary is missing or exits non-zero, it reports that in its result. */
+function defaultTaskkill(pid: number): boolean {
+  try {
+    const res = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return res.error === undefined && res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Terminates the wrapped child. On win32, `child.kill(signal)` doesn't
  * honour the signal (Windows has no POSIX signals) and, critically, doesn't
@@ -269,23 +329,19 @@ export function withNodeDirOnPath(
  * through `cmd.exe` (see `planSpawn`), the process the MCP client actually
  * cares about is a *grandchild* of the child we hold a handle to, and it
  * survives a plain `child.kill()`. `taskkill /T /F` kills the whole process
- * tree rooted at the child's pid instead. Falls back to `child.kill()` if
- * `taskkill` itself is unavailable or errors (fail-open: termination must
- * never throw). POSIX behaviour is unchanged — a real signal, no subprocess.
+ * tree rooted at the child's pid instead. Falls back to `child.kill()`
+ * whenever taskkill did not succeed (missing binary, non-zero exit, no pid
+ * because the spawn itself failed) — termination must never throw. POSIX
+ * behaviour is unchanged: a real signal, no subprocess. `taskkill` is
+ * injectable for tests.
  */
 export function terminateChild(
   child: { pid?: number; kill: (signal?: NodeJS.Signals | number) => boolean },
   signal: NodeJS.Signals,
   platform: NodeJS.Platform = process.platform,
+  taskkill: (pid: number) => boolean = defaultTaskkill,
 ): void {
-  if (platform === 'win32' && child.pid !== undefined) {
-    try {
-      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-      return;
-    } catch {
-      /* fall through to child.kill() below */
-    }
-  }
+  if (platform === 'win32' && child.pid !== undefined && taskkill(child.pid)) return;
   try {
     child.kill(signal);
   } catch {

@@ -38,8 +38,35 @@ describe('detectWsl', () => {
   });
 
   it('true via /proc/version mentioning "microsoft" case-insensitively, no distro', () => {
-    const result = detectWsl({}, () => 'Linux version 5.15.0 (MICROSOFT@buildhost)', 'linux');
+    const result = detectWsl({}, () => 'Linux version 5.15.0 (MICROSOFT@buildhost)', 'linux', () => false);
     expect(result).toEqual({ inWsl: true });
+  });
+
+  it('a container on a Microsoft kernel (Docker Desktop WSL2 backend) is NOT WSL', () => {
+    // /proc/version matches, but /.dockerenv exists and no WSL env marker is set.
+    const kernel = (): string => 'Linux version 5.15.153.1-microsoft-standard-WSL2';
+    const dockerenv = (p: string): boolean => p === '/.dockerenv';
+    expect(detectWsl({}, kernel, 'linux', dockerenv)).toEqual({ inWsl: false });
+    const podman = (p: string): boolean => p === '/run/.containerenv';
+    expect(detectWsl({}, kernel, 'linux', podman)).toEqual({ inWsl: false });
+  });
+
+  it('the env markers still win inside a container (a real WSL session that happens to run in one)', () => {
+    const kernel = (): string => 'Linux version 5.15.153.1-microsoft-standard-WSL2';
+    const dockerenv = (p: string): boolean => p === '/.dockerenv';
+    expect(detectWsl({ WSL_DISTRO_NAME: 'Ubuntu' }, kernel, 'linux', dockerenv)).toEqual({
+      inWsl: true,
+      distro: 'Ubuntu',
+    });
+    expect(detectWsl({ WSL_INTEROP: '/run/WSL/1_interop' }, kernel, 'linux', dockerenv)).toEqual({ inWsl: true });
+  });
+
+  it('an exists() probe that throws is treated as "no marker"', () => {
+    const kernel = (): string => 'Linux version 5.15.0-microsoft-standard';
+    const boom = (): boolean => {
+      throw new Error('EACCES');
+    };
+    expect(detectWsl({}, kernel, 'linux', boom)).toEqual({ inWsl: true });
   });
 
   it('true via WSL_INTEROP alone', () => {
@@ -137,14 +164,29 @@ describe('windowsHomeCandidates', () => {
     expect(homes).toEqual(['/mnt/c/Users/joni']);
   });
 
-  it('de-duplicates and preserves order across both sources', () => {
+  it('when Windows answers, /mnt/c/Users is never listed: another account is not a candidate', () => {
+    // If it were, an operator whose own client config does not exist yet
+    // would have setup silently edit the other account's config.
     const spawnSync: SpawnSyncFn = (command) => {
       if (command === 'cmd.exe') return ok('C:\\Users\\joni\n');
       if (command === 'wslpath') return ok('/mnt/c/Users/joni\n');
       return notFound();
     };
     const exists = (p: string): boolean => p === '/mnt/c/Users';
-    const readdir = (): string[] => ['joni', 'other'];
+    let listed = false;
+    const readdir = (): string[] => {
+      listed = true;
+      return ['joni', 'other'];
+    };
+    const homes = windowsHomeCandidates({ spawnSync, existsSync: exists, readdirSync: readdir });
+    expect(homes).toEqual(['/mnt/c/Users/joni']);
+    expect(listed).toBe(false);
+  });
+
+  it('the glob fallback de-duplicates its own listing', () => {
+    const spawnSync: SpawnSyncFn = () => notFound();
+    const exists = (p: string): boolean => p === '/mnt/c/Users';
+    const readdir = (): string[] => ['joni', 'other', 'joni'];
     const homes = windowsHomeCandidates({ spawnSync, existsSync: exists, readdirSync: readdir });
     expect(homes).toEqual(['/mnt/c/Users/joni', '/mnt/c/Users/other']);
   });

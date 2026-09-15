@@ -287,6 +287,15 @@ Run everything on the Windows side; WSL doesn't come into it at all.
 This is the simplest option, and the only one that works for a server that's
 Windows-only (something that shells out to a `.exe`, for instance).
 
+How the recorder launches the server on Windows: an `.exe` is spawned
+directly; a `.cmd`/`.bat` shim (which is what `npx`, `npm` and `uvx` are on
+Windows) has to go through `cmd.exe`, so its arguments are escaped the same
+way `cross-spawn` does it. Two consequences of `cmd.exe` being in the loop:
+a `%VAR%` sequence inside an argument is expanded by `cmd.exe` before the
+server sees it (no escaping can prevent that), and an argument containing a
+line break is refused outright — the recorder exits with an error instead of
+letting `cmd.exe` run the text after the break as a second command.
+
 ### Option 2 — recorder and servers inside WSL
 
 Keep your servers (and the recorder) running inside WSL — useful if your

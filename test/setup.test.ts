@@ -475,7 +475,7 @@ describe('mcp-recorder setup', () => {
     expect(res.code).toBe(0);
     const result = JSON.parse(res.stdout) as Record<string, unknown>;
     expect(Object.keys(result).sort()).toEqual(
-      ['already_wrapped', 'backup', 'config', 'skipped', 'wrapped'].sort(),
+      ['already_wrapped', 'backup', 'config', 'notes', 'skipped', 'wrapped'].sort(),
     );
     expect(result.config).toBe(configPath);
     expect(typeof result.backup).toBe('string');
@@ -829,6 +829,27 @@ describe('mcp-recorder setup — wsl wrapper & BOM handling (via the CLI)', () =
     expect(rewritten.charCodeAt(0)).not.toBe(0xfeff);
     const updated = JSON.parse(rewritten) as { mcpServers: Record<string, WrapServerEntry> };
     expect(updated.mcpServers.filesystem!.env).toEqual({ FOO: 'bar' });
+  }, 30_000);
+
+  it('a CRLF config (Windows-authored) is rewritten with CRLF, and --undo keeps it too', async () => {
+    const dir = tmpDir('mcp-rec-setup-crlf-');
+    const configPath = join(dir, 'config.json');
+    const crlf = JSON.stringify(claudeDesktopFixture(), null, 2).replace(/\n/g, '\r\n') + '\r\n';
+    writeFileSync(configPath, crlf);
+
+    const wrap = await runCli(['setup', '--config', configPath]);
+    expect(wrap.code).toBe(0);
+    const rewritten = readFileSync(configPath, 'utf8');
+    expect(rewritten).toContain('\r\n');
+    // every newline is a CRLF one — no bare LF slipped in
+    expect(rewritten.replace(/\r\n/g, '')).not.toContain('\n');
+    expect(rewritten.endsWith('\r\n')).toBe(true);
+    const updated = JSON.parse(rewritten) as { mcpServers: Record<string, WrapServerEntry> };
+    expect(updated.mcpServers.filesystem!.command).not.toBe('npx');
+
+    const undo = await runCli(['setup', '--config', configPath, '--undo']);
+    expect(undo.code).toBe(0);
+    expect(readFileSync(configPath, 'utf8')).toBe(crlf);
   }, 30_000);
 
   it('--undo works on a config that picked up a BOM after wrapping', async () => {

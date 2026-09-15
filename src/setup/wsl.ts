@@ -35,11 +35,14 @@ export interface WslDetection {
   distro?: string;
 }
 
+/** Files that exist inside a Docker / Podman container and nowhere else. */
+const CONTAINER_MARKERS = ['/.dockerenv', '/run/.containerenv'];
+
 /**
  * True when running inside WSL: platform is linux AND at least one of
- * WSL_DISTRO_NAME, `/proc/version` mentioning "microsoft" (case-insensitive
- * — WSL1 and WSL2 kernels both self-identify this way), or WSL_INTEROP is
- * set. `env` and `readFile` are injected so tests never touch the real
+ * WSL_DISTRO_NAME or WSL_INTEROP is set, or `/proc/version` mentions
+ * "microsoft" (case-insensitive — WSL1 and WSL2 kernels both self-identify
+ * this way) while no container marker file is present. `env` and `readFile` are injected so tests never touch the real
  * environment or filesystem; `readFile` may throw (e.g. `/proc/version`
  * doesn't exist on a non-Linux test double) and that's treated the same as
  * "no match".
@@ -48,6 +51,7 @@ export function detectWsl(
   env: Readonly<Record<string, string | undefined>>,
   readFile: (path: string) => string,
   platform: NodeJS.Platform = process.platform,
+  exists: (path: string) => boolean = nodeExistsSync,
 ): WslDetection {
   if (platform !== 'linux') return { inWsl: false };
 
@@ -64,7 +68,20 @@ export function detectWsl(
   const interop = env.WSL_INTEROP;
   const hasInterop = interop !== undefined && interop.length > 0;
 
-  const inWsl = distro !== undefined || procVersionMentionsMicrosoft || hasInterop;
+  // Docker Desktop's WSL2 backend runs every container on the same
+  // Microsoft kernel, so /proc/version alone also matches inside an ordinary
+  // Linux container that has no interop bridge to Windows at all. The env
+  // markers are per-session and never leak into such a container; the
+  // kernel string is only trusted when no container marker is present.
+  const inContainer = CONTAINER_MARKERS.some((p) => {
+    try {
+      return exists(p);
+    } catch {
+      return false;
+    }
+  });
+
+  const inWsl = distro !== undefined || hasInterop || (procVersionMentionsMicrosoft && !inContainer);
   return distro !== undefined ? { inWsl, distro } : { inWsl };
 }
 
@@ -174,9 +191,9 @@ function globWindowsUsersDir(readdir: (p: string) => string[], exists: (p: strin
  * Discover Windows user profile directories, as seen from inside WSL.
  * Prefers asking Windows directly (cmd.exe's %USERPROFILE%, converted to a
  * WSL path), which reliably finds the *current* Windows user even when
- * several profiles exist; falls back to listing `/mnt/c/Users` when cmd.exe
- * can't be run at all (e.g. interop disabled). Always returns an ordered,
- * de-duplicated list — deps are injectable so no test ever shells out to a
+ * several profiles exist; ONLY when cmd.exe can't be run at all (e.g.
+ * interop disabled) does it fall back to listing `/mnt/c/Users`. Always
+ * returns a de-duplicated list — deps are injectable so no test ever shells out to a
  * real `cmd.exe`/`wslpath` or touches the real filesystem.
  */
 export function windowsHomeCandidates(deps: Partial<WindowsHomeDeps> = {}): string[] {
@@ -184,17 +201,18 @@ export function windowsHomeCandidates(deps: Partial<WindowsHomeDeps> = {}): stri
   const exists = deps.existsSync ?? nodeExistsSync;
   const readdir = deps.readdirSync ?? nodeReaddirSync;
 
-  const candidates: string[] = [];
-
+  // When Windows itself answers, that answer is the whole list: listing
+  // /mnt/c/Users as well would put every OTHER account's profile on the
+  // candidate list, and an operator whose own client config does not exist
+  // yet would have setup silently edit another user's. The listing is a
+  // fallback for when cmd.exe cannot be run at all, nothing more.
   const winProfile = windowsUserProfileVia(spawn, exists);
   if (winProfile !== undefined) {
     const converted = convertWindowsPath(winProfile, spawn);
-    if (converted !== undefined) candidates.push(converted);
+    if (converted !== undefined) return [converted];
   }
 
-  for (const dir of globWindowsUsersDir(readdir, exists)) candidates.push(dir);
-
-  return [...new Set(candidates)];
+  return [...new Set(globWindowsUsersDir(readdir, exists))];
 }
 
 /* --------------------------- config candidates ---------------------------- */

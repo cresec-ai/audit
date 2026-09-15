@@ -277,7 +277,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   if (spawnPlan.options.windowsVerbatimArguments) {
     diag(`spawning "${opts.command[0]}" via cmd.exe (resolved to a .cmd/.bat shim)`);
   }
-  const child = spawnWrapped(opts.command, spawnEnv);
+  const child = spawnWrapped(opts.command, spawnEnv, spawnPlan);
 
   // Forwarding: plain pipes, untouched. (pipe() ends child.stdin when
   // proxyStdin ends, which is exactly the MCP stdio shutdown convention.)

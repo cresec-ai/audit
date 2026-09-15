@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { planSpawn, resolveCommand } from '../src/proxy/spawn.js';
+import { escapeCmdArg, planSpawn, resolveCommand, terminateChild } from '../src/proxy/spawn.js';
 import type { FsProbe } from '../src/proxy/spawn.js';
 
 /**
@@ -235,6 +235,131 @@ describe('planSpawn', () => {
     it('joins the resolved command and every escaped argument with spaces, in order', () => {
       const inner = innerFor(['C:\\tools\\run.cmd', 'first', 'second arg']);
       expect(inner).toBe('C:\\tools\\run.cmd ^^^"first^^^" ^^^"second^^^ arg^^^"');
+    });
+  });
+
+  describe('escaping: backslash rules and worst-case inputs', () => {
+    // Reference implementation of steps 1-2 as the (quadratic) regexes
+    // cross-spawn originally shipped; escapeCmdArg must agree byte for byte
+    // on every input, it just has to get there in linear time.
+    const reference = (arg: string): string => {
+      let out = arg.replace(/(\\*)"/g, '$1$1\\"');
+      out = out.replace(/(\\*)$/, '$1$1');
+      return `"${out}"`.replace(/([()\][%!^"`<>&|;, *?])/g, '^$1');
+    };
+
+    it('agrees with the reference regex algorithm on tricky backslash/quote layouts', () => {
+      const inputs = [
+        '',
+        'plain',
+        '"',
+        '\\',
+        '\\"',
+        'a\\b',
+        'a\\"b',
+        'a\\\\"b',
+        'a\\\\\\"b',
+        'x\\\\',
+        '"a" "b"',
+        'C:\\Program Files\\x\\',
+        '\\"\\"\\',
+      ];
+      for (const input of inputs) {
+        expect(escapeCmdArg(input, false), JSON.stringify(input)).toBe(reference(input));
+      }
+    });
+
+    it('a million backslashes with no closing quote escapes in linear time', () => {
+      const arg = '\\'.repeat(1_000_000);
+      const t0 = performance.now();
+      const out = escapeCmdArg(arg, true);
+      const elapsed = performance.now() - t0;
+      // trailing run doubled, wrapped in the double-escaped quotes
+      expect(out).toBe('^^^"' + '\\'.repeat(2_000_000) + '^^^"');
+      expect(elapsed).toBeLessThan(2_000);
+    });
+  });
+
+  describe('planSpawn refuses line breaks bound for cmd.exe', () => {
+    it('throws for a CR or LF in any argument of a .cmd/.bat target, before anything is spawned', () => {
+      expect(() => planSpawn(['C:\\tools\\run.cmd', 'ok', 'a\nb'], {}, 'win32')).toThrow(
+        /refusing to launch C:\\tools\\run\.cmd through cmd\.exe: argument 2 contains a line break/,
+      );
+      expect(() => planSpawn(['C:\\tools\\run.cmd', 'a\rb'], {}, 'win32')).toThrow(/line break/);
+    });
+
+    it('does not apply to a direct (no-shell) spawn, where Node passes the argument verbatim', () => {
+      expect(() => planSpawn(['C:\\tools\\run.exe', 'a\nb'], {}, 'win32')).not.toThrow();
+      expect(() => planSpawn(['/usr/bin/x', 'a\nb'], {}, 'linux')).not.toThrow();
+    });
+  });
+
+  describe('terminateChild', () => {
+    interface FakeChild {
+      pid?: number;
+      kill: (s?: NodeJS.Signals | number) => boolean;
+      killed: Array<NodeJS.Signals | number | undefined>;
+    }
+    const fakeChild = (pid: number | undefined): FakeChild => {
+      const killed: FakeChild['killed'] = [];
+      const child: FakeChild = {
+        kill: (s) => {
+          killed.push(s);
+          return true;
+        },
+        killed,
+      };
+      if (pid !== undefined) child.pid = pid;
+      return child;
+    };
+
+    it('win32: a successful taskkill is the whole job, child.kill() is not called', () => {
+      const child = fakeChild(4242);
+      const pids: number[] = [];
+      terminateChild(child, 'SIGTERM', 'win32', (pid) => {
+        pids.push(pid);
+        return true;
+      });
+      expect(pids).toEqual([4242]);
+      expect(child.killed).toEqual([]);
+    });
+
+    it('win32: a failed taskkill (missing binary, non-zero exit) falls back to child.kill()', () => {
+      const child = fakeChild(4242);
+      terminateChild(child, 'SIGTERM', 'win32', () => false);
+      expect(child.killed).toEqual(['SIGTERM']);
+    });
+
+    it('win32: no pid (spawn itself failed) skips taskkill and calls child.kill()', () => {
+      const child = fakeChild(undefined);
+      let called = false;
+      terminateChild(child, 'SIGTERM', 'win32', () => {
+        called = true;
+        return true;
+      });
+      expect(called).toBe(false);
+      expect(child.killed).toEqual(['SIGTERM']);
+    });
+
+    it('POSIX: never runs taskkill, forwards the real signal', () => {
+      const child = fakeChild(4242);
+      let called = false;
+      terminateChild(child, 'SIGHUP', 'linux', () => {
+        called = true;
+        return true;
+      });
+      expect(called).toBe(false);
+      expect(child.killed).toEqual(['SIGHUP']);
+    });
+
+    it('a child.kill() that throws (already gone) is swallowed', () => {
+      const child = {
+        pid: 1,
+        kill: (): boolean => {
+          throw new Error('ESRCH');
+        },
+      };
+      expect(() => terminateChild(child, 'SIGTERM', 'linux')).not.toThrow();
     });
   });
 });

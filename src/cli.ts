@@ -30,6 +30,7 @@ import { serveUi } from './replay/serve.js';
 import { CLIENT_KINDS, isClientKind, resolveClientConfigPath } from './setup/client-config.js';
 import type { ClientKind } from './setup/client-config.js';
 import {
+  detectEol,
   detectIndent,
   readSidecarStrict,
   removeSidecar,
@@ -1130,6 +1131,9 @@ interface SetupJsonResult {
   wrapped: string[];
   skipped: SkipEntry[];
   already_wrapped: string[];
+  /** Same notices the human output prints (e.g. which env var names a
+   * `--wrapper wsl` entry forwards via WSLENV). */
+  notes: string[];
 }
 
 function printSetupHuman(configPath: string, backup: string | null, plan: WrapPlan, dryRun: boolean): void {
@@ -1187,6 +1191,7 @@ function printSetupResult(
       wrapped: plan.wrapped,
       skipped: plan.skipped,
       already_wrapped: plan.alreadyWrapped,
+      notes: plan.notes,
     };
     out(JSON.stringify(payload, null, 2));
     return;
@@ -1257,6 +1262,7 @@ function runSetupUndo(
   root: Record<string, unknown>,
   servers: McpServersMap,
   indent: string,
+  eol: '\n' | '\r\n',
   dryRun: boolean,
   jsonOut: boolean,
 ): void {
@@ -1301,7 +1307,7 @@ function runSetupUndo(
 
   const backup = writeBackup(configPath);
   root.mcpServers = next;
-  writeJsonAtomic(configPath, root, indent);
+  writeJsonAtomic(configPath, root, indent, eol);
   if (sidecar !== undefined) removeSidecar(configPath);
 
   printUndoResult(configPath, backup, outcome, jsonOut, false);
@@ -1383,9 +1389,10 @@ async function cmdSetup(flags: Flags): Promise<void> {
       ? (serversRaw as McpServersMap)
       : {};
   const indent = detectIndent(raw);
+  const eol = detectEol(raw);
 
   if (isUndo) {
-    runSetupUndo(configPath, root, servers, indent, dryRun, jsonOut);
+    runSetupUndo(configPath, root, servers, indent, eol, dryRun, jsonOut);
     return;
   }
 
@@ -1443,7 +1450,7 @@ async function cmdSetup(flags: Flags): Promise<void> {
 
   const backup = writeBackup(configPath);
   root.mcpServers = plan.next;
-  writeJsonAtomic(configPath, root, indent);
+  writeJsonAtomic(configPath, root, indent, eol);
   writeSidecarAtomic(configPath, existingSidecar, indent);
 
   printSetupResult(configPath, backup, plan, jsonOut, false);

@@ -28,6 +28,12 @@ export function detectIndent(raw: string): string {
   return indent.length >= 4 ? '    ' : '  ';
 }
 
+/** The line ending a JSON file uses, so a rewrite keeps it: Windows-side
+ * configs (the ones `setup` finds from WSL) are often CRLF. */
+export function detectEol(raw: string): '\n' | '\r\n' {
+  return raw.includes('\r\n') ? '\r\n' : '\n';
+}
+
 export function sidecarPath(configPath: string): string {
   return configPath + SIDECAR_SUFFIX;
 }
@@ -52,8 +58,8 @@ export function atomicWriteFile(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
-export function writeJsonAtomic(path: string, value: unknown, indent: string): void {
-  atomicWriteFile(path, JSON.stringify(value, null, indent) + '\n');
+export function writeJsonAtomic(path: string, value: unknown, indent: string, eol: '\n' | '\r\n' = '\n'): void {
+  atomicWriteFile(path, JSON.stringify(value, null, indent).split('\n').join(eol) + eol);
 }
 
 /**
