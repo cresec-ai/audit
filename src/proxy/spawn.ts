@@ -275,17 +275,19 @@ export function spawnWrapped(
 }
 
 /**
- * Appends (never prepends) the directory containing the currently running
- * Node binary to `env`'s PATH, when it is not already present. This is what
+ * Adds the directory containing the currently running Node binary to
+ * `env`'s PATH when it is not already present — appended, except that on
+ * WSL it goes ahead of the Windows interop entries (see below). This is what
  * lets a wrapped command like `npx` resolve when the recorder process itself
  * was launched by an absolute path to a specific Node binary with a minimal
  * PATH (nvm/fnm shims, a WSL bridge invoking a Windows Node, or a Windows
  * MCP client launching `node.exe` directly with `PATH` trimmed down) —
  * `npx`/`npm`/`corepack` are installed next to that same Node binary.
  * Appending (not prepending) means it can never shadow a binary the operator
- * put earlier on their own PATH on purpose. Applies on every platform, not
- * just win32 — the same failure mode (absolute node path, thin PATH) shows
- * up on POSIX launchers too.
+ * put earlier on their own PATH on purpose; the Windows interop entries WSL
+ * adds are the one exception, since nothing there is an operator choice.
+ * Applies on every platform, not just win32 — the same failure mode
+ * (absolute node path, thin PATH) shows up on POSIX launchers too.
  */
 export function withNodeDirOnPath(
   env: NodeJS.ProcessEnv,
@@ -301,10 +303,20 @@ export function withNodeDirOnPath(
     platform === 'win32' ? seg.toLowerCase() === dir.toLowerCase() : seg === dir,
   );
   if (alreadyPresent || dir.length === 0) return env;
-  return {
-    ...env,
-    [pathKey]: current.length > 0 ? `${current}${delimiter}${dir}` : dir,
-  };
+  // WSL: interop appends the Windows PATH (`/mnt/c/Program Files/nodejs`,
+  // `/mnt/c/Windows/System32`, ...) to every session's PATH — including the
+  // minimal one a `wsl.exe -e` launch gets — and a Windows Node install
+  // ships POSIX `npx`/`npm` shim scripts there that a bare `npx` would
+  // resolve to first, then fail (they exec a Windows node). The Node
+  // directory therefore goes in front of the first Windows-mount entry;
+  // everything the operator put ahead of that keeps its precedence.
+  const firstWindowsMount =
+    platform === 'win32' ? -1 : segments.findIndex((seg) => /^\/mnt\/[a-zA-Z](\/|$)/.test(seg));
+  const next =
+    firstWindowsMount === -1
+      ? [...segments, dir]
+      : [...segments.slice(0, firstWindowsMount), dir, ...segments.slice(firstWindowsMount)];
+  return { ...env, [pathKey]: next.join(delimiter) };
 }
 
 /** Kill the process tree rooted at `pid` with `taskkill /T /F`. True only

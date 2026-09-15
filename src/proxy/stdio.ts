@@ -257,13 +257,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
   /* ------------------------------- spawn ---------------------------------- */
 
-  // Child PATH: append (never prepend) the directory of the Node binary
-  // running this proxy, on every platform, when it isn't already there. A
-  // wrapped command like "npx" needs to resolve to a sibling npx/npx.cmd
-  // even when this proxy itself was launched by an absolute path to Node
-  // with a thin PATH (nvm/fnm shims, a WSL bridge invoking a Windows Node,
-  // some Windows MCP client launchers) — appending (not prepending) means it
-  // can never shadow something the operator put earlier on PATH on purpose.
+  // Child PATH: add the directory of the Node binary running this proxy, on
+  // every platform, when it isn't already there. A wrapped command like
+  // "npx" needs to resolve to a sibling npx/npx.cmd even when this proxy
+  // itself was launched by an absolute path to Node with a thin PATH
+  // (nvm/fnm shims, `wsl.exe -e`, some Windows MCP client launchers). It is
+  // appended, so it never shadows something the operator put earlier on
+  // PATH on purpose — except on WSL, where it goes ahead of the Windows
+  // interop entries (see withNodeDirOnPath).
   const spawnEnv = withNodeDirOnPath(env, process.execPath);
 
   // On win32, a .cmd/.bat shim (npx, npm, uvx, ... installed as such) can't
