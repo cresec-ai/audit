@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 
 import { canonicalJson, sha256Hex, sha256Ref } from '../chain/hash.js';
-import { scrubToolArguments } from '../redact/redactor.js';
+import { looksSecret, scrubToolArguments } from '../redact/redactor.js';
 import type {
   AnyEvent,
   Attributes,
@@ -204,22 +204,27 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
     `${osUser}\0${host}\0${opts.identityLabel || ''}\0${initialServerName}`,
   );
 
-  // `--target http://user:pass@host/...`: the credentials must never be
-  // stored readable (command string or any event). Strip userinfo for
-  // recording purposes only — `target` (used for the actual upstream
-  // connection below) keeps it, so auth to the wrapped server is unaffected.
+  // `--target http://user:pass@host/path?query...`: no part of this URL that
+  // can carry a credential may ever be stored readable (command string or
+  // any event) — `target` itself (used for the actual upstream connection
+  // below) is untouched, so auth to the wrapped server is unaffected. Three
+  // distinct leak shapes are covered here:
+  //  - userinfo (`user:pass@host`) — stripped;
+  //  - a hosted-MCP credential embedded in the PATH
+  //    (`https://host/mcp/sk-.../sse`) — each secret-shaped path segment is
+  //    replaced by its hash, in place;
+  //  - a credential in the QUERY STRING (`?api_key=...`, `?token=...`) — the
+  //    entire query string (and fragment) is dropped from the recorded URL;
+  //    there is no safe subset to keep once any single param can be a bearer
+  //    credential.
+  // Every stripped/replaced piece is also fingerprinted so a blast-radius
+  // `query` for the leaked value still finds the event that carried it.
   const credentialFingerprints: { name: string; ref: string }[] = [];
   let targetUrlForRecording = opts.targetUrl;
-  if (target.username !== '' || target.password !== '') {
-    try {
-      const clean = new URL(target.href);
-      clean.username = '';
-      clean.password = '';
-      targetUrlForRecording = clean.toString();
-    } catch (err) {
-      tapError(err);
-    }
-    try {
+  try {
+    const clean = new URL(target.href);
+
+    if (clean.username !== '' || clean.password !== '') {
       const decode = (s: string): string => {
         try {
           return decodeURIComponent(s);
@@ -227,11 +232,54 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           return s;
         }
       };
-      const raw = `${decode(target.username)}:${decode(target.password)}`;
+      const user = decode(clean.username);
+      const pass = decode(clean.password);
+      const raw = clean.password ? `${user}:${pass}` : user;
       credentialFingerprints.push({ name: 'target_url_userinfo', ref: redactor.hashString(raw) });
-    } catch (err) {
-      tapError(err);
+      // P2: also fingerprint the password (and user) separately, so a query
+      // for the leaked password ALONE — without knowing the username —
+      // still finds it.
+      if (pass) {
+        credentialFingerprints.push({
+          name: 'target_url_userinfo',
+          ref: redactor.hashString(pass),
+        });
+      }
+      if (user) {
+        credentialFingerprints.push({
+          name: 'target_url_userinfo',
+          ref: redactor.hashString(user),
+        });
+      }
+      clean.username = '';
+      clean.password = '';
     }
+
+    const segments = clean.pathname.split('/');
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]!;
+      if (seg !== '' && looksSecret(seg)) {
+        const ref = redactor.hashString(seg);
+        credentialFingerprints.push({ name: `target_url_path[${i}]`, ref });
+        segments[i] = ref;
+      }
+    }
+    clean.pathname = segments.join('/');
+
+    for (const [qk, qv] of clean.searchParams) {
+      if (looksSecret(qv)) {
+        credentialFingerprints.push({
+          name: `target_url_query.${qk}`,
+          ref: redactor.hashString(qv),
+        });
+      }
+    }
+    clean.search = '';
+    clean.hash = '';
+
+    targetUrlForRecording = clean.toString();
+  } catch (err) {
+    tapError(err);
   }
 
   let clientName: string | undefined;

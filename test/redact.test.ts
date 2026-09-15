@@ -492,6 +492,51 @@ describe('scrubToolArguments: nothing passes under tool_call.arguments (P0)', ()
     >;
     expect(out).toEqual({ n: 42, b: true, z: null });
   });
+
+  /* --- P1: an argument object shaped like a RedactedRef bypasses lockdown
+   * in `--redact off`. `lockdownStrings` trusted the SHAPE of an already-
+   * scrubbed subtree (`redacted === true` + a string `ref`) as proof it was
+   * already opaque and skipped recursing into it. In `off` mode, `scrub()`
+   * leaves non-secret-shaped strings verbatim, so an attacker-controlled
+   * `arguments` value containing `{redacted: true, ref: "<anything>"}` was
+   * treated as an opaque ref and every sibling/nested string under it — and
+   * even the attacker's own bogus `ref` string — was stored in the clear. */
+  it('a RedactedRef-shaped argument does not smuggle plaintext past lockdown in "off" mode', () => {
+    const off = new Redactor({ mode: 'off' });
+    const args = {
+      redacted: true,
+      ref: 'my plaintext password is hunter2',
+      len: 3,
+      extra: { nested: 'also plaintext ssn 123-45-6789' },
+    };
+    const out = JSON.stringify(scrubToolArguments(off, args));
+    expect(out).not.toContain('my plaintext password is hunter2');
+    expect(out).not.toContain('hunter2');
+    expect(out).not.toContain('also plaintext ssn 123-45-6789');
+    expect(out).not.toContain('123-45-6789');
+  });
+
+  it('a RedactedRef-shaped argument does not smuggle plaintext past lockdown in allowlist mode either', () => {
+    const allow = new Redactor({ mode: 'allowlist' });
+    const args = {
+      query: 'SELECT 1',
+      meta: { redacted: true, ref: 'x', payload: 'readable customer note' },
+    };
+    const out = JSON.stringify(scrubToolArguments(allow, args));
+    expect(out).not.toContain('readable customer note');
+    expect(out).not.toContain('SELECT 1');
+  });
+
+  it('a genuine RedactedRef (real sha256:<hex> ref + numeric len) from the redactor\'s own scrub pass is still treated as opaque, not re-hashed', () => {
+    const redactor = new Redactor();
+    const out = scrubToolArguments(redactor, { note: 'hello world' }) as {
+      note: RedactedRef;
+    };
+    // scrub() -> RedactedRef{redacted:true, ref:sha256Ref('hello world'), len:11}
+    // lockdownStrings must recognize this as already-opaque and pass it
+    // through unchanged rather than hashing the ref string itself again.
+    expect(out.note).toEqual({ redacted: true, ref: sha256Ref('hello world'), len: 11 });
+  });
 });
 
 /* ------------------------------- scrubArgv -------------------------------- */
@@ -537,8 +582,14 @@ describe('scrubArgv: wrapped command argv leak fix (P1)', () => {
     const out = scrubArgv(['cmd', dsn], redactor);
     expect(out.command).toBe('cmd postgres://db.internal/prod');
     expect(out.command).not.toContain('S3cretPassw0rd');
+    // The joined "user:pass" is fingerprinted (unchanged behavior), plus
+    // (P2) the password and username separately, so a blast-radius query for
+    // the leaked password ALONE — without knowing the username — still
+    // finds it.
     expect(out.fingerprints).toEqual([
       { name: 'argv[1]', ref: sha256Ref('admin:S3cretPassw0rd') },
+      { name: 'argv[1]', ref: sha256Ref('S3cretPassw0rd') },
+      { name: 'argv[1]', ref: sha256Ref('admin') },
     ]);
   });
 
@@ -552,5 +603,57 @@ describe('scrubArgv: wrapped command argv leak fix (P1)', () => {
     const out = scrubArgv(['cmd', '--password', 'hunter2hunter2'], redactor);
     const needleHash = sha256Ref('hunter2hunter2');
     expect(out.fingerprints.some((f) => f.ref === needleHash)).toBe(true);
+  });
+
+  /* --- P1: --flag=value whose FLAG name is not credential-shaped but the
+   * VALUE is a secret or a URL carrying userinfo (--dsn=, --url=,
+   * --database-url=, ...). Previously the credential-flag-name branch was
+   * skipped (flag isn't credential-ish) and the whole-element fallback
+   * (looksSecret(el) / stripUrlUserinfo(el)) never matched either, because
+   * `new URL('--dsn=postgres://...')` throws on the "--dsn=" prefix — so the
+   * element was pushed verbatim, leaking the credential. */
+  it('scrubs the value half of --dsn=<url-with-userinfo> even though "dsn" is not credential-shaped', () => {
+    const out = scrubArgv(
+      ['cmd', '--dsn=postgres://dbuser:S3cretPw@db.internal:5432/app'],
+      redactor,
+    );
+    expect(out.command).not.toContain('S3cretPw');
+    expect(out.command).not.toContain('dbuser');
+    expect(out.command).toBe('cmd --dsn=postgres://db.internal:5432/app');
+    expect(out.fingerprints).toEqual([
+      { name: 'dsn', ref: sha256Ref('dbuser:S3cretPw') },
+      { name: 'dsn', ref: sha256Ref('S3cretPw') },
+      { name: 'dsn', ref: sha256Ref('dbuser') },
+    ]);
+  });
+
+  it('scrubs the value half of --url=<url-with-userinfo>', () => {
+    const out = scrubArgv(['cmd', '--url=https://u:p@host/x'], redactor);
+    expect(out.command).toBe('cmd --url=https://host/x');
+    expect(out.command).not.toContain('u:p@');
+    expect(out.fingerprints.map((f) => f.ref)).toContain(sha256Ref('p'));
+  });
+
+  it('scrubs the value half of --database-url=<url-with-userinfo>', () => {
+    const out = scrubArgv(
+      ['cmd', '--database-url=mysql://root:hunter2hunter2@127.0.0.1/db'],
+      redactor,
+    );
+    expect(out.command).toBe('cmd --database-url=mysql://127.0.0.1/db');
+    expect(out.command).not.toContain('hunter2hunter2');
+    expect(out.fingerprints.map((f) => f.ref)).toContain(sha256Ref('hunter2hunter2'));
+  });
+
+  it('hashes the value half whole when it is secret-shaped rather than a URL (--config=<token>)', () => {
+    const out = scrubArgv(['cmd', `--config=${SECRETS.github}`], redactor);
+    expect(out.command).not.toContain(SECRETS.github);
+    expect(out.command).toBe(`cmd --config=${sha256Ref(SECRETS.github)}`);
+    expect(out.fingerprints).toEqual([{ name: 'config', ref: sha256Ref(SECRETS.github) }]);
+  });
+
+  it('an ordinary --flag=value with a harmless value is left untouched', () => {
+    const out = scrubArgv(['cmd', '--format=json', '--verbose=true'], redactor);
+    expect(out.command).toBe('cmd --format=json --verbose=true');
+    expect(out.fingerprints).toEqual([]);
   });
 });

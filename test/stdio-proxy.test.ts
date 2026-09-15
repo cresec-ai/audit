@@ -573,3 +573,53 @@ describe('runStdioProxy (e2e against echo-server fixture)', () => {
     expect(events.indexOf(call!)).toBeLessThan(events.indexOf(end!));
   });
 });
+
+/* --- P2: credential-fingerprint cap reservation. Env-derived fingerprints
+ * used to share the SAME 32-slot cap as argv/URL-derived ones, so a wrapped
+ * server with >=32 credential-shaped env vars silently crowded out every
+ * argv-derived fingerprint (e.g. a leaked `--token` value) — `query` could
+ * never find it. Env is now capped on its own at 32, reserving room for
+ * argv/URL-derived fingerprints up to a total of 64. */
+describe('credential-fingerprint cap reservation (P2)', () => {
+  it('an argv-derived fingerprint is never dropped just because env filled the 32-slot budget first', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+
+    // 40 distinct credential-shaped env vars: more than the old shared cap
+    // of 32, so a naive shared counter would leave zero room for argv. Start
+    // from a minimal env (not a spread of process.env) so ambient
+    // credential-shaped vars from the outer environment (GITHUB_TOKEN,
+    // AWS_SECRET_ACCESS_KEY, ...) cannot shift the count.
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '' };
+    for (let i = 0; i < 40; i++) {
+      env[`SERVICE_TOKEN_${i}`] = `env-credential-value-number-${i}`;
+    }
+
+    const argvSecret = 'argv-secret-should-still-be-fingerprinted';
+    const code = await runStdioProxy({
+      command: [process.execPath, '-e', 'process.exit(0)', '--', '--token', argvSecret],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      env,
+    });
+    expect(code).toBe(0);
+
+    const start = store.events().find((e): e is SessionStartEvent => e.kind === 'session_start');
+    expect(start).toBeDefined();
+    const fps = start!.identity.credential_fingerprints ?? [];
+
+    // Env-derived fingerprints are capped at 32...
+    const envFps = fps.filter((f) => f.name.startsWith('SERVICE_TOKEN_'));
+    expect(envFps.length).toBe(32);
+
+    // ...but the argv-derived one is still present (not silently dropped),
+    // and the total never exceeds the reserved 64-slot cap.
+    const argvHash = sha256Ref(argvSecret);
+    expect(fps.some((f) => f.ref === argvHash)).toBe(true);
+    expect(fps.length).toBeLessThanOrEqual(64);
+  });
+});

@@ -69,6 +69,15 @@ const MAX_PENDING = 10_000;
 // Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
 // contended store delays session_end rather than losing it.
 const CLOSE_TIMEOUT_MS = 8_000;
+/**
+ * Credential-fingerprint caps (P2 fix): env-derived fingerprints are capped
+ * on their own so a wrapped server with many credential-shaped env vars
+ * cannot fill the whole budget and silently crowd out argv/URL-derived
+ * fingerprints pushed afterward — those must always have room to append, up
+ * to the overall total below.
+ */
+const ENV_CREDENTIAL_FINGERPRINT_CAP = 32;
+const MAX_CREDENTIAL_FINGERPRINTS = 64;
 /** result_hash for a synthesized "unanswered" event: sha256 of canonical `null`. */
 const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
 
@@ -165,10 +174,15 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     `${osUser}\0${host}\0${opts.identityLabel || ''}\0${initialServerName}`,
   );
 
+  // P2 fix: env-derived fingerprints are capped at ENV_CREDENTIAL_FINGERPRINT_CAP
+  // on their own (not the shared total), reserving room below the overall
+  // MAX_CREDENTIAL_FINGERPRINTS cap for argv/URL-derived fingerprints so
+  // those are never silently dropped just because env filled the budget
+  // first.
   const credentialFingerprints: { name: string; ref: string }[] = [];
   try {
     for (const [name, value] of Object.entries(env)) {
-      if (credentialFingerprints.length >= 32) break;
+      if (credentialFingerprints.length >= ENV_CREDENTIAL_FINGERPRINT_CAP) break;
       if (typeof value !== 'string' || value.length < 8) continue;
       if (!CREDENTIAL_NAME_RE.test(name)) continue;
       credentialFingerprints.push({ name, ref: redactor.hashString(value) });
@@ -186,7 +200,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const scrubbedArgv = scrubArgv(opts.command, redactor);
     scrubbedCommand = scrubbedArgv.command;
     for (const fp of scrubbedArgv.fingerprints) {
-      if (credentialFingerprints.length >= 32) break;
+      if (credentialFingerprints.length >= MAX_CREDENTIAL_FINGERPRINTS) break;
       credentialFingerprints.push(fp);
     }
   } catch (err) {

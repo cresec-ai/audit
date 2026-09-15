@@ -107,13 +107,13 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | --- | --- | --- |
 | `name` | `string` | Logical server name (`--name` flag, else derived from command/initialize). |
 | `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. |
-| `command` | `string` | The wrapped command line (argv, scrubbed and re-joined with spaces); env values never included. |
+| `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
 
-**`command` argv handling.** A raw `argv.join(' ')` would leak `--api-key sk-...`,
-`--token ...`, and connection strings like `postgres://user:pass@host` straight into
-every event, the replay HTML, and export bundles. Each argv element is scrubbed before
-joining:
+**`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
+`--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`
+straight into every event, the replay HTML, and export bundles. Each argv element is
+scrubbed before joining:
 
 - an element that looks secret-shaped (`looksSecret` / `alwaysPatterns`) is replaced
   whole by `sha256:<hex>`;
@@ -121,12 +121,39 @@ joining:
   only `scheme://host/path` is kept, dropping the credential and any query/fragment;
 - an element that is (or immediately follows) a flag whose name matches
   `/(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i` — both `--token X` and
-  `--token=X` — is replaced whole by `sha256:<hex>`.
+  `--token=X` — is replaced whole by `sha256:<hex>`;
+- a `--flag=value` pair whose FLAG name does **not** match that credential-name pattern
+  still has its VALUE half scrubbed on its own (looks-secret check, then the
+  URL-userinfo check) before being re-joined as `--flag=<scrubbed-value>` — this covers
+  DSN/URL-shaped flags a fixed name list can't anticipate, e.g. `--dsn=postgres://u:p@h`
+  or `--database-url=mysql://u:p@h/db`.
 
 Every replaced or stripped piece is also recorded as a `CredentialFingerprint` on
 `identity.credential_fingerprints` (`name` is the flag name when one applied, else
 `argv[<index>]`), so a blast-radius `query` for the leaked value still finds the event
-that carried it, even though `command` itself no longer contains it.
+that carried it, even though `command` itself no longer contains it. When a piece is a
+URL's `user:pass` userinfo, the joined string is fingerprinted AND (additive) the
+password and username are each fingerprinted separately, so a query for the leaked
+password alone — without knowing the username — still matches.
+
+**`command` target-URL handling (http transport).** The `--target` URL can carry a
+credential in three different places, not just userinfo, so all three are scrubbed
+independently before the URL is recorded:
+
+- userinfo (`http://user:pass@host/...`) is stripped from the recorded URL;
+- each PATH segment that looks secret-shaped (`looksSecret`) — the shape hosted-MCP
+  endpoints use, e.g. `https://host/mcp/sk-.../sse` — is replaced in place by
+  `sha256:<hex>`, leaving the rest of the path intact;
+- the entire QUERY STRING and fragment are dropped from the recorded URL
+  unconditionally (e.g. `?api_key=...`, `?token=...`) — there is no safe subset of a
+  query string to keep once any single parameter can be a bearer credential.
+
+The real upstream connection still uses the original, unscrubbed target URL; only the
+copy stamped on events is affected. Every stripped/replaced piece (userinfo — joined
+and, additively, user/password separately — each secret-shaped path segment, each
+secret-shaped query value) is recorded as a `CredentialFingerprint` on
+`identity.credential_fingerprints`, named `target_url_userinfo`, `target_url_path[<i>]`,
+or `target_url_query.<key>` respectively.
 
 ### `Attributes`
 

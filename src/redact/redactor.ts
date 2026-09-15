@@ -347,13 +347,33 @@ export class Redactor implements RedactorLike {
 /* tool_call.arguments lockdown (P0)                                    */
 /* -------------------------------------------------------------------- */
 
+/** Exact shape of a genuine `RedactedRef.ref` — matches `Redactor.hashString()`'s output. */
+const SHA256_REF_RE = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * Structural check for "already an opaque RedactedRef" — used to avoid
+ * re-hashing a ref lockdownStrings has already produced. This is duck-typed
+ * (scrubToolArguments must work with any RedactorLike, not just the concrete
+ * Redactor class — see its own doc comment), so it does NOT prove the value
+ * is trustworthy on its own (P1 fix): in `--redact off`, an attacker-supplied
+ * `arguments` object shaped like `{redacted: true, ref: "<anything>", len: N}`
+ * used to be accepted at face value and everything under it — siblings,
+ * nested plaintext — was left readable. Requiring `ref` to match the EXACT
+ * sha256:<hex> shape closes that: any raw string of that shape is itself a
+ * >=32-char hex run, which `alwaysPatterns` (the long-hex-blob rule) already
+ * hashes in EVERY mode during the `scrub()` pass that runs before this ever
+ * sees the tree — so a raw string field can never legitimately have this
+ * shape unless it really did come out of a redactor's own hashing.
+ */
 function isRedactedRefLike(value: unknown): value is RedactedRef {
   return (
     typeof value === 'object' &&
     value !== null &&
     !Array.isArray(value) &&
     (value as { redacted?: unknown }).redacted === true &&
-    typeof (value as { ref?: unknown }).ref === 'string'
+    typeof (value as { ref?: unknown }).ref === 'string' &&
+    SHA256_REF_RE.test((value as { ref: string }).ref) &&
+    typeof (value as { len?: unknown }).len === 'number'
   );
 }
 
@@ -414,8 +434,13 @@ function flagName(arg: string): string | undefined {
 }
 
 /** A URL carrying userinfo: strip it, keep scheme+host+path. Undefined if
- *  `s` isn't a URL, or is one without userinfo. */
-function stripUrlUserinfo(s: string): { stripped: string; userinfo: string } | undefined {
+ *  `s` isn't a URL, or is one without userinfo. `username`/`password` are
+ *  exposed separately (P2) alongside the joined `userinfo` so a caller can
+ *  fingerprint the password ALONE — a query for just the leaked password,
+ *  without the username, must still find it. */
+function stripUrlUserinfo(
+  s: string,
+): { stripped: string; userinfo: string; username: string; password: string } | undefined {
   let url: URL;
   try {
     url = new URL(s);
@@ -424,7 +449,12 @@ function stripUrlUserinfo(s: string): { stripped: string; userinfo: string } | u
   }
   if (!url.username && !url.password) return undefined;
   const userinfo = url.password ? `${url.username}:${url.password}` : url.username;
-  return { stripped: `${url.protocol}//${url.host}${url.pathname}`, userinfo };
+  return {
+    stripped: `${url.protocol}//${url.host}${url.pathname}`,
+    userinfo,
+    username: url.username,
+    password: url.password,
+  };
 }
 
 /**
@@ -448,15 +478,50 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
     return ref;
   };
 
+  // A url-fingerprinting helper shared by both the `--flag=value` and
+  // standalone-element branches below: records the joined `user:pass` AND
+  // (P2) the user/password components separately, so a blast-radius query
+  // for the password alone — without knowing the username — still finds it.
+  const fingerprintUrlHit = (
+    name: string,
+    hit: { userinfo: string; username: string; password: string },
+  ): void => {
+    fingerprint(name, hit.userinfo);
+    if (hit.password) fingerprint(name, hit.password);
+    if (hit.username) fingerprint(name, hit.username);
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const el = argv[i]!;
 
-    // --flag=value half carrying a credential-ish flag name.
+    // --flag=value half.
     const eq = el.indexOf('=');
     if (eq > 0 && el.startsWith('-')) {
       const fname = flagName(el.slice(0, eq));
+      const value = el.slice(eq + 1);
+      const label = fname ?? `argv[${i}]`;
+
       if (fname !== undefined && CREDENTIAL_FLAG_RE.test(fname)) {
-        out.push(el.slice(0, eq + 1) + fingerprint(fname, el.slice(eq + 1)));
+        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
+        continue;
+      }
+
+      // P1 fix: the flag name alone isn't credential-shaped (`--dsn`,
+      // `--url`, `--database-url`, ...), but the VALUE half can still be a
+      // bare secret or a URL carrying userinfo — e.g.
+      // `--dsn=postgres://user:pass@host` or `--url=https://u:p@host`. The
+      // whole-element checks below never fire here because `new URL(el)`
+      // throws on a `--flag=...` string, so the value half must be checked
+      // on its own, and the `--flag=` prefix re-joined onto the scrubbed
+      // result.
+      if (looksSecret(value)) {
+        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
+        continue;
+      }
+      const eqUrlHit = stripUrlUserinfo(value);
+      if (eqUrlHit !== undefined) {
+        fingerprintUrlHit(label, eqUrlHit);
+        out.push(el.slice(0, eq + 1) + eqUrlHit.stripped);
         continue;
       }
     }
@@ -475,7 +540,7 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
 
     const urlHit = stripUrlUserinfo(el);
     if (urlHit !== undefined) {
-      fingerprint(`argv[${i}]`, urlHit.userinfo);
+      fingerprintUrlHit(`argv[${i}]`, urlHit);
       out.push(urlHit.stripped);
       continue;
     }

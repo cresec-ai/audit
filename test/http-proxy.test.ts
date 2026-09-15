@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Recorder } from '../src/capture/recorder.js';
+import { sha256Ref } from '../src/chain/hash.js';
 import { Signer } from '../src/chain/keys.js';
 import { runHttpProxy } from '../src/proxy/http.js';
 import { Redactor } from '../src/redact/redactor.js';
@@ -557,5 +558,94 @@ describe('runHttpProxy', () => {
       expect(e.server.command).not.toContain('sup3rSecr3t');
       expect(e.server.command.startsWith('http://')).toBe(true);
     }
+
+    // P2: the password is fingerprinted separately from the joined
+    // "user:pass" string, so a blast-radius query for the leaked PASSWORD
+    // ALONE — without knowing the username — still finds the event.
+    const passwordHash = sha256Ref('sup3rSecr3t');
+    const userHash = sha256Ref('svcuser');
+    const hitPassword = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === passwordHash),
+    );
+    const hitUser = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === userHash),
+    );
+    expect(hitPassword).toBe(true);
+    expect(hitUser).toBe(true);
+  });
+
+  /* --- P1: hosted-MCP URLs sometimes carry the credential in the PATH
+   * (`https://host/mcp/sk-.../sse`) or QUERY STRING (`?api_key=...`,
+   * `?token=...`) rather than userinfo. Previously only userinfo was
+   * stripped, so both shapes landed readable in ServerContext.command on
+   * every event (session_start, rpc, session_end, ...), in replay and in
+   * export bundles. */
+  it('never stores a credential embedded in the target URL PATH (hosted-MCP shape)', async () => {
+    const target = await startJsonTarget(); // .../mcp
+    const secretSegment = 'sk-ak-1234567890abcdefXYZ';
+    const withPathCred = target.url + '/' + secretSegment + '/sse';
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(withPathCred, dataDir);
+
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(secretSegment);
+
+    for (const e of events) {
+      expect(e.server.command).not.toContain(secretSegment);
+      expect(e.server.command.startsWith('http://')).toBe(true);
+    }
+
+    // A blast-radius query for the path-embedded credential still finds it.
+    const needleHash = sha256Ref(secretSegment);
+    const hit = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === needleHash),
+    );
+    expect(hit).toBe(true);
+  });
+
+  it('never stores credentials in the target URL QUERY STRING, and drops the query entirely', async () => {
+    const target = await startJsonTarget(); // .../mcp
+    const apiKey = 'AKIAABCDEFGHIJKLMNOP';
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz1234';
+    const withQueryCreds = `${target.url}?api_key=${apiKey}&token=${token}`;
+
+    const dataDir = tmpDataDir();
+    const proxy = await startProxy(withQueryCreds, dataDir);
+
+    const res = await post(proxy.url, initializeMsg);
+    expect(res.status).toBe(200);
+    await proxy.close();
+
+    const events = loadEvents(dataDir);
+    expect(events.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(apiKey);
+    expect(serialized).not.toContain(token);
+
+    for (const e of events) {
+      // The query string is dropped entirely, not merely scrubbed in place.
+      expect(e.server.command).not.toContain('?');
+      expect(e.server.command).not.toContain(apiKey);
+      expect(e.server.command).not.toContain(token);
+      expect(e.server.command).toBe(target.url);
+    }
+
+    const apiKeyHash = sha256Ref(apiKey);
+    const tokenHash = sha256Ref(token);
+    const hitApiKey = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === apiKeyHash),
+    );
+    const hitToken = events.some((e) =>
+      e.identity.credential_fingerprints?.some((f) => f.ref === tokenHash),
+    );
+    expect(hitApiKey).toBe(true);
+    expect(hitToken).toBe(true);
   });
 });
