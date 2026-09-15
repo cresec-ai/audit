@@ -86,7 +86,8 @@ export interface EventBase {
     schema: SchemaId;
     /** UUID v4, unique per event. */
     event_id: string;
-    /** UUID v4, one per proxy process lifetime. */
+    /** UUID v4, one per proxy process lifetime — or, for hook-captured events,
+     *  one per Claude Code session (the hook input's own `session_id`). */
     session_id: string;
     /** ISO-8601 UTC with milliseconds. */
     timestamp: string;
@@ -94,6 +95,13 @@ export interface EventBase {
     identity: IdentityContext;
     server: ServerContext;
     attributes: Attributes;
+    /**
+     * Additive optional field (schema stays v1). Set to `'hook'` when this
+     * event was captured by `mcp-recorder hook` — a Claude Code PreToolUse /
+     * PostToolUse / SessionEnd / Stop hook — rather than the stdio/http proxy
+     * tap. Undefined on every proxy-captured event.
+     */
+    source?: 'hook';
 }
 /** Proxy process started; carries the redaction policy in force. */
 export interface SessionStartEvent extends EventBase {
@@ -134,6 +142,13 @@ export interface ToolCallEvent extends EventBase {
     };
     /** Wall-clock ms between request and response crossing the proxy. */
     duration_ms: number;
+    /**
+     * Additive optional field (schema stays v1). `mcp-recorder hook` records a
+     * tool call as two separate correlated events sharing `request_id` — this
+     * says which half. Undefined for proxy-captured tool_call events, which
+     * are already request+response correlated into a single event.
+     */
+    phase?: 'pre' | 'post';
 }
 /** Any other correlated JSON-RPC request/response (tools/list, resources/read, ...). */
 export interface RpcEvent extends EventBase {
