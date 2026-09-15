@@ -6,10 +6,12 @@ format, see [docs/event-schema.md](event-schema.md).
 
 ## Requirements
 
-- **Node.js >= 18.17** (macOS or Linux). Check with `node --version`.
-- **macOS or Linux.** Windows is not supported yet: the proxy spawns the
-  wrapped command directly (no shell), and on Windows that breaks `npx` and
-  other `.cmd`/`.bat` shims. If you're on Windows, use WSL for now.
+- **Node.js >= 20.** Check with `node --version`.
+- **macOS, Linux, or Windows** — Windows is supported natively (CI-tested on
+  `windows-latest`): the proxy resolves `.cmd`/`.bat` shims (like `npx`)
+  through `cmd.exe` itself, no shell required in your config. Running
+  entirely inside WSL works too — see **[Windows and WSL](#windows-and-wsl)**
+  below for the two ways to set it up.
 - No database to run, no account, no network access required. Everything is
   local files under a data directory (default `~/.mcp-recorder`).
 
@@ -35,12 +37,6 @@ Install straight from the repository. `npm install` runs the package's
 build step needed.
 
 ```sh
-npm install -g github:cresec-ai/audit#claude/p0-subagents-scoping-qibt2p
-```
-
-Once this branch merges, the equivalent from `main` will be:
-
-```sh
 npm install -g github:cresec-ai/audit#main
 ```
 
@@ -57,7 +53,7 @@ and invoke it from a local clone instead:
 
 ```sh
 git clone https://github.com/cresec-ai/audit.git
-cd audit && git checkout claude/p0-subagents-scoping-qibt2p
+cd audit
 npm ci   # runs `prepare` -> builds dist/
 node dist/cli.js --version
 ```
@@ -79,19 +75,27 @@ mcp-recorder setup --client claude-desktop
 ```
 
 ```
-mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] [--wrapper local|npx]
+mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] [--wrapper local|npx|wsl]
                    [--only NAME[,NAME...]] [--except NAME[,NAME...]] [--data-dir D] [--dry-run] [--undo] [--json]
 ```
 
 - `--client` picks the config file automatically:
-  - `claude-desktop`: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `~/.config/Claude/claude_desktop_config.json` (Linux)
+  - `claude-desktop`: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%\Claude\claude_desktop_config.json` (Windows), or `~/.config/Claude/claude_desktop_config.json` (Linux)
   - `claude-code`: `~/.claude.json`, or a project's `.mcp.json`
   - `cursor`: `~/.cursor/mcp.json`
   - `--config PATH` overrides the resolved path.
+  - Running inside **WSL**: if the Linux-side path above doesn't exist,
+    `setup` automatically looks for it on the **Windows** side instead (e.g.
+    `/mnt/c/Users/<you>/AppData/Roaming/Claude/claude_desktop_config.json`)
+    — see [Windows and WSL](#windows-and-wsl) below.
 - `--wrapper local` (the default) points at this Node binary and this
-  install's `dist/cli.js` by absolute path — the form that works before
-  publish. `--wrapper npx` writes the future `npx -y @edut/mcp-recorder` form
-  (use it once the package is on npm).
+  install's `dist/cli.js` by absolute path. `--wrapper npx` writes the
+  `npx -y @edut/mcp-recorder` form (once the package is on npm). `--wrapper
+  wsl` writes a `wsl.exe -e node ...` form so a **Windows** client can launch
+  a server that actually runs inside **WSL**; from inside WSL, `setup`
+  auto-selects it for you whenever the resolved config is a Windows-side
+  file (see [Windows and WSL](#windows-and-wsl)) — you don't need to pass it
+  by hand in that case.
 - `--only NAME,...` / `--except NAME,...` limit which server entries get
   wrapped; entries that are already `url`/`http` (not stdio) are always
   skipped, and an already-wrapped entry is never wrapped twice.
@@ -253,6 +257,135 @@ restart** the client afterward (closing the window is not enough for Claude
 Desktop; also true for Cursor). MCP servers are only launched at startup, so
 a running client keeps using its old, unwrapped process until it's relaunched.
 
+## Windows and WSL
+
+**Claude Desktop is a Windows program** — even if you also have WSL
+installed, Claude Desktop itself runs on Windows and its config
+(`claude_desktop_config.json`) lives under your Windows profile, not inside
+any WSL distro. That means the MCP servers it launches run as Windows
+processes too, by default. You have two options, and they can be mixed
+per-server (`--only`/`--except`).
+
+### Option 1 — recorder on Windows
+
+Run everything on the Windows side; WSL doesn't come into it at all.
+
+1. Install Node.js >= 20 on Windows (from [nodejs.org](https://nodejs.org) or
+   `winget install OpenJS.NodeJS.LTS`).
+2. In **PowerShell**:
+
+   ```powershell
+   npm install -g github:cresec-ai/audit#main
+   mcp-recorder setup --client claude-desktop --dry-run
+   mcp-recorder setup --client claude-desktop
+   ```
+
+3. Restart Claude Desktop. Sessions land under `%USERPROFILE%\.mcp-recorder`
+   (override with `--data-dir` or `MCP_RECORDER_DATA_DIR`, same as anywhere
+   else). Run `mcp-recorder sessions` / `ui` / `verify` from PowerShell too.
+
+This is the simplest option, and the only one that works for a server that's
+Windows-only (something that shells out to a `.exe`, for instance).
+
+### Option 2 — recorder and servers inside WSL
+
+Keep your servers (and the recorder) running inside WSL — useful if your
+servers, their dependencies, or your usual dev environment already live
+there. From inside WSL:
+
+```sh
+mcp-recorder setup --client claude-desktop --dry-run
+mcp-recorder setup --client claude-desktop
+```
+
+Since Claude Desktop's config isn't on the Linux side, `setup` looks for it
+on the Windows side instead — under
+`/mnt/c/Users/<you>/AppData/Roaming/Claude/claude_desktop_config.json` — and,
+finding it, automatically writes the `--wrapper wsl` form instead of the
+ordinary local-node form (a plain Linux `node` path in `command` would be
+meaningless to a Windows process). The result looks like this:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "wsl.exe",
+      "args": [
+        "-d", "Ubuntu-22.04", "-e",
+        "/home/you/.nvm/versions/node/v20.18.0/bin/node",
+        "/home/you/audit/dist/cli.js",
+        "record", "--name", "filesystem", "--data-dir", "/home/you/.mcp-recorder",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"
+      ]
+    }
+  }
+}
+```
+
+Claude Desktop spawns `wsl.exe`, which launches the recorder (and the server
+behind it) inside your WSL distro. Consequences worth knowing:
+
+- **The wrapped server now runs inside WSL**, so any paths in its own
+  args must be *Linux* paths (`/home/you/projects`, not
+  `C:\Users\you\projects`) — `setup` never rewrites the original server's
+  own arguments, only wraps around them.
+- **A Windows-only server can't go through this path** — if one of your
+  servers shells out to a `.exe` or otherwise needs to run on Windows, wrap
+  it with Option 1 instead and use `--except <name>` here (or `--only` on
+  the Windows side) to split the set.
+- **Env vars are forwarded via `WSLENV`.** wsl.exe only passes a Windows
+  environment variable through to the WSL process when its name is listed
+  in the `WSLENV` variable; `setup` adds any keys your server's `env` block
+  already had to `WSLENV` automatically, so this is handled for you — you
+  don't need to set `WSLENV` yourself for a server `setup` wrapped.
+- **The data dir is the Linux-side one** (`~/.mcp-recorder` inside your
+  distro, always passed explicitly with `--data-dir` since `wsl.exe -e`
+  launches the target directly — with no shell in the loop, `~` is never
+  expanded). Run `mcp-recorder sessions` / `ui` / `verify` / `export` from
+  inside WSL, not PowerShell.
+
+**Troubleshooting a WSL-wrapped server:** copy the exact `command`/`args`
+from the config and run it from PowerShell yourself — this surfaces stderr a
+client's UI usually hides:
+
+```powershell
+wsl.exe -d Ubuntu-22.04 -e /home/you/.nvm/versions/node/v20.18.0/bin/node /home/you/audit/dist/cli.js record --name filesystem --data-dir /home/you/.mcp-recorder -- npx -y @modelcontextprotocol/server-filesystem /home/you/projects
+```
+
+A couple of things that specifically trip people up here:
+
+- **nvm and similar Node version managers.** If `node` itself came from nvm,
+  its directory usually isn't on the `PATH` a non-interactive `wsl.exe -e`
+  launch sees, which can break `npx` resolution for the *wrapped* server.
+  The recorder appends its own Node's directory to the wrapped child's
+  `PATH` for exactly this reason, so `npx` still resolves even in that
+  environment — but if you've swapped Node versions since running `setup`,
+  re-run it so the baked-in `node` path (`process.execPath`, resolved at
+  `setup` time) still points somewhere real.
+- **`wsl.exe -e` needs absolute paths** — it does not go through a shell, so
+  there's no `~` expansion and no `PATH` search for the program it launches
+  directly (`node`, here). `setup` always writes absolute paths for exactly
+  this reason; if you hand-edit this form, keep them absolute.
+
+### Cursor
+
+Same two options, same reasoning — Cursor on Windows reads
+`~/.cursor/mcp.json` under your Windows profile:
+
+- **Option 1** (recorder on Windows): `mcp-recorder setup --client cursor`
+  from PowerShell.
+- **Option 2** (recorder in WSL): `mcp-recorder setup --client cursor` from
+  WSL — `setup` finds `/mnt/c/Users/<you>/.cursor/mcp.json` on the Windows
+  side the same way, and wraps it with the same `wsl.exe` form.
+
+### Claude Code in WSL
+
+Nothing special here — Claude Code running inside WSL is a plain Linux
+install using `~/.claude.json` (or a project's `.mcp.json`) on the Linux
+side, same as any other Linux setup. There's no separate Windows-side config
+for it to fall back to.
+
 ## Install with Claude
 
 You can hand the install off to Claude itself — Claude Desktop or Claude
@@ -262,7 +395,7 @@ Code — with a prompt like this. Copy it in as-is:
 Install @edut/mcp-recorder and wrap my MCP servers with it.
 
 1. It isn't on npm yet, so install it from git:
-   npm install -g github:cresec-ai/audit#claude/p0-subagents-scoping-qibt2p
+   npm install -g github:cresec-ai/audit#main
    Confirm with: mcp-recorder --version
 
 2. Run `mcp-recorder setup --client <claude-desktop|claude-code|cursor> --dry-run`
@@ -273,6 +406,10 @@ Install @edut/mcp-recorder and wrap my MCP servers with it.
 
 4. Tell me to fully quit and restart the client — closing the window is not
    enough, the MCP servers only reload on relaunch.
+
+If I'm on Windows or WSL, follow the Windows and WSL section of
+docs/install.md and tell me which option you're using before changing
+anything.
 
 Do not skip the dry-run step, and do not silently pick a client if more than
 one config file is present.
@@ -388,9 +525,13 @@ recorded. If the problem persists with this set, it isn't the recorder.
 the MCP wire) — everything it logs is prefixed `[mcp-recorder]` on stderr.
 Claude Desktop and Cursor both keep per-server log files; check those first.
 
-**Windows.** Not supported yet — the proxy spawns the wrapped command
-without a shell, which breaks `npx`/`.cmd` shims on Windows. Use WSL, or
-wait for native Windows support.
+**Windows.** Supported natively — the proxy resolves `.cmd`/`.bat` shims
+(like `npx`) through `cmd.exe` itself, no shell needed in your config. If a
+wrapped server won't start, run the exact `command`/`args` from the config
+directly in PowerShell to see its real output, same as the Linux/macOS
+troubleshooting step above. Running inside WSL instead (recorder and servers
+on the Linux side, `wsl.exe`-wrapped for a Windows client) has its own
+troubleshooting notes — see [Windows and WSL](#windows-and-wsl).
 
 ## Cloud coding agents
 

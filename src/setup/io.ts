@@ -32,6 +32,15 @@ export function sidecarPath(configPath: string): string {
   return configPath + SIDECAR_SUFFIX;
 }
 
+/** Strip a leading UTF-8 BOM (U+FEFF), if present, before handing text to
+ * `JSON.parse` — common on config files written by Windows tools (e.g. a
+ * Windows-side client config found from WSL, see src/setup/wsl.ts), which
+ * `JSON.parse` otherwise rejects outright. Writes in this module never add
+ * one back (`atomicWriteFile`/`writeJsonAtomic` emit plain UTF-8). */
+export function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
 function backupPathFor(configPath: string, now: Date): string {
   return `${configPath}.bak-${now.toISOString().replace(/:/g, '-')}`;
 }
@@ -64,7 +73,7 @@ export function writeBackup(configPath: string): string {
 export function readSidecarStrict(configPath: string): SetupSidecar | undefined {
   const p = sidecarPath(configPath);
   if (!existsSync(p)) return undefined;
-  return JSON.parse(readFileSync(p, 'utf8')) as SetupSidecar;
+  return JSON.parse(stripBom(readFileSync(p, 'utf8'))) as SetupSidecar;
 }
 
 export function writeSidecarAtomic(configPath: string, sidecar: SetupSidecar, indent: string): void {

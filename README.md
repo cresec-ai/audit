@@ -11,7 +11,7 @@ AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--", "npx", "-y
 
 That's the whole integration. The proxy forwards bytes unchanged, fails open (recording failure never breaks traffic), and adds <5ms p50 latency.
 
-- **License:** GPL-3.0 · **Node:** >= 18.17 (macOS/Linux — Windows not yet) · **Binary:** `mcp-recorder`
+- **License:** GPL-3.0 · **Node:** >= 20 (macOS, Linux, Windows; WSL supported via wsl.exe wrapper) · **Binary:** `mcp-recorder`
 
 ---
 
@@ -22,7 +22,7 @@ resolve for anyone today. Install from the git repository instead — `npm
 install` builds it for you, no manual build step:
 
 ```sh
-npm install -g github:cresec-ai/audit#claude/p0-subagents-scoping-qibt2p
+npm install -g github:cresec-ai/audit#main
 mcp-recorder --version
 ```
 
@@ -40,7 +40,9 @@ diff, then apply it — Claude just needs a shell/terminal or config-file
 access to do this for you.
 
 Full instructions (manual JSON edits per client, uninstall, troubleshooting)
-are in **[docs/install.md](docs/install.md)**.
+are in **[docs/install.md](docs/install.md)** — on Windows, or running from
+inside WSL, see its **[Windows and WSL](docs/install.md#windows-and-wsl)**
+section first.
 
 ## 60-second quickstart
 
@@ -172,7 +174,7 @@ mcp-recorder [record] [options] -- <server command...>
 | `mcp-recorder ui [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--port P] [--out FILE] [--no-open] [--public-key K] [--allow-unsigned]` | Serve the HTML replay timeline (or write it to a file with `--out`). Opens your default browser to the served URL unless `--no-open` is set, `--out` is used, or the host looks headless. The integrity banner is resolved the same way as `verify` (same default `identity.pub` pin, same `--public-key`/`--allow-unsigned`), so it never shows green for a chain `verify` would reject. |
 | `mcp-recorder export [--data-dir D] [--store sqlite\|jsonl] [--session ID] [--out FILE.zip] [--dir DIR]` | Produce a signed evidence bundle as a ZIP or plain directory. `--session` accepts a unique id prefix, the same short id `sessions` prints. Requires an existing `identity.key` in the data dir — it signs with the key that actually produced the chain, never minting a fresh one, so exit 2 on a data dir with no key (e.g. a store copied without it). |
 | `mcp-recorder http --target URL [--port P]` | Recording proxy for HTTP-transport MCP servers. |
-| `mcp-recorder setup --client claude-desktop\|claude-code\|cursor [--config PATH] [--wrapper local\|npx] [--only N,...] [--except N,...] [--data-dir D] [--dry-run] [--undo] [--json]` | Wrap every stdio MCP server in a client's config behind the recorder — safely (a timestamped backup + a sidecar recording the originals) and reversibly (`--undo`). `--config` overrides the resolved path (and makes `--client` optional). `--wrapper local` (default) points at this install's own `dist/cli.js`; `--wrapper npx` writes the published-package form. `--dry-run` previews without writing. See [docs/install.md](docs/install.md) for the full walkthrough. |
+| `mcp-recorder setup --client claude-desktop\|claude-code\|cursor [--config PATH] [--wrapper local\|npx\|wsl] [--only N,...] [--except N,...] [--data-dir D] [--dry-run] [--undo] [--json]` | Wrap every stdio MCP server in a client's config behind the recorder — safely (a timestamped backup + a sidecar recording the originals) and reversibly (`--undo`). `--config` overrides the resolved path (and makes `--client` optional). `--wrapper local` (default) points at this install's own `dist/cli.js`; `--wrapper npx` writes the published-package form; `--wrapper wsl` writes a `wsl.exe`-launched form for a Windows client whose server should run inside WSL, auto-selected when `setup` runs inside WSL against a Windows-side config (see [docs/install.md#windows-and-wsl](docs/install.md#windows-and-wsl)). `--dry-run` previews without writing. See [docs/install.md](docs/install.md) for the full walkthrough. |
 
 `--help`/`-h` and `--version`/`-V` work on every invocation.
 

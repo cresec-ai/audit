@@ -34,11 +34,14 @@ import {
   readSidecarStrict,
   removeSidecar,
   sidecarPath,
+  stripBom,
   writeBackup,
   writeJsonAtomic,
   writeSidecarAtomic,
 } from './setup/io.js';
 import type { SetupSidecar } from './setup/io.js';
+import { chooseWrapper, detectWsl, isWindowsMountPath, windowsHomeCandidates } from './setup/wsl.js';
+import type { WrapperChoice } from './setup/wsl.js';
 import { planWrap, structuralUnwrap } from './setup/wrap.js';
 import type { McpServersMap, SkipEntry, WrapOpts, WrapPlan } from './setup/wrap.js';
 import { openStore, openStoreReadOnly } from './store/index.js';
@@ -87,11 +90,14 @@ Usage:
   mcp-recorder http     --target URL [--port N] [flags]
       transparent streamable-HTTP proxy in front of an HTTP MCP server
   mcp-recorder setup    --client <claude-desktop|claude-code|cursor> [--config PATH]
-                        [--wrapper local|npx] [--only N,...] [--except N,...]
+                        [--wrapper local|npx|wsl] [--only N,...] [--except N,...]
                         [--data-dir D] [--dry-run] [--undo] [--json]
       wrap every stdio MCP server in a client's config behind this recorder,
       safely (timestamped backup + sidecar) and reversibly (--undo). --config
-      overrides the resolved path and makes --client optional
+      overrides the resolved path and makes --client optional. Inside WSL,
+      when the resolved config belongs to a Windows-side client, --wrapper
+      wsl is auto-selected (spawns the wrapped server via wsl.exe so a
+      Windows client can actually launch it) unless --wrapper is given
   mcp-recorder --help | --version
 
 Flags:
@@ -110,7 +116,8 @@ Flags:
   --json          machine-readable output (verify / query / sessions / setup)
   --client C      setup: claude-desktop | claude-code | cursor
   --config PATH   setup: config file to edit (overrides --client's default)
-  --wrapper W     setup: local (default, this install) | npx (published form)
+  --wrapper W     setup: local (default, this install) | npx (published form) |
+                   wsl (wsl.exe, auto-selected for a Windows-side config in WSL)
   --only N,...    setup: wrap only these server names
   --except N,...  setup: wrap every server except these names
   --dry-run       setup: print what would change; write nothing
@@ -1248,6 +1255,10 @@ function printSetupHuman(configPath: string, backup: string | null, plan: WrapPl
     out('');
     out(`already wrapped, left alone: ${plan.alreadyWrapped.join(', ')}`);
   }
+  if (plan.notes.length > 0) {
+    out('');
+    for (const n of plan.notes) out(`note: ${n}`);
+  }
   if (plan.skipped.length > 0) {
     out('');
     out('skipped:');
@@ -1410,11 +1421,16 @@ async function cmdSetup(flags: Flags): Promise<void> {
   }
   const client = clientFlag as ClientKind | undefined;
 
-  const wrapperFlag = asStr(flags['wrapper']) ?? 'local';
-  if (wrapperFlag !== 'local' && wrapperFlag !== 'npx') {
-    err(`setup: invalid --wrapper '${wrapperFlag}' (expected 'local' or 'npx')`);
+  const wrapperFlagRaw = asStr(flags['wrapper']);
+  if (
+    wrapperFlagRaw !== undefined &&
+    wrapperFlagRaw !== 'local' &&
+    wrapperFlagRaw !== 'npx' &&
+    wrapperFlagRaw !== 'wsl'
+  ) {
+    err(`setup: invalid --wrapper '${wrapperFlagRaw}' (expected 'local', 'npx' or 'wsl')`);
   }
-  const wrapper = wrapperFlag as 'local' | 'npx';
+  const explicitWrapper = wrapperFlagRaw as WrapperChoice | undefined;
 
   const dataDir = asStr(flags['data-dir']);
   const dryRun = flags['dry-run'] === true;
@@ -1423,9 +1439,17 @@ async function cmdSetup(flags: Flags): Promise<void> {
   const only = parseNameList(asStr(flags['only']));
   const except = parseNameList(asStr(flags['except']));
 
+  // Cheap (env vars + one /proc/version read, no process spawned) — safe to
+  // always compute, unlike windowsHomeCandidates() below which may shell
+  // out to cmd.exe and is only invoked lazily, when actually needed.
+  const wslInfo = detectWsl(process.env, (p) => readFileSync(p, 'utf8'));
+
   let resolved: ReturnType<typeof resolveClientConfigPath>;
   try {
-    resolved = resolveClientConfigPath(client, asStr(flags['config']), process.cwd());
+    resolved = resolveClientConfigPath(client, asStr(flags['config']), process.cwd(), {
+      inWsl: wslInfo.inWsl,
+      homeCandidates: () => windowsHomeCandidates(),
+    });
   } catch (cause) {
     err(cause instanceof Error ? cause.message : String(cause));
   }
@@ -1442,12 +1466,15 @@ async function cmdSetup(flags: Flags): Promise<void> {
   let parsed: unknown;
   try {
     raw = readFileSync(configPath, 'utf8');
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripBom(raw));
   } catch (cause) {
     const msg = cause instanceof Error ? cause.message : String(cause);
     diag(`error: ${configPath} is not valid JSON: ${msg}`);
     process.exitCode = 2;
     return;
+  }
+  if (raw.charCodeAt(0) === 0xfeff) {
+    diag(`note: ${configPath} starts with a UTF-8 BOM (common on Windows) — parsed fine, rewritten without one`);
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     diag(`error: ${configPath} does not contain a JSON object`);
@@ -1468,10 +1495,26 @@ async function cmdSetup(flags: Flags): Promise<void> {
   }
 
   const localWrapperPath = resolveLocalWrapperPath();
+
+  const wrapper = chooseWrapper(explicitWrapper, wslInfo.inWsl, configPath);
+  if (explicitWrapper === undefined && wrapper === 'wsl') {
+    diag(
+      `auto-selected --wrapper wsl: running inside WSL and ${configPath} is a Windows-side config ` +
+        '(under /mnt/...) — a Linux node path would not be runnable by that client (pass --wrapper to override)',
+    );
+  }
+  if (explicitWrapper === 'local' && isWindowsMountPath(configPath)) {
+    diag(
+      `warning: --wrapper local writes a Linux node path into a Windows-side config (${configPath}); ` +
+        'the Windows client will not be able to launch it — did you mean --wrapper wsl?',
+    );
+  }
+
   const wrapOpts: WrapOpts = { wrapper, localWrapperPath };
   if (dataDir !== undefined) wrapOpts.dataDir = dataDir;
   if (only !== undefined) wrapOpts.only = only;
   if (except !== undefined) wrapOpts.except = except;
+  if (wslInfo.distro !== undefined) wrapOpts.wslDistro = wslInfo.distro;
 
   const plan = planWrap(servers, wrapOpts);
 

@@ -1,12 +1,19 @@
 import { execFileSync, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { spawnTsx } from './helpers/tsx.js';
+import {
+  buildWrappedEntry,
+  isAlreadyWrapped,
+  mergeWslEnv,
+  structuralUnwrap,
+} from '../src/setup/wrap.js';
+import type { ServerEntry as WrapServerEntry } from '../src/setup/wrap.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ECHO_SERVER = fileURLToPath(new URL('./fixtures/echo-server.cjs', import.meta.url));
@@ -536,4 +543,312 @@ describe('mcp-recorder setup', () => {
       expect(list[0]!.tool_call_count).toBe(1);
     }, 60_000);
   });
+});
+
+/* ----------------------------- wrapper: 'wsl' ------------------------------
+ * Pure-function coverage for the wsl.exe wrapper form (src/setup/wrap.ts) —
+ * no client, no real wsl.exe/cmd.exe, direct imports like the rest of the
+ * codebase's unit tests (see test/redact.test.ts, test/config.test.ts).
+ */
+
+describe('wrapper: wsl (buildWrappedEntry / mergeWslEnv)', () => {
+  const LOCAL_WRAPPER = '/install/dist/cli.js';
+
+  it('produces "wsl.exe -d <distro> -e <node> <wrapper> record --name N --data-dir D -- <original>"', () => {
+    const original: WrapServerEntry = {
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+    };
+    const entry = buildWrappedEntry('filesystem', original, {
+      wrapper: 'wsl',
+      localWrapperPath: LOCAL_WRAPPER,
+      wslDistro: 'Ubuntu-22.04',
+    });
+    expect(entry.command).toBe('wsl.exe');
+    expect(entry.args).toEqual([
+      '-d',
+      'Ubuntu-22.04',
+      '-e',
+      process.execPath,
+      LOCAL_WRAPPER,
+      'record',
+      '--name',
+      'filesystem',
+      '--data-dir',
+      join(homedir(), '.mcp-recorder'),
+      '--',
+      'npx',
+      '-y',
+      '@modelcontextprotocol/server-filesystem',
+      '/tmp',
+    ]);
+    expect(entry.env).toBeUndefined();
+  });
+
+  it('omits the "-d" pair entirely when the distro is unknown', () => {
+    const original: WrapServerEntry = { command: 'node', args: ['server.js'] };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    expect(entry.args!.slice(0, 2)).toEqual(['-e', process.execPath]);
+    expect(entry.args).not.toContain('-d');
+  });
+
+  it('an explicit --data-dir is used verbatim instead of the ~/.mcp-recorder default', () => {
+    const original: WrapServerEntry = { command: 'node', args: ['server.js'] };
+    const entry = buildWrappedEntry('custom', original, {
+      wrapper: 'wsl',
+      localWrapperPath: LOCAL_WRAPPER,
+      dataDir: '/custom/data',
+    });
+    const i = entry.args!.indexOf('--data-dir');
+    expect(entry.args![i + 1]).toBe('/custom/data');
+  });
+
+  it('--data-dir is always present, even when nothing was requested (wsl.exe -e never expands ~)', () => {
+    const original: WrapServerEntry = { command: 'node', args: ['server.js'] };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    expect(entry.args).toContain('--data-dir');
+  });
+
+  it('no env on the original entry -> no env on the wrapped entry', () => {
+    const original: WrapServerEntry = { command: 'node', args: ['server.js'] };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    expect(entry.env).toBeUndefined();
+  });
+
+  it('carries env over unchanged and adds a fresh WSLENV listing every key', () => {
+    const original: WrapServerEntry = { command: 'node', args: ['server.js'], env: { FOO: 'x', BAR: 'y' } };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    expect(entry.env).toEqual({ FOO: 'x', BAR: 'y', WSLENV: 'FOO:BAR' });
+  });
+
+  it('merges into an existing WSLENV without duplicating a key or losing its /flags', () => {
+    const original: WrapServerEntry = {
+      command: 'node',
+      args: ['server.js'],
+      env: { FOO: 'x', BAR: 'y', WSLENV: 'FOO/p:BAR' },
+    };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    // FOO and BAR are both already listed (FOO with its /p flag preserved) —
+    // nothing new to add, so WSLENV is unchanged.
+    expect(entry.env).toEqual({ FOO: 'x', BAR: 'y', WSLENV: 'FOO/p:BAR' });
+  });
+
+  it('extends an existing WSLENV with only the genuinely new keys', () => {
+    const original: WrapServerEntry = {
+      command: 'node',
+      args: ['server.js'],
+      env: { FOO: 'x', BAZ: 'z', WSLENV: 'FOO/p' },
+    };
+    const entry = buildWrappedEntry('custom', original, { wrapper: 'wsl', localWrapperPath: LOCAL_WRAPPER });
+    expect(entry.env).toEqual({ FOO: 'x', BAZ: 'z', WSLENV: 'FOO/p:BAZ' });
+  });
+});
+
+describe('mergeWslEnv', () => {
+  it('starts fresh (colon-joined) when there is no existing WSLENV', () => {
+    expect(mergeWslEnv(undefined, ['FOO', 'BAR'])).toBe('FOO:BAR');
+  });
+  it('treats an empty existing value the same as undefined', () => {
+    expect(mergeWslEnv('', ['FOO'])).toBe('FOO');
+  });
+  it('does not duplicate a key that is already listed, /flags and all', () => {
+    expect(mergeWslEnv('FOO/p:BAR', ['FOO', 'BAR', 'BAZ'])).toBe('FOO/p:BAR:BAZ');
+  });
+  it('no new keys leaves the existing value untouched', () => {
+    expect(mergeWslEnv('FOO:BAR', ['FOO'])).toBe('FOO:BAR');
+  });
+});
+
+describe('isAlreadyWrapped — wsl.exe prefix', () => {
+  it('recognizes localWrapperPath even behind a "wsl.exe -d <distro> -e ..." prefix', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: [
+        '-d',
+        'Ubuntu',
+        '-e',
+        '/usr/bin/node',
+        '/install/dist/cli.js',
+        'record',
+        '--name',
+        'x',
+        '--data-dir',
+        '/d',
+        '--',
+        'node',
+        'server.js',
+      ],
+    };
+    expect(isAlreadyWrapped(entry, '/install/dist/cli.js')).toBe(true);
+  });
+
+  it('a wsl.exe entry wrapping a DIFFERENT install is not "already wrapped" by this one', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: ['-e', '/usr/bin/node', '/other/install/dist/cli.js', 'record', '--name', 'x', '--', 'node', 'server.js'],
+    };
+    expect(isAlreadyWrapped(entry, '/install/dist/cli.js')).toBe(false);
+  });
+});
+
+describe('structuralUnwrap — wsl.exe form', () => {
+  it('restores command/args, stripping the full "wsl.exe -d ... -e ... record ... --" prefix', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: [
+        '-d',
+        'Ubuntu',
+        '-e',
+        '/usr/bin/node',
+        '/install/dist/cli.js',
+        'record',
+        '--name',
+        'custom',
+        '--data-dir',
+        '/home/joni/.mcp-recorder',
+        '--',
+        'node',
+        'server.js',
+        '--flag',
+      ],
+    };
+    expect(structuralUnwrap(entry)).toEqual({ command: 'node', args: ['server.js', '--flag'] });
+  });
+
+  it('works without "-d" too (unknown distro)', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: [
+        '-e',
+        '/usr/bin/node',
+        '/install/dist/cli.js',
+        'record',
+        '--name',
+        'custom',
+        '--data-dir',
+        '/d',
+        '--',
+        'node',
+        'server.js',
+      ],
+    };
+    expect(structuralUnwrap(entry)).toEqual({ command: 'node', args: ['server.js'] });
+  });
+
+  it('is not confused by a "--" that appears inside the wrapped server\'s own argv', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: [
+        '-e',
+        '/usr/bin/node',
+        '/install/dist/cli.js',
+        'record',
+        '--name',
+        'custom',
+        '--data-dir',
+        '/d',
+        '--',
+        'node',
+        'server.js',
+        '--',
+        'extra',
+      ],
+    };
+    expect(structuralUnwrap(entry)).toEqual({ command: 'node', args: ['server.js', '--', 'extra'] });
+  });
+
+  it('leaves a WSLENV addition lingering in env (documented: only the sidecar restores exactly)', () => {
+    const entry: WrapServerEntry = {
+      command: 'wsl.exe',
+      args: ['-e', '/usr/bin/node', '/install/dist/cli.js', 'record', '--name', 'custom', '--data-dir', '/d', '--', 'node', 'server.js'],
+      env: { FOO: 'x', WSLENV: 'FOO' },
+    };
+    const restored = structuralUnwrap(entry);
+    expect(restored).toBeDefined();
+    expect(restored!.env).toEqual({ FOO: 'x', WSLENV: 'FOO' });
+  });
+});
+
+/* ------------------------- CLI: --wrapper wsl / BOM ------------------------ */
+
+describe('mcp-recorder setup — wsl wrapper & BOM handling (via the CLI)', () => {
+  it('--wrapper wsl --dry-run produces the wsl.exe shape; needs no real wsl.exe or cmd.exe', async () => {
+    const dir = tmpDir('mcp-rec-setup-wsl-dryrun-');
+    const configPath = writeConfig(dir, 'config.json', {
+      mcpServers: {
+        filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+      },
+    });
+    const before = readFileSync(configPath, 'utf8');
+
+    const res = await runCli([
+      'setup',
+      '--config',
+      configPath,
+      '--wrapper',
+      'wsl',
+      '--data-dir',
+      '/home/me/.mcp-recorder',
+      '--dry-run',
+    ]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain('wsl.exe');
+    expect(res.stdout).toContain('"-e"');
+    expect(res.stdout).toContain('"record"');
+    expect(res.stdout).toContain('"--data-dir"');
+    expect(res.stdout).toContain('"/home/me/.mcp-recorder"');
+
+    // --dry-run never writes anything, wsl or not.
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(existsSync(sidecarFor(configPath))).toBe(false);
+  }, 30_000);
+
+  it('--wrapper wsl --json --dry-run reports the server as wrapped', async () => {
+    const dir = tmpDir('mcp-rec-setup-wsl-json-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+
+    const res = await runCli(['setup', '--config', configPath, '--wrapper', 'wsl', '--dry-run', '--json']);
+    expect(res.code).toBe(0);
+    const result = JSON.parse(res.stdout) as { wrapped: string[] };
+    expect([...result.wrapped].sort()).toEqual(['custom', 'filesystem']);
+  }, 30_000);
+
+  it('a UTF-8 BOM at the start of the config is stripped before parsing and not written back', async () => {
+    const dir = tmpDir('mcp-rec-setup-bom-');
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, '﻿' + JSON.stringify(claudeDesktopFixture(), null, 2) + '\n');
+
+    const res = await runCli(['setup', '--config', configPath, '--json']);
+    expect(res.code).toBe(0);
+    expect(res.stderr).toMatch(/BOM/i);
+
+    const result = JSON.parse(res.stdout) as { wrapped: string[] };
+    expect([...result.wrapped].sort()).toEqual(['custom', 'filesystem']);
+
+    const rewritten = readFileSync(configPath, 'utf8');
+    expect(rewritten.charCodeAt(0)).not.toBe(0xfeff);
+    const updated = JSON.parse(rewritten) as { mcpServers: Record<string, WrapServerEntry> };
+    expect(updated.mcpServers.filesystem!.env).toEqual({ FOO: 'bar' });
+  }, 30_000);
+
+  it('--undo works on a config that picked up a BOM after wrapping', async () => {
+    const dir = tmpDir('mcp-rec-setup-bom-undo-');
+    const configPath = writeConfig(dir, 'config.json', claudeDesktopFixture());
+    const original = readFileSync(configPath, 'utf8');
+
+    const wrap = await runCli(['setup', '--config', configPath]);
+    expect(wrap.code).toBe(0);
+
+    // Simulate a Windows tool re-saving the file with a BOM in between.
+    writeFileSync(configPath, '﻿' + readFileSync(configPath, 'utf8'));
+
+    const undo = await runCli(['setup', '--config', configPath, '--undo', '--json']);
+    expect(undo.code).toBe(0);
+    const result = JSON.parse(undo.stdout) as { restored: string[] };
+    expect([...result.restored].sort()).toEqual(['custom', 'filesystem']);
+
+    const rewritten = readFileSync(configPath, 'utf8');
+    expect(rewritten.charCodeAt(0)).not.toBe(0xfeff);
+    expect(JSON.parse(rewritten)).toEqual(JSON.parse(original));
+  }, 30_000);
 });
