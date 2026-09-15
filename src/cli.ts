@@ -442,7 +442,16 @@ async function cmdHttp(flags: Flags): Promise<void> {
     ...(config.identityLabel !== undefined ? { identityLabel: config.identityLabel } : {}),
     proxyVersion: VERSION,
   });
-  diag(`http proxy listening at ${proxy.url} -> ${targetUrl} (Ctrl-C to stop)`);
+  // Only the origin: the target may carry credentials in its userinfo, path
+  // or query, and this line lands in terminals, scrollback and log capture.
+  let targetOrigin = '<target>';
+  try {
+    const u = new URL(targetUrl);
+    targetOrigin = `${u.protocol}//${u.host}`;
+  } catch {
+    /* leave the placeholder */
+  }
+  diag(`http proxy listening at ${proxy.url} -> ${targetOrigin} (Ctrl-C to stop)`);
   await waitForShutdownSignal();
   await proxy.close();
   writeRunSummary(setup);
