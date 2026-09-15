@@ -43,7 +43,11 @@ function logOnce(loggedRef: { v: boolean }, msg: string, err?: unknown): void {
   if (loggedRef.v) return;
   loggedRef.v = true;
   const detail = err instanceof Error ? err.message : err !== undefined ? String(err) : '';
-  process.stderr.write(`[mcp-recorder] ${msg}${detail ? `: ${detail}` : ''}\n`);
+  try {
+    process.stderr.write(`[mcp-recorder] ${msg}${detail ? `: ${detail}` : ''}\n`);
+  } catch {
+    /* even diagnostics are fail-open: a closed stderr must never take the proxy down */
+  }
 }
 
 export class Recorder implements RecorderLike {
