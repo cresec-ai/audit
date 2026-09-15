@@ -367,9 +367,12 @@ A couple of things that specifically trip people up here:
 - **nvm and similar Node version managers.** If `node` itself came from nvm,
   its directory usually isn't on the `PATH` a non-interactive `wsl.exe -e`
   launch sees, which can break `npx` resolution for the *wrapped* server.
-  The recorder appends its own Node's directory to the wrapped child's
+  The recorder adds its own Node's directory to the wrapped child's
   `PATH` for exactly this reason, so `npx` still resolves even in that
-  environment — but if you've swapped Node versions since running `setup`,
+  environment. It is placed ahead of the Windows entries WSL's interop
+  appends (`/mnt/c/Program Files/nodejs`, ...), so a Node installed on
+  Windows can never capture a bare `npx` meant for WSL — but if you've
+  swapped Node versions since running `setup`,
   re-run it so the baked-in `node` path (`process.execPath`, resolved at
   `setup` time) still points somewhere real.
 - **`wsl.exe -e` needs absolute paths** — it does not go through a shell, so

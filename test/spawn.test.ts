@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { escapeCmdArg, planSpawn, resolveCommand, terminateChild } from '../src/proxy/spawn.js';
+import { escapeCmdArg, planSpawn, resolveCommand, terminateChild, withNodeDirOnPath } from '../src/proxy/spawn.js';
 import type { FsProbe } from '../src/proxy/spawn.js';
 
 /**
@@ -360,6 +360,42 @@ describe('planSpawn', () => {
         },
       };
       expect(() => terminateChild(child, 'SIGTERM', 'linux')).not.toThrow();
+    });
+  });
+
+  describe('withNodeDirOnPath', () => {
+    it('appends the node directory on linux when PATH has no Windows-mount entry', () => {
+      const env = withNodeDirOnPath({ PATH: '/usr/local/bin:/usr/bin' }, '/home/me/.nvm/v22/bin/node', 'linux');
+      expect(env.PATH).toBe('/usr/local/bin:/usr/bin:/home/me/.nvm/v22/bin');
+    });
+
+    it('WSL: inserts it ahead of the first /mnt/<drive>/ entry that interop appended', () => {
+      // A `wsl.exe -e` launch sees exactly this shape: the distro defaults,
+      // then the Windows PATH converted to /mnt/c/... — where a Windows Node
+      // install ships a POSIX `npx` shim script that must not win.
+      const before = '/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib:/mnt/c/Program Files/nodejs:/mnt/c/Windows/System32';
+      const env = withNodeDirOnPath({ PATH: before }, '/home/me/.nvm/v22/bin/node', 'linux');
+      expect(env.PATH).toBe(
+        '/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib:/home/me/.nvm/v22/bin:/mnt/c/Program Files/nodejs:/mnt/c/Windows/System32',
+      );
+    });
+
+    it('leaves PATH alone when the directory is already present, wherever it is', () => {
+      const before = '/mnt/c/Program Files/nodejs:/home/me/.nvm/v22/bin';
+      const env = withNodeDirOnPath({ PATH: before }, '/home/me/.nvm/v22/bin/node', 'linux');
+      expect(env.PATH).toBe(before);
+    });
+
+    it('an empty or missing PATH becomes just the node directory', () => {
+      expect(withNodeDirOnPath({}, '/opt/node/bin/node', 'linux').PATH).toBe('/opt/node/bin');
+      expect(withNodeDirOnPath({ PATH: '' }, '/opt/node/bin/node', 'linux').PATH).toBe('/opt/node/bin');
+    });
+
+    it('win32: appends with ";" and matches the existing entry case-insensitively under any PATH key casing', () => {
+      const env = withNodeDirOnPath({ Path: 'C:\\Windows' }, 'C:\\Program Files\\nodejs\\node.exe', 'win32');
+      expect(env.Path).toBe('C:\\Windows;C:\\Program Files\\nodejs');
+      const same = withNodeDirOnPath({ Path: 'c:\\program files\\nodejs;C:\\Windows' }, 'C:\\Program Files\\nodejs\\node.exe', 'win32');
+      expect(same.Path).toBe('c:\\program files\\nodejs;C:\\Windows');
     });
   });
 });
