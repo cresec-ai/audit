@@ -343,8 +343,10 @@ const LOCK_RETRY_MAX_MS = 20;
 /**
  * A lock dir older than this is assumed abandoned by a process that died
  * inside the critical section. That section takes milliseconds, so 5s is
- * generous, and it is short enough that a recorder's retry run (~1s of
- * backoff plus up to 7 lock waits) reaches the reclaim instead of dropping.
+ * generous, and it is short enough that a recorder's retry run (~6s of
+ * asynchronous backoff plus a short synchronous lock wait per attempt — see
+ * RETRY_DELAYS_MS in src/capture/recorder.ts) reaches the reclaim instead
+ * of dropping the batch.
  */
 const STALE_LOCK_MS = 5_000;
 
