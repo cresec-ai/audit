@@ -95,6 +95,11 @@ export declare class JsonlStore implements EvidenceStore {
     signatures(): HeadSignature[];
     iterate(opts?: IterateOpts): Iterable<ChainRecord>;
     count(): number;
+    /**
+     * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL
+     * — test/store.test.ts runs the same fixtures through both backends; the
+     * counting rules are spelled out on SessionSummary (src/types.ts).
+     */
     sessions(): SessionSummary[];
     close(): void;
 }

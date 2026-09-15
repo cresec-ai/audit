@@ -75,9 +75,9 @@ Usage:
       this machine) into a local entry via 'npx -y mcp-remote URL', then
       wraps that like any other stdio server
   mcp-recorder hook     [--data-dir D] [--store B] [--policy FILE] [--client NAME] [--all-tools]
-      Claude Code PreToolUse/PostToolUse/SessionEnd/Stop hook handler: reads
-      one hook JSON object on stdin, records a redacted tool_call/session_*
-      event, and (PreToolUse only) prints a policy deny decision when
+      Claude Code PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop
+      hook handler: reads one hook JSON object on stdin, records a redacted
+      tool_call/session_* event, and (PreToolUse only) prints a policy deny decision when
       --policy says to. This is the ONLY place a third party gets visibility
       into Anthropic-hosted connectors (mcp__ClickUp__*, mcp__Gmail__*, ...)
       that no local MCP proxy can see. Fail-open: never blocks a tool call,
@@ -87,8 +87,8 @@ Usage:
   mcp-recorder hook install [--settings PATH] [--all-tools] [--policy FILE]
                         [--data-dir D] [--client NAME] [--command CMD]
                         [--dry-run] [--undo] [--json]
-      merge PreToolUse/PostToolUse (matcher mcp__.* or .* with --all-tools)
-      and SessionEnd/Stop hook entries running 'hook' into a Claude Code
+      merge PreToolUse/PostToolUse/PostToolUseFailure (matcher mcp__.* or .*
+      with --all-tools) and SessionEnd/Stop hook entries running 'hook' into a Claude Code
       settings file (default .claude/settings.json in cwd; created if
       missing), safely (timestamped backup) and reversibly (--undo).
       --command overrides the generated command verbatim (e.g. a
@@ -133,6 +133,11 @@ Flags:
 
 Environment:
   MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded
+  MCP_RECORDER_MCP_CONFIG=PATH[,PATH...]
+                           hook: Claude Code MCP config file(s) to resolve
+                           server origins (server.url, policy alias
+                           mcp__<host>__<tool>) from; default: the cloud
+                           session's /tmp/mcp-config-*.json (see docs/hooks.md)
 `;
 const FLAG_DEFS = {
     'data-dir': { type: 'string' },
@@ -758,7 +763,10 @@ async function cmdSessions(flags) {
             out('no sessions recorded');
             return;
         }
-        out(formatTable(['SESSION', 'STARTED', 'ENDED', 'SERVER', 'EVENTS', 'TOOL_CALLS', 'ERRORS'], sessions.map((s) => [
+        // SERVERS is appended LAST so every column that existed before it keeps
+        // its position for anyone who split this table by column index; `--json`
+        // is the stable machine interface (README).
+        out(formatTable(['SESSION', 'STARTED', 'ENDED', 'SERVER', 'EVENTS', 'TOOL_CALLS', 'ERRORS', 'SERVERS'], sessions.map((s) => [
             id8(s.session_id),
             s.started_at,
             s.ended_at ?? '(open)',
@@ -766,6 +774,10 @@ async function cmdSessions(flags) {
             String(s.event_count),
             String(s.tool_call_count),
             String(s.error_count),
+            // Distinct server.name values over the session's tool_call events:
+            // 1 for a proxy session, the number of servers called for a hook
+            // session (SERVER is only the first event's — 'claude-code' there).
+            s.server_count === undefined ? '' : String(s.server_count),
         ])));
     }
     finally {
@@ -1205,8 +1217,9 @@ async function cmdSetup(flags) {
     printSetupResult(configPath, backup, plan, jsonOut, false, bridgedNames);
 }
 /* --------------------------------- hook ----------------------------------
- * `mcp-recorder hook` is a Claude Code PreToolUse/PostToolUse/SessionEnd/Stop
- * hook handler — see src/hook/run.ts's file-level doc comment for the full
+ * `mcp-recorder hook` is a Claude Code PreToolUse/PostToolUse/
+ * PostToolUseFailure/SessionEnd/Stop hook handler — see src/hook/run.ts's
+ * file-level doc comment for the full
  * contract and citations. `mcp-recorder hook install` merges the settings.json
  * entries that wire it up; see src/hook/install.ts.
  */
@@ -1245,9 +1258,24 @@ async function cmdHook(flags, positionals) {
     if (positionals[0] === 'install') {
         return cmdHookInstall(flags);
     }
+    // Fail-open on stdout too. The one thing this command ever prints is a
+    // policy deny; if the reader is gone by then (Claude Code killed the hook,
+    // or a `| head` in a manual test), the write raises EPIPE asynchronously
+    // and an unhandled stream error would exit 1 — a non-zero exit from a
+    // hook is exactly what must never happen here. Unlike `guardStdoutEpipe`
+    // (which rethrows non-EPIPE errors), every stdout error is swallowed.
+    try {
+        process.stdout.on('error', () => {
+            /* fail-open */
+        });
+    }
+    catch {
+        /* fail-open */
+    }
     // Fail-open, ALWAYS: nothing below may throw or leave a non-zero exit
     // code — this command is spawned fresh by Claude Code for every
-    // PreToolUse/PostToolUse/SessionEnd/Stop hook event, and a bug here must
+    // PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop hook event,
+    // and a bug here must
     // never block a tool call or an agent turn. runHook() itself never
     // throws; this try/catch is defense in depth around stdin reading and
     // flag resolution too.

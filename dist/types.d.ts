@@ -35,11 +35,45 @@ export interface SessionSummary {
     session_id: string;
     started_at: string;
     ended_at?: string;
+    /**
+     * `server.name` of the session's first event. For a proxy session that is
+     * the one wrapped server; for a hook-captured session it is the client
+     * (`claude-code`) — the MCP servers its tool calls went to are counted in
+     * `server_count` and stamped on each event's own `server.name`.
+     */
     server_name: string;
     identity_fingerprint: string;
     event_count: number;
+    /**
+     * Tool CALLS, not `tool_call` events. A proxy-captured call is one
+     * request+response-correlated event (no `phase`); a hook-captured call is
+     * a `phase: 'pre'` event plus, once Claude Code fired PostToolUse or
+     * PostToolUseFailure for it, a `phase: 'post'` event sharing its
+     * `request_id`. Only the `pre` half is counted, so a call whose post half
+     * never arrived still counts exactly once.
+     */
     tool_call_count: number;
+    /**
+     * `tool_call` / `rpc` events with `is_error: true`, whichever phase — a
+     * failed hook call carries exactly one such event (the denied `pre`, or
+     * the failing `post`), so this too is per call. A failing `post` whose
+     * `pre` was never recorded (the hook installed mid-call) counts here but
+     * not in `tool_call_count`, so `error_count` can exceed it.
+     */
     error_count: number;
+    /**
+     * Additive, optional: the number of distinct `server.name` values over
+     * the session's `tool_call` events — the servers actually called. 1 for
+     * a proxy session with or without `--name` (its session_start may carry
+     * the argv-derived name and its later events the initialize-learned one,
+     * but every tool call carries one name), 0 for a session that never
+     * called a tool, and for a hook session the number of MCP servers its
+     * calls went to (ClickUp + GitHub + a local server = 3; the client's own
+     * `claude-code` session-level events are not a server). Both store
+     * backends always set it; it is optional only so a summary produced by an
+     * older reader of this contract still type-checks.
+     */
+    server_count?: number;
 }
 export interface IterateOpts {
     fromSeq?: number;
@@ -218,6 +252,10 @@ export declare const ENV: {
     readonly STORE: "MCP_RECORDER_STORE";
     readonly REDACT: "MCP_RECORDER_REDACT";
     readonly DISABLE: "MCP_RECORDER_DISABLE";
+    /** `hook`: MCP config file(s) to resolve server origins from — one path or
+     *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
+     *  See src/hook/mcp-config.ts. */
+    readonly MCP_CONFIG: "MCP_RECORDER_MCP_CONFIG";
 };
 /** File names inside the data dir. */
 export declare const FILES: {
