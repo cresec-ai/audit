@@ -11,7 +11,7 @@
 
 import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, win32 } from 'node:path';
+import { join, posix, resolve, win32 } from 'node:path';
 import { windowsClientConfigCandidates } from './wsl.js';
 
 // The win32 branch of claudeDesktopConfigPath() below builds Windows paths
@@ -22,6 +22,9 @@ import { windowsClientConfigCandidates } from './wsl.js';
 // output on a non-Windows host, where it's what makes the simulation
 // meaningful.
 const joinWin32 = win32.join;
+// Same reasoning for the darwin/linux branches: with `platform` injected as
+// 'darwin' on a Windows host, the ambient `join` would produce backslashes.
+const joinPosix = posix.join;
 
 export type ClientKind = 'claude-desktop' | 'claude-code' | 'cursor';
 
@@ -50,7 +53,7 @@ export function claudeDesktopConfigPath(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): ResolvedConfigPath {
   if (platform === 'darwin') {
-    return { path: join(homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') };
+    return { path: joinPosix(homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') };
   }
   if (platform === 'win32') {
     const appData = env.APPDATA ?? joinWin32(homedir(), 'AppData', 'Roaming');
@@ -91,7 +94,7 @@ export function claudeDesktopConfigPath(
           : `also checked for a Microsoft Store (MSIX) install under ${packagesDir} (no Claude_* package found)`,
     };
   }
-  return { path: join(homedir(), '.config', 'Claude', 'claude_desktop_config.json') };
+  return { path: joinPosix(homedir(), '.config', 'Claude', 'claude_desktop_config.json') };
 }
 
 export interface ResolvedConfigPath {

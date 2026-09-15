@@ -115,15 +115,19 @@ describe.skipIf(process.platform !== 'win32')('resolveClientConfigPath — win32
   // the path outright — including its note, which must survive the pass
   // through resolveWithWslFallback's early-return branch.
   it('propagates the MSIX note through when running natively on win32 (inWsl: false)', () => {
-    const pkg = msixPath('Claude_pzs8sxrjxfjjc');
+    // Only fileExists is injectable here, so the primary path and the
+    // Packages listing come from the runner's real environment: with nothing
+    // "existing", the result is the real %APPDATA% primary plus the note that
+    // the MSIX location was checked — which is exactly what must survive
+    // resolveWithWslFallback's early return.
     const resolved = resolveClientConfigPath(
       'claude-desktop',
       undefined,
       '/cwd',
       { inWsl: false, homeCandidates: () => [] },
-      existsAmong([pkg]),
+      () => false,
     );
-    expect(resolved.path).toBe(pkg);
-    expect(resolved.note).toContain(pkg);
+    expect(resolved.path).toMatch(/AppData[\\/]Roaming[\\/]Claude[\\/]claude_desktop_config\.json$/);
+    expect(resolved.note).toMatch(/MSIX|Microsoft Store/);
   });
 });
