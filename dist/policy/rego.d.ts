@@ -18,7 +18,7 @@
  *   glob.match(pattern, ["."], input.host)           host
  *   some p in [...]; glob.match(p, ...)              lists with more than one glob
  *   v0 := object.get(input.args, ["a", 0, "c"], null); v0 != null;
- *   type_name(v0) in {"string", "number", "boolean"}; regex.match(re, sprintf("%v", [v0]))
+ *   type_name(v0) in {"string", "number", "boolean"}; regex.match(re, scalar_text(v0))
  *   input.args_bytes <= N / input.body_bytes <= N
  *   input.method in ["GET", "HEAD"]
  *

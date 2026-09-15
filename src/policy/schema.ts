@@ -39,7 +39,7 @@ export const POLICY_SCHEMA: JsonSchema = {
       type: 'string',
       minLength: 1,
       description:
-        'Glob: "*" = any run without the delimiter, "**" = any run, "?" = one non-delimiter character; everything else literal. Case-sensitive.',
+        'Glob: "*" = any run without the delimiter, "**" = any run; everything else literal. Case-sensitive. The "?" wildcard is not supported in v1.',
     },
     globOrList: {
       anyOf: [{ $ref: '#/$defs/glob' }, { type: 'array', minItems: 1, items: { $ref: '#/$defs/glob' } }],
@@ -62,7 +62,7 @@ export const POLICY_SCHEMA: JsonSchema = {
         id: { $ref: '#/$defs/identifier', description: 'Default "rule[<index>]".' },
         match: { $ref: '#/$defs/mcpMatch' },
         action: { $ref: '#/$defs/action' },
-        reason: { type: 'string', description: 'Shown to the model on deny / hold-denied.' },
+        reason: { type: 'string', maxLength: 512, description: 'Shown to the model on deny / hold-denied.' },
       },
     },
     mcpMatch: {
@@ -70,7 +70,10 @@ export const POLICY_SCHEMA: JsonSchema = {
       additionalProperties: false,
       required: ['tool'],
       properties: {
-        server: { $ref: '#/$defs/glob', description: 'Glob on the logical server name (delimiter "/"). Default "*".' },
+        server: {
+          $ref: '#/$defs/globOrList',
+          description: 'Glob or list of globs on the logical server name (delimiter "/"). Default "*".',
+        },
         tool: { $ref: '#/$defs/globOrList', description: 'Glob or list of globs on the tool name (delimiter "/").' },
         args: {
           type: 'object',
@@ -119,7 +122,7 @@ export const POLICY_SCHEMA: JsonSchema = {
         id: { $ref: '#/$defs/identifier' },
         match: { $ref: '#/$defs/egressMatch' },
         action: { $ref: '#/$defs/action' },
-        reason: { type: 'string' },
+        reason: { type: 'string', maxLength: 512 },
       },
     },
     egressMatch: {

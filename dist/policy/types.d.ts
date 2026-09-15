@@ -24,7 +24,7 @@ export type OnOversize = 'flag' | 'block';
 /** A glob or a non-empty list of globs, as written in the file. */
 export type GlobOrList = string | string[];
 export interface McpMatchInput {
-    server?: string;
+    server?: GlobOrList;
     tool: GlobOrList;
     args?: Record<string, string>;
     max_args_bytes?: number;
@@ -75,8 +75,8 @@ export interface PolicyInput {
     egress?: EgressPolicyInput;
 }
 export interface McpMatch {
-    /** Glob on the logical server name, delimiter "/". Default "*". */
-    server: string;
+    /** Globs on the logical server name, delimiter "/". Any one matching is enough. Default ["*"]. */
+    server: string[];
     /** Globs on the tool name, delimiter "/". Any one matching is enough. */
     tool: string[];
     /** Dot-path -> RE2-compatible regex. All entries must match. */

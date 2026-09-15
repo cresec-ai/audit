@@ -29,7 +29,7 @@ export type OnOversize = 'flag' | 'block';
 export type GlobOrList = string | string[];
 
 export interface McpMatchInput {
-  server?: string;
+  server?: GlobOrList;
   tool: GlobOrList;
   args?: Record<string, string>;
   max_args_bytes?: number;
@@ -91,8 +91,8 @@ export interface PolicyInput {
 /* ------------------------------- normalized ------------------------------- */
 
 export interface McpMatch {
-  /** Glob on the logical server name, delimiter "/". Default "*". */
-  server: string;
+  /** Globs on the logical server name, delimiter "/". Any one matching is enough. Default ["*"]. */
+  server: string[];
   /** Globs on the tool name, delimiter "/". Any one matching is enough. */
   tool: string[];
   /** Dot-path -> RE2-compatible regex. All entries must match. */
@@ -197,7 +197,7 @@ export function autoRuleId(index: number): string {
 
 function normalizeMcpRule(rule: McpRuleInput, index: number): McpRule {
   const match: McpMatch = {
-    server: rule.match.server ?? DEFAULTS.match.server,
+    server: toList(rule.match.server ?? DEFAULTS.match.server),
     tool: toList(rule.match.tool),
   };
   if (rule.match.args !== undefined) match.args = { ...rule.match.args };

@@ -5,14 +5,18 @@
  * the section's default applies. Every predicate here has a line-for-line
  * counterpart in `rego.ts`, and the OPA comparison test proves they agree:
  *
- * - server / tool / host / path: `globMatch` with the section's delimiter.
+ * - server / tool / host / path: `globMatch` with the section's delimiter,
+ *   any entry of the list matching.
  * - args: each dot-path is resolved like `object.get(input.args, [...], null)`
- *   — numeric segments address ARRAY INDEXES only, other segments address
- *   OBJECT KEYS only; a missing path, a null, or a non-scalar value means the
- *   rule does not match. Scalars are coerced with `String()` (Rego:
- *   `sprintf("%v", [v])`), truncated to `REGEX_VALUE_CAP` UTF-16 units
- *   before matching (Rego does not truncate: RE2 is linear-time, so only
- *   values beyond the cap can ever differ, and that is documented).
+ *   — the root must be a plain object (Rego's `object.get` is undefined for
+ *   an array or scalar root), numeric segments address ARRAY INDEXES only,
+ *   other segments address OBJECT KEYS only; a missing path, a null, or a
+ *   non-scalar value means the rule does not match. Scalars are coerced with
+ *   `String()` (Rego: `scalar_text`, i.e. `json.marshal` for non-strings,
+ *   whose number formatting is the ES6 one `String()` also uses), truncated
+ *   to `REGEX_VALUE_CAP` UTF-16 units before matching (Rego does not
+ *   truncate: RE2 is linear-time, so only values beyond the cap can ever
+ *   differ, and that is documented).
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
  * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
@@ -84,8 +88,16 @@ export function dotPathSegments(dotPath: string): Array<string | number> {
  * Resolve a dot-path like `object.get(root, segments, undefined)`: numeric
  * segments index arrays only, string segments read own keys of plain
  * objects only. Returns undefined when the path does not exist.
+ *
+ * The ROOT must be a plain (non-array) object, exactly like Rego's
+ * `object.get(input.args, ...)`, which is undefined for every non-object
+ * root — an array `params.arguments` (or a string, number, boolean or null)
+ * therefore never matches any `args` condition. `params.arguments` is an
+ * object per MCP, so this only bites on malformed requests, and both engines
+ * now agree that those never match.
  */
 export function getPath(root: unknown, dotPath: string): unknown {
+  if (typeof root !== 'object' || root === null || Array.isArray(root)) return undefined;
   let cur: unknown = root;
   for (const seg of dotPathSegments(dotPath)) {
     if (typeof seg === 'number') {
@@ -124,7 +136,7 @@ function argsMatch(args: Record<string, string>, input: unknown): boolean {
 
 function mcpRuleMatches(rule: McpRule, input: McpRequestInput): boolean {
   const m = rule.match;
-  if (!globMatch(m.server, '/', input.server)) return false;
+  if (!m.server.some((g) => globMatch(g, '/', input.server))) return false;
   if (!m.tool.some((g) => globMatch(g, '/', input.tool))) return false;
   if (m.args !== undefined && !argsMatch(m.args, input.args)) return false;
   if (m.max_args_bytes !== undefined && !(input.argsBytes <= m.max_args_bytes)) return false;

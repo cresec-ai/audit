@@ -28,15 +28,15 @@ rule_matches contains 1 if {
 	v0 := object.get(input.args, ["filters", 0, "field"], null)
 	v0 != null
 	type_name(v0) in {"string", "number", "boolean"}
-	regex.match("^(title|body)$", sprintf("%v", [v0]))
+	regex.match("^(title|body)$", scalar_text(v0))
 	v1 := object.get(input.args, ["limit"], null)
 	v1 != null
 	type_name(v1) in {"string", "number", "boolean"}
-	regex.match("^[0-9]{1,2}$", sprintf("%v", [v1]))
+	regex.match("^[0-9]{1,2}$", scalar_text(v1))
 	v2 := object.get(input.args, ["dry_run"], null)
 	v2 != null
 	type_name(v2) in {"string", "number", "boolean"}
-	regex.match("^true$", sprintf("%v", [v2]))
+	regex.match("^true$", scalar_text(v2))
 }
 
 # rule[2]
@@ -45,6 +45,12 @@ rule_matches contains 2 if {
 	glob.match("*", ["/"], input.tool)
 	input.args_bytes <= 1024
 }
+
+# The exact text the TypeScript engine matches on: strings as-is, numbers and
+# booleans through json.marshal (Go formats them exactly like JavaScript String()).
+scalar_text(v) := v if is_string(v)
+
+scalar_text(v) := json.marshal(v) if not is_string(v)
 
 first_match := min(rule_matches) if count(rule_matches) > 0
 

@@ -122,12 +122,12 @@ never silently disables a rule.
 | Key | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `id` | identifier | no | `^[A-Za-z0-9_.:/-]{1,64}$`, unique within the section. Defaults to `rule[<index>]`. Appears in events (`rule_id`) and in the text the model sees on a deny. |
-| `match.server` | glob \| glob[] | no | Matches the recorder's logical server name (`--name`, else the name learned from the `initialize` handshake, else the wrapped command's basename). Default `*`. Delimiter `/`. |
-| `match.tool` | glob \| glob[] | yes | Matches the `tools/call` `params.name`. Delimiter `/`. |
-| `match.args` | object of regex | no | Each key is a dot-path into `params.arguments`; each value an RE2-compatible regex. **All** entries must match. A missing path never matches. |
+| `match.server` | glob \| glob[] | no | Matches the recorder's logical server name (`--name`, else the name learned from the `initialize` handshake, else the wrapped command's basename). Any one entry of the list matching is enough. Default `*`. Delimiter `/`. |
+| `match.tool` | glob \| glob[] | yes | Matches the `tools/call` `params.name`. Any one entry of the list matching is enough. Delimiter `/`. |
+| `match.args` | object of regex | no | Each key is a dot-path into `params.arguments`; each value an RE2-compatible regex. **All** entries must match. A missing path — or an `arguments` that is not an object — never matches. |
 | `match.max_args_bytes` | integer ≥ 0 | no | Rule matches only when the canonical JSON of `params.arguments` is at most this many bytes. |
 | `action` | `allow` \| `hold` \| `deny` | yes | |
-| `reason` | string ≤ 512 | no | Shown to the model on a deny / hold-denied result; also copied into the compiled Rego. |
+| `reason` | string ≤ 512 | no | Shown to the model on a deny / hold-denied result; also copied into the compiled Rego. Longer than 512 characters is a validation error. |
 
 ### `mcp.hold`
 
@@ -171,30 +171,89 @@ uses `glob.match(pattern, [delimiter], subject)`):
 | --- | --- |
 | `*` | any run of characters **not** containing the delimiter |
 | `**` | any run of characters, delimiter included |
-| `?` | exactly one non-delimiter character |
+| `?` | **not supported in v1** — `policy validate` rejects any glob containing it |
 | anything else | literal, case-sensitive |
 
 Delimiters: `/` for `tool`, `server` and `path`; `.` for `host`. Patterns are
-anchored (they must match the whole subject).
+anchored (they must match the whole subject). `[ ] { } \` are rejected too:
+OPA's glob library gives them a meaning this one does not.
+
+`?` is out because the two engines disagree about it: OPA's `glob.match`
+matches `?` against exactly one **ASCII** character, while the local engine
+(a UTF-16 regex) matches any non-delimiter character — `a?b` accepts `aéb`
+in the gateway and rejects it in OPA. `*` and `**` have no such split, so v1
+ships without `?` rather than with two meanings for it. Use `*` instead.
 
 **Regexes** (`match.args`) must stay inside the RE2 subset so that the local
-JavaScript engine and OPA's RE2 agree: lookaround (`(?=`, `(?!`, `(?<=`,
-`(?<!`) and backreferences (`\1`…`\9`) are rejected by `policy validate`.
-Inline flag and modifier groups (`(?i)`, `(?s)`, `(?m)`, `(?U)`, `(?i:...)`,
-`(?-i:...)`) are rejected as well: RE2 accepts them, JavaScript engines differ
-by version (Node 24 accepts `(?i:...)`, Node 20 does not), and both sides must
-agree — only `(?:...)` non-capturing and `(?<name>...)` named groups are
-allowed. Use character classes (`[Aa]`) for case-insensitive matching. Regexes are
-unanchored (write `^`/`$` yourself) and matching is a *search*, not a
-full-string match.
+JavaScript engine and OPA's RE2 agree. `policy validate` rejects:
+
+- lookaround — `(?=`, `(?!`, `(?<=`, `(?<!`;
+- backreferences — `\1`…`\9` and the named form `\k<name>`;
+- inline flag and modifier groups — `(?i)`, `(?s)`, `(?m)`, `(?U)`,
+  `(?i:...)`, `(?-i:...)`, and every other `(?` form (`(?P<name>`, `(?#`,
+  `(?>`): RE2 accepts inline flags, JavaScript engines differ by version
+  (Node 24 accepts `(?i:...)`, Node 20 does not), and both sides must agree —
+  only `(?:...)` non-capturing and `(?<name>...)` named groups are allowed.
+  Use character classes (`[Aa]`) for case-insensitive matching;
+- a `]` written directly after `[` or `[^` — `[]a]` is a class containing
+  `]` and `a` in RE2 but an *empty* class in JavaScript. Escape it: `[\]a]`;
+- POSIX classes (`[:alpha:]`) and `\x{...}`;
+- every backslash escape outside this list.
+
+The accepted escapes — each means exactly the same thing in RE2 and in V8
+without the `u` flag — are:
+
+| Escape | Meaning |
+| --- | --- |
+| `\d` `\D` `\w` `\W` | ASCII digit / non-digit, word / non-word character |
+| `\b` `\B` | word boundary / non-boundary (**outside** a character class only — RE2 rejects `[\b]`, which JavaScript reads as a backspace) |
+| `\n` `\r` `\t` `\f` `\v` | newline, carriage return, tab, form feed, vertical tab |
+| `\xhh` | the byte `hh`, exactly two hex digits (`\x41`) |
+| `\` + any ASCII punctuation | that character, literally (`\.` `\\` `\-` `\]` `\+` …) |
+
+Everything else after a backslash is rejected, including `\s` and `\S`
+(RE2's `\s` is ASCII-only, JavaScript's also matches Unicode spaces such as
+U+00A0 — write `[ \t\r\n\f]` instead), `\0`, `\a`, `\e`, `\h`, `\z`,
+`\A`, `\Z`, `\p`, `\P`, `\Q`, `\E`, `\C`, `\G`, `\u`, `\U`, `\c` and
+any escaped non-ASCII character. Regexes are unanchored (write `^`/`$`
+yourself) and matching is a *search*, not a full-string match.
 
 **Dot-paths** (`match.args` keys) address into `params.arguments`:
-`path`, `options.recursive`, `items.0.name`. Numeric segments index arrays.
-Keys containing `.` are not addressable in v1. The value at the path is
-coerced before matching: strings as-is, numbers and booleans via their
-canonical string form (`1.5`, `true`), anything else (`null`, objects,
-arrays, missing) never matches. Values longer than 64 KiB are truncated to
-64 KiB before the regex runs (a bound against pathological inputs).
+`path`, `options.recursive`, `items.0.name`. Numeric segments index arrays
+(and *only* arrays: a `{"0": ...}` object key is not reachable by `0`).
+Keys containing `.` are not addressable in v1.
+
+`params.arguments` is an object per MCP, and a dot-path only resolves when it
+is one: if a client sends an array, a string, a number, a boolean or `null`
+as `arguments`, **no `args` condition matches** — a rule with `args` simply
+falls through. (Rego's `object.get` is undefined for a non-object, so this is
+what the compiled policy does too.)
+
+The value at the path is coerced before matching: strings as-is, numbers and
+booleans via their canonical string form (`1.5`, `true`), anything else
+(`null`, objects, arrays, missing) never matches. Values longer than 64 KiB
+are truncated to 64 KiB before the regex runs (a bound against pathological
+inputs; RE2 is linear-time, so the Rego side does not truncate and only
+values beyond the cap can differ).
+
+The number form is JavaScript's: the shortest text that round-trips, with an
+exponent only below `1e-6` or at/above `1e21`. `1234567.5` is `"1234567.5"`,
+`0.00001` is `"0.00001"`, `1e-7` is `"1e-7"`, `1e21` is `"1e+21"`, `42.0` is
+`"42"` and `-0` is `"0"`. The emitted Rego gets the same text from
+`json.marshal` (Go's `encoding/json` formats float64 by the same rules) —
+**not** from `sprintf("%v", [v])`, which would print `1.2345675e+06` for
+`1234567.5` and make the two engines disagree.
+
+One residual difference, unreachable through this gateway but worth knowing
+for the hosted one: OPA keeps a JSON number exactly as it was *written on the
+wire*, so a request body containing `{"n": 1.0}`, `{"n": 1e21}`, `{"n": -0}`
+or an integer with more than 17 significant digits compares as `"1.0"`,
+`"1e21"`, `"-0"` and its full-precision text in OPA, where JavaScript's
+`JSON.parse` + `String()` produce `"1"`, `"1e+21"`, `"0"` and the nearest
+float64. Any value that has been through a JavaScript `JSON.stringify` — as
+everything the recorder forwards has — is already in the canonical form and
+the two agree exactly. Match on strings when a number's exact spelling
+matters.
 
 **`max_args_bytes`** compares against the byte length of the canonical JSON
 (sorted keys, no whitespace) of `params.arguments` — the same canonical form

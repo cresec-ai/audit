@@ -21,7 +21,7 @@ rule_matches contains 0 if {
 	v0 := object.get(input.args, ["url"], null)
 	v0 != null
 	type_name(v0) in {"string", "number", "boolean"}
-	regex.match("^https?://", sprintf("%v", [v0]))
+	regex.match("^https?://", scalar_text(v0))
 	input.args_bytes <= 65536
 }
 
@@ -30,6 +30,12 @@ rule_matches contains 1 if {
 	glob.match("*", ["/"], input.server)
 	glob.match("write_*", ["/"], input.tool)
 }
+
+# The exact text the TypeScript engine matches on: strings as-is, numbers and
+# booleans through json.marshal (Go formats them exactly like JavaScript String()).
+scalar_text(v) := v if is_string(v)
+
+scalar_text(v) := json.marshal(v) if not is_string(v)
 
 first_match := min(rule_matches) if count(rule_matches) > 0
 

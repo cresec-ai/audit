@@ -49,7 +49,7 @@ export function autoRuleId(index) {
 }
 function normalizeMcpRule(rule, index) {
     const match = {
-        server: rule.match.server ?? DEFAULTS.match.server,
+        server: toList(rule.match.server ?? DEFAULTS.match.server),
         tool: toList(rule.match.tool),
     };
     if (rule.match.args !== undefined)

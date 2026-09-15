@@ -11,11 +11,13 @@
  * - duplicate rule ids within a section;
  * - `args` values are strings, keys are well-formed dot-paths;
  * - regexes compile in JS AND stay inside the RE2-portable subset (no
- *   lookaround, no backreferences, no inline flag / modifier groups, no
- *   RE2-only or JS-only escapes) so the local engine and OPA agree on every
- *   input, whatever the running Node version's V8 happens to accept;
- * - globs are not blank and do not use `[ ] { } \`, which OPA's glob library
- *   interprets and ours does not.
+ *   lookaround, no backreferences, no inline flag / modifier groups, only
+ *   whitelisted escapes, no leading `]` in a character class) so the local
+ *   engine and OPA agree on every input, whatever the running Node version's
+ *   V8 happens to accept;
+ * - globs are not blank and use neither `[ ] { } \`, which OPA's glob library
+ *   interprets and ours does not, nor `?`, which both interpret but not the
+ *   same way (OPA's `?` is ASCII-only).
  *
  * Every error keeps an RFC 6901 pointer (`/mcp/rules/1/match/tool`).
  */
@@ -33,6 +35,12 @@ export type ValidationResult = {
  * Why `glob` is not acceptable, or undefined when it is. Blank globs can
  * never match anything useful and the reserved characters would make the TS
  * engine and the emitted Rego disagree.
+ *
+ * `?` is rejected for the same reason: OPA's glob library matches `?`
+ * against exactly one ASCII character, while the TS engine (a RegExp over
+ * UTF-16) matches any non-delimiter character — `a?b` accepts "aéb" locally
+ * and rejects it in OPA. `*` / `**` have no such split, so v1 ships without
+ * `?` rather than with two meanings for it.
  */
 export declare function checkGlob(glob: string): string | undefined;
 /**
@@ -41,14 +49,17 @@ export declare function checkGlob(glob: string): string | undefined;
  * `(?<!`, every other `(?` group that is not a plain non-capturing `(?:`
  * or a named group `(?<name>` — inline flags `(?i)` `(?s)` `(?m)` `(?U)`,
  * modifier groups `(?i:...)` `(?-i:...)`, `(?P<name>`, comments `(?#` —
- * backreferences `\1`..`\9`, escapes that only one engine knows
- * (`\A \z \Z \p \P \Q \E \C \G \u \U \c`), `\x{...}` and POSIX classes
- * `[:alpha:]`.
+ * backreferences `\1`..`\9` and `\k<name>`, every backslash-letter/digit
+ * escape outside `PORTABLE_LETTER_ESCAPES` + `\xhh`, a leading `]` in a
+ * character class, and POSIX classes `[:alpha:]`.
  *
  * The `(?` check is explicit and runs BEFORE `new RegExp`: RE2 accepts inline
  * flags, Node 20's V8 rejects them all, and Node 24's V8 accepts the
  * `(?i:...)` modifier form — the policy must mean the same thing everywhere,
- * so none of them is allowed regardless of what the local engine says.
+ * so none of them is allowed regardless of what the local engine says. The
+ * escape whitelist is explicit for the same reason: V8 silently turns an
+ * unknown escape into the literal character (`\e` is "e"), where RE2 either
+ * rejects it or gives it a meaning of its own.
  */
 export declare function checkRe2Subset(pattern: string): string | undefined;
 /**

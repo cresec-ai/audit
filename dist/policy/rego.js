@@ -18,7 +18,7 @@
  *   glob.match(pattern, ["."], input.host)           host
  *   some p in [...]; glob.match(p, ...)              lists with more than one glob
  *   v0 := object.get(input.args, ["a", 0, "c"], null); v0 != null;
- *   type_name(v0) in {"string", "number", "boolean"}; regex.match(re, sprintf("%v", [v0]))
+ *   type_name(v0) in {"string", "number", "boolean"}; regex.match(re, scalar_text(v0))
  *   input.args_bytes <= N / input.body_bytes <= N
  *   input.method in ["GET", "HEAD"]
  *
@@ -87,7 +87,7 @@ function globLines(globs, delimiter, subject, varName) {
 function mcpRuleBody(rule) {
     const m = rule.match;
     const lines = [];
-    lines.push(...globLines([m.server], '/', 'input.server', 's'));
+    lines.push(...globLines(m.server, '/', 'input.server', 's'));
     lines.push(...globLines(m.tool, '/', 'input.tool', 'p'));
     if (m.args !== undefined) {
         Object.entries(m.args).forEach(([dotPath, pattern], n) => {
@@ -95,7 +95,7 @@ function mcpRuleBody(rule) {
             lines.push(`${v} := object.get(input.args, ${segmentsLiteral(dotPath)}, null)`);
             lines.push(`${v} != null`);
             lines.push(`type_name(${v}) in {"string", "number", "boolean"}`);
-            lines.push(`regex.match(${q(pattern)}, sprintf("%v", [${v}]))`);
+            lines.push(`regex.match(${q(pattern)}, scalar_text(${v}))`);
         });
     }
     if (m.max_args_bytes !== undefined)
@@ -161,6 +161,24 @@ const DECISION_RULES = [
     '',
     'default_deny_reason := sprintf("default %s", [default_action]) if default_action != "allow"',
 ];
+/**
+ * The scalar -> text helper used by every `args` regex.
+ *
+ * Strings are matched as they are; numbers and booleans go through
+ * `json.marshal`, whose output for a JSON scalar is byte-for-byte what
+ * JavaScript's `String()` / `JSON.stringify()` produce (Go's `encoding/json`
+ * formats float64 with the same ES6 shortest-round-trip rules, and booleans
+ * as "true"/"false"). `sprintf("%v", [v])` must NOT be used here: Go's `%v`
+ * prints 1234567.5 as "1.2345675e+06" and 0.00001 as "1e-05", which would
+ * make the emitted Rego disagree with the TypeScript engine.
+ */
+const SCALAR_TEXT_RULES = [
+    '# The exact text the TypeScript engine matches on: strings as-is, numbers and',
+    '# booleans through json.marshal (Go formats them exactly like JavaScript String()).',
+    'scalar_text(v) := v if is_string(v)',
+    '',
+    'scalar_text(v) := json.marshal(v) if not is_string(v)',
+];
 function renderModule(spec, opts) {
     const revision = policyRevision(opts.policyHash);
     const name = opts.policyName ?? '';
@@ -189,18 +207,24 @@ function renderModule(spec, opts) {
             out.push('}', '');
         });
     }
+    if (spec.helpers !== undefined && spec.helpers.length > 0)
+        out.push(...spec.helpers, '');
     out.push('first_match := min(rule_matches) if count(rule_matches) > 0', '');
     out.push(...DECISION_RULES);
     return out.join('\n') + '\n';
 }
 /** Render `cresec/mcp/tool.rego`. A policy without `mcp` compiles to the documented default (allow, no rules). */
 export function renderMcpModule(policy, opts) {
+    const rules = policy.mcp?.rules ?? [];
     return renderModule({
         pkg: 'cresec.mcp',
         inputShape: '{"server": "...", "tool": "...", "args": {...}, "args_bytes": 123}',
         defaultAction: policy.mcp?.default ?? 'allow',
-        rules: policy.mcp?.rules ?? [],
+        rules,
         body: mcpRuleBody,
+        // Only emitted when something actually calls it, so a policy without
+        // `args` conditions compiles to exactly the same module as before.
+        ...(rules.some((r) => r.match.args !== undefined) ? { helpers: SCALAR_TEXT_RULES } : {}),
     }, opts);
 }
 /** Render `cresec/egress/http.rego`; throws when the policy has no `egress` section. */

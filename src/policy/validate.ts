@@ -11,11 +11,13 @@
  * - duplicate rule ids within a section;
  * - `args` values are strings, keys are well-formed dot-paths;
  * - regexes compile in JS AND stay inside the RE2-portable subset (no
- *   lookaround, no backreferences, no inline flag / modifier groups, no
- *   RE2-only or JS-only escapes) so the local engine and OPA agree on every
- *   input, whatever the running Node version's V8 happens to accept;
- * - globs are not blank and do not use `[ ] { } \`, which OPA's glob library
- *   interprets and ours does not.
+ *   lookaround, no backreferences, no inline flag / modifier groups, only
+ *   whitelisted escapes, no leading `]` in a character class) so the local
+ *   engine and OPA agree on every input, whatever the running Node version's
+ *   V8 happens to accept;
+ * - globs are not blank and use neither `[ ] { } \`, which OPA's glob library
+ *   interprets and ours does not, nor `?`, which both interpret but not the
+ *   same way (OPA's `?` is ASCII-only).
  *
  * Every error keeps an RFC 6901 pointer (`/mcp/rules/1/match/tool`).
  */
@@ -37,6 +39,12 @@ const GLOB_RESERVED = /[[\]{}\\]/;
  * Why `glob` is not acceptable, or undefined when it is. Blank globs can
  * never match anything useful and the reserved characters would make the TS
  * engine and the emitted Rego disagree.
+ *
+ * `?` is rejected for the same reason: OPA's glob library matches `?`
+ * against exactly one ASCII character, while the TS engine (a RegExp over
+ * UTF-16) matches any non-delimiter character — `a?b` accepts "aéb" locally
+ * and rejects it in OPA. `*` / `**` have no such split, so v1 ships without
+ * `?` rather than with two meanings for it.
  */
 export function checkGlob(glob: string): string | undefined {
   if (glob.trim().length === 0) return 'glob must not be empty or blank';
@@ -44,11 +52,69 @@ export function checkGlob(glob: string): string | undefined {
   if (m !== null) {
     return `glob must not contain ${JSON.stringify(m[0])} (reserved: [ ] { } \\ have no meaning in policy v1)`;
   }
+  if (glob.includes('?')) {
+    return (
+      'the ? wildcard is not supported in policy.yaml v1 (use * or **): ' +
+      "OPA's glob matches it against one ASCII character only, so it would not mean the same thing in the compiled Rego"
+    );
+  }
   return undefined;
 }
 
-/** Escapes that mean something in RE2 but not in JavaScript (or vice versa). */
-const NON_PORTABLE_ESCAPES = new Set(['A', 'z', 'Z', 'p', 'P', 'Q', 'E', 'C', 'G', 'u', 'U', 'c']);
+/**
+ * The ONLY backslash-letter/digit escapes allowed: each means exactly the
+ * same thing in V8 without the `u` flag and in RE2. Everything else is
+ * rejected, including escapes both engines know but read differently
+ * (`\s`, `\0`, `\x{...}`) and escapes only one of them knows
+ * (`\A \z \Z \p \P \Q \E \C \G \u \U \c \a \e \h \k`). Any escaped
+ * NON-alphanumeric character (`\.` `\\` `\-` `\]` ...) is a literal in both
+ * and stays allowed; `\xhh` (exactly two hex digits) is handled separately.
+ */
+const PORTABLE_LETTER_ESCAPES: ReadonlySet<string> = new Set(['d', 'D', 'w', 'W', 'b', 'B', 'n', 'r', 't', 'f', 'v']);
+
+/** The escape whitelist, for error messages. */
+const ALLOWED_ESCAPES = '\\d \\D \\w \\W \\b \\B \\n \\r \\t \\f \\v \\xhh and any escaped punctuation';
+
+const HEX_DIGIT = /^[0-9A-Fa-f]$/;
+const ALPHANUMERIC = /^[0-9A-Za-z]$/;
+
+/**
+ * Why the escape starting at `pattern[i]` (a backslash) is not acceptable, or
+ * undefined when it is. `inClass` is true inside a `[...]` character class,
+ * where `\b` / `\B` are a JavaScript-only spelling (backspace / literal "B")
+ * that RE2 rejects outright.
+ */
+function checkEscape(pattern: string, i: number, inClass: boolean): string | undefined {
+  const next = pattern[i + 1];
+  if (next === undefined) return 'pattern ends with a dangling backslash';
+  if (next >= '1' && next <= '9') return `backreference "\\${next}" is not supported (RE2 subset)`;
+  if (next === 'k') return 'named backreference "\\k<name>" is not supported (RE2 subset)';
+  if (next === 'x') {
+    if (pattern[i + 2] === '{') return 'escape "\\x{...}" is not supported; use "\\xhh"';
+    if (!HEX_DIGIT.test(pattern[i + 2] ?? '') || !HEX_DIGIT.test(pattern[i + 3] ?? '')) {
+      return 'escape "\\x" must be followed by exactly two hex digits (e.g. "\\x41")';
+    }
+    return undefined;
+  }
+  if (next === 's' || next === 'S') {
+    return (
+      `escape "\\${next}" is not portable between JavaScript and RE2 ` +
+      "(RE2's \\s is ASCII-only, JavaScript's also matches Unicode spaces); use \"[ \\t\\r\\n\\f]\""
+    );
+  }
+  if ((next === 'b' || next === 'B') && inClass) {
+    return `escape "\\${next}" inside a character class is not supported: RE2 rejects it and JavaScript reads it as ${
+      next === 'b' ? 'a backspace' : 'a literal "B"'
+    }`;
+  }
+  if (PORTABLE_LETTER_ESCAPES.has(next)) return undefined;
+  // RE2 reads `\<ASCII punctuation>` as that literal character and rejects
+  // everything else; V8 quietly turns any unknown escape into the literal.
+  if (ALPHANUMERIC.test(next) || next.charCodeAt(0) > 0x7f) {
+    return `escape "\\${next}" is not portable between JavaScript and RE2 (allowed: ${ALLOWED_ESCAPES})`;
+  }
+  return undefined; // escaped ASCII punctuation: a literal in both engines
+}
 
 /**
  * Why `pattern` is outside the RE2-portable subset (or fails to compile), or
@@ -56,27 +122,25 @@ const NON_PORTABLE_ESCAPES = new Set(['A', 'z', 'Z', 'p', 'P', 'Q', 'E', 'C', 'G
  * `(?<!`, every other `(?` group that is not a plain non-capturing `(?:`
  * or a named group `(?<name>` — inline flags `(?i)` `(?s)` `(?m)` `(?U)`,
  * modifier groups `(?i:...)` `(?-i:...)`, `(?P<name>`, comments `(?#` —
- * backreferences `\1`..`\9`, escapes that only one engine knows
- * (`\A \z \Z \p \P \Q \E \C \G \u \U \c`), `\x{...}` and POSIX classes
- * `[:alpha:]`.
+ * backreferences `\1`..`\9` and `\k<name>`, every backslash-letter/digit
+ * escape outside `PORTABLE_LETTER_ESCAPES` + `\xhh`, a leading `]` in a
+ * character class, and POSIX classes `[:alpha:]`.
  *
  * The `(?` check is explicit and runs BEFORE `new RegExp`: RE2 accepts inline
  * flags, Node 20's V8 rejects them all, and Node 24's V8 accepts the
  * `(?i:...)` modifier form — the policy must mean the same thing everywhere,
- * so none of them is allowed regardless of what the local engine says.
+ * so none of them is allowed regardless of what the local engine says. The
+ * escape whitelist is explicit for the same reason: V8 silently turns an
+ * unknown escape into the literal character (`\e` is "e"), where RE2 either
+ * rejects it or gives it a meaning of its own.
  */
 export function checkRe2Subset(pattern: string): string | undefined {
   let inClass = false;
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
     if (ch === '\\') {
-      const next = pattern[i + 1];
-      if (next === undefined) return 'pattern ends with a dangling backslash';
-      if (next >= '1' && next <= '9') return `backreference "\\${next}" is not supported (RE2 subset)`;
-      if (NON_PORTABLE_ESCAPES.has(next)) {
-        return `escape "\\${next}" is not portable between JavaScript and RE2`;
-      }
-      if (next === 'x' && pattern[i + 2] === '{') return 'escape "\\x{...}" is not supported; use "\\xhh"';
+      const why = checkEscape(pattern, i, inClass);
+      if (why !== undefined) return why;
       i++;
       continue;
     }
@@ -86,10 +150,13 @@ export function checkRe2Subset(pattern: string): string | undefined {
       continue;
     }
     if (ch === '[') {
+      // A leading "]" (after an optional "^") is a literal "]" in RE2 but
+      // closes an EMPTY class in JavaScript — the two engines cannot agree.
+      const lead = pattern[i + 1] === '^' ? pattern[i + 2] : pattern[i + 1];
+      if (lead === ']') {
+        return 'a "]" directly after "[" or "[^" means a literal "]" in RE2 but an empty character class in JavaScript; escape it as "\\]"';
+      }
       inClass = true;
-      // A leading "]" (or "^]") is literal in RE2; JS treats "[]" as empty. Skip it consistently.
-      if (pattern[i + 1] === '^' && pattern[i + 2] === ']') i += 2;
-      else if (pattern[i + 1] === ']') i += 1;
       continue;
     }
     if (ch === '(' && pattern[i + 1] === '?') {

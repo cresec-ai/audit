@@ -272,7 +272,7 @@ describe('validatePolicyObject: happy path', () => {
         rules: [
           {
             id: 'no-exfil',
-            match: { server: '*', tool: ['http_post', 'send_*'], args: { url: '^https?://' }, max_args_bytes: 65536 },
+            match: { server: ['*'], tool: ['http_post', 'send_*'], args: { url: '^https?://' }, max_args_bytes: 65536 },
             action: 'deny',
             reason: 'no outbound HTTP',
           },
@@ -392,13 +392,49 @@ describe('validatePolicyObject: error paths', () => {
     expectError(errorsFor((d) => (rule0(d).match.tool = ['a', 'x{y,z}'])), '/mcp/rules/0/match/tool/1', 'glob', '"{"');
     expectError(errorsFor((d) => (rule0(d).match.server = '[ab]')), '/mcp/rules/0/match/server', 'glob', '"["');
     expectError(errorsFor((d) => (rule0(d).match.server = 'a\\*')), '/mcp/rules/0/match/server', 'glob', '"\\\\"');
-    expectError(errorsFor((d) => (rule0(d).match.server = '')), '/mcp/rules/0/match/server', 'minLength');
-    expectError(errorsFor((d) => (rule0(d).match.server = ['a'])), '/mcp/rules/0/match/server', 'type');
+    expectError(errorsFor((d) => (rule0(d).match.server = '')), '/mcp/rules/0/match/server', 'anyOf', 'at least 1 character');
+    expectError(errorsFor((d) => (rule0(d).match.server = ['ok', 'a{b}'])), '/mcp/rules/0/match/server/1', 'glob', '"{"');
+    expectError(errorsFor((d) => (rule0(d).match.server = [])), '/mcp/rules/0/match/server', 'anyOf', 'at least 1 item');
     expectError(errorsFor((d) => (erule0(d).match.host = ['ok', ' '])), '/egress/rules/0/match/host/1', 'glob');
     expectError(errorsFor((d) => (erule0(d).match.path = '/a/}')), '/egress/rules/0/match/path', 'glob', '"}"');
     expectError(errorsFor((d) => (erule0(d).match.path = ['/a', '/]'])), '/egress/rules/0/match/path/1', 'glob', '"]"');
     expect(checkGlob('*')).toBeUndefined();
-    expect(checkGlob('a/**/b?')).toBeUndefined();
+    expect(checkGlob('a/**/b')).toBeUndefined();
+  });
+
+  it('the "?" wildcard is rejected everywhere: OPA matches it against ASCII only, we do not', () => {
+    // Reproduced against OPA 1.20: glob.match("a?b", ["/"], "aéb") is false,
+    // while the TS engine's RegExp [^/] matches "é" — so `?` cannot mean one
+    // thing in the gateway and another in the compiled Rego.
+    expect(checkGlob('a?b')).toMatch(/the \? wildcard is not supported in policy\.yaml v1 \(use \* or \*\*\)/);
+    expect(checkGlob('?')).toBeDefined();
+    expect(checkGlob('read_?ile')).toBeDefined();
+    for (const field of ['tool', 'server'] as const) {
+      expectError(errorsFor((d) => (rule0(d).match[field] = 'a?b')), `/mcp/rules/0/match/${field}`, 'glob', /\? wildcard is not supported/);
+    }
+    expectError(errorsFor((d) => (rule0(d).match.tool = ['ok', 'a?b'])), '/mcp/rules/0/match/tool/1', 'glob', /\? wildcard/);
+    expectError(errorsFor((d) => (erule0(d).match.host = 'api?github.com')), '/egress/rules/0/match/host', 'glob', /\? wildcard/);
+    expectError(errorsFor((d) => (erule0(d).match.path = ['/a', '/?'])), '/egress/rules/0/match/path/1', 'glob', /\? wildcard/);
+    // `*` and `**` are unaffected.
+    expect(checkGlob('*')).toBeUndefined();
+    expect(checkGlob('**/a/**')).toBeUndefined();
+  });
+
+  it('match.server accepts a list of globs (docs/policy.md: glob | glob[])', () => {
+    const doc = designExample();
+    doc.mcp!.rules![0]!.match.server = ['corp-*', 'fs'];
+    const r = validatePolicyObject(doc);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.policy.mcp!.rules[0]!.match.server).toEqual(['corp-*', 'fs']);
+  });
+
+  it('reason is capped at 512 characters in both sections', () => {
+    const ok = designExample();
+    ok.mcp!.rules![0]!.reason = 'x'.repeat(512);
+    ok.egress!.rules![0]!.reason = 'y'.repeat(512);
+    expect(validatePolicyObject(ok).ok).toBe(true);
+    expectError(errorsFor((d) => (rule0(d).reason = 'x'.repeat(513))), '/mcp/rules/0/reason', 'maxLength', 'at most 512 character(s)');
+    expectError(errorsFor((d) => ((erule0(d) as Doc).reason = 'y'.repeat(513))), '/egress/rules/0/reason', 'maxLength', 'at most 512 character(s)');
   });
 
   it('args: must be an object of dot-path -> regex string', () => {
@@ -443,18 +479,85 @@ describe('validatePolicyObject: error paths', () => {
     const good = [
       '^https?://',
       '\\d+\\.\\d+',
-      '[a-z_]+\\s*=\\s*"[^"]*"',
+      '[a-z_]+[ \\t]*=[ \\t]*"[^"]*"',
       '(?:foo|bar)+',
       '(?<name>x)',
       '\\x41\\t\\n\\.\\\\',
-      '[]a]',
-      '[^]a]',
+      '[\\]a]',
+      '[^\\]a]',
       'a{2,3}',
       '.*',
       '\\bword\\b',
       '',
     ];
     for (const pattern of good) expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+  });
+
+  it('args regexes: named backreferences are rejected like numbered ones', () => {
+    for (const pattern of ['(?<n>a)\\k<n>', 'a\\kb', '\\k']) {
+      expect(checkRe2Subset(pattern), pattern).toMatch(/named backreference "\\k<name>" is not supported \(RE2 subset\)/);
+    }
+    expectError(
+      errorsFor((d) => (rule0(d).match.args = { url: '(?<n>a)\\k<n>' })),
+      '/mcp/rules/0/match/args/url',
+      'regex',
+      /named backreference/,
+    );
+    // The named GROUP itself stays allowed; only the back-reference to it is out.
+    expect(checkRe2Subset('(?<n>a)')).toBeUndefined();
+  });
+
+  it('args regexes: a leading "]" in a character class is rejected (literal in RE2, empty class in JS)', () => {
+    const why = /a "\]" directly after "\[" or "\[\^" means a literal "\]" in RE2 but an empty character class in JavaScript/;
+    for (const pattern of ['[]a]', '[^]a]', '[]', '[^]', '[]]']) {
+      expect(checkRe2Subset(pattern), pattern).toMatch(why);
+    }
+    expectError(errorsFor((d) => (rule0(d).match.args = { url: '[]a]' })), '/mcp/rules/0/match/args/url', 'regex', why);
+    // Escaped, it means the same thing in both engines.
+    expect(checkRe2Subset('[\\]a]')).toBeUndefined();
+    expect(checkRe2Subset('[^\\]a]')).toBeUndefined();
+    expect(checkRe2Subset('[a]]')).toBeUndefined();
+  });
+
+  it('args regexes: only whitelisted escapes are accepted', () => {
+    // Everything V8 (no `u` flag) and RE2 read identically.
+    const allowed = [
+      '\\d\\D\\w\\W',
+      '\\bword\\B',
+      '\\n\\r\\t\\f\\v',
+      '\\x41\\xff\\xAB',
+      '\\.\\\\\\+\\*\\?\\(\\)\\[\\]\\{\\}\\|\\^\\$\\-\\/\\_\\#\\ ',
+      '[\\d\\w\\n\\t\\x41\\-\\]]',
+    ];
+    for (const pattern of allowed) expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+
+    // \s / \S differ: RE2's is ASCII-only, JavaScript's also matches U+00A0, U+2028, ...
+    for (const pattern of ['a\\s+b', '[^\\S]']) {
+      const msg = checkRe2Subset(pattern);
+      expect(msg, pattern).toMatch(/is not portable between JavaScript and RE2/);
+      expect(msg, pattern).toMatch(/RE2's \\s is ASCII-only/);
+      expect(msg, pattern).toContain('[ \\t\\r\\n\\f]');
+    }
+
+    // Every other backslash-letter / backslash-digit escape is out.
+    const rejected = ['\\0', '\\a', '\\e', '\\h', '\\z', '\\A', '\\Z', '\\C', '\\G', '\\U', '\\y', '\\q', '\\g', '\\N', '\\R', '\\X', '\\é'];
+    for (const pattern of rejected) {
+      expect(checkRe2Subset(`a${pattern}b`), pattern).toMatch(/is not portable between JavaScript and RE2 \(allowed: /);
+    }
+    expectError(errorsFor((d) => (rule0(d).match.args = { url: '\\0' })), '/mcp/rules/0/match/args/url', 'regex', /"\\0" is not portable/);
+    expectError(errorsFor((d) => (rule0(d).match.args = { url: 'a\\s+b' })), '/mcp/rules/0/match/args/url', 'regex', /"\\s" is not portable/);
+
+    // \x needs exactly two hex digits: \x4 and \xZZ are literal "x..." in V8 and an error in RE2.
+    for (const pattern of ['\\x4', '\\xZZ', '\\x', '\\x4g']) {
+      expect(checkRe2Subset(pattern), pattern).toMatch(/escape "\\x" must be followed by exactly two hex digits/);
+    }
+    expect(checkRe2Subset('\\x{41}')).toMatch(/"\\x\{\.\.\.\}" is not supported/);
+
+    // \b / \B mean a word boundary outside a class (fine) but backspace / literal "B"
+    // inside one, where RE2 refuses the escape altogether.
+    for (const pattern of ['[\\b]', '[a\\B]', '[^\\b-x]']) {
+      expect(checkRe2Subset(pattern), pattern).toMatch(/inside a character class is not supported/);
+    }
   });
 
   it('args regexes: every "(?" group that is not "(?:" (or a named group) is rejected explicitly, whatever V8 accepts', () => {
@@ -583,8 +686,8 @@ describe('normalizePolicy', () => {
       mcp: {
         default: 'allow',
         rules: [
-          { id: 'rule[0]', match: { server: '*', tool: ['a'] }, action: 'allow' },
-          { id: 'named', match: { server: '*', tool: ['b', 'c'] }, action: 'hold' },
+          { id: 'rule[0]', match: { server: ['*'], tool: ['a'] }, action: 'allow' },
+          { id: 'named', match: { server: ['*'], tool: ['b', 'c'] }, action: 'hold' },
         ],
         hold: { timeout_ms: 60000, on_timeout: 'deny' },
         boundary: { secrets: 'redact', injection: 'flag', max_scan_bytes: 1048576, on_oversize: 'flag' },
@@ -802,6 +905,13 @@ describe('glob', () => {
     expect(globToRegExp(glob, delim).test(s)).toBe(expected);
   });
 
+  it('the "?" rows above are dead code: `checkGlob` rejects every glob containing "?"', () => {
+    // globToRegExp still gives `?` the "one non-delimiter character" reading
+    // (see src/policy/glob.ts) so it can never silently become a literal, but
+    // no validated policy can reach it — OPA's `?` is ASCII-only, ours is not.
+    for (const glob of ['?', 'a?c', 'api?github.com']) expect(checkGlob(glob), glob).toMatch(/\? wildcard is not supported/);
+  });
+
   it('produces anchored, flag-less, escaped regexes', () => {
     expect(globToRegExp('a.*/**?', '/').source).toBe('^a\\.[^\\/]*\\/[\\s\\S]*[^\\/]$');
     expect(globToRegExp('*.x', '.').source).toBe('^[^\\.]*\\.x$');
@@ -859,6 +969,31 @@ describe('evaluateMcp', () => {
       action: 'deny',
       matched: false,
     });
+  });
+
+  it('args: an array (or scalar) `arguments` never matches, whatever the dot-path', () => {
+    const p = mcp([{ id: 'idx', match: { tool: 'http_post', args: { '0.url': '^https://' } }, action: 'deny' }]);
+    const run = (args: unknown) => evaluateMcp(p, { server: 's', tool: 'http_post', args, argsBytes: 20 });
+    // TS used to resolve "0" against the array and deny here while OPA allowed.
+    expect(run([{ url: 'https://x' }])).toEqual({ action: 'allow', matched: false });
+    expect(run(['https://x'])).toEqual({ action: 'allow', matched: false });
+    expect(run('https://x')).toEqual({ action: 'allow', matched: false });
+    expect(run(7)).toEqual({ action: 'allow', matched: false });
+    expect(run(null)).toEqual({ action: 'allow', matched: false });
+    // An object whose key happens to be "0" is not addressable by a numeric segment either.
+    expect(run({ '0': { url: 'https://x' } })).toEqual({ action: 'allow', matched: false });
+  });
+
+  it('server accepts a list of globs and matches when any entry does', () => {
+    const p = mcp([{ id: 'multi', match: { server: ['corp-*', 'fs'], tool: 't' }, action: 'deny' }]);
+    const run = (server: string) => evaluateMcp(p, { server, tool: 't', args: {}, argsBytes: 2 });
+    expect(run('corp-notes')).toMatchObject({ ruleId: 'multi', action: 'deny' });
+    expect(run('fs')).toMatchObject({ ruleId: 'multi' });
+    expect(run('other')).toEqual({ action: 'allow', matched: false });
+    expect(run('corp-a/b')).toEqual({ action: 'allow', matched: false });
+    expect(p.mcp!.rules[0]!.match.server).toEqual(['corp-*', 'fs']);
+    // An omitted `server` still normalizes to the documented default.
+    expect(mcp([{ match: { tool: 't' }, action: 'deny' }]).mcp!.rules[0]!.match.server).toEqual(['*']);
   });
 
   it('server glob uses the "/" delimiter and tool lists match any entry', () => {
@@ -926,6 +1061,21 @@ describe('evaluateMcp', () => {
     expect(getPath({ a: 1 }, '__proto__')).toBeUndefined();
   });
 
+  it('getPath: a non-object root never resolves, like Rego object.get on a non-object', () => {
+    // Rego's object.get(input.args, [0, "url"], null) is UNDEFINED when
+    // input.args is an array, so a numeric first segment must not reach into
+    // an array root here either. `params.arguments` is an object per MCP.
+    expect(getPath([{ url: 'https://x' }], '0.url')).toBeUndefined();
+    expect(getPath([1, 2, 3], '0')).toBeUndefined();
+    expect(getPath([], '0')).toBeUndefined();
+    for (const root of ['str', 7, true, null, undefined]) {
+      expect(getPath(root, 'a'), JSON.stringify(root) ?? 'undefined').toBeUndefined();
+      expect(getPath(root, '0'), JSON.stringify(root) ?? 'undefined').toBeUndefined();
+    }
+    // Nested arrays still work; only the ROOT has to be a plain object.
+    expect(getPath({ a: [{ b: 'v' }] }, 'a.0.b')).toBe('v');
+  });
+
   it('max_args_bytes is inclusive', () => {
     expect(call('sized', {}, { argsBytes: 100 })).toMatchObject({ ruleId: 'small' });
     expect(call('sized', {}, { argsBytes: 101 })).toEqual({ action: 'allow', matched: false });
@@ -942,7 +1092,7 @@ describe('evaluateMcp', () => {
       version: 1,
       mcp: {
         default: 'allow',
-        rules: [{ id: 'bad', match: { server: '*', tool: ['t'], args: { a: '(' } }, action: 'allow' }],
+        rules: [{ id: 'bad', match: { server: ['*'], tool: ['t'], args: { a: '(' } }, action: 'allow' }],
         hold: { ...DEFAULTS.hold },
         boundary: { ...DEFAULTS.boundary },
       },

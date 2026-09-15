@@ -21,6 +21,7 @@ import {
   policyRevision,
   renderEgressModule,
   renderMcpModule,
+  ruleLabel,
   validatePolicyObject,
 } from '../src/policy/index.js';
 import type { Decision, EgressRequestInput, McpRequestInput, Policy, RegoBundle } from '../src/policy/index.js';
@@ -174,7 +175,10 @@ describe('compileToRego: bundle layout', () => {
     expect(mcp).toContain(`# Decision: ${DECISION_SHAPE}`);
     expect(mcp).toContain('\tsome p in ["http_post", "send_*"]\n\tglob.match(p, ["/"], input.tool)\n');
     expect(mcp).toContain('\tv0 := object.get(input.args, ["url"], null)\n\tv0 != null\n');
-    expect(mcp).toContain('\tregex.match("^https?://", sprintf("%v", [v0]))\n\tinput.args_bytes <= 65536\n');
+    expect(mcp).toContain('\tregex.match("^https?://", scalar_text(v0))\n\tinput.args_bytes <= 65536\n');
+    // P1: json.marshal, never sprintf("%v") — Go's %v renders 1234567.5 as "1.2345675e+06".
+    expect(mcp).not.toContain('sprintf("%v"');
+    expect(mcp).toContain('\nscalar_text(v) := v if is_string(v)\n\nscalar_text(v) := json.marshal(v) if not is_string(v)\n');
     expect(mcp).toContain('first_match := min(rule_matches) if count(rule_matches) > 0');
     expect(mcp).not.toMatch(/^ +/m); // tabs only
     expect(mcp).not.toContain('cresec.gateway');
@@ -272,7 +276,7 @@ describe('compileToRego: bundle layout', () => {
     if (!r.ok) throw new Error('fixture invalid');
     const out = compileToRego(r.policy, { policyHash: goldenHash('esc'), toolVersion: 'v' }).files[MCP_REGO_PATH]!;
     expect(out).toContain('glob.match("say \\"hi\\"\\t", ["/"], input.tool)');
-    expect(out).toContain('regex.match("^\\\\d+\\\\\\\\$", sprintf("%v", [v0]))');
+    expect(out).toContain('regex.match("^\\\\d+\\\\\\\\$", scalar_text(v0))');
     expect(out).toContain('"reason": "line\\nbreak \\"x\\" é"');
   });
 
@@ -492,6 +496,86 @@ describe('OPA parity (skipped when no opa binary is available)', () => {
       }
     }
     expect(seen).toEqual(['rule quiet-deny', 'rule quiet-hold', '', 'default hold', 'rule no-colon', 'default hold']);
+  });
+
+  /*
+   * Scalar coercion (P1), an array `arguments` root (P2) and a two-entry
+   * `match.server` list (P5). Each case names the rule it must hit so a
+   * regression that makes BOTH engines stop matching still fails the test.
+   */
+  const parityResult = validatePolicyObject({
+    version: 1,
+    name: 'parity',
+    mcp: {
+      default: 'allow',
+      rules: [
+        { id: 'servers', match: { server: ['corp-*', 'fs'], tool: 'ls' }, action: 'deny', reason: 'two-entry server list' },
+        // A numeric FIRST segment: `params.arguments` is an object per MCP, so
+        // this can never match — object.get on an array is undefined in Rego
+        // and getPath refuses a non-object root in TypeScript.
+        { id: 'array-root', match: { tool: 'http_post', args: { '0.url': '^https://' } }, action: 'deny', reason: 'numeric first segment' },
+        { id: 'object-root', match: { tool: 'http_post', args: { url: '^https://' } }, action: 'deny', reason: 'object root' },
+        { id: 'big-float', match: { tool: 'num', args: { n: '^1234567\\.5$' } }, action: 'deny', reason: 'float >= 1e6' },
+        { id: 'small-float', match: { tool: 'num', args: { n: '^0\\.00001$' } }, action: 'deny', reason: 'float < 1e-4' },
+        { id: 'tiny-float', match: { tool: 'num', args: { n: '^1e-7$' } }, action: 'deny', reason: 'float below 1e-6' },
+        { id: 'huge-int', match: { tool: 'num', args: { n: '^1e\\+21$' } }, action: 'deny', reason: 'integer >= 1e21' },
+        { id: 'int', match: { tool: 'num', args: { n: '^42$' } }, action: 'deny', reason: 'integer' },
+        { id: 'neg-zero', match: { tool: 'num', args: { n: '^0$' } }, action: 'deny', reason: 'negative zero' },
+        { id: 'neg-float', match: { tool: 'num', args: { n: '^-1\\.5$' } }, action: 'deny', reason: 'negative float' },
+        { id: 'bool', match: { tool: 'num', args: { n: '^true$' } }, action: 'deny', reason: 'boolean' },
+      ],
+    },
+  });
+  if (!parityResult.ok) throw new Error('parity fixture invalid');
+  const parityPolicy = parityResult.policy;
+  const parityDir = join(tmp, 'parity');
+  writeBundle(parityDir, compileToRego(parityPolicy, { policyHash: goldenHash('parity'), toolVersion: TOOL_VERSION, policyName: 'parity' }));
+  const num = (n: unknown): McpRequestInput => mcpIn('s', 'num', { n }, 16);
+  const PARITY_CASES: Array<{ note: string; input: McpRequestInput; ruleId: string | null }> = [
+    // P1 — Go's sprintf("%v") renders these as "1.2345675e+06" / "1e-05";
+    // json.marshal (and JavaScript's String()) render them as written here.
+    { note: 'P1 float >= 1e6', input: num(1234567.5), ruleId: 'big-float' },
+    { note: 'P1 float < 1e-4', input: num(0.00001), ruleId: 'small-float' },
+    { note: 'P1 float below 1e-6 (exponent form in both)', input: num(1e-7), ruleId: 'tiny-float' },
+    { note: 'P1 integer >= 1e21 (exponent form in both)', input: num(1e21), ruleId: 'huge-int' },
+    { note: 'P1 integer', input: num(42), ruleId: 'int' },
+    { note: 'P1 integer-valued float coerces without a ".0"', input: num(42.0), ruleId: 'int' },
+    { note: 'P1 negative zero prints as "0"', input: num(-0), ruleId: 'neg-zero' },
+    { note: 'P1 plain zero prints as "0"', input: num(0), ruleId: 'neg-zero' },
+    { note: 'P1 negative float', input: num(-1.5), ruleId: 'neg-float' },
+    { note: 'P1 boolean true', input: num(true), ruleId: 'bool' },
+    { note: 'P1 boolean false matches nothing', input: num(false), ruleId: null },
+    { note: 'P1 the string "1234567.5" coerces to itself', input: num('1234567.5'), ruleId: 'big-float' },
+    { note: 'P1 a non-scalar never matches', input: num({ v: 42 }), ruleId: null },
+    // P2 — an array (or scalar) `arguments` must not resolve any dot-path.
+    { note: 'P2 array arguments root with a numeric first segment', input: mcpIn('s', 'http_post', [{ url: 'https://x' }], 22), ruleId: null },
+    { note: 'P2 array arguments root, plain path', input: mcpIn('s', 'http_post', ['https://x'], 13), ruleId: null },
+    { note: 'P2 scalar arguments root', input: mcpIn('s', 'http_post', 'https://x', 11), ruleId: null },
+    { note: 'P2 object arguments root still matches', input: mcpIn('s', 'http_post', { url: 'https://x' }, 22), ruleId: 'object-root' },
+    { note: 'P2 object key "0" is not an array index', input: mcpIn('s', 'http_post', { '0': { url: 'https://x' } }, 28), ruleId: null },
+    // P5 — a two-entry `match.server` list.
+    { note: 'P5 server list: first entry', input: mcpIn('corp-notes', 'ls', {}, 2), ruleId: 'servers' },
+    { note: 'P5 server list: second entry', input: mcpIn('fs', 'ls', {}, 2), ruleId: 'servers' },
+    { note: 'P5 server list: neither entry', input: mcpIn('other', 'ls', {}, 2), ruleId: null },
+    { note: 'P5 server list: "*" does not cross the "/" delimiter', input: mcpIn('corp-a/b', 'ls', {}, 2), ruleId: null },
+  ];
+
+  it('parity policy: opa check --strict and opa fmt --fail stay green with the scalar_text helper', () => {
+    const check = spawnSync(opa, ['check', '--strict', '-b', parityDir], { encoding: 'utf8' });
+    expect(check.status, check.stderr + check.stdout).toBe(0);
+    const fmt = spawnSync(opa, ['fmt', '--fail', '--list', join(parityDir, 'cresec')], { encoding: 'utf8' });
+    expect(fmt.status, `opa fmt would reformat:\n${fmt.stdout}${fmt.stderr}`).toBe(0);
+    const module = readFileSync(join(parityDir, MCP_REGO_PATH), 'utf8');
+    expect(module).toContain('scalar_text(v) := json.marshal(v) if not is_string(v)');
+    expect(module).not.toContain('sprintf("%v"');
+    expect(module).toContain('some s in ["corp-*", "fs"]');
+  });
+
+  it.each(PARITY_CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
+    const ts = evaluateMcp(parityPolicy, c.input);
+    expect(ts.ruleId ?? null, `TypeScript engine picked ${ruleLabel(ts)}`).toBe(c.ruleId);
+    const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };
+    expect(opaEval(opa, parityDir, 'data.cresec.mcp.decision', opaInput)).toEqual(asOpa(ts));
   });
 
   it.each(CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
