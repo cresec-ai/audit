@@ -335,6 +335,7 @@ function ansiSequenceAt(s, i) {
     let body;
     let kind;
     let dcs = false;
+    let osc = false;
     if (c0 === ESC) {
         const n = s.charCodeAt(i + 1);
         if (Number.isNaN(n))
@@ -346,6 +347,7 @@ function ansiSequenceAt(s, i) {
         else if (STRING_INTRODUCERS_7BIT.has(n)) {
             kind = 'string';
             dcs = n === 0x50;
+            osc = n === 0x5d;
             body = i + 2;
         }
         else if (n >= 0x20 && n <= 0x7e) {
@@ -373,44 +375,83 @@ function ansiSequenceAt(s, i) {
     else if (STRING_INTRODUCERS_8BIT.has(c0)) {
         kind = 'string';
         dcs = c0 === 0x90;
+        osc = c0 === 0x9d;
         body = i + 1;
     }
     else {
         return undefined;
     }
     if (kind === 'csi') {
+        let hidesText = false;
         for (let j = body; j < s.length; j++) {
             const c = s.charCodeAt(j);
-            // Parameter and intermediate bytes, EXCEPT the space: `CSI SP s` is a
-            // legal sequence nobody writes, and reading one lets ` s` be eaten out
-            // of the middle of a word.
+            // Parameter (0x30-0x3f) and intermediate (0x20-0x2f) bytes. The space
+            // IS an intermediate — `CSI 2 SP q` sets the cursor style and
+            // `CSI SP @` scrolls left — and excluding it left eight standard
+            // sequences able to split a marker in two. Consuming one deletes a
+            // space a byte-reader sees, so the sequence is marked and the second
+            // copy keeps it.
+            if (c === 0x20) {
+                hidesText = true;
+                continue;
+            }
             if (c >= 0x21 && c <= 0x3f)
                 continue;
             // final byte
             if (c >= 0x40 && c <= 0x7e)
-                return { end: j + 1, dataStart: j + 1, isString: false, isBareEscape: false };
+                return { end: j + 1, dataStart: j + 1, isString: false, hidesText };
             return undefined; // malformed: leave it to the lone-control drop
         }
         return undefined; // unterminated
     }
     if (kind === 'escape') {
-        // ESC + zero or more intermediates (0x21-0x2f) + one final (0x30-0x7e).
-        // The space is excluded for the reason above: `ESC SP i` is legal and
-        // unused, and reading one eats the space and the letter after it.
+        // ESC + zero or more intermediates (0x20-0x2f) + one final (0x30-0x7e).
+        // `ESC SP F`, `ESC SP G`, `ESC SP L` and `ESC SP N` are the announcement
+        // sequences, and a terminal renders all four as nothing at all.
+        let hasSpace = false;
         for (let j = body; j < s.length; j++) {
             const c = s.charCodeAt(j);
+            if (c === 0x20) {
+                hasSpace = true;
+                continue;
+            }
             if (c >= 0x21 && c <= 0x2f)
                 continue;
             if (c >= 0x30 && c <= 0x7e) {
-                return { end: j + 1, dataStart: j + 1, isString: false, isBareEscape: j === body };
+                // Bare: the final byte follows the ESC directly, so consuming the
+                // sequence eats a letter. With a space: consuming eats the space.
+                return { end: j + 1, dataStart: j + 1, isString: false, hidesText: hasSpace || j === body };
             }
             return undefined;
         }
         return undefined; // unterminated
     }
     // A string family. DCS carries a header (parameters, intermediates and a
-    // final byte) before its data; the others start their data immediately.
+    // final byte) before its data; OSC carries `Ps ;`, a numeric command and a
+    // separator; the rest start their data immediately.
+    //
+    // The header matters because the second copy keeps the DATA and drops the
+    // header. Counting `0;` as data left it standing between the two halves of
+    // a marker — `ignore all previous ESC]0;instructions BEL` — and a header
+    // that is digits and a semicolon cannot carry one itself.
     let dataStart = body;
+    if (osc) {
+        // `Ps ; ... ;` — one or more numeric fields. OSC 8 has two of them
+        // (`OSC 8 ; params ; URI`), so the header runs to the LAST semicolon of
+        // the leading digit-and-semicolon run, not the first.
+        let j = body;
+        let lastSemi = -1;
+        while (j < s.length) {
+            const c = s.charCodeAt(j);
+            if (c === 0x3b)
+                lastSemi = j;
+            else if (c < 0x30 || c > 0x39)
+                break;
+            j++;
+        }
+        if (lastSemi >= 0)
+            dataStart = lastSemi + 1;
+    }
     if (dcs) {
         let j = body;
         while (j < s.length) {
@@ -428,9 +469,9 @@ function ansiSequenceAt(s, i) {
     for (let j = dataStart; j < s.length; j++) {
         const c = s.charCodeAt(j);
         if (c === BEL || c === C1_ST)
-            return { end: j + 1, dataStart, isString: true, isBareEscape: false };
+            return { end: j + 1, dataStart, isString: true, hidesText: false };
         if (c === ESC && s.charCodeAt(j + 1) === 0x5c) {
-            return { end: j + 2, dataStart, isString: true, isBareEscape: false };
+            return { end: j + 2, dataStart, isString: true, hidesText: false };
         }
     }
     return undefined; // unterminated: nothing is consumed, so nothing is hidden
@@ -508,9 +549,9 @@ export function normalizeForScan(original, opts = {}) {
             if (seq !== undefined) {
                 // A sequence whose removal takes TEXT with it needs the second copy;
                 // a CSI does not, so coloured output never pays for one.
-                if (!sawEscapeText && (seq.isString || seq.isBareEscape))
+                if (!sawEscapeText && (seq.isString || seq.hidesText))
                     sawEscapeText = true;
-                if (keepEscapeText && seq.isBareEscape) {
+                if (keepEscapeText && seq.hidesText) {
                     // Fall through: the ESC drops as a control and its final byte,
                     // which may be a letter of a marker, stays.
                 }
@@ -551,11 +592,21 @@ export function normalizeForScan(original, opts = {}) {
                 if (c === ESC || c === C1_CSI || STRING_INTRODUCERS_8BIT.has(c)) {
                     const seq = ansiSequenceAt(original, j);
                     if (seq !== undefined) {
-                        if (!sawEscapeText && (seq.isString || seq.isBareEscape))
+                        if (!sawEscapeText && (seq.isString || seq.hidesText))
                             sawEscapeText = true;
-                        if (!(keepEscapeText && (seq.isString || seq.isBareEscape))) {
+                        if (!(keepEscapeText && (seq.isString || seq.hidesText))) {
                             j = seq.end;
                             continue;
+                        }
+                        if (seq.isString) {
+                            // The run absorbs the introducer and the header — invisible to
+                            // a reader either way — and ENDS at the data, so the data is
+                            // scanned as the text it is. Falling through instead left the
+                            // header standing: one space in front of the introducer was
+                            // enough to put `Pq` between the two halves of a marker, and
+                            // the copy that exists to recover exactly that missed it.
+                            j = seq.dataStart;
+                            break;
                         }
                     }
                 }

@@ -415,10 +415,15 @@ blocks. That last case is scanned fail-closed and still recorded as
   whitespace collapse to a single space; and ANSI escape sequences are
   consumed WHOLE — CSI, the intermediate and two-character forms, OSC, DCS,
   APC, PM, SOS and the 8-bit C1 introducers — so a sequence a terminal does
-  not render cannot split a marker in two. Consuming a sequence also removes
-  text a model reading the raw bytes still sees, so a second copy keeps
-  exactly that (a string family's data, a bare escape's final byte) and the
-  two span sets are unioned. Every marker found is mapped back onto the
+  not render cannot split a marker in two. That includes the SPACE
+  intermediate (`CSI 2 SP q`, `ESC SP F`), which is what eight standard
+  sequences use. Consuming a sequence also removes text a model reading the
+  raw bytes still sees, so a second copy keeps exactly that — a string
+  family's data, a bare escape's final byte, and any space a sequence
+  swallowed — and the two span sets are unioned. In that copy a string
+  family's HEADER is still dropped (`Pq` for DCS, `Ps ;` for OSC): it is
+  digits and punctuation, it cannot carry a marker, and leaving it in put it
+  between the two halves of one. Every marker found is mapped back onto the
   original text, so what gets reported and rewritten is exactly the original
   bytes. Base64-encoded instructions and keywords split by markdown or HTML
   markup are out of scope — the filter does not decode or un-mark-up text
