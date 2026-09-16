@@ -102,23 +102,4 @@ export declare const MAX_IN_THREAD_STEPS = 400000;
  * and simply yields undefined here.
  */
 export declare function checkCatastrophicShape(pattern: string): string | undefined;
-/**
- * Why `pattern` may NOT be matched on the proxy thread, or undefined when it
- * provably runs in (at worst low-degree polynomial) bounded time.
- *
- * This is the fail-closed twin of {@link checkCatastrophicShape}: there,
- * absence of a known-bad shape is enough to load a policy, because at run
- * time the worker's hard deadline is what actually bounds the match. With no
- * worker there is nothing to abandon a runaway match, so a pattern gets to
- * run in-thread only if it is positively cleared here:
- *
- * - it parses, and has none of the catastrophic shapes;
- * - no group carries a repeating quantifier at all (`(...)+` is the whole
- *   exponential family; a wrapper cannot hide one from this rule);
- * - at most {@link MAX_LINEAR_REPEATS} repeated atoms in the entire pattern,
- *   so the worst case stays quadratic in the value length (~8 ms at the
- *   4096-character `REGEX_VALUE_CAP`, measured);
- * - at most {@link MAX_LINEAR_BRANCHES} alternation paths, so a pattern
- *   cannot multiply its way to an exponential number of them.
- */
 export declare function checkProvablyLinear(pattern: string, valueLength?: number): string | undefined;

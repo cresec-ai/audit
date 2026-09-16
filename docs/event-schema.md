@@ -293,7 +293,17 @@ One-way JSON-RPC notification in either direction.
 
 ### `protocol_error`
 
-Traffic the tap could not interpret. Forwarding is unaffected (fail-open).
+Traffic the tap could not interpret.
+
+In **record mode** forwarding is unaffected (fail-open): the bytes cross
+byte-for-byte and the event is the only trace. In **gateway mode** a client
+line the policy could not be shown is REFUSED — the client is answered
+`-32600` and nothing reaches the server — and takes this same event, because
+it has no method to record a `notification` against and no id to record
+anything else against. That covers an oversized line, a line that is not
+JSON, and a nested array inside a JSON-RPC batch. So in gateway mode this
+kind is also part of the enforcement record, and `line_hash` is what
+identifies the artifact that was refused.
 
 | Field | Type | Description |
 | --- | --- | --- |

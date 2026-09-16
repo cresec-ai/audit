@@ -2899,6 +2899,15 @@ describe('G4: a nested array inside a batch is not a way in', () => {
     expect(refusal['id']).toBeNull();
     expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([10]);
     expect(s.err.raw()).toContain('refused a nested array inside a JSON-RPC batch');
+    // ...and the refusal is EVIDENCE, not just that stderr line. A nested
+    // array has no `method` to record a notification against and no id to
+    // record anything else against, so it takes the same `protocol_error`
+    // the refused oversized and non-JSON client lines take. Without it this
+    // was the third enforcement path with nothing in the chain to show.
+    const errors = s.events().filter((e) => e.kind === 'protocol_error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ reason: 'unparseable', direction: 'client_to_server' });
+    expect(errors[0]!.line_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
     assertChainIntact(s.store);
   });
 

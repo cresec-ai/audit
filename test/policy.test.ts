@@ -2019,6 +2019,27 @@ describe('checkProvablyLinear: an optional group has one more path than it has b
     }
   });
 
+  it('charges the start-position loop an UNANCHORED pattern runs in', () => {
+    // One repeat and no `^` is quadratic, not linear: the engine runs the
+    // whole pattern again at every starting offset, and that loop multiplies
+    // whatever the repeat costs. Measured on a 4000-character non-match,
+    // `a.*b` takes 7 ms against `^a.*b$`'s 0.00 ms, and the budget used to
+    // certify both.
+    for (const pattern of ['a.*b', '[a-z]+z9', '.*x']) {
+      expect(checkProvablyLinear(pattern)).toBeUndefined(); // the SHAPE is fine
+      expect(checkProvablyLinear(pattern, REGEX_VALUE_CAP)).toMatch(/no `\^` anchor/);
+    }
+    // Anchored, the same patterns are certified at any length.
+    for (const pattern of ['^a.*b$', '^[a-z]+z9', '^.*x']) {
+      expect(checkProvablyLinear(pattern, REGEX_VALUE_CAP)).toBeUndefined();
+    }
+    // A top-level alternation is NOT anchored by one branch: `^a|b` can
+    // start anywhere, so it is charged the loop.
+    expect(checkProvablyLinear('^a.*b|c', REGEX_VALUE_CAP)).toMatch(/no `\^` anchor/);
+    // And a fixed-width pattern has no repeat for the loop to multiply.
+    expect(checkProvablyLinear('(?:foo|foobar)barbaz', REGEX_VALUE_CAP)).toBeUndefined();
+  });
+
   it('never refuses a single repeat, however long the value', () => {
     // One repeated atom is genuinely linear, so the value cannot make it
     // expensive and the budget must not fire on it.

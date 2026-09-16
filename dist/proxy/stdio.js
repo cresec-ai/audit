@@ -2509,7 +2509,16 @@ export async function runStdioProxy(opts) {
                 if (Array.isArray(el)) {
                     // Not a JSON-RPC request. A server that flattens nested arrays
                     // would execute whatever is inside it, so it never crosses.
+                    //
+                    // It is recorded as `protocol_error` `unparseable`, which is the
+                    // same event the refused oversized and non-JSON client lines get:
+                    // a nested array is not a JSON-RPC message, it has no `method` to
+                    // record a `notification` against and no id to record anything
+                    // else against, and the alternative is the third enforcement path
+                    // whose only trace is a line on stderr. The `line_hash` still
+                    // identifies the artifact.
                     diag('gateway: refused a nested array inside a JSON-RPC batch; not forwarded');
+                    guarded(() => protocolError('client_to_server', 'unparseable', line.bytesLen, line.lineHashHex));
                     responses.push(invalidRequestResponse(null, NESTED_BATCH_MESSAGE));
                     return;
                 }

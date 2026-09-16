@@ -623,6 +623,20 @@ export function checkCatastrophicShape(pattern) {
  * - at most {@link MAX_LINEAR_BRANCHES} alternation paths, so a pattern
  *   cannot multiply its way to an exponential number of them.
  */
+/**
+ * True when every match must start at offset 0, so the engine runs the
+ * pattern once rather than once per starting position.
+ *
+ * Conservative on purpose: a top-level alternation is not anchored even when
+ * one branch is (`^a|b` can start anywhere), so only a single-branch pattern
+ * beginning with `^` counts.
+ */
+function startsAnchored(root) {
+    if (root.branches.length !== 1)
+        return false;
+    const first = root.branches[0][0];
+    return first !== undefined && first.zeroWidth && first.text === '^';
+}
 export function checkProvablyLinear(pattern, valueLength) {
     const parsed = parsePattern(pattern);
     const shape = checkCatastrophicShape(pattern);
@@ -658,10 +672,23 @@ export function checkProvablyLinear(pattern, valueLength) {
     // Linear in the pattern is not the same as cheap on THIS value: see
     // MAX_IN_THREAD_STEPS. Asked without a value this stays the pure shape
     // question, which is what `policy validate` wants.
-    if (valueLength !== undefined && repeatedAtoms > 1 && valueLength > 1) {
-        const steps = Math.pow(valueLength, repeatedAtoms);
+    //
+    // An UNANCHORED pattern is also run once per starting position, and that
+    // loop multiplies whatever the repeats cost — it is not free just because
+    // it is implicit. `a.*b` has one repeat and is quadratic: measured 0.47 ms
+    // at 1000 characters, 2 ms at 2000, 7 ms at 4000, while the anchored
+    // `^a.*b$` stays at 0.00 ms throughout. Charging only the repeats
+    // certified the first as linear. The loop costs a factor only when there
+    // is a repeat inside it to multiply; a fixed-width pattern scanned at
+    // every position is linear in the value.
+    const exponent = repeatedAtoms === 0 ? 1 : repeatedAtoms + (startsAnchored(parsed.root) ? 0 : 1);
+    if (valueLength !== undefined && exponent > 1 && valueLength > 1) {
+        const steps = Math.pow(valueLength, exponent);
         if (steps > MAX_IN_THREAD_STEPS) {
-            return (`the pattern's ${repeatedAtoms} repeated quantifiers cost up to ${valueLength}^${repeatedAtoms} steps on a ` +
+            const why = exponent > repeatedAtoms
+                ? `${repeatedAtoms} repeated quantifier${repeatedAtoms === 1 ? '' : 's'} and no \`^\` anchor`
+                : `${repeatedAtoms} repeated quantifiers`;
+            return (`the pattern's ${why} cost up to ${valueLength}^${exponent} steps on a ` +
                 `${valueLength}-character value, over the ${MAX_IN_THREAD_STEPS} an uninterruptible match may take`);
         }
     }
