@@ -232,12 +232,30 @@ function secretId(index) {
     return `secret:${index}`;
 }
 /**
- * The sources of the two families whose match is `<name><separator><value>`,
- * taken from the table above so the two cannot drift apart. The flag family
- * (`--password hunter2`) is NOT here: its value is already gated hard, and
- * it has no separator to split on.
+ * The sources of the three families whose match is `<name><separator><value>`,
+ * taken from the table above so they cannot drift apart. The flag family
+ * (`--password hunter2`) is NOT here: it has no separator to split on.
+ *
+ * Matched by source rather than by index because `findSecretSpans` takes the
+ * pattern list as a parameter, so position is not a reliable identity.
  */
 const ASSIGNMENT_SOURCES = new Set(BOUNDARY_SECRET_FAMILIES.filter((f) => f.id.startsWith('secret-assignment')).map((f) => f.re.source));
+/**
+ * The BARE family's source, the one arm that gets the NAME-side rules below.
+ *
+ * The three assignment arms are not interchangeable. The affixed and camel
+ * arms gate the value — 8+ characters with a digit, or 16+ — and that gate
+ * is most of what keeps them off source code. The bare arm has no gate at
+ * all: `password=` followed by anything. So a rule that reads a value as
+ * "too ordinary to be a credential" is sound for the bare arm and unsound
+ * for the other two, where every value it sees has already cleared the gate
+ * and dropping it can only subtract credentials. Applying the bare arm's
+ * rules to all three was a leak: `CLIENT_SECRET=supersecretpassphrase`,
+ * `SecretAccessKey: wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY` and twelve more
+ * shapes reached the model in clear, any of them recoverable by putting one
+ * `.` before the keyword (`env.DB_PASSWORD=`, `aws.SecretAccessKey`).
+ */
+const BARE_ASSIGNMENT_SOURCE = BOUNDARY_SECRET_FAMILIES.find((f) => f.id === 'secret-assignment')?.re.source;
 /**
  * The value half of an assignment match: everything past the first `:` or
  * `=`. No keyword and no affix contains either character, so the first one
@@ -278,12 +296,31 @@ const BARE_WORD_VALUE = /^[A-Za-z]+\W*$/;
  */
 const SHAPE_CAP = 512;
 /**
+ * Punctuation that separates an EXPRESSION from an opaque credential. A call
+ * in real code carries at least one of these — the argument's quotes, a
+ * member `.`, a comma, the statement's `;`, a template's `${}`, or the space
+ * around an operator. A passphrase is one unbroken run of characters.
+ */
+const CODE_PUNCTUATION = /[.,;'"`${}\s]/;
+/**
  * True when `value` contains an identifier immediately followed by a call or
  * an index (`decode(url.password);`, `m[0];`). Written as a scan rather than
  * a regex so it is linear: each `(`/`[` walks back over its own run of
  * spaces and nothing else.
+ *
+ * A bracket alone is not enough, because a passphrase may contain one:
+ * `DB_PASSWORD=Tr0ub4dor(3)andmore` read as a call expression and was
+ * delivered in clear. So a value with no code punctuation anywhere is a
+ * call only if a bracket CLOSES it — `getSecret()` — and not if the bracket
+ * is embedded in a longer run, which is a credential with a paren in it.
+ * The residual is the exact shape where the two are indistinguishable
+ * without a parser: an unquoted, punctuation-free value that ends at its own
+ * closing bracket (`password=Tr0ub4dor(3)`). It stays on the code side
+ * because `secret_key = loadFromEnvironment()` is the commoner line, and
+ * storage hashes the value either way.
  */
 function hasCallOrIndex(value) {
+    const punctuated = CODE_PUNCTUATION.test(value);
     for (let i = 1; i < value.length; i++) {
         const c = value[i];
         if (c !== '(' && c !== '[')
@@ -291,7 +328,9 @@ function hasCallOrIndex(value) {
         let j = i - 1;
         while (j >= 0 && (value[j] === ' ' || value[j] === '\t'))
             j--;
-        if (j >= 0 && /[A-Za-z0-9_$]/.test(value[j]))
+        if (j < 0 || !/[A-Za-z0-9_$]/.test(value[j]))
+            continue;
+        if (punctuated || /[)\]]$/.test(value))
             return true;
     }
     return false;
@@ -299,8 +338,33 @@ function hasCallOrIndex(value) {
 /** A shell or template placeholder rather than a value: `${x}`, `$(x)`, `$VAR`, `<your-key>`. */
 const PLACEHOLDER_VALUE = /^(?:\$[{(]|\$[A-Z_][A-Za-z0-9_]*\W*$|<)/;
 /**
+ * True when the VALUE of an assignment match is a fragment of source code
+ * rather than a credential. Applies to every assignment arm.
+ *
+ * These three rules read the value alone and none of them can mistake a
+ * credential for code on its own terms: a credential is a literal, so it is
+ * not a `${...}` reference, not pure punctuation, and not an expression.
+ * They are what lets `const password = decode(url.password);` cross — a line
+ * the AFFIXED arm matches too, because its optional affix means a bare
+ * `password` is in its language as well, and `decode(url.password);` is 21
+ * characters, which clears the arm's value gate.
+ */
+export function isCodeShapedValue(matched) {
+    const value = assignmentValue(matched);
+    if (value === undefined)
+        return false; // a shape this function cannot split stays a match
+    if (PLACEHOLDER_VALUE.test(value))
+        return true;
+    if (!/[A-Za-z0-9]/.test(value))
+        return true; // `…`, a stray backtick, punctuation only
+    const head = value.length > SHAPE_CAP ? value.slice(0, SHAPE_CAP) : value;
+    // A template literal or an expression: code, where a credential is a literal.
+    return head.includes('`') || hasCallOrIndex(head);
+}
+/**
  * True when a BARE-family match is a fragment of source code rather than a
- * credential.
+ * credential: `isCodeShapedValue` plus two rules that are sound ONLY for the
+ * bare arm.
  *
  * The bare family takes ANY value on purpose: a field whose whole name is
  * `password` carries a credential whatever it looks like, and a value gate
@@ -314,10 +378,17 @@ const PLACEHOLDER_VALUE = /^(?:\$[{(]|\$[A-Z_][A-Za-z0-9_]*\W*$|<)/;
  * Measured over this repository's own sources before the fix: 21 files, 188
  * lines rewritten.
  *
- * `preceding` is the character before the match, which separates a member
- * assignment in code (`clean.password = ''`) from the same keyword in JSON,
- * YAML or an env dump, where it is preceded by a quote, a brace, a dash or
- * nothing.
+ * The two extra rules are the ones that need the missing value gate to be
+ * safe, and both are applied HERE ONLY:
+ *
+ * - `preceding === '.'` reads the name as a member access. In code that is
+ *   `clean.password = ''`; in a config dump the same dot is part of the key
+ *   (`spring.datasource.password=`, `aws.SecretAccessKey`, `env.DB_PASSWORD=`),
+ *   which is why the gated arms must not consult it — one dot would
+ *   otherwise veto the whole family.
+ * - A one-word value is an identifier or a type (`password = None`,
+ *   `token: string`). For a gated arm a one-word value is a 16-character
+ *   passphrase (`CLIENT_SECRET=supersecretpassphrase`).
  *
  * This runs at the BOUNDARY only. The storage pattern keeps the permissive
  * `\S+`, because the two directions fail differently: hashing a type
@@ -330,17 +401,11 @@ const PLACEHOLDER_VALUE = /^(?:\$[{(]|\$[A-Z_][A-Za-z0-9_]*\W*$|<)/;
 export function isCodeShapedAssignment(matched, preceding) {
     if (preceding === '.')
         return true; // `clean.password = ''` — a member assignment
+    if (isCodeShapedValue(matched))
+        return true;
     const value = assignmentValue(matched);
     if (value === undefined)
-        return false; // a shape this function cannot split stays a match
-    if (PLACEHOLDER_VALUE.test(value))
-        return true;
-    if (!/[A-Za-z0-9]/.test(value))
-        return true; // `…`, a stray backtick, punctuation only
-    const head = value.length > SHAPE_CAP ? value.slice(0, SHAPE_CAP) : value;
-    // A template literal or an expression: code, where a credential is a literal.
-    if (head.includes('`') || hasCallOrIndex(head))
-        return true;
+        return false;
     return value.length <= SHAPE_CAP && BARE_WORD_VALUE.test(value);
 }
 /** Every raw per-pattern match (may overlap), in pattern order. */
@@ -348,9 +413,15 @@ function rawSecretSpans(text, patterns) {
     const out = [];
     patterns.forEach((re, i) => {
         const assignment = ASSIGNMENT_SOURCES.has(re.source);
+        const bare = re.source === BARE_ASSIGNMENT_SOURCE;
         for (const s of matchSpans(re, text, secretId(i))) {
             const before = s.start === 0 ? '' : text.slice(s.start - 1, s.start);
-            if (assignment && isCodeShapedAssignment(text.slice(s.start, s.end), before))
+            if (!assignment) {
+                out.push(s);
+                continue;
+            }
+            const matched = text.slice(s.start, s.end);
+            if (bare ? isCodeShapedAssignment(matched, before) : isCodeShapedValue(matched))
                 continue;
             out.push(s);
         }

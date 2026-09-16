@@ -162,8 +162,22 @@ export declare const BOUNDARY_SECRET_FAMILIES: readonly BoundarySecretFamily[];
  */
 export declare function boundarySecretPatterns(): readonly RegExp[];
 /**
+ * True when the VALUE of an assignment match is a fragment of source code
+ * rather than a credential. Applies to every assignment arm.
+ *
+ * These three rules read the value alone and none of them can mistake a
+ * credential for code on its own terms: a credential is a literal, so it is
+ * not a `${...}` reference, not pure punctuation, and not an expression.
+ * They are what lets `const password = decode(url.password);` cross — a line
+ * the AFFIXED arm matches too, because its optional affix means a bare
+ * `password` is in its language as well, and `decode(url.password);` is 21
+ * characters, which clears the arm's value gate.
+ */
+export declare function isCodeShapedValue(matched: string): boolean;
+/**
  * True when a BARE-family match is a fragment of source code rather than a
- * credential.
+ * credential: `isCodeShapedValue` plus two rules that are sound ONLY for the
+ * bare arm.
  *
  * The bare family takes ANY value on purpose: a field whose whole name is
  * `password` carries a credential whatever it looks like, and a value gate
@@ -177,10 +191,17 @@ export declare function boundarySecretPatterns(): readonly RegExp[];
  * Measured over this repository's own sources before the fix: 21 files, 188
  * lines rewritten.
  *
- * `preceding` is the character before the match, which separates a member
- * assignment in code (`clean.password = ''`) from the same keyword in JSON,
- * YAML or an env dump, where it is preceded by a quote, a brace, a dash or
- * nothing.
+ * The two extra rules are the ones that need the missing value gate to be
+ * safe, and both are applied HERE ONLY:
+ *
+ * - `preceding === '.'` reads the name as a member access. In code that is
+ *   `clean.password = ''`; in a config dump the same dot is part of the key
+ *   (`spring.datasource.password=`, `aws.SecretAccessKey`, `env.DB_PASSWORD=`),
+ *   which is why the gated arms must not consult it — one dot would
+ *   otherwise veto the whole family.
+ * - A one-word value is an identifier or a type (`password = None`,
+ *   `token: string`). For a gated arm a one-word value is a 16-character
+ *   passphrase (`CLIENT_SECRET=supersecretpassphrase`).
  *
  * This runs at the BOUNDARY only. The storage pattern keeps the permissive
  * `\S+`, because the two directions fail differently: hashing a type

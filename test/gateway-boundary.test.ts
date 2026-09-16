@@ -16,6 +16,7 @@ import {
   findInjectionSpans,
   findSecretSpans,
   isCodeShapedAssignment,
+  isCodeShapedValue,
   mergeSpans,
   normalizeForScan,
   oversizeBlockedText,
@@ -1744,6 +1745,98 @@ describe('boundary secrets: source code is delivered intact', () => {
   it('isCodeShapedAssignment keeps a match whose shape it cannot split', () => {
     // No separator to split on: the flag family's own gate decides, not this.
     expect(isCodeShapedAssignment('--password hunter2', ' ')).toBe(false);
+  });
+});
+
+/* ------------- the shape filter belongs to the BARE arm alone -------------
+ * The fix above was wired by `id.startsWith('secret-assignment')`, which
+ * caught all three assignment arms. That is unsound for two of them. The
+ * affixed and camel arms GATE the value — 8+ characters with a digit, or
+ * 16+ — and every value the shape rules then saw had already cleared that
+ * gate, so dropping it could only subtract credentials. Fourteen shapes that
+ * were redacted before the filter existed went back to reaching the model in
+ * clear, and any of them could be recovered by an attacker putting a single
+ * `.` before the keyword.
+ *
+ * The suite did not catch it because all seven of its positives have a digit
+ * or quotes in the value and none of them sits behind a dotted key. These
+ * are the negative direction: letters-only values and dotted keys.
+ */
+describe('boundary secrets: a gated arm does not inherit the bare arm’s shape rules', () => {
+  it.each([
+    // A dot before the keyword is a KEY separator in every config format
+    // there is. Only the bare arm may read it as a member access.
+    ['a dotted JSON key', '{"aws.SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
+    ['a dotted env dump', 'env.DB_PASSWORD=hunter2-correct-horse', 'hunter2-correct-horse'],
+    ['a dotted camel key', 'config.apiKey = "AIzaSyD1a2b3c4d5e6f7g8h9i0jKlMnOp"', 'AIzaSyD1a2b3c4d5e6f7g8h9i0jKlMnOp'],
+    ['a Spring property', 'spring.datasource.password=MyRealPassw0rd', 'MyRealPassw0rd'],
+    ['a dotted bare key', 'db.password=hunter2-correct-horse', 'hunter2-correct-horse'],
+    // A one-word value is a type or an identifier only when ANY value would
+    // have matched. Past a gate it is a passphrase.
+    ['a letters-only client secret', 'CLIENT_SECRET=supersecretpassphrase', 'supersecretpassphrase'],
+    ['a letters-only password', 'DB_PASSWORD=correcthorsebatterystaple', 'correcthorsebatterystaple'],
+    ['a letters-only passwd', 'PASSWD=onetwothreefourfivesix', 'onetwothreefourfivesix'],
+    ['a digit-free AWS secret', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY', 'wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY'],
+    ['a digit-free camel key', 'SecretAccessKey: wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY', 'wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY'],
+    ['a digit-free clientSecret', 'clientSecret: GOCSPXabcdefghijklmnopqrstuvw', 'GOCSPXabcdefghijklmnopqrstuvw'],
+    // A passphrase may contain a bracket. `Tr0ub4dor(3)` is the canonical
+    // example of a strong one, and it read as a call expression.
+    ['a parenthesised passphrase', 'DB_PASSWORD=Tr0ub4dor(3)andmore', 'Tr0ub4dor(3)andmore'],
+    ['a bracketed passphrase', 'clientSecret: Tr0ub4dor[3]andmore', 'Tr0ub4dor[3]andmore'],
+  ])('%s is redacted', (_label, line, secretPart) => {
+    expect(findSecretSpans(line, boundarySecretPatterns()).length).toBeGreaterThan(0);
+    const out = applyBoundary(textResult(line), cfg(), deps);
+    expect(out.changed).toBe(true);
+    expect(contentText(out.message)).not.toContain(secretPart);
+    expect(JSON.stringify(out.message)).not.toContain(secretPart);
+  });
+
+  it('the value rules still apply to a gated arm, or source code comes back', () => {
+    // The affixed arm's optional affix means a plain `password` is in its
+    // language too, and `decode(url.password);` is 21 characters, which
+    // clears its gate. So the VALUE rules have to stay on every arm — it is
+    // only the name-side ones that are the bare arm's alone.
+    for (const line of [
+      'const password = decode(url.password);',
+      'secret_refs: [sha256Ref(SECRETS.aws)],',
+      'const session_token = await client.fetchSessionToken();',
+      'api_token = os.environ.get("API_TOKEN")',
+      'DB_PASSWORD=${VAULT_DB_PASSWORD}',
+    ]) {
+      expect(findSecretSpans(line, boundarySecretPatterns())).toEqual([]);
+    }
+  });
+
+  it('isCodeShapedValue is the gated arms’ whole share of the filter', () => {
+    // The two name-side rules are what a gated arm must not get: a dotted
+    // key and a one-word value are both ordinary credential shapes once a
+    // value gate has already run.
+    expect(isCodeShapedAssignment('password=hunter', '.')).toBe(true);
+    expect(isCodeShapedValue('password=hunter')).toBe(false);
+    expect(isCodeShapedAssignment('password=hunter', '"')).toBe(true);
+    expect(isCodeShapedValue('PASSWORD=supersecretpassphrase')).toBe(false);
+    // Both agree that an expression is code, whichever arm asks.
+    expect(isCodeShapedValue('password = decode(url.password);')).toBe(true);
+    expect(isCodeShapedAssignment('password = decode(url.password);', ' ')).toBe(true);
+  });
+
+  it('is wired to exactly one family, by that family’s own pattern', () => {
+    // The regression was a prefix match over family ids. Pin the count: a
+    // fourth assignment arm must make a deliberate choice here, not inherit
+    // the bare arm's rules by being named like it.
+    const bare = BOUNDARY_SECRET_FAMILIES.filter((f) => f.id === 'secret-assignment');
+    expect(bare).toHaveLength(1);
+    expect(BOUNDARY_SECRET_FAMILIES.filter((f) => f.id.startsWith('secret-assignment'))).toHaveLength(3);
+    // The bare arm has no value gate; the other two do. That asymmetry is
+    // the reason the rules are split, so assert it rather than assume it.
+    const gateless = 'password=x';
+    expect(bare[0]!.re.test(gateless)).toBe(true);
+    for (const f of BOUNDARY_SECRET_FAMILIES.filter(
+      (g) => g.id === 'secret-assignment-affixed' || g.id === 'secret-assignment-camel',
+    )) {
+      expect(f.re.test('DB_PASSWORD=x')).toBe(false);
+      expect(f.re.test('DbPassword=x')).toBe(false);
+    }
   });
 });
 

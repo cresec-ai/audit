@@ -28,6 +28,7 @@ export {
   deniedText,
   findSecretSpans,
   isCodeShapedAssignment,
+  isCodeShapedValue,
   oversizeBlockedText,
   redactSpans,
   synthesizeDeniedResult,

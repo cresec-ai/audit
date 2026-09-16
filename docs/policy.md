@@ -369,6 +369,35 @@ blocks. That last case is scanned fail-closed and still recorded as
   token is recorded on the event (`gateway.boundary.secret_refs`) so
   `mcp-recorder query <value>` still finds the call even though the model
   never saw the value.
+
+  The assignment shapes are matched in three styles — the bare keyword
+  (`password=`), an affix separated by `_`/`-` (`DB_PASSWORD=`, `X-Api-Key:`)
+  and camelCase or PascalCase (`SecretAccessKey:`, `clientSecret:`), which is
+  the style real tool output uses. The last two require the value to look
+  like a credential (8+ characters with a digit, or 16+); the bare one takes
+  any value, because a field whose whole name is `password` carries a
+  credential whatever it looks like.
+
+  That makes the bare style read SOURCE CODE as an assignment — the main
+  thing an agent gets back from a filesystem server — so a bare match whose
+  value is a bare word, an identifier, a type or a keyword
+  (`password = None`, `token: string`), or whose keyword is preceded by a
+  `.` (`clean.password = ''`), is dropped at the boundary. **Those two rules
+  apply to the bare style only.** Past a value gate a one-word value is a
+  passphrase and a leading `.` is a key separator
+  (`spring.datasource.password=`), so applying them more widely would
+  subtract credentials rather than false positives. What every style does
+  drop is a value that is a placeholder (`${VAULT_SECRET}`), punctuation
+  only, or an expression (`decode(url.password)`, a template literal) —
+  though a value with no other punctuation in it is an expression only if a
+  bracket closes it, so `DB_PASSWORD=Tr0ub4dor(3)andmore` is still redacted.
+  The one shape that stays on the code side is an unquoted, punctuation-free
+  value ending at its own closing bracket (`password=Tr0ub4dor(3)`), because
+  `secret_key = loadFromEnvironment()` is the commoner line.
+
+  None of this changes what is STORED. Storage redaction keeps the
+  permissive patterns and hashes the value either way, so a credential the
+  boundary let through is still not in the evidence store in clear.
 - **Injection markers.** A conservative, documented list
   (`src/gateway/injection.ts`): "ignore previous instructions", "SYSTEM
   OVERRIDE", developer-mode jailbreaks, "do not mention this step", "reveal
