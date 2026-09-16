@@ -721,9 +721,24 @@ describe('gateway: deny', () => {
 
 /* -------------------------------- holds --------------------------------- */
 
+/**
+ * A hold that must still be PARKED when the test looks at it.
+ *
+ * `standardPolicy`'s 1000 ms is there for the timeout tests, and every test
+ * that waits for a hold file was racing it — `HoldStore.list()` applies
+ * `withExpiry` as it reads, so an expired hold stops being `pending` with no
+ * proxy involvement at all. A poller descheduled past the deadline, which a
+ * loaded Windows runner does, then sees an empty list for the rest of the
+ * 10 s wait and the test fails with "timeout waiting for hold file". The
+ * timeout's own behaviour is tested by the two tests that set 150 ms.
+ */
+const HOLD_STAYS_PARKED = (p: Policy): void => {
+  p.mcp!.hold.timeout_ms = 30_000;
+};
+
 describe('gateway: hold', () => {
   it('approved via HoldStore.decide: the server sees the original bytes, events carry approval_id/waited_ms/approver', async () => {
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     const args = { to: 'ops@example.com', secret: SECRET };
     s.send(toolsCall(2, 'send_mail', args));
@@ -767,7 +782,7 @@ describe('gateway: hold', () => {
   });
 
   it('denied via HoldStore.decide: isError names the approval id and outcome; nothing reaches the server', async () => {
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     s.send(toolsCall('h1', 'send_mail', { body: 'hi' }));
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
@@ -842,7 +857,7 @@ describe('gateway: hold', () => {
   });
 
   it('cancelled via notifications/cancelled for that request id (the notification itself is still forwarded and recorded)', async () => {
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     s.send(toolsCall(2, 'send_mail', {}));
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
@@ -870,7 +885,7 @@ describe('gateway: hold', () => {
     // batched cancellation was forwarded to the server while the gateway
     // kept the call parked. With `on_timeout: allow` the call the client had
     // already cancelled then executed when the hold timed out.
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     s.send(toolsCall(2, 'send_mail', {}));
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
@@ -899,7 +914,7 @@ describe('gateway: hold', () => {
   });
 
   it('still pending when stdin ends: outcome session_end, ONE tool_call (no unanswered duplicate), session_end last', async () => {
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     s.send(toolsCall(2, 'send_mail', { secret: SECRET }));
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
@@ -979,7 +994,7 @@ describe('gateway: hold', () => {
   });
 
   it('two holds in flight resolve independently, by id', async () => {
-    const s = startProxy(standardPolicy());
+    const s = startProxy(standardPolicy(HOLD_STAYS_PARKED));
     await handshake(s);
     s.send(toolsCall(2, 'send_a', { a: 1 }));
     s.send(toolsCall('two', 'send_b', { b: 2 }));
