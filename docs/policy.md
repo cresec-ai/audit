@@ -378,26 +378,48 @@ blocks. That last case is scanned fail-closed and still recorded as
   any value, because a field whose whole name is `password` carries a
   credential whatever it looks like.
 
-  That makes the bare style read SOURCE CODE as an assignment — the main
-  thing an agent gets back from a filesystem server — so a bare match whose
-  value is a bare word, an identifier, a type or a keyword
-  (`password = None`, `token: string`), or whose keyword is preceded by a
-  `.` (`clean.password = ''`), is dropped at the boundary. **Those two rules
-  apply to the bare style only.** Past a value gate a one-word value is a
-  passphrase and a leading `.` is a key separator
-  (`spring.datasource.password=`), so applying them more widely would
-  subtract credentials rather than false positives. What every style does
-  drop is a value that is a placeholder (`${VAULT_SECRET}`), punctuation
-  only, or an expression (`decode(url.password)`, a template literal) —
-  though a value with no other punctuation in it is an expression only if a
-  bracket closes it, so `DB_PASSWORD=Tr0ub4dor(3)andmore` is still redacted.
-  The one shape that stays on the code side is an unquoted, punctuation-free
-  value ending at its own closing bracket (`password=Tr0ub4dor(3)`), because
-  `secret_key = loadFromEnvironment()` is the commoner line.
+  That makes every style read SOURCE CODE as an assignment — the main thing
+  an agent gets back from a filesystem server — so a match whose value is a
+  placeholder (`${VAULT_SECRET}`, quoted or not), punctuation only, an
+  expression (`decode(url.password)`, a template literal), or a one-word
+  value ended by the syntax around it (`token: CommentOrToken):`,
+  `Token = isClosingBraceToken;`) is dropped at the boundary.
+
+  Two of those rules are the BARE style's alone, because only it has no
+  value gate: a one-word value with NO trailing punctuation
+  (`password = None`), and a keyword preceded by a `.`
+  (`clean.password = ''`). Past a gate, an unterminated one-word value is a
+  passphrase (`CLIENT_SECRET=supersecretpassphrase`) and a leading `.` is a
+  key separator (`spring.datasource.password=`), so applying those two more
+  widely subtracts credentials rather than false positives.
+
+  The discriminator for the shared rule is that **a credential ends the
+  field**: a passphrase stops at the passphrase, while a type name stops at
+  the `)`, `;` or `,` of the code around it. Note that the affixed style's
+  affix is optional, so its names are a superset of the bare style's — a
+  rule the bare style drops is re-added by the affixed one for any value of
+  16+ characters unless the shared rule covers it.
+
+  The shapes that stay on the code side, stated rather than hidden: a
+  punctuation-free value ending at its own closing bracket
+  (`password=Tr0ub4dor(3)`, indistinguishable from
+  `secret_key = loadFromEnvironment()` without a parser), and a letters-only
+  credential with a trailing separator in a gated field
+  (`DB_PASSWORD=supersecretpassphrase.`). Quoting changes nothing either
+  way: the value's own delimiters are removed before the expression test, so
+  `{"db":{"password":"Tr0ub4dor(3)andmore"}}` is redacted exactly as its
+  unquoted twin is.
 
   None of this changes what is STORED. Storage redaction keeps the
   permissive patterns and hashes the value either way, so a credential the
   boundary let through is still not in the evidence store in clear.
+
+  Measured, because this is the part that has moved most: over 1.08 million
+  lines of installed third-party TypeScript the filter rewrites 692 lines,
+  and `test/fixtures/third-party-source.txt` pins 138 of the at-risk ones in
+  CI. This repository's own sources are deliberately NOT the measure — a
+  change that corrupted 119 lines of real code showed zero regressions
+  against them.
 - **Injection markers.** A conservative, documented list
   (`src/gateway/injection.ts`): "ignore previous instructions", "SYSTEM
   OVERRIDE", developer-mode jailbreaks, "do not mention this step", "reveal

@@ -1748,6 +1748,64 @@ describe('boundary secrets: source code is delivered intact', () => {
   });
 });
 
+/* ---------- a corpus the filter has never seen (blocking finding) --------
+ * The suite could not catch the last regression, and the reason is
+ * structural rather than an oversight: of the 12 "source code delivered
+ * intact" cases above, 11 have values too short to reach a GATED arm at all
+ * (`string`, `str`, `None`, `512`, `m[0]`), so they say nothing about the
+ * arms that round changed. The sweep could not catch it either — over this
+ * repository's own 142 tracked files the change showed ZERO regressions,
+ * while over 1.08 million lines of installed TypeScript it corrupted 119
+ * lines the previous tree delivered intact.
+ *
+ * A filter whose job is reading other people's code cannot be measured
+ * against the code it ships with. This is the other corpus.
+ */
+describe('boundary secrets: real third-party source crosses intact', () => {
+  const corpus = readFileSync(fileURLToPath(new URL('./fixtures/third-party-source.txt', import.meta.url)), 'utf8')
+    .split('\n')
+    .map((l) => l.replace(/\r$/, ''))
+    .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+  it('the fixture is real, and every line of it reaches a gated arm', () => {
+    // A fixture of lines the gated arms never look at would pass forever
+    // while proving nothing, which is the failure mode this replaces.
+    expect(corpus.length).toBeGreaterThanOrEqual(120);
+    const gated = BOUNDARY_SECRET_FAMILIES.filter(
+      (f) => f.id === 'secret-assignment-affixed' || f.id === 'secret-assignment-camel',
+    ).map((f) => f.re);
+    const atRisk = corpus.filter((line) => gated.some((re) => re.test(line)));
+    expect(atRisk).toHaveLength(corpus.length);
+  });
+
+  it('every line crosses the boundary byte-for-byte', () => {
+    const corrupted: string[] = [];
+    for (const line of corpus) {
+      const out = applyBoundary(textResult(line), cfg(), deps);
+      if (out.changed) corrupted.push(line);
+    }
+    // Named rather than counted: a failure here should print the shape that
+    // broke, not a number to go hunting for.
+    expect(corrupted).toEqual([]);
+  });
+
+  it('and the credential direction still holds on the same shapes', () => {
+    // The corpus pins one direction only, so pin the other beside it: the
+    // same gated arms, with values that ARE credentials, on names taken from
+    // the corpus's own style.
+    for (const [line, secret] of [
+      ['clientSecret: GOCSPXabcdefghijklmnopqrstuvw', 'GOCSPXabcdefghijklmnopqrstuvw'],
+      ['DB_PASSWORD=correcthorsebatterystaple', 'correcthorsebatterystaple'],
+      ['resumptionToken: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig', 'eyJhbGciOiJIUzI1NiJ9'],
+      ['{"accessToken":"Tr0ub4dor(3)andmore"}', 'Tr0ub4dor(3)andmore'],
+    ] as [string, string][]) {
+      const out = applyBoundary(textResult(line), cfg(), deps);
+      expect(out.changed).toBe(true);
+      expect(JSON.stringify(out.message)).not.toContain(secret);
+    }
+  });
+});
+
 /* ------------- the shape filter belongs to the BARE arm alone -------------
  * The fix above was wired by `id.startsWith('secret-assignment')`, which
  * caught all three assignment arms. That is unsound for two of them. The

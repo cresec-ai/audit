@@ -380,6 +380,35 @@ function assignmentValue(matched: string): string | undefined {
 const BARE_WORD_VALUE = /^[A-Za-z]+\W*$/;
 
 /**
+ * The same shape with the trailing punctuation REQUIRED, which is the part
+ * that is safe for a gated arm.
+ *
+ * The affixed arm's affix is optional, so its name language is a strict
+ * SUPERSET of the bare arm's: every `password=` the bare arm matches, it
+ * matches too. Scoping `BARE_WORD_VALUE` to the bare arm therefore did not
+ * scope the rule at all — it deleted it for every value of 16+ characters,
+ * because the affixed arm re-added the identical span the moment the value
+ * cleared its gate, which any type name that long does. Measured over 1.08
+ * million lines of third-party TypeScript: 119 lines corrupted that the
+ * previous tree delivered intact, `declare function isCommaToken(token:
+ * CommentOrToken): token is CommaToken$1;` among them — the canonical shape
+ * the whole filter was written for.
+ *
+ * What makes the trailing punctuation the right discriminator is that a
+ * CREDENTIAL ENDS THE FIELD. `CLIENT_SECRET=supersecretpassphrase` stops at
+ * the passphrase; `token: CommentOrToken):` stops at the syntax of the code
+ * around it, and `Token = isClosingBraceToken;` at its statement's
+ * semicolon. So a letters-only value followed by punctuation is an
+ * annotation and a letters-only value followed by nothing is a passphrase.
+ *
+ * The cost is one shape, stated rather than hidden: a letters-only
+ * credential with a trailing separator in an AFFIXED field
+ * (`DB_PASSWORD=supersecretpassphrase.`) is no longer redacted at the
+ * boundary. Storage still hashes it.
+ */
+const TYPE_ANNOTATION_VALUE = /^[A-Za-z]+\W+$/;
+
+/**
  * How much of a value the shape rules look at. A type name, a keyword and a
  * placeholder are all short; past this the value is a blob, and a blob in a
  * field called `password` is a credential, so the cap fails towards
@@ -398,6 +427,23 @@ const SHAPE_CAP = 512;
  * around an operator. A passphrase is one unbroken run of characters.
  */
 const CODE_PUNCTUATION = /[.,;'"`${}\s]/;
+
+/**
+ * The value without its own surrounding quotes, for the expression test
+ * ONLY.
+ *
+ * `CODE_PUNCTUATION` contains `"` and `'`, so a quoted value was punctuated
+ * by its own delimiters and the bracket rule below fired on every one of
+ * them. That made the whole "a bracket must CLOSE the value" refinement
+ * inapplicable to JSON and YAML — which is most of what a tool result is —
+ * and `{"db":{"password":"Tr0ub4dor(3)andmore"}}` went to the model in
+ * clear while its unquoted twin was redacted.
+ */
+function unquotedValue(value: string): string {
+  const q = value[0];
+  const closes = value.length >= 2 && value[value.length - 1] === q;
+  return (q === '"' || q === "'") && closes ? value.slice(1, -1) : value;
+}
 
 /**
  * True when `value` contains an identifier immediately followed by a call or
@@ -447,9 +493,14 @@ const PLACEHOLDER_VALUE = /^(?:\$[{(]|\$[A-Z_][A-Za-z0-9_]*\W*$|<)/;
 export function isCodeShapedValue(matched: string): boolean {
   const value = assignmentValue(matched);
   if (value === undefined) return false; // a shape this function cannot split stays a match
-  if (PLACEHOLDER_VALUE.test(value)) return true;
+  const inner = unquotedValue(value);
+  // A placeholder is one whether or not the format quoted it:
+  // `password = "${VAULT_SECRET}"` is a template reference, not a secret.
+  if (PLACEHOLDER_VALUE.test(value) || PLACEHOLDER_VALUE.test(inner)) return true;
   if (!/[A-Za-z0-9]/.test(value)) return true; // `…`, a stray backtick, punctuation only
-  const head = value.length > SHAPE_CAP ? value.slice(0, SHAPE_CAP) : value;
+  // A type annotation or an identifier, ended by the code around it.
+  if (value.length <= SHAPE_CAP && TYPE_ANNOTATION_VALUE.test(value)) return true;
+  const head = inner.length > SHAPE_CAP ? inner.slice(0, SHAPE_CAP) : inner;
   // A template literal or an expression: code, where a credential is a literal.
   return head.includes('`') || hasCallOrIndex(head);
 }
