@@ -146,10 +146,12 @@ export type { CompileOptions as RegoCompileOptions, RegoBundle } from './policy/
 /* gateway primitives (record --policy): boundary filter, injection markers, hold store */
 export {
   BOUNDARY_SECRET_FAMILIES,
+  FAIL_CLOSED_REFUSAL_GUIDANCE,
   INJECTION_MARKER,
   INJECTION_PATTERNS,
   MARKER_HASH_HEX,
   MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS,
+  POLICY_REFUSAL_GUIDANCE,
   applyBoundary,
   blockedText,
   boundarySecretPatterns,

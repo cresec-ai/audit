@@ -368,6 +368,14 @@ An enforcement action taken by the gateway: one per **deny**, and one per
 carries `gateway.decision: 'allow'`), so the kind is a complete list of
 everything the gateway ever refused or paused.
 
+`mcp-recorder sessions` reports how many of these a session has: the
+`DECISIONS` column, `policy_decision_count` in `--json` (an additive key both
+store backends always set). It counts these **events**, so an approved hold
+counts exactly like a deny — the gateway ruled on the call either way — and a
+session recorded without a policy reads `0`. The synthetic `tool_call` that
+carries a refusal back to the client is counted under `TOOL_CALLS` and
+`ERRORS` like any other failed call, never a second time here.
+
 | Field | Type | Description |
 | --- | --- | --- |
 | `decision` | `'deny' \| 'hold'` | The action the policy selected. |

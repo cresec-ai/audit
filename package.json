@@ -26,6 +26,7 @@
   },
   "files": [
     "dist",
+    "docs/agent-guidance.md",
     "docs/event-schema.md",
     "docs/gateway.md",
     "docs/install.md",
@@ -42,6 +43,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "tsx bench/latency.ts",
+    "bench:gateway": "tsx bench/latency.ts --gateway",
+    "bench:boundary": "tsx bench/boundary.ts",
     "demo": "tsx demo/run.ts",
     "prepublishOnly": "npm run compile && npm test"
   },

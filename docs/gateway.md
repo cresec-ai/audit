@@ -126,6 +126,30 @@ the model as a tool error, so the conversation continues:
 > policy rule "no-exfil": outbound HTTP from agents is not allowed on this
 > machine`.
 
+The full text the model reads is two lines — the refusal, then one standard
+clause so the agent does not treat a policy decision as a broken tool:
+
+```
+mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil": outbound HTTP from agents is not allowed on this machine
+This is a policy decision by the operator, not a tool failure. Do not retry it or use another tool to get the same effect; report it to the user.
+```
+
+A refusal where the gateway FAILED CLOSED — the policy could not be evaluated,
+the hold file could not be written, `MAX_HOLDS` was already reached, the proxy
+was shutting down, or a result was too large to scan — gets the other clause,
+because nobody decided anything about that call and a retry is often exactly
+what clears it:
+
+```
+mcp-recorder gateway: tools/call "send_mail" denied by policy rule "needs-human": too many pending holds
+The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. You may retry it; do not use another tool to get the same effect, and report it to the user.
+```
+
+One line of tool output is not much against a model that is mid-plan, so
+[docs/agent-guidance.md](agent-guidance.md) has a snippet to paste into
+`CLAUDE.md` / `AGENTS.md` / `.cursor/rules` — the agent then reads the same
+thing *before* it plans, instead of after it has been refused.
+
 A held call blocks that one tool call (only that one — everything else keeps
 flowing) until you decide:
 
@@ -139,7 +163,8 @@ mcp-recorder approve 5d1c9e0a      # or: mcp-recorder deny 5d1c9e0a
 
 On approval the original request is forwarded to the server byte-for-byte.
 On deny or timeout the model receives an `isError` result that names the
-approval id, and nothing reaches the server.
+approval id — the same two-line shape as a deny — and nothing reaches the
+server.
 
 The boundary filter is silent unless a result carries something it
 recognizes. Run the repository's scripted incident to see it fire:
@@ -252,7 +277,10 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   *request* is always evaluated, and one whose `params.name` is missing or is
   not a string is evaluated as the tool name `""`, so `mcp.default` (and any
   rule whose tool glob matches an empty string) decides it; a `hold` rule
-  matched inside a JSON-RPC batch is treated as `deny` (batching was removed
+  matched inside a JSON-RPC batch is treated as `deny` and carries the
+  **fail-closed** clause rather than the policy-decision one, because a batch
+  element has nowhere to park and so no operator is ever asked — sending the
+  same call on its own is what reaches an approver (batching was removed
   from MCP in 2025-06-18; allowed and denied batch elements are answered
   individually, and when the server answers a forwarded batch with an array,
   every element that answers a `tools/call` goes through the boundary filter,

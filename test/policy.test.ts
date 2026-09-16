@@ -1174,6 +1174,11 @@ describe('evaluateMcp', () => {
     expect(d.action).toBe('deny');
     expect(d.matched).toBe(false);
     expect(d.reason).toMatch(/^policy evaluation error: Invalid regular expression/);
+    // The marker that tells this deny apart from one a rule or the section
+    // default decided: nothing was decided, the gateway failed closed. The
+    // proxy reads it to pick the guidance an agent gets (it must not forbid
+    // the retry) instead of parsing the reason string.
+    expect(d.failClosed).toBe(true);
 
     const throwing = {
       get a(): string {
@@ -1185,9 +1190,21 @@ describe('evaluateMcp', () => {
       action: 'deny',
       matched: false,
       reason: 'policy evaluation error: boom',
+      failClosed: true,
     });
     // A malformed policy object (rules not iterable) is also caught.
     expect(evaluateMcp({ version: 1, mcp: { rules: null } } as unknown as Policy, { server: 's', tool: 't', args: {}, argsBytes: 2 }).action).toBe('deny');
+  });
+
+  it('failClosed marks ONLY the fail-closed deny, never a real decision', () => {
+    // A rule deny, a default deny and an allow all omit the field entirely:
+    // it is additive and optional, so nothing that reads a Decision today
+    // sees a change.
+    const denied = mcp([{ id: 'no-exfil', match: { tool: 'http_post' }, action: 'deny', reason: 'nope' }]);
+    expect(evaluateMcp(denied, { server: 's', tool: 'http_post', args: {}, argsBytes: 2 }).failClosed).toBeUndefined();
+    expect(evaluateMcp(denied, { server: 's', tool: 'other', args: {}, argsBytes: 2 }).failClosed).toBeUndefined();
+    expect(evaluateMcp(mcp([], { default: 'deny' }), { server: 's', tool: 't', args: {}, argsBytes: 2 }).failClosed).toBeUndefined();
+    expect('failClosed' in evaluateMcp(denied, { server: 's', tool: 'http_post', args: {}, argsBytes: 2 })).toBe(false);
   });
 });
 
@@ -1228,6 +1245,8 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
       action: 'deny',
       matched: false,
       reason: 'policy evaluation error: regex timed out (exfil-guard)',
+      // An unevaluable regex is the gateway failing closed, not a decision.
+      failClosed: true,
     });
     // Without the guard this call alone is minutes long.
     expect(elapsed).toBeLessThan(5_000);
@@ -1355,5 +1374,8 @@ describe('evaluateEgress', () => {
     const d = evaluateEgress({ version: 1, egress: { rules: null } } as unknown as Policy, { host: 'h', method: 'GET', path: '/', bodyBytes: 0 });
     expect(d.action).toBe('deny');
     expect(d.reason).toMatch(/^policy evaluation error: /);
+    expect(d.failClosed).toBe(true);
+    // The documented default deny is a decision, not a fail-closed refusal.
+    expect(evaluateEgress(mcp([]), { host: 'h', method: 'GET', path: '/', bodyBytes: 0 }).failClosed).toBeUndefined();
   });
 });

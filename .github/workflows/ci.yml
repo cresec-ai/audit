@@ -82,6 +82,11 @@ jobs:
     name: bench smoke (node 20)
     runs-on: ubuntu-latest
     # Latency numbers are jittery on shared runners; this job is informational.
+    # `continue-on-error` therefore also covers the boundary bench's p99 gate
+    # here. That gate is NOT only informational: test/latency.smoke.test.ts
+    # runs the same bench with the gate ENABLED inside `npm test`, in the
+    # `test` job above, which does fail the build. This job exists to print
+    # the numbers and to run the boundary matrix on a second machine shape.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -91,5 +96,11 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Bench smoke
+      - name: Bench smoke (latency, p50 added-latency gate)
         run: npm run bench -- --smoke
+      # The boundary bench's P99_GATE_MS is a ReDoS alarm: a pattern that went
+      # superlinear costs orders of magnitude, so a gate ~3x over the worst
+      # measured cell catches it without tripping on a loaded runner. Run it
+      # WITHOUT --no-gate so the alarm is actually armed.
+      - name: Bench smoke (boundary, p99 ReDoS gate)
+        run: npm run bench:boundary -- --smoke

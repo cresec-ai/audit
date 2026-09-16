@@ -23,7 +23,13 @@ import { GENESIS_HASH, canonicalJson, computeHash, makeRecord, sha256Ref } from 
 import { Recorder } from '../src/capture/recorder.js';
 import { HoldStore } from '../src/gateway/holds.js';
 import type { GatewayOptions } from '../src/gateway/options.js';
-import { blockedText, deniedText, oversizeBlockedText } from '../src/gateway/boundary.js';
+import {
+  FAIL_CLOSED_REFUSAL_GUIDANCE,
+  POLICY_REFUSAL_GUIDANCE,
+  blockedText,
+  deniedText,
+  oversizeBlockedText,
+} from '../src/gateway/boundary.js';
 import type { LoadedPolicy } from '../src/policy/load.js';
 import type { Policy, PolicyInput } from '../src/policy/types.js';
 import { validatePolicyObject } from '../src/policy/validate.js';
@@ -514,6 +520,12 @@ describe('gateway: deny', () => {
     const result = deny.result as { isError: boolean; content: { type: string; text: string }[] };
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toBe(deniedText({ tool: 'delete_everything', ruleId: 'no-delete', reason: 'destructive' }));
+    // A rule denied this: the operator decided, so the agent is told not to
+    // retry it and not to reach the same effect another way.
+    expect(result.content[0]!.text).toBe(
+      'mcp-recorder gateway: tools/call "delete_everything" denied by policy rule "no-delete": destructive\n' + POLICY_REFUSAL_GUIDANCE,
+    );
+    expect(result.content[0]!.text).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
     // Never reached the server: echo-server would have echoed the arguments back.
     expect(result.content[0]!.text).not.toContain('"/"');
     expect(s.out.lines().filter((l) => parseLine(l)?.id === 2)).toHaveLength(1);
@@ -623,6 +635,14 @@ describe('gateway: deny', () => {
     const text = (s.response(2).result as { isError: boolean; content: { text: string }[] });
     expect(text.isError).toBe(true);
     expect(text.content[0]!.text).toContain('policy evaluation error: synthetic evaluation failure');
+    // Nothing was decided here, so the model gets the fail-closed clause: it
+    // may retry, but it must not route around the gateway.
+    expect(text.content[0]!.text).toBe(
+      'mcp-recorder gateway: tools/call "explode_on_evaluate" denied by policy: ' +
+        'policy evaluation error: synthetic evaluation failure\n' +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
+    expect(text.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
     s.send(toolsCall(3, 'echo', {}));
     await waitFor(s.responded(3), 'still flowing');
     s.stdin.end();
@@ -712,6 +732,9 @@ describe('gateway: hold', () => {
     expect(result.content[0]!.text).toBe(
       deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'outbound', approvalId: pending!.approval_id, outcome: 'denied' }),
     );
+    // A human answered `mcp-recorder deny`: this really is a policy decision.
+    expect(result.content[0]!.text.endsWith(`\n${POLICY_REFUSAL_GUIDANCE}`)).toBe(true);
+    expect(result.content[0]!.text).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
     s.stdin.end();
     await s.done;
     const events = s.events();
@@ -806,6 +829,10 @@ describe('gateway: hold', () => {
     const result = s.response(2).result as { isError: boolean; content: { text: string }[] };
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toContain('was abandoned at session end');
+    // Shutdown swept this hold; nobody answered it. The agent must not be told
+    // the operator decided — that is the fail-closed case, not a policy deny.
+    expect(result.content[0]!.text).toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    expect(result.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
 
     const events = s.events();
     const decision = decisions(events)[0]!;
@@ -852,7 +879,16 @@ describe('gateway: hold', () => {
     await waitFor(s.responded(2), 'deny');
     const result = s.response(2).result as { isError: boolean; content: { text: string }[] };
     expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toBe(deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'hold unavailable' }));
+    expect(result.content[0]!.text).toBe(
+      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'hold unavailable', failClosed: true }),
+    );
+    // The hold file could not be written; nobody decided anything. Retrying
+    // is not forbidden, routing around the gateway still is.
+    expect(result.content[0]!.text).toBe(
+      'mcp-recorder gateway: tools/call "send_mail" denied by policy rule "needs-human": hold unavailable\n' +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
+    expect(result.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
     s.stdin.end();
     await s.done;
     expect(decisions(s.events())[0]).toMatchObject({ decision: 'deny', rule_id: 'needs-human', request_id: 2 });
@@ -988,6 +1024,14 @@ describe('gateway: boundary filter', () => {
     expect(res.isError).toBe(true);
     const rawLine = JSON.stringify({ jsonrpc: '2.0', id: 2, result: echoResult(big) });
     expect(res.content[0]!.text).toBe(oversizeBlockedText(Buffer.byteLength(rawLine), 4096));
+    // Too large to scan is the gateway failing closed, not a judgement on the
+    // call: asking for less output is the recovery, so the clause the model
+    // reads must not forbid a retry.
+    expect(res.content[0]!.text).toBe(
+      `mcp-recorder gateway: tool result blocked by policy (result of ${Buffer.byteLength(rawLine)} bytes exceeds max_scan_bytes 4096)\n` +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
+    expect(res.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
     block.stdin.end();
     await block.done;
     expect(toolCalls(block.events())[0]!.gateway!.boundary).toMatchObject({ scanned: false, action: 'block' });
@@ -1035,9 +1079,18 @@ describe('gateway: JSON-RPC batches', () => {
     const batchResponse = lines.find((l): l is Record<string, unknown>[] => Array.isArray(l))!;
     expect(batchResponse.map((r) => r.id)).toEqual([11, 12]);
     for (const r of batchResponse) expect((r.result as { isError: boolean }).isError).toBe(true);
-    expect((batchResponse[1]!.result as { content: { text: string }[] }).content[0]!.text).toBe(
-      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'outbound' }),
-    );
+    // `send_mail` matched a HOLD rule; a batch has nowhere to park one, so it
+    // is refused. No operator was ever asked, and sending the same call on its
+    // own is the only way to reach one — so it must carry the fail-closed
+    // clause (which permits a retry), never the policy one (which forbids it).
+    const heldInBatch = (batchResponse[1]!.result as { content: { text: string }[] }).content[0]!.text;
+    expect(heldInBatch).toBe(deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'outbound', failClosed: true }));
+    expect(heldInBatch).toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    expect(heldInBatch).not.toContain(POLICY_REFUSAL_GUIDANCE);
+    // The plain deny in the same batch is the operator's decision and keeps it.
+    const deniedInBatch = (batchResponse[0]!.result as { content: { text: string }[] }).content[0]!.text;
+    expect(deniedInBatch).toContain(POLICY_REFUSAL_GUIDANCE);
+    expect(deniedInBatch).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
     const echoed = lines.find((l) => parseLine(JSON.stringify(l))?.id === 10) as Record<string, unknown>;
     expect((echoed.result as { content: { text: string }[] }).content[0]!.text).toBe('{"a":1}');
     expect(lines.some((l) => parseLine(JSON.stringify(l))?.id === 13)).toBe(true);
@@ -1516,8 +1569,21 @@ describe('gateway: adversarial regressions', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toContain('session_end');
     expect(result.content[0]!.text).toBe(
-      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'session_end (hold not started)' }),
+      deniedText({
+        tool: 'send_mail',
+        ruleId: 'needs-human',
+        reason: 'session_end (hold not started)',
+        outcome: 'session_end',
+        failClosed: true,
+      }),
     );
+    // The proxy was shutting down: this hold was never started, so no human
+    // decided it. `failClosed` beats the `session_end` outcome here.
+    expect(result.content[0]!.text).toBe(
+      'mcp-recorder gateway: tools/call "send_mail" denied by policy rule "needs-human": session_end (hold not started)\n' +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
+    expect(result.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
 
     const events = s.events();
     const decision = decisions(events).find((d) => d.request_id === 3)!;
@@ -1577,8 +1643,15 @@ describe('gateway: adversarial regressions', () => {
     const result = s.response('over').result as { isError: boolean; content: { text: string }[] };
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toBe(
-      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'too many pending holds' }),
+      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'too many pending holds', failClosed: true }),
     );
+    // A concurrency cap, not a decision: the retry the policy clause would
+    // have forbidden is exactly what succeeds once a parked hold resolves.
+    expect(result.content[0]!.text).toBe(
+      'mcp-recorder gateway: tools/call "send_mail" denied by policy rule "needs-human": too many pending holds\n' +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
+    expect(result.content[0]!.text).not.toContain(POLICY_REFUSAL_GUIDANCE);
     expect(holdFileCount(s.dataDir)).toBe(MAX_HOLDS); // no hold file for the refused call
     expect(s.err.raw()).toContain(`gateway: ${MAX_HOLDS} holds already pending; denying tools/call "send_mail"`);
     s.stdin.end();

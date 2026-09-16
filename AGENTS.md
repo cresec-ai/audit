@@ -24,6 +24,12 @@ setup hook calls the same script:
 - `npm test` — vitest; spawns real child processes, takes about a minute.
 - `npm run demo` — scripted prompt-injection incident, recorded and verified.
 - `npm run bench` — latency gate (p50 added latency must stay under 5 ms).
+- `npm run bench:gateway` — the same round-trip measured with a policy in
+  force, so gateway-mode added latency is comparable to record mode. Opt-in;
+  it does not change `npm run bench` or its gate.
+- `npm run bench:boundary` — what the tool-result boundary filter costs
+  synchronously on the forwarding path, by result size and content. Gated on
+  p99 as a ReDoS alarm, and run by `npm test` and by CI.
 
 ## Rules that must hold
 

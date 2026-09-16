@@ -16,9 +16,11 @@ export {
 } from './injection.js';
 export {
   BOUNDARY_SECRET_FAMILIES,
+  FAIL_CLOSED_REFUSAL_GUIDANCE,
   INJECTION_MARKER,
   MARKER_HASH_HEX,
   MAX_SECRET_REFS,
+  POLICY_REFUSAL_GUIDANCE,
   applyBoundary,
   blockedText,
   boundarySecretPatterns,

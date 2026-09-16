@@ -15,6 +15,7 @@ import type {
   AnyEvent,
   ChainRecord,
   IdentityContext,
+  PolicyDecisionEvent,
   ServerContext,
   SessionStartEvent,
   ToolCallEvent,
@@ -377,6 +378,92 @@ function seedHookSession(dataDir: string, sessionId: string): void {
   }
 }
 
+/**
+ * Seed a jsonl store with one gateway-mode session: an allowed call (no
+ * policy_decision of its own), a deny (decision + the synthetic tool_call
+ * the client was handed), and a hold the operator APPROVED (decision + the
+ * forwarded call). Two decisions, three calls, one error.
+ */
+function seedGatewaySession(dataDir: string, sessionId: string): void {
+  const at = (s: number): string => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+  const envelope = (timestamp: string) => ({
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp,
+    identity: FIXTURE_IDENTITY,
+    server: FIXTURE_SERVER,
+    attributes: {},
+  });
+  const call = (
+    timestamp: string,
+    tool: string,
+    requestId: number,
+    gateway: ToolCallEvent['gateway'],
+    isError = false,
+  ): ToolCallEvent => {
+    const ev: ToolCallEvent = {
+      ...envelope(timestamp),
+      kind: 'tool_call',
+      tool,
+      request_id: requestId,
+      args: {},
+      result_hash: sha256Ref('{}'),
+      result: {},
+      is_error: isError,
+      duration_ms: isError ? 0 : 1,
+      gateway,
+    };
+    if (isError) ev.error = { type: 'policy_denied' };
+    return ev;
+  };
+  const decision = (
+    timestamp: string,
+    requestId: number,
+    fields: Partial<PolicyDecisionEvent> & Pick<PolicyDecisionEvent, 'decision' | 'tool'>,
+  ): PolicyDecisionEvent => ({
+    ...envelope(timestamp),
+    kind: 'policy_decision',
+    request_id: requestId,
+    policy_hash: sha256Ref('policy bytes'),
+    args_hash: sha256Ref('{}'),
+    ...fields,
+  });
+  const events: AnyEvent[] = [
+    fixtureSessionStart(sessionId, at(0)),
+    call(at(1), 'read_note', 1, { decision: 'allow' }),
+    decision(at(2), 2, { decision: 'deny', tool: 'http_post', rule_id: 'no-exfil' }),
+    call(at(3), 'http_post', 2, { decision: 'deny', rule_id: 'no-exfil' }, true),
+    decision(at(4), 3, {
+      decision: 'hold',
+      tool: 'send_mail',
+      rule_id: 'needs-human',
+      outcome: 'approved',
+      approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
+      waited_ms: 1500,
+    }),
+    call(at(5), 'send_mail', 3, {
+      decision: 'hold',
+      rule_id: 'needs-human',
+      outcome: 'approved',
+      approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
+      waited_ms: 1500,
+    }),
+  ];
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records = events.map((event) => {
+      const record = makeRecord(head, event);
+      head = { seq: record.seq, hash: record.hash };
+      return record;
+    });
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
 function waitMs(ms: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
@@ -539,8 +626,8 @@ describe('mcp-recorder CLI', () => {
     expect(human.code).toBe(0);
     const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
     const headers = headerLine!.trim().split(/\s+/);
-    // SERVERS is the LAST column: every column that existed before it keeps
-    // its position.
+    // SERVERS and DECISIONS were appended, in that order: every column that
+    // existed before them keeps its position.
     expect(headers).toEqual([
       'SESSION',
       'STARTED',
@@ -550,6 +637,7 @@ describe('mcp-recorder CLI', () => {
       'TOOL_CALLS',
       'ERRORS',
       'SERVERS',
+      'DECISIONS',
     ]);
     expect(rowLines).toHaveLength(1);
     const cells = rowLines[0]!.trim().split(/\s+/);
@@ -560,6 +648,7 @@ describe('mcp-recorder CLI', () => {
     expect(cell('EVENTS')).toBe('6'); // session_start + 5 tool_call events
     expect(cell('TOOL_CALLS')).toBe('3'); // 2 pre+post pairs + 1 lone pre = 3 calls, not 5
     expect(cell('ERRORS')).toBe('0');
+    expect(cell('DECISIONS')).toBe('0'); // the hook does not enforce anything
 
     const json = await runCli(['sessions', '--data-dir', dataDir, '--json']);
     expect(json.code).toBe(0);
@@ -579,6 +668,42 @@ describe('mcp-recorder CLI', () => {
       event_count: 6,
       tool_call_count: 3,
       error_count: 0,
+    });
+  }, 60_000);
+
+  it('sessions: a gateway session shows what was denied and held in a DECISIONS column and in --json', async () => {
+    const dataDir = tmpDir('mcp-rec-sessions-gateway-');
+    const sessionId = 'dddddddd-0000-4000-8000-000000000000';
+    seedGatewaySession(dataDir, sessionId);
+
+    const human = await runCli(['sessions', '--data-dir', dataDir]);
+    expect(human.code).toBe(0);
+    const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
+    const headers = headerLine!.trim().split(/\s+/);
+    expect(rowLines).toHaveLength(1);
+    const cells = rowLines[0]!.trim().split(/\s+/);
+    const cell = (name: string): string => cells[headers.indexOf(name)]!;
+    // One deny + one resolved (approved) hold. The approved call ran, so
+    // this is not an error count: a session that refused work no longer
+    // looks like one that did not.
+    expect(cell('DECISIONS')).toBe('2');
+    expect(cell('TOOL_CALLS')).toBe('3'); // allowed + the denied call's synthetic response + approved
+    expect(cell('ERRORS')).toBe('1'); // only the denied one
+
+    const json = await runCli(['sessions', '--data-dir', dataDir, '--json']);
+    expect(json.code).toBe(0);
+    const list = JSON.parse(json.stdout) as Array<{
+      session_id: string;
+      policy_decision_count: number;
+      tool_call_count: number;
+      error_count: number;
+    }>;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      session_id: sessionId,
+      policy_decision_count: 2,
+      tool_call_count: 3,
+      error_count: 1,
     });
   }, 60_000);
 

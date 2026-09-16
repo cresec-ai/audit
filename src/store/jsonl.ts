@@ -600,7 +600,11 @@ export class JsonlStore implements EvidenceStore {
    */
   sessions(): SessionSummary[] {
     this.syncRecords();
-    const byId = new Map<string, { summary: SessionSummary; servers: Set<string> }>();
+    // policy_decision_count is optional on the contract but always set
+    // here, so the accumulator spells it out as required — `+= 1` on an
+    // optional number would not type-check.
+    type Accumulator = SessionSummary & { policy_decision_count: number };
+    const byId = new Map<string, { summary: Accumulator; servers: Set<string> }>();
     for (const record of this.records) {
       const ev = record.event;
       let entry = byId.get(ev.session_id);
@@ -617,6 +621,7 @@ export class JsonlStore implements EvidenceStore {
             tool_call_count: 0,
             error_count: 0,
             server_count: 0,
+            policy_decision_count: 0,
           },
           servers: new Set<string>(),
         };
@@ -648,6 +653,15 @@ export class JsonlStore implements EvidenceStore {
       if (ev.kind === 'tool_call' && typeof ev.server?.name === 'string') {
         servers.add(ev.server.name);
         summary.server_count = servers.size;
+      }
+      // Gateway mode's enforcement: one per deny, one per resolved hold
+      // (an approved hold included). Counted off the kind alone, like
+      // event_count — the synthetic tool_call that carries a refusal back
+      // to the client is counted as a call and an error above, not here,
+      // and a policy_decision with missing or off-shape decision/outcome
+      // fields still counts because nothing below the kind is read.
+      if (ev.kind === 'policy_decision') {
+        summary.policy_decision_count += 1;
       }
       if (ev.kind === 'session_end') {
         if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {

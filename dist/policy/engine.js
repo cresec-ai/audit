@@ -27,9 +27,11 @@
  * poisoned for the rest of the process.
  *
  * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
- * deny with `reason: "policy evaluation error: ..."` (enforcement is
- * fail-closed, unlike recording). A timed-out args regex lands there as
- * `policy evaluation error: regex timed out (<rule id>)`.
+ * deny with `reason: "policy evaluation error: ..."` and `failClosed: true`
+ * (enforcement is fail-closed, unlike recording). A timed-out args regex
+ * lands there as `policy evaluation error: regex timed out (<rule id>)`.
+ * `failClosed` is how a caller tells that deny apart from one a rule or a
+ * section default actually decided, without parsing the reason string.
  */
 import { globMatch } from './glob.js';
 import { RegexGuardError, matchBounded } from './regex-guard.js';
@@ -146,7 +148,7 @@ function decide(rules, defaultAction, matches) {
 }
 function evaluationError(err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}` };
+    return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}`, failClosed: true };
 }
 /**
  * Decide a `tools/call`. A policy without an `mcp` section yields the

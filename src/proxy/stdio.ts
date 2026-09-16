@@ -153,6 +153,20 @@ interface GatewayCall {
   rawRuleId?: string;
   ruleId?: string;
   reason?: string;
+  /**
+   * True when this refusal is the gateway FAILING CLOSED, not the operator
+   * deciding: the policy could not be evaluated, the hold file could not be
+   * written, `MAX_HOLDS` was already reached, finalize() had begun, a `hold`
+   * rule matched inside a JSON-RPC batch (nowhere to park it, so nobody is
+   * asked), or a parked hold ended because the session did rather than
+   * because a human answered — including one the operator had already
+   * APPROVED. The test is who decided, not what the outcome was: a human's
+   * `deny` and a `timeout` the policy configured are both policy decisions.
+   * It only picks which guidance clause `deniedText` appends — the refusal,
+   * the events and the diagnostics are unchanged. Internal to the proxy; no
+   * event carries it.
+   */
+  failClosed?: true;
 }
 
 /** A held tools/call: parked bytes + everything needed to resolve it later. */
@@ -1167,6 +1181,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       action: 'deny',
       matched: false,
       reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
+      // Same marker `evaluateMcp` sets for its own internal errors: nothing
+      // was decided here, so the model is told it may retry.
+      failClosed: true,
     });
 
     /**
@@ -1244,6 +1261,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         call.ruleId = cappedRuleId(decision.ruleId);
       }
       if (decision.reason !== undefined) call.reason = decision.reason;
+      if (decision.failClosed === true) call.failClosed = true;
       return { call, action: decision.action };
     };
 
@@ -1336,6 +1354,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       const input: Parameters<typeof deniedText>[0] = { tool: call.rawTool };
       if (call.rawRuleId !== undefined) input.ruleId = call.rawRuleId;
       if (call.reason !== undefined) input.reason = call.reason;
+      if (call.failClosed === true) input.failClosed = true;
       if (hold !== undefined && hold.approvalId !== undefined) {
         input.approvalId = hold.approvalId;
         input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
@@ -1474,7 +1493,13 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         return;
       }
       if (forward) resolution.outcome = 'session_end'; // approved, but the server is already gone
-      denyCall(entry, resolution);
+      // `session_end` means the session ended under the hold, not that anyone
+      // refused it: either shutdown swept a hold nobody had answered, or an
+      // answer arrived too late to act on. The sharpest case is a hold the
+      // operator APPROVED that still did not run — telling that agent "this
+      // is a policy decision by the operator" would invert what happened.
+      const failedClosed = resolution.outcome === 'session_end';
+      denyCall(failedClosed ? { ...entry, failClosed: true } : entry, resolution);
       diag(`gateway: hold ${entry.approvalId} ${resolution.outcome} after ${resolution.waitedMs} ms; tools/call "${entry.tool}" not forwarded`);
     };
 
@@ -1483,7 +1508,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // Fail closed: the holds map is bounded, so a client that parks
         // holds nobody ever resolves cannot grow it without limit.
         denyCall(
-          { ...call, reason: TOO_MANY_HOLDS_REASON },
+          { ...call, reason: TOO_MANY_HOLDS_REASON, failClosed: true },
           undefined,
           `gateway: ${MAX_HOLDS} holds already pending; denying tools/call "${call.tool}"` +
             ` (rule ${call.ruleId ?? 'default'})`,
@@ -1508,7 +1533,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // Fail closed: a hold that cannot be written is a deny.
         const message = err instanceof Error ? err.message : String(err);
         diag(`gateway: cannot write hold for tools/call "${call.tool}" (${message}); denying`);
-        denyCall({ ...call, reason: 'hold unavailable' });
+        denyCall({ ...call, reason: 'hold unavailable', failClosed: true });
         return;
       }
       const entry: HoldEntry = {
@@ -1533,8 +1558,13 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         },
         (err: unknown) => {
           // waitForDecision never rejects by contract; deny if it ever does.
+          // That deny is the gateway failing to learn the operator's answer,
+          // not a human giving one, so it must not read as a human's refusal.
           tapError(err);
-          if (!entry.settled) settleHold(entry, 'denied');
+          if (!entry.settled) {
+            entry.failClosed = true;
+            settleHold(entry, 'denied');
+          }
         },
       );
     };
@@ -1651,7 +1681,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // would never be recorded. Refuse it now, with the same outcome a
         // hold parked a moment earlier gets.
         denyCall(
-          { ...call, reason: SESSION_END_HOLD_REASON },
+          { ...call, reason: SESSION_END_HOLD_REASON, failClosed: true },
           { outcome: 'session_end', waitedMs: 0 },
           `gateway: session ending; tools/call "${call.tool}" refused instead of held` +
             ` (rule ${call.ruleId ?? 'default'})`,
@@ -1687,10 +1717,16 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
           forwardedCalls.push(call);
           continue;
         }
+        // A `hold` inside a batch is a deny because a batch element has
+        // nowhere to park — so no operator is ever asked about it, and the
+        // retry the policy clause forbids (the same call sent on its own) is
+        // the only thing that reaches an approver. That makes it the gateway
+        // failing closed, not the operator deciding.
+        const refused = action === 'hold' ? { ...call, failClosed: true as const } : call;
         if (action === 'hold') {
           diag(`gateway: hold inside a JSON-RPC batch is treated as deny (tools/call "${call.tool}")`);
         }
-        responses.push(synthesizeDeny(call));
+        responses.push(synthesizeDeny(refused));
         diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
       }
       if (kept.length > 0) forwardC2s(Buffer.from(JSON.stringify(kept) + '\n'));

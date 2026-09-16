@@ -597,6 +597,7 @@ export class JsonlStore {
                         tool_call_count: 0,
                         error_count: 0,
                         server_count: 0,
+                        policy_decision_count: 0,
                     },
                     servers: new Set(),
                 };
@@ -627,6 +628,15 @@ export class JsonlStore {
             if (ev.kind === 'tool_call' && typeof ev.server?.name === 'string') {
                 servers.add(ev.server.name);
                 summary.server_count = servers.size;
+            }
+            // Gateway mode's enforcement: one per deny, one per resolved hold
+            // (an approved hold included). Counted off the kind alone, like
+            // event_count — the synthetic tool_call that carries a refusal back
+            // to the client is counted as a call and an error above, not here,
+            // and a policy_decision with missing or off-shape decision/outcome
+            // fields still counts because nothing below the kind is read.
+            if (ev.kind === 'policy_decision') {
+                summary.policy_decision_count += 1;
             }
             if (ev.kind === 'session_end') {
                 if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {

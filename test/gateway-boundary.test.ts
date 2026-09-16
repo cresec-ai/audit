@@ -1,10 +1,14 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { sha256Ref } from '../src/chain/hash.js';
 import { DEFAULT_POLICY, Redactor } from '../src/redact/redactor.js';
 import {
   BOUNDARY_SECRET_FAMILIES,
+  FAIL_CLOSED_REFUSAL_GUIDANCE,
   INJECTION_MARKER,
   INJECTION_PATTERNS,
+  POLICY_REFUSAL_GUIDANCE,
   applyBoundary,
   blockedText,
   boundarySecretPatterns,
@@ -19,6 +23,7 @@ import {
   type BoundaryConfig,
   type Span,
 } from '../src/gateway/index.js';
+import { NULL_ID_TOOLS_CALL_MESSAGE, duplicateIdText } from '../src/proxy/stdio.js';
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -395,13 +400,23 @@ describe('applyBoundary: secrets', () => {
       jsonrpc: '2.0',
       id: 'abc',
       result: {
-        content: [{ type: 'text', text: 'mcp-recorder gateway: tool result blocked by policy (1 secret-shaped value, 0 injection markers)' }],
+        content: [
+          {
+            type: 'text',
+            text:
+              'mcp-recorder gateway: tool result blocked by policy (1 secret-shaped value, 0 injection markers)\n' +
+              'This is a policy decision by the operator, not a tool failure. Do not retry it or use another tool to get the same effect; report it to the user.',
+          },
+        ],
         isError: true,
       },
     });
     expect(out.report.action).toBe('block');
     expect(out.report.secret_refs).toEqual([sha256Ref(SECRETS.openai)]);
-    expect(blockedText(2, 1)).toBe('mcp-recorder gateway: tool result blocked by policy (2 secret-shaped values, 1 injection marker)');
+    expect(blockedText(2, 1)).toBe(
+      'mcp-recorder gateway: tool result blocked by policy (2 secret-shaped values, 1 injection marker)\n' +
+        'This is a policy decision by the operator, not a tool failure. Do not retry it or use another tool to get the same effect; report it to the user.',
+    );
   });
 
   it('off does not scan secrets at all', () => {
@@ -596,7 +611,10 @@ describe('applyBoundary: oversize', () => {
     expect(out.changed).toBe(true);
     expect(out.report).toEqual({ scanned: false, action: 'block', secrets_found: 0, injection_found: 0 });
     expect(contentText(out.message)).toBe(oversizeBlockedText(5000, 4096));
-    expect(contentText(out.message)).toBe('mcp-recorder gateway: tool result blocked by policy (result of 5000 bytes exceeds max_scan_bytes 4096)');
+    expect(contentText(out.message)).toBe(
+      'mcp-recorder gateway: tool result blocked by policy (result of 5000 bytes exceeds max_scan_bytes 4096)\n' +
+        FAIL_CLOSED_REFUSAL_GUIDANCE,
+    );
     expect(JSON.stringify(out.message)).not.toContain(SECRETS.aws);
   });
 
@@ -617,31 +635,31 @@ describe('applyBoundary: oversize', () => {
 describe('deniedText / synthesizeDeniedResult', () => {
   it('pins the deny strings', () => {
     expect(deniedText({ tool: 'http_post', ruleId: 'no-exfil', reason: 'no outbound HTTP' })).toBe(
-      'mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil": no outbound HTTP',
+      'mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil": no outbound HTTP\n' + POLICY_REFUSAL_GUIDANCE,
     );
     expect(deniedText({ tool: 'http_post', ruleId: 'no-exfil' })).toBe(
-      'mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil"',
+      'mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil"\n' + POLICY_REFUSAL_GUIDANCE,
     );
     expect(deniedText({ tool: 'http_post' })).toBe(
-      'mcp-recorder gateway: tools/call "http_post" denied by policy (no rule matched; mcp.default is deny)',
+      'mcp-recorder gateway: tools/call "http_post" denied by policy (no rule matched; mcp.default is deny)\n' + POLICY_REFUSAL_GUIDANCE,
     );
     expect(deniedText({ tool: 'http_post', reason: '' })).toBe(
-      'mcp-recorder gateway: tools/call "http_post" denied by policy (no rule matched; mcp.default is deny)',
+      'mcp-recorder gateway: tools/call "http_post" denied by policy (no rule matched; mcp.default is deny)\n' + POLICY_REFUSAL_GUIDANCE,
     );
   });
 
   it('never blames the policy default for a deny that was not the default acting', () => {
     // Fail-closed evaluation error: no rule id, a reason from the engine.
-    expect(deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom' })).toBe(
-      'mcp-recorder gateway: tools/call "read_file" denied by policy: policy evaluation error: boom',
+    expect(deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom', failClosed: true })).toBe(
+      'mcp-recorder gateway: tools/call "read_file" denied by policy: policy evaluation error: boom\n' + FAIL_CLOSED_REFUSAL_GUIDANCE,
     );
     // Proxy-side refusal (hold limit): no rule id, a reason from the proxy.
-    expect(deniedText({ tool: 'rm', reason: 'too many pending holds' })).toBe(
-      'mcp-recorder gateway: tools/call "rm" denied by policy: too many pending holds',
+    expect(deniedText({ tool: 'rm', reason: 'too many pending holds', failClosed: true })).toBe(
+      'mcp-recorder gateway: tools/call "rm" denied by policy: too many pending holds\n' + FAIL_CLOSED_REFUSAL_GUIDANCE,
     );
     for (const text of [
-      deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom' }),
-      deniedText({ tool: 'rm', reason: 'too many pending holds' }),
+      deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom', failClosed: true }),
+      deniedText({ tool: 'rm', reason: 'too many pending holds', failClosed: true }),
       deniedText({ tool: 'x', approvalId: 'id1' }),
     ]) {
       expect(text).not.toContain('default');
@@ -651,19 +669,23 @@ describe('deniedText / synthesizeDeniedResult', () => {
   it('pins the hold-outcome strings', () => {
     const base = { tool: 'delete_file', ruleId: 'danger', reason: 'needs a human', approvalId: 'abc-123' };
     expect(deniedText({ ...base, outcome: 'denied' })).toBe(
-      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 was denied): needs a human',
+      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 was denied): needs a human\n' +
+        POLICY_REFUSAL_GUIDANCE,
     );
     expect(deniedText({ ...base, outcome: 'timeout' })).toBe(
-      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 timed out): needs a human',
+      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 timed out): needs a human\n' +
+        POLICY_REFUSAL_GUIDANCE,
     );
+    // The client withdrew this one itself: no guidance clause (see deniedText).
     expect(deniedText({ ...base, outcome: 'cancelled' })).toBe(
       'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 was cancelled): needs a human',
     );
     expect(deniedText({ ...base, outcome: 'session_end' })).toBe(
-      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 was abandoned at session end): needs a human',
+      'mcp-recorder gateway: tools/call "delete_file" denied by policy rule "danger" (hold abc-123 was abandoned at session end): needs a human\n' +
+        POLICY_REFUSAL_GUIDANCE,
     );
     expect(deniedText({ tool: 'x', approvalId: 'id1' })).toBe(
-      'mcp-recorder gateway: tools/call "x" denied by policy (hold id1 was not approved)',
+      'mcp-recorder gateway: tools/call "x" denied by policy (hold id1 was not approved)\n' + POLICY_REFUSAL_GUIDANCE,
     );
   });
 
@@ -675,5 +697,289 @@ describe('deniedText / synthesizeDeniedResult', () => {
     });
     expect(synthesizeDeniedResult('req-1', 'nope').id).toBe('req-1');
     expect(JSON.parse(JSON.stringify(synthesizeDeniedResult(1, 'x')))).toEqual(synthesizeDeniedResult(1, 'x'));
+  });
+});
+
+/* ------------------------------ refusal guidance ------------------------------ */
+
+describe('refusal guidance clauses', () => {
+  it('pins the exact clauses', () => {
+    expect(POLICY_REFUSAL_GUIDANCE).toBe(
+      'This is a policy decision by the operator, not a tool failure. ' +
+        'Do not retry it or use another tool to get the same effect; report it to the user.',
+    );
+    expect(FAIL_CLOSED_REFUSAL_GUIDANCE).toBe(
+      'The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. ' +
+        'You may retry it; do not use another tool to get the same effect, and report it to the user.',
+    );
+  });
+
+  it('each is one line, appended after the refusal, and short enough to carry on every refusal', () => {
+    for (const clause of [POLICY_REFUSAL_GUIDANCE, FAIL_CLOSED_REFUSAL_GUIDANCE]) {
+      expect(clause).not.toContain('\n');
+      expect(clause.length).toBeLessThanOrEqual(220);
+    }
+    // The first line stays byte-for-byte the refusal it always was.
+    const text = deniedText({ tool: 'http_post', ruleId: 'no-exfil', reason: 'no outbound HTTP' });
+    const lines = text.split('\n');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe('mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil": no outbound HTTP');
+    expect(lines[1]).toBe(POLICY_REFUSAL_GUIDANCE);
+    const failed = deniedText({ tool: 'rm', reason: 'too many pending holds', failClosed: true }).split('\n');
+    expect(failed).toHaveLength(2);
+    expect(failed[0]).toBe('mcp-recorder gateway: tools/call "rm" denied by policy: too many pending holds');
+    expect(failed[1]).toBe(FAIL_CLOSED_REFUSAL_GUIDANCE);
+  });
+
+  it('only the operator-decided refusals claim to be a policy decision, and only they forbid a retry', () => {
+    // Someone actually decided each of these: a rule, `mcp.default`, a human
+    // (or the timeout/session-end the operator configured), or the boundary.
+    const decided = [
+      deniedText({ tool: 'http_post', ruleId: 'no-exfil', reason: 'no outbound HTTP' }),
+      deniedText({ tool: 'http_post' }),
+      deniedText({ tool: 'delete_file', approvalId: 'abc-123', outcome: 'denied' }),
+      deniedText({ tool: 'delete_file', approvalId: 'abc-123', outcome: 'timeout' }),
+      deniedText({ tool: 'delete_file', approvalId: 'abc-123', outcome: 'session_end' }),
+      deniedText({ tool: 'delete_file', approvalId: 'abc-123' }),
+      blockedText(1, 0),
+      blockedText(0, 1),
+    ];
+    for (const text of decided) {
+      expect(text.endsWith(`\n${POLICY_REFUSAL_GUIDANCE}`)).toBe(true);
+      expect(text).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    }
+    const delivered = synthesizeDeniedResult(1, decided[0]!);
+    expect(JSON.parse(JSON.stringify(delivered)).result.content[0].text).toBe(decided[0]);
+  });
+
+  it('a fail-closed refusal says so, never calls itself a decision, and never forbids a retry', () => {
+    // Nobody decided any of these: the gateway could not reach a decision.
+    // The proxy passes `failClosed` explicitly (src/proxy/stdio.ts); the
+    // reason string is never sniffed for it.
+    const failClosed = [
+      deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom', failClosed: true }),
+      deniedText({ tool: 'rm', reason: 'too many pending holds', failClosed: true }),
+      deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'hold unavailable', failClosed: true }),
+      deniedText({
+        tool: 'send_mail',
+        ruleId: 'needs-human',
+        reason: 'session_end (hold not started)',
+        outcome: 'session_end',
+        failClosed: true,
+      }),
+      oversizeBlockedText(5000, 4096),
+    ];
+    for (const text of failClosed) {
+      expect(text.endsWith(`\n${FAIL_CLOSED_REFUSAL_GUIDANCE}`)).toBe(true);
+      expect(text).not.toContain(POLICY_REFUSAL_GUIDANCE);
+      // The two lies the old single clause told about these refusals.
+      expect(text).not.toContain('policy decision by the operator');
+      expect(text).not.toContain('Do not retry');
+    }
+    // ... and the two instructions that must survive on all of them.
+    for (const text of failClosed) {
+      expect(text).toContain('do not use another tool to get the same effect');
+      expect(text).toContain('report it to the user');
+    }
+  });
+
+  it('`failClosed` beats the hold outcome: a hold REFUSED at session end is not a decision', () => {
+    // A hold that was parked and then abandoned when the session ended is the
+    // operator's timeout acting; one refused because finalize() had already
+    // begun was never held at all. Both read `session_end`.
+    const abandoned = deniedText({ tool: 'send_mail', approvalId: 'abc-123', outcome: 'session_end' });
+    const neverStarted = deniedText({
+      tool: 'send_mail',
+      reason: 'session_end (hold not started)',
+      outcome: 'session_end',
+      failClosed: true,
+    });
+    expect(abandoned.endsWith(`\n${POLICY_REFUSAL_GUIDANCE}`)).toBe(true);
+    expect(neverStarted.endsWith(`\n${FAIL_CLOSED_REFUSAL_GUIDANCE}`)).toBe(true);
+  });
+
+  it('stays off a cancelled hold entirely, even when the call was failClosed-flagged', () => {
+    // The client cancelled its own request; nothing was refused, so neither
+    // clause is true.
+    expect(deniedText({ tool: 'delete_file', approvalId: 'abc-123', outcome: 'cancelled' })).toBe(
+      'mcp-recorder gateway: tools/call "delete_file" denied by policy (hold abc-123 was cancelled)',
+    );
+    const text = deniedText({ tool: 'delete_file', approvalId: 'abc-123', outcome: 'cancelled', failClosed: true });
+    expect(text).not.toContain('\n');
+    expect(text).not.toContain(POLICY_REFUSAL_GUIDANCE);
+    expect(text).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+  });
+
+  it('an oversize block keeps its byte counts on the first line and permits asking for less', () => {
+    const lines = oversizeBlockedText(5000, 4096).split('\n');
+    expect(lines[0]).toBe('mcp-recorder gateway: tool result blocked by policy (result of 5000 bytes exceeds max_scan_bytes 4096)');
+    expect(lines[1]).toBe(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    expect(lines[1]).toContain('You may retry it');
+  });
+});
+
+/* ------------------------------ docs/agent-guidance.md ------------------------------ */
+
+/**
+ * The snippet in docs/agent-guidance.md is pasted into an agent's project
+ * instructions, so every claim it makes has to be true of the strings this
+ * module actually produces. These tests read the doc and check it against
+ * them: the clauses it quotes, the substrings it tells a model to match on,
+ * and the order it tells the model to match them in.
+ */
+describe('docs/agent-guidance.md matches the refusals the gateway really sends', () => {
+  const DOC = readFileSync(fileURLToPath(new URL('../docs/agent-guidance.md', import.meta.url)), 'utf8');
+  const snippetStart = DOC.indexOf('```markdown');
+  const SNIPPET = DOC.slice(snippetStart, DOC.indexOf('```', snippetStart + 3));
+
+  /** Every client-visible refusal the gateway synthesizes, by the bullet that claims it. */
+  const CORPUS: Array<{ text: string; bucket: string }> = [
+    { text: deniedText({ tool: 'http_post', ruleId: 'no-exfil', reason: 'no outbound HTTP' }), bucket: 'denied by policy' },
+    { text: deniedText({ tool: 'rm' }), bucket: 'denied by policy' },
+    { text: deniedText({ tool: 'read_file', reason: 'policy evaluation error: boom', failClosed: true }), bucket: 'denied by policy' },
+    { text: deniedText({ tool: 'rm', ruleId: 'needs-human', reason: 'too many pending holds', failClosed: true }), bucket: 'denied by policy' },
+    { text: deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'hold unavailable', failClosed: true }), bucket: 'denied by policy' },
+    { text: deniedText({ tool: 'delete_file', ruleId: 'danger', approvalId: 'abc-123', outcome: 'denied' }), bucket: '(hold ' },
+    { text: deniedText({ tool: 'delete_file', ruleId: 'danger', approvalId: 'abc-123', outcome: 'timeout' }), bucket: '(hold ' },
+    { text: deniedText({ tool: 'delete_file', ruleId: 'danger', approvalId: 'abc-123', outcome: 'cancelled' }), bucket: '(hold ' },
+    { text: deniedText({ tool: 'delete_file', ruleId: 'danger', approvalId: 'abc-123', outcome: 'session_end', failClosed: true }), bucket: '(hold ' },
+    {
+      text: deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'session_end (hold not started)', outcome: 'session_end', failClosed: true }),
+      bucket: '(hold ',
+    },
+    { text: deniedText({ tool: 'send_mail', ruleId: 'needs-human', reason: 'outbound', failClosed: true }), bucket: 'denied by policy' },
+    { text: blockedText(1, 0), bucket: 'secret-shaped value' },
+    { text: blockedText(0, 1), bucket: 'secret-shaped value' },
+    { text: oversizeBlockedText(5000, 4096), bucket: 'exceeds max_scan_bytes' },
+    { text: duplicateIdText('read_file', 7, 'pending'), bucket: 'must be unique while in flight' },
+    { text: duplicateIdText('read_file', 7, 'held'), bucket: 'must be unique while in flight' },
+  ];
+
+  it('the clauses are APPENDED, and their own doc block no longer says otherwise', () => {
+    // The clause sits on line 2 of a refusal, not at the head of it, and it
+    // is not on every refusal. The behaviour is pinned above; this keeps the
+    // source comment that describes it from drifting back to the old claim.
+    const src = readFileSync(fileURLToPath(new URL('../src/gateway/boundary.ts', import.meta.url)), 'utf8');
+    const block = src.slice(0, src.indexOf('export const FAIL_CLOSED_REFUSAL_GUIDANCE'));
+    expect(block).not.toContain('prepended');
+    expect(block).not.toContain('EVERY refusal');
+  });
+
+  it('quotes both clauses byte-for-byte, here and in the reference docs', () => {
+    const read = (name: string): string => readFileSync(fileURLToPath(new URL(`../docs/${name}`, import.meta.url)), 'utf8');
+    for (const text of [DOC, read('gateway.md'), read('policy.md')]) {
+      expect(text).toContain(POLICY_REFUSAL_GUIDANCE);
+      expect(text).toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    }
+    // docs/policy.md used to call the oversize block the one refusal with no
+    // clause at all; it now carries the fail-closed one.
+    expect(read('policy.md')).not.toMatch(/oversize `block` is\s+the one refusal with \*\*no\*\* guidance clause/);
+  });
+
+  it('the snippet’s "who refused" keys really open the two clauses', () => {
+    const decided = 'This is a policy decision by the operator';
+    const failed = 'The gateway could not reach a policy decision';
+    expect(POLICY_REFUSAL_GUIDANCE.startsWith(decided)).toBe(true);
+    expect(FAIL_CLOSED_REFUSAL_GUIDANCE.startsWith(failed)).toBe(true);
+    expect(SNIPPET).toContain(decided);
+    expect(SNIPPET).toContain(failed);
+    // Neither key may appear in the other clause, or the model cannot tell
+    // the two apart at all.
+    expect(FAIL_CLOSED_REFUSAL_GUIDANCE).not.toContain(decided);
+    expect(POLICY_REFUSAL_GUIDANCE).not.toContain(failed);
+  });
+
+  it('the "what happened" bullets are listed in an order that buckets every refusal correctly', () => {
+    // The keys, in the order the snippet lists them. A model reading
+    // top-down takes the FIRST one that matches, so a general bullet above a
+    // specific one silently steals its refusals.
+    const KEYS = ['exceeds max_scan_bytes', 'secret-shaped value', 'must be unique while in flight', '(hold ', 'denied by policy'];
+    const marker = SNIPPET.indexOf('**First line');
+    expect(marker, 'the snippet no longer has a "what happened" list').toBeGreaterThan(-1);
+    const WHAT = SNIPPET.slice(marker);
+    let at = -1;
+    for (const key of KEYS) {
+      const idx = WHAT.indexOf(`\`${key}`);
+      expect(idx, `snippet is missing a bullet keyed on \`${key}\``).toBeGreaterThan(-1);
+      expect(idx, `\`${key}\` is listed out of order`).toBeGreaterThan(at);
+      at = idx;
+    }
+    for (const { text, bucket } of CORPUS) {
+      const first = KEYS.find((key) => text.includes(key));
+      expect(first, `no bullet matches: ${text.split('\n')[0]!}`).toBe(bucket);
+    }
+  });
+
+  it('the page states the rule by WHO decided, and names the two cases that look like decisions', () => {
+    // A hold a human denied and a hold the operator's on_timeout ended are
+    // policy decisions; a hold the session ended under, and one refused
+    // inside a batch, are not — nobody was asked. Those two are exactly the
+    // cases a reader (or a later edit) is most likely to file under "deny".
+    // The doc is hard-wrapped, so these match across a line break.
+    expect(DOC).toMatch(/JSON-RPC\s+batch/);
+    expect(DOC).toMatch(/session\s+ended\s+under\s+a\s+parked\s+hold/);
+    expect(DOC).toMatch(/already\s+approved/);
+    // Both hold refusals appear in the exact-lines block with their clause,
+    // since that block is what a reader checks the snippet against.
+    const shown = DOC.slice(DOC.indexOf('What the gateway actually sends'));
+    expect(shown).toContain('(hold abc-123 was denied)');
+    expect(shown).toContain('(hold abc-123 was abandoned at session end)');
+  });
+
+  it('the blocked-result bullet does not shadow the oversize one', () => {
+    // The oversize text is also a "tool result blocked by policy (...)", so
+    // the general bullet may not be keyed on words the oversize text shares.
+    const oversize = oversizeBlockedText(5000, 4096);
+    expect(oversize).toContain('tool result blocked by policy');
+    expect(oversize).not.toContain('secret-shaped value');
+    expect(oversize).not.toContain('injection marker');
+    expect(SNIPPET).not.toContain('`tool result blocked by policy`');
+  });
+
+  it('does not claim a deny is about the tool rather than the call', () => {
+    // MCP rules match on ARGUMENTS (match.args, max_args_bytes), so the same
+    // tool with different arguments is routinely allowed — see the headline
+    // example in docs/policy.md, where `read_file` is denied only for
+    // credential paths.
+    expect(SNIPPET).not.toContain('different arguments will not help');
+    expect(SNIPPET).toContain('final for THIS call');
+    expect(SNIPPET).toContain('not necessarily off limits');
+    expect(SNIPPET).toMatch(/rules can\s+match on arguments/);
+  });
+
+  it('describes a hold as silence, not as text the agent can wait on', () => {
+    // Nothing reaches the client while a call is parked; the only text that
+    // names a hold is the FINAL refusal.
+    expect(SNIPPET).toContain('nothing at all');
+    expect(SNIPPET).toMatch(/hold\s+is already over/);
+    expect(SNIPPET).toMatch(/no second route/);
+  });
+
+  it('forbids retrying only what was decided, and never forbids the duplicate-id retry', () => {
+    const duplicate = duplicateIdText('read_file', 7, 'pending');
+    expect(duplicate).toContain('retry with a fresh id');
+    // A blanket "never retry a refused call" contradicts that text.
+    expect(SNIPPET).not.toMatch(/Never retry a refused call/i);
+    expect(SNIPPET).toContain('Retrying is allowed');
+    expect(SNIPPET).toContain('Do not retry this call');
+  });
+
+  it('counts the clause-less refusals correctly and says what the null-id one looks like', () => {
+    const clauseless = [
+      deniedText({ tool: 'delete_file', ruleId: 'danger', approvalId: 'abc-123', outcome: 'cancelled' }),
+      duplicateIdText('read_file', 7, 'pending'),
+      NULL_ID_TOOLS_CALL_MESSAGE,
+    ];
+    for (const text of clauseless) {
+      expect(text).not.toContain(POLICY_REFUSAL_GUIDANCE);
+      expect(text).not.toContain(FAIL_CLOSED_REFUSAL_GUIDANCE);
+    }
+    expect(clauseless).toHaveLength(3);
+    expect(DOC).toMatch(/Three gateway-synthesized refusals carry no clause/);
+    for (const text of clauseless) expect(DOC).toContain(text);
+    // The null-id refusal is not an isError tool result at all, so the
+    // snippet's matching rule cannot reach it.
+    expect(DOC).toContain('-32600');
+    expect(DOC).toMatch(/JSON-RPC error/);
   });
 });

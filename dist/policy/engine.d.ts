@@ -27,9 +27,11 @@
  * poisoned for the rest of the process.
  *
  * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
- * deny with `reason: "policy evaluation error: ..."` (enforcement is
- * fail-closed, unlike recording). A timed-out args regex lands there as
- * `policy evaluation error: regex timed out (<rule id>)`.
+ * deny with `reason: "policy evaluation error: ..."` and `failClosed: true`
+ * (enforcement is fail-closed, unlike recording). A timed-out args regex
+ * lands there as `policy evaluation error: regex timed out (<rule id>)`.
+ * `failClosed` is how a caller tells that deny apart from one a rule or a
+ * section default actually decided, without parsing the reason string.
  */
 import type { Action, Policy } from './types.js';
 export interface McpRequestInput {
@@ -53,6 +55,19 @@ export interface Decision {
     reason?: string;
     /** True when a rule matched, false when the default applied. */
     matched: boolean;
+    /**
+     * Only ever set (to `true`) on the fail-closed deny below: the policy
+     * could NOT be evaluated, so nothing was decided about this request. It is
+     * the difference between "the operator said no" and "the gateway refused
+     * rather than guess", which the proxy turns into the guidance an agent
+     * reads on a refusal (`FAIL_CLOSED_REFUSAL_GUIDANCE`). Additive and
+     * optional: a real allow/deny/hold decision simply omits it, so every
+     * existing consumer, and the Rego twin (which has no counterpart — OPA
+     * evaluates or it does not answer at all), is unaffected. This is an
+     * internal TypeScript type, not the frozen `edut.mcp-recorder.event.v1`
+     * schema; no event gains a field.
+     */
+    failClosed?: true;
 }
 export type McpDecision = Decision;
 export type EgressDecision = Decision;

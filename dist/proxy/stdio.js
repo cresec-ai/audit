@@ -1030,6 +1030,9 @@ export async function runStdioProxy(opts) {
             action: 'deny',
             matched: false,
             reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
+            // Same marker `evaluateMcp` sets for its own internal errors: nothing
+            // was decided here, so the model is told it may retry.
+            failClosed: true,
         });
         /**
          * Canonical JSON of a call's arguments, plus its hash. The canonical
@@ -1100,6 +1103,8 @@ export async function runStdioProxy(opts) {
             }
             if (decision.reason !== undefined)
                 call.reason = decision.reason;
+            if (decision.failClosed === true)
+                call.failClosed = true;
             return { call, action: decision.action };
         };
         /* ---- events ---- */
@@ -1190,6 +1195,8 @@ export async function runStdioProxy(opts) {
                 input.ruleId = call.rawRuleId;
             if (call.reason !== undefined)
                 input.reason = call.reason;
+            if (call.failClosed === true)
+                input.failClosed = true;
             if (hold !== undefined && hold.approvalId !== undefined) {
                 input.approvalId = hold.approvalId;
                 input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
@@ -1315,14 +1322,20 @@ export async function runStdioProxy(opts) {
             }
             if (forward)
                 resolution.outcome = 'session_end'; // approved, but the server is already gone
-            denyCall(entry, resolution);
+            // `session_end` means the session ended under the hold, not that anyone
+            // refused it: either shutdown swept a hold nobody had answered, or an
+            // answer arrived too late to act on. The sharpest case is a hold the
+            // operator APPROVED that still did not run — telling that agent "this
+            // is a policy decision by the operator" would invert what happened.
+            const failedClosed = resolution.outcome === 'session_end';
+            denyCall(failedClosed ? { ...entry, failClosed: true } : entry, resolution);
             diag(`gateway: hold ${entry.approvalId} ${resolution.outcome} after ${resolution.waitedMs} ms; tools/call "${entry.tool}" not forwarded`);
         };
         const startHold = (call, raw) => {
             if (holds.size >= MAX_HOLDS) {
                 // Fail closed: the holds map is bounded, so a client that parks
                 // holds nobody ever resolves cannot grow it without limit.
-                denyCall({ ...call, reason: TOO_MANY_HOLDS_REASON }, undefined, `gateway: ${MAX_HOLDS} holds already pending; denying tools/call "${call.tool}"` +
+                denyCall({ ...call, reason: TOO_MANY_HOLDS_REASON, failClosed: true }, undefined, `gateway: ${MAX_HOLDS} holds already pending; denying tools/call "${call.tool}"` +
                     ` (rule ${call.ruleId ?? 'default'})`);
                 return;
             }
@@ -1347,7 +1360,7 @@ export async function runStdioProxy(opts) {
                 // Fail closed: a hold that cannot be written is a deny.
                 const message = err instanceof Error ? err.message : String(err);
                 diag(`gateway: cannot write hold for tools/call "${call.tool}" (${message}); denying`);
-                denyCall({ ...call, reason: 'hold unavailable' });
+                denyCall({ ...call, reason: 'hold unavailable', failClosed: true });
                 return;
             }
             const entry = {
@@ -1370,9 +1383,13 @@ export async function runStdioProxy(opts) {
                     settleHold(entry, res.status, res.record);
             }, (err) => {
                 // waitForDecision never rejects by contract; deny if it ever does.
+                // That deny is the gateway failing to learn the operator's answer,
+                // not a human giving one, so it must not read as a human's refusal.
                 tapError(err);
-                if (!entry.settled)
+                if (!entry.settled) {
+                    entry.failClosed = true;
                     settleHold(entry, 'denied');
+                }
             });
         };
         const cancelHold = (msg) => {
@@ -1494,7 +1511,7 @@ export async function runStdioProxy(opts) {
                 // would leave a pending hold file and a live poller behind and
                 // would never be recorded. Refuse it now, with the same outcome a
                 // hold parked a moment earlier gets.
-                denyCall({ ...call, reason: SESSION_END_HOLD_REASON }, { outcome: 'session_end', waitedMs: 0 }, `gateway: session ending; tools/call "${call.tool}" refused instead of held` +
+                denyCall({ ...call, reason: SESSION_END_HOLD_REASON, failClosed: true }, { outcome: 'session_end', waitedMs: 0 }, `gateway: session ending; tools/call "${call.tool}" refused instead of held` +
                     ` (rule ${call.ruleId ?? 'default'})`);
                 return;
             }
@@ -1526,10 +1543,16 @@ export async function runStdioProxy(opts) {
                     forwardedCalls.push(call);
                     continue;
                 }
+                // A `hold` inside a batch is a deny because a batch element has
+                // nowhere to park — so no operator is ever asked about it, and the
+                // retry the policy clause forbids (the same call sent on its own) is
+                // the only thing that reaches an approver. That makes it the gateway
+                // failing closed, not the operator deciding.
+                const refused = action === 'hold' ? { ...call, failClosed: true } : call;
                 if (action === 'hold') {
                     diag(`gateway: hold inside a JSON-RPC batch is treated as deny (tools/call "${call.tool}")`);
                 }
-                responses.push(synthesizeDeny(call));
+                responses.push(synthesizeDeny(refused));
                 diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
             }
             if (kept.length > 0)

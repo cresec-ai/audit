@@ -43,7 +43,7 @@ export { compileGlob, globMatch, globToRegExp } from './policy/glob.js';
 export { evaluateEgress, evaluateMcp, getPath, ruleLabel } from './policy/engine.js';
 export { bundleFileOrder, compileToRego, policyRevision, renderEgressModule, renderMcpModule, } from './policy/rego.js';
 /* gateway primitives (record --policy): boundary filter, injection markers, hold store */
-export { BOUNDARY_SECRET_FAMILIES, INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, applyBoundary, blockedText, boundarySecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
+export { BOUNDARY_SECRET_FAMILIES, FAIL_CLOSED_REFUSAL_GUIDANCE, INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, POLICY_REFUSAL_GUIDANCE, applyBoundary, blockedText, boundarySecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
 /* config + version */
 export { resolveConfig } from './config.js';
 export { VERSION } from './version.js';

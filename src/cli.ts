@@ -1120,12 +1120,22 @@ async function cmdSessions(flags: Flags): Promise<void> {
       out('no sessions recorded');
       return;
     }
-    // SERVERS is appended LAST so every column that existed before it keeps
-    // its position for anyone who split this table by column index; `--json`
-    // is the stable machine interface (README).
+    // New columns are appended LAST so every column that existed before
+    // them keeps its position for anyone who split this table by column
+    // index; `--json` is the stable machine interface (README).
     out(
       formatTable(
-        ['SESSION', 'STARTED', 'ENDED', 'SERVER', 'EVENTS', 'TOOL_CALLS', 'ERRORS', 'SERVERS'],
+        [
+          'SESSION',
+          'STARTED',
+          'ENDED',
+          'SERVER',
+          'EVENTS',
+          'TOOL_CALLS',
+          'ERRORS',
+          'SERVERS',
+          'DECISIONS',
+        ],
         sessions.map((s) => [
           id8(s.session_id),
           s.started_at,
@@ -1138,6 +1148,11 @@ async function cmdSessions(flags: Flags): Promise<void> {
           // 1 for a proxy session, the number of servers called for a hook
           // session (SERVER is only the first event's — 'claude-code' there).
           s.server_count === undefined ? '' : String(s.server_count),
+          // policy_decision events: what gateway mode denied or held (an
+          // approved hold included), 0 for a session recorded without a
+          // policy. A denied call also shows up under TOOL_CALLS and
+          // ERRORS — the refusal the client was handed is a call too.
+          s.policy_decision_count === undefined ? '' : String(s.policy_decision_count),
         ]),
       ),
     );

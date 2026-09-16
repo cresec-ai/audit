@@ -21,6 +21,7 @@ import type {
   AnyEvent,
   ChainRecord,
   HeadSignature,
+  HoldOutcome,
   IdentityContext,
   PolicyDecisionEvent,
   NotificationEvent,
@@ -302,8 +303,43 @@ function policyDecision(sessionId: string, timestamp: string, requestId: number)
   };
 }
 
-function deniedToolCall(sessionId: string, timestamp: string, requestId: number): ToolCallEvent {
-  const ev = toolCall(sessionId, timestamp, 'http_post', { isError: true, requestId });
+/**
+ * A hold the proxy resolved: one policy_decision per OUTCOME, whatever the
+ * outcome was — an approved hold is an enforcement action the gateway took
+ * just as much as a denied one, and is recorded the same way.
+ */
+function holdDecision(
+  sessionId: string,
+  timestamp: string,
+  requestId: number,
+  outcome: HoldOutcome,
+): PolicyDecisionEvent {
+  const ev: PolicyDecisionEvent = {
+    ...policyDecision(sessionId, timestamp, requestId),
+    decision: 'hold',
+    outcome,
+    tool: 'send_mail',
+    rule_id: 'needs-human',
+    approval_id: `a1b2c3d4-0000-4000-8000-${String(requestId).padStart(12, '0')}`,
+    waited_ms: 1500,
+  };
+  ev.attributes = {
+    ...ev.attributes,
+    'gen_ai.tool.name': 'send_mail',
+    'cresec.policy.decision': 'hold',
+    'cresec.policy.rule_id': 'needs-human',
+  };
+  if (outcome === 'approved') ev.approver = 'alice';
+  return ev;
+}
+
+function deniedToolCall(
+  sessionId: string,
+  timestamp: string,
+  requestId: number,
+  tool = 'http_post',
+): ToolCallEvent {
+  const ev = toolCall(sessionId, timestamp, tool, { isError: true, requestId });
   ev.error = { type: 'policy_denied' };
   ev.attributes['error.type'] = 'policy_denied';
   ev.gateway = { decision: 'deny', rule_id: 'no-exfil' };
@@ -344,6 +380,106 @@ function gatewaySessionFixture(): ChainRecord[] {
     approved,
     sessionEnd(SESSION_G, '2026-06-11T12:00:05.000Z'),
   ]);
+}
+
+/* --- Gateway enforcement as `sessions` reports it: sessions that differ
+ * only in what the gateway denied, held or let through. */
+const SESSION_DENY_ONLY = '77777777-7777-4777-8777-777777777777';
+const SESSION_HOLDS = '88888888-8888-4888-8888-888888888888';
+const SESSION_POLICY_MIX = '99999999-9999-4999-8999-999999999999';
+const SESSION_NO_ENFORCEMENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const SESSION_ODD_POLICY = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+/**
+ * Five sessions recorded in gateway mode, interleaved in one chain the way
+ * concurrent `record` wrappers share a data dir: denies only, resolved
+ * holds (one of them APPROVED — the call ran, the gateway still ruled on
+ * it), a mix of allow + deny + hold, one where the gateway refused nothing
+ * at all, and one whose policy_decision records are malformed.
+ */
+function enforcementSessionEvents(): AnyEvent[] {
+  const at = (hour: number, second: number): string =>
+    `2026-06-12T${String(hour).padStart(2, '0')}:00:${String(second).padStart(2, '0')}.000Z`;
+  /** Allowed: forwarded and boundary-filtered, and NOT a policy_decision. */
+  const allowed = (sessionId: string, timestamp: string, requestId: number): ToolCallEvent => {
+    const ev = toolCall(sessionId, timestamp, 'read_note', { requestId });
+    ev.gateway = {
+      decision: 'allow',
+      boundary: { scanned: true, action: 'none', secrets_found: 0, injection_found: 0 },
+    };
+    return ev;
+  };
+  /** A deny: the decision, then the synthetic tool_call the client was handed. */
+  const denied = (sessionId: string, hour: number, second: number, id: number): AnyEvent[] => [
+    policyDecision(sessionId, at(hour, second), id),
+    deniedToolCall(sessionId, at(hour, second + 1), id),
+  ];
+  /** A resolved hold: the decision, then the call — forwarded iff approved. */
+  const held = (
+    sessionId: string,
+    hour: number,
+    second: number,
+    id: number,
+    outcome: HoldOutcome,
+  ): AnyEvent[] => {
+    const decision = holdDecision(sessionId, at(hour, second), id, outcome);
+    const call =
+      outcome === 'approved'
+        ? toolCall(sessionId, at(hour, second + 1), 'send_mail', { requestId: id })
+        : deniedToolCall(sessionId, at(hour, second + 1), id, 'send_mail');
+    call.gateway = {
+      decision: 'hold',
+      rule_id: 'needs-human',
+      outcome,
+      approval_id: decision.approval_id!,
+      waited_ms: 1500,
+    };
+    return [decision, call];
+  };
+  /** A policy_decision bent into a shape no writer of ours produces. */
+  const odd = (
+    base: PolicyDecisionEvent,
+    drop: Array<keyof PolicyDecisionEvent>,
+    overrides: Record<string, unknown>,
+  ): AnyEvent => {
+    const ev: Record<string, unknown> = { ...base, ...overrides };
+    for (const key of drop) delete ev[key];
+    return ev as unknown as AnyEvent;
+  };
+  return [
+    sessionStart(SESSION_DENY_ONLY, at(9, 0)),
+    ...denied(SESSION_DENY_ONLY, 9, 1, 1),
+    ...denied(SESSION_DENY_ONLY, 9, 3, 2),
+    sessionEnd(SESSION_DENY_ONLY, at(9, 9)),
+
+    sessionStart(SESSION_HOLDS, at(10, 0)),
+    ...held(SESSION_HOLDS, 10, 1, 1, 'approved'),
+    ...held(SESSION_HOLDS, 10, 3, 2, 'denied'),
+    ...held(SESSION_HOLDS, 10, 5, 3, 'timeout'),
+    sessionEnd(SESSION_HOLDS, at(10, 9)),
+
+    sessionStart(SESSION_POLICY_MIX, at(11, 0)),
+    allowed(SESSION_POLICY_MIX, at(11, 1), 1),
+    ...denied(SESSION_POLICY_MIX, 11, 2, 2),
+    ...held(SESSION_POLICY_MIX, 11, 4, 3, 'approved'),
+    sessionEnd(SESSION_POLICY_MIX, at(11, 9)),
+
+    sessionStart(SESSION_NO_ENFORCEMENT, at(12, 0)),
+    allowed(SESSION_NO_ENFORCEMENT, at(12, 1), 1),
+    allowed(SESSION_NO_ENFORCEMENT, at(12, 2), 2),
+    sessionEnd(SESSION_NO_ENFORCEMENT, at(12, 9)),
+
+    // Shapes no writer of ours produces, pinned so the backends cannot
+    // drift: a policy_decision with no `decision` at all and one whose
+    // `decision`/`outcome` are off-vocabulary still count (neither backend
+    // reads below the kind), while a tool_call that merely CARRIES
+    // `gateway.decision: 'deny'` with no decision event of its own does not
+    // — the count is of policy_decision events, not of refused calls.
+    sessionStart(SESSION_ODD_POLICY, at(13, 0)),
+    odd(policyDecision(SESSION_ODD_POLICY, at(13, 1), 1), ['decision', 'tool'], {}),
+    odd(policyDecision(SESSION_ODD_POLICY, at(13, 2), 2), [], { decision: 'maybe', outcome: 42 }),
+    deniedToolCall(SESSION_ODD_POLICY, at(13, 3), 3),
+  ];
 }
 
 function fakeSignature(record: ChainRecord, signedAt: string): HeadSignature {
@@ -518,6 +654,7 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(a.tool_call_count).toBe(2);
     expect(a.error_count).toBe(1);
     expect(a.server_count).toBe(1);
+    expect(a.policy_decision_count).toBe(0); // recorded without a policy: the gateway never ruled
 
     const b = sessions.find((s) => s.session_id === SESSION_B)!;
     expect(b).toBeDefined();
@@ -635,7 +772,7 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(odd.error_count).toBe(0); // is_error on a notification is not an error
   });
 
-  it('sessions() counts a gateway session: a denied call is 1 tool call + 1 error, policy_decision adds only to event_count', () => {
+  it('sessions() counts a gateway session: a denied call is 1 tool call + 1 error, and each policy_decision is 1 decision', () => {
     const store = open();
     const records = gatewaySessionFixture();
     store.append(records);
@@ -653,6 +790,9 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(g.tool_call_count).toBe(3);
     // exactly the denied call (policy_decision carries no is_error).
     expect(g.error_count).toBe(1);
+    // The gateway ruled twice: the deny, and the hold it resolved by
+    // approving — the allowed call produced no policy_decision at all.
+    expect(g.policy_decision_count).toBe(2);
 
     // The new kind round-trips through the store byte-exactly and the chain still verifies.
     const back = [...store.iterate({ sessionId: SESSION_G })].map((r) => r.event);
@@ -669,6 +809,46 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect('is_error' in back[2]!).toBe(false);
     expect((back[3] as ToolCallEvent).gateway).toEqual({ decision: 'deny', rule_id: 'no-exfil' });
     expect((back[0] as SessionStartEvent).policy).toEqual({ hash: sha256Ref('policy bytes'), name: 'laptop' });
+  });
+
+  it('sessions() counts enforcement: denies, every hold outcome (approved included), malformed decisions, and 0 when the gateway refused nothing', () => {
+    const store = open();
+    store.append(seal(enforcementSessionEvents()));
+    const byId = new Map(store.sessions().map((s) => [s.session_id, s]));
+
+    // Denies only: each refusal is one decision AND one (failed) call.
+    const denies = byId.get(SESSION_DENY_ONLY)!;
+    expect(denies.policy_decision_count).toBe(2);
+    expect(denies.tool_call_count).toBe(2);
+    expect(denies.error_count).toBe(2);
+    expect(denies.event_count).toBe(6);
+
+    // Hold outcomes: one decision per RESOLVED hold, including the approved
+    // one — whose call was forwarded and is therefore not an error.
+    const holds = byId.get(SESSION_HOLDS)!;
+    expect(holds.policy_decision_count).toBe(3);
+    expect(holds.tool_call_count).toBe(3);
+    expect(holds.error_count).toBe(2);
+
+    // A mix: the allowed call contributes a call and no decision.
+    const mixed = byId.get(SESSION_POLICY_MIX)!;
+    expect(mixed.policy_decision_count).toBe(2);
+    expect(mixed.tool_call_count).toBe(3);
+    expect(mixed.error_count).toBe(1);
+
+    // Gateway mode that never refused anything reads exactly like a session
+    // recorded without a policy at all.
+    const quiet = byId.get(SESSION_NO_ENFORCEMENT)!;
+    expect(quiet.policy_decision_count).toBe(0);
+    expect(quiet.tool_call_count).toBe(2);
+
+    // Malformed decisions still count (neither backend reads below the
+    // kind); a tool_call that merely carries `gateway.decision: 'deny'`
+    // does not.
+    const odd = byId.get(SESSION_ODD_POLICY)!;
+    expect(odd.policy_decision_count).toBe(2);
+    expect(odd.tool_call_count).toBe(1);
+    expect(odd.error_count).toBe(1);
   });
 
   it('signatures round-trip in insertion order', () => {
@@ -742,6 +922,45 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(store.count()).toBe(3);
     expect(store.append([])).toBeUndefined();
     expect(store.appendEvents([])).toEqual([]);
+  });
+});
+
+/* ---------------- the two backends over one identical chain ---------------- */
+
+/**
+ * The suite above runs each fixture through both backends against the same
+ * expected numbers. This pins the property that actually has to hold for
+ * the aggregate to be trustworthy: given ONE chain, the two backends
+ * produce identical summaries, field for field — not merely numbers that
+ * each happened to match a hand-written expectation.
+ */
+describe('sessions() is identical across backends for the same chain', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-store-parity-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('sqlite and jsonl agree on enforcement, allowed calls and malformed decisions', () => {
+    expect(isSqliteAvailable()).toBe(true); // the interesting case: both backends are real
+    const records = seal([...twoSessionEvents(), ...enforcementSessionEvents()]);
+    const sqlite = openStore({ dataDir: join(dir, 'sqlite'), backend: 'sqlite' });
+    const jsonl = openStore({ dataDir: join(dir, 'jsonl'), backend: 'jsonl' });
+    try {
+      sqlite.append(records);
+      jsonl.append(records);
+      const fromSqlite = sqlite.sessions();
+      expect(fromSqlite).toEqual(jsonl.sessions());
+      // A, B (no policy at all), then denies / holds / mix / none / malformed.
+      expect(fromSqlite.map((s) => s.policy_decision_count)).toEqual([0, 0, 2, 3, 2, 0, 2]);
+    } finally {
+      sqlite.close();
+      jsonl.close();
+    }
   });
 });
 

@@ -44,6 +44,51 @@ export const MARKER_HASH_HEX = 16;
 /** Text a redacted injection span is replaced with. */
 export const INJECTION_MARKER = '[gateway: suspected prompt injection removed]';
 /**
+ * The clause a refusal carries when the OPERATOR decided it: a rule denied
+ * the call, `mcp.default` denied it, a human denied the hold (or let it time
+ * out / lapse at session end), or the boundary filter blocked the result.
+ *
+ * An agent that reads a bare refusal plausibly does the wrong thing with it:
+ * retries the identical call in a loop, reaches the same effect through a
+ * tool the policy does not name (denied `http_post` -> `bash curl`), or
+ * decides the tool is broken and gives up without telling anyone. A policy
+ * the agent routes around is not a policy. Almost no agent will have
+ * `docs/agent-guidance.md` installed, so this line is the only guidance the
+ * model is guaranteed to see.
+ *
+ * It is a directive ("do not retry"), not a prediction ("retrying will
+ * fail"): a held call that nobody answered could in principle go through on
+ * a second attempt, and the text must not claim otherwise. It is two short
+ * sentences because it is appended to the agent's context on every refusal
+ * of this kind.
+ */
+export const POLICY_REFUSAL_GUIDANCE = 'This is a policy decision by the operator, not a tool failure. ' +
+    'Do not retry it or use another tool to get the same effect; report it to the user.';
+/**
+ * The clause a refusal carries when the gateway FAILED CLOSED: it could not
+ * reach a decision, so it refused rather than forward the call unchecked.
+ * Nobody decided anything about this call — the policy could not be
+ * evaluated, the hold file could not be written, the hold cap was already
+ * full, the proxy was shutting down, or a result was too large to scan.
+ *
+ * This one must NOT forbid a retry. `too many pending holds` clears as soon
+ * as a parked hold resolves, and an oversize block clears as soon as the
+ * agent asks for less output — a retry is the recovery, and {@link
+ * POLICY_REFUSAL_GUIDANCE} would forbid exactly the move that works. The two
+ * instructions that still hold are the ones that make the gateway a control
+ * rather than a speed bump: do not route around it, and tell the user.
+ */
+export const FAIL_CLOSED_REFUSAL_GUIDANCE = 'The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. ' +
+    'You may retry it; do not use another tool to get the same effect, and report it to the user.';
+/**
+ * `text` with one guidance clause on its own line. The newline keeps the
+ * refusal's first line byte-for-byte what it was before the clause existed,
+ * so the rule id and reason still read exactly as the docs quote them.
+ */
+function withRefusalGuidance(text, failClosed) {
+    return `${text}\n${failClosed ? FAIL_CLOSED_REFUSAL_GUIDANCE : POLICY_REFUSAL_GUIDANCE}`;
+}
+/**
  * The secret families the BOUNDARY filter may rewrite: provider-prefixed
  * credentials, JWTs, PEM private-key blocks and explicit secret assignments.
  * Every entry names a pattern that also lives in the recorder's
@@ -231,15 +276,34 @@ function blockedMessage(message, text) {
 function plural(n, noun) {
     return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
-/** The exact isError text of a blocked result (pinned by tests). */
+/**
+ * The exact isError text of a blocked result (pinned by tests).
+ *
+ * Unlike a deny, this withheld a RESULT: the call already ran on the server
+ * and whatever it did is done. {@link POLICY_REFUSAL_GUIDANCE} still belongs
+ * here — the operator's `mcp.boundary` setting decided this, and re-running
+ * a side-effecting tool to get the same bytes back, or reading the same
+ * content through a tool the policy does not name, are the two moves the
+ * boundary exists to stop.
+ */
 export function blockedText(secrets, injections) {
-    return ('mcp-recorder gateway: tool result blocked by policy ' +
-        `(${plural(secrets, 'secret-shaped value')}, ${plural(injections, 'injection marker')})`);
+    return withRefusalGuidance('mcp-recorder gateway: tool result blocked by policy ' +
+        `(${plural(secrets, 'secret-shaped value')}, ${plural(injections, 'injection marker')})`, false);
 }
-/** The exact isError text of a result blocked for exceeding max_scan_bytes. */
+/**
+ * The exact isError text of a result blocked for exceeding max_scan_bytes.
+ *
+ * This carries {@link FAIL_CLOSED_REFUSAL_GUIDANCE}, not the policy-decision
+ * clause. Nothing about the call or its content was judged: the line was too
+ * large to scan, so `on_oversize` blocked it unread — the definition of
+ * failing closed. Asking for less output (a page, a byte range, a narrower
+ * filter) is the correct recovery, and the fail-closed clause permits
+ * exactly that while still refusing the one move that would defeat the
+ * boundary: reading the same bytes through a tool that is not scanned.
+ */
 export function oversizeBlockedText(rawBytes, maxScanBytes) {
-    return ('mcp-recorder gateway: tool result blocked by policy ' +
-        `(result of ${rawBytes} bytes exceeds max_scan_bytes ${maxScanBytes})`);
+    return withRefusalGuidance('mcp-recorder gateway: tool result blocked by policy ' +
+        `(result of ${rawBytes} bytes exceeds max_scan_bytes ${maxScanBytes})`, true);
 }
 function unchanged(message, report) {
     return { message, changed: false, report };
@@ -343,16 +407,34 @@ const OUTCOME_PHRASE = {
     session_end: 'was abandoned at session end',
 };
 /**
- * The text the model sees for a call the gateway did not forward:
+ * The text the model sees for a call the gateway did not forward. The first
+ * line is the refusal itself:
  *   mcp-recorder gateway: tools/call "<tool>" denied by policy rule "<rule>": <reason>
  *   mcp-recorder gateway: tools/call "<tool>" denied by policy (no rule matched; mcp.default is deny)
  *   mcp-recorder gateway: tools/call "<tool>" denied by policy: policy evaluation error: <detail>
  *   mcp-recorder gateway: tools/call "<tool>" denied by policy rule "<rule>" (hold <id> timed out): <reason>
+ * and one guidance clause follows on a second line.
  *
  * A deny without a rule id says "denied by policy", never "by policy
  * default": an evaluation-error deny or a hold-limit refusal is not the
  * default acting, and the text must not claim it is. The default case is
  * the one with neither a rule nor a reason, and it says so explicitly.
+ *
+ * WHICH clause is not a property of the text: a refusal the operator decided
+ * (a rule deny, an `mcp.default` deny, a hold denied / timed out / abandoned
+ * at session end) gets {@link POLICY_REFUSAL_GUIDANCE}, and one where the
+ * gateway failed closed instead (`failClosed`) gets
+ * {@link FAIL_CLOSED_REFUSAL_GUIDANCE}, which does not forbid the retry that
+ * is often the fix. `failClosed` wins over the outcome: a hold REFUSED
+ * because the session was already closing reads `session_end` too, but
+ * nobody decided it.
+ *
+ * The one outcome that gets NO clause is `cancelled`: there the CLIENT
+ * withdrew its own request with `notifications/cancelled` and the gateway
+ * merely stopped waiting. Nothing was refused, the caller already knows
+ * (per MCP it should ignore this response entirely), and its own reason for
+ * cancelling may well make a fresh attempt correct — so either clause would
+ * be untrue.
  */
 export function deniedText(input) {
     const by = input.ruleId !== undefined ? `policy rule "${input.ruleId}"` : 'policy';
@@ -366,7 +448,9 @@ export function deniedText(input) {
         text += `: ${input.reason}`;
     else if (input.ruleId === undefined && input.approvalId === undefined)
         text += ' (no rule matched; mcp.default is deny)';
-    return text;
+    if (input.outcome === 'cancelled')
+        return text;
+    return withRefusalGuidance(text, input.failClosed === true);
 }
 /** JSON-RPC response carrying a tool-execution error (MCP `isError`). */
 export function synthesizeDeniedResult(id, text) {

@@ -284,13 +284,46 @@ the evidence chain hashes.
 | `deny` | **no** | a tool result with `isError: true` whose text names the rule and reason |
 | `hold` | only after `mcp-recorder approve <id>` | on approval, the real result; on deny/timeout/cancel, an `isError` result naming the approval id and outcome; when the hold could not be started at all (unwritable hold file, 256 holds already pending, or the session already shutting down) an `isError` result naming that reason instead |
 
-A denial is a *tool error*, not a JSON-RPC protocol error, so clients keep
-the session alive and the model can explain itself or try something else.
-The exact text is:
+A denial is a *tool error*, not a JSON-RPC protocol error, so clients keep the
+session alive and the model can explain itself to the user. The exact text is
+two lines — the refusal, then one standard clause telling the agent this was a
+policy decision rather than a broken tool:
 
 ```
 mcp-recorder gateway: tools/call "http_post" denied by policy rule "no-exfil": outbound HTTP from agents is not allowed on this machine
+This is a policy decision by the operator, not a tool failure. Do not retry it or use another tool to get the same effect; report it to the user.
 ```
+
+Which clause depends on **who refused**, and the recorder tracks that
+explicitly rather than guessing from the reason text. A rule deny, an
+`mcp.default` deny, a hold a human denied (or whose configured timeout ran
+out, or that was abandoned at session end) and a boundary `block` all carry
+the clause above. The refusals where the gateway **failed closed** — a policy
+that could not be evaluated, an unwritable hold file, 256 holds already
+pending, a hold refused because the session was shutting down, and a result
+too large to scan — carry a different one:
+
+```
+The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. You may retry it; do not use another tool to get the same effect, and report it to the user.
+```
+
+Nobody decided those, so the text does not claim they did, and it does not
+forbid the retry that is often the fix — `too many pending holds` clears the
+moment a parked hold resolves. What it still forbids is the move that would
+make the gateway pointless: getting the same effect through a tool the policy
+does not name.
+
+One refusal in the table above carries neither clause: a hold the **client**
+itself cancelled (`notifications/cancelled`), where nothing was refused and
+the caller already knows.
+
+Without a clause, an agent that reads only the first line plausibly retries
+the identical call forever, reaches the same effect through a tool the rule
+does not name (denied `http_post` → `bash curl`), or decides the tool is
+broken and gives up without telling anyone. One line of tool output is a
+floor, not a fix: [docs/agent-guidance.md](agent-guidance.md) has a snippet to
+paste into the agent's own instructions so it reads the same guidance *before*
+it plans.
 
 Holds park the original request bytes in memory and write a record to
 `<data-dir>/holds/<approval-id>.json` (mode `0600`, containing the tool name
@@ -348,13 +381,29 @@ blocks. That last case is scanned fail-closed and still recorded as
   result with an `isError` result saying what was found; `flag` forwards the
   result unchanged and only records; `off` skips the scan. When secrets and
   injection resolve to different actions, `block` beats `redact` beats `flag`.
+  A `block` carries the same policy-decision clause a deny does: the operator's
+  `mcp.boundary` setting decided it, and reading the same content through
+  another tool is exactly what the boundary exists to stop.
+
+  Which clause a refusal carries turns on WHO decided, not on how it turned
+  out. A hold a human denied, and one the operator's own `on_timeout: deny`
+  ended, are both policy decisions. A hold the session simply ended under is
+  not — nobody answered it — and neither is one refused inside a JSON-RPC
+  batch, where there is nowhere to park and so nobody is asked; both carry the
+  fail-closed clause. The sharpest case is a hold a human APPROVED that the
+  proxy still could not forward because the session was already closing: the
+  operator said yes, so the text must not tell the agent they refused.
 - **Scope.** `result.content[*].text` for `text` blocks and
   `result.content[*].resource.text` for embedded text resources. Binary
   blobs, images and `structuredContent` are not scanned in v1.
 - **Size.** A result line larger than `max_scan_bytes` is not scanned and
   `on_oversize` decides (`flag` or `block`). The event records `scanned: false`.
   For a batch answer the comparison uses the length of the whole array line, so
-  an oversized batch is skipped (or blocked) as a unit.
+  an oversized batch is skipped (or blocked) as a unit. An oversize `block`
+  carries the **fail-closed** clause, not the policy-decision one: nothing
+  about the call was judged, so re-issuing it for less output (a page, a
+  range, a narrower filter) is the correct recovery and the text must not
+  discourage it.
 
 When nothing changes, the server's bytes are forwarded untouched. When the
 filter rewrites a result, the event keeps `result`/`result_hash` for the raw
