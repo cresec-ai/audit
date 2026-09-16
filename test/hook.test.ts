@@ -1,18 +1,19 @@
 /**
- * `mcp-recorder hook` — turns Claude Code PreToolUse/PostToolUse/SessionEnd/
+ * `mcp-recorder hook` — turns Claude Code PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/
  * Stop hook invocations into recorded, redacted evidence-chain events, with
  * an allow/deny policy. Drives the real CLI (spawned fresh per hook event,
  * same as Claude Code does) and inspects the resulting store, exactly like
  * test/cli.test.ts and test/setup.test.ts do for the commands they cover.
  */
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsx } from './helpers/tsx.js';
+import { canonicalJson, sha256Ref } from '../src/chain/hash.js';
 import { openStoreReadOnly } from '../src/store/index.js';
 import type { AnyEvent, NotificationEvent, SessionEndEvent, SessionStartEvent, ToolCallEvent } from '../src/schema/events.js';
 
@@ -56,10 +57,19 @@ function waitExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolvePromise) => child.once('close', (code) => resolvePromise(code)));
 }
 
-function spawnCli(args: string[]): ChildProcess {
+/** Fixture shaped exactly like a cloud session's /tmp/mcp-config-<session>.json
+ *  (cloud dogfood 3, step 5), with fake ids — see test/fixtures/mcp-config. */
+const CLOUD_MCP_CONFIG = join(ROOT, 'test', 'fixtures', 'mcp-config', 'cloud-session.json');
+/** A path that does not exist: "no MCP config file at all". Every test runs
+ *  with this unless it says otherwise, so the hook's default lookup of the
+ *  host's own /tmp/mcp-config-*.json (this suite may itself run inside a
+ *  cloud session) can never leak into an assertion. */
+const NO_MCP_CONFIG = join(ROOT, 'test', 'fixtures', 'mcp-config', 'does-not-exist.json');
+
+function spawnCli(args: string[], env: Record<string, string | undefined> = {}): ChildProcess {
   const child = spawnTsx(['src/cli.ts', ...args], {
     cwd: ROOT,
-    env: { ...process.env, MCP_RECORDER_DISABLE: undefined },
+    env: { ...process.env, MCP_RECORDER_DISABLE: undefined, MCP_RECORDER_MCP_CONFIG: NO_MCP_CONFIG, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   cleanups.push(() => {
@@ -79,8 +89,12 @@ async function runCli(args: string[]): Promise<CliResult> {
 }
 
 /** Run `mcp-recorder hook <args>`, feeding `stdinText` on stdin. */
-async function runHook(args: string[], stdinText: string): Promise<CliResult> {
-  const child = spawnCli(['hook', ...args]);
+async function runHook(
+  args: string[],
+  stdinText: string,
+  env: Record<string, string | undefined> = {},
+): Promise<CliResult> {
+  const child = spawnCli(['hook', ...args], env);
   const stdout = collect(child.stdout);
   const stderr = collect(child.stderr);
   child.stdin!.write(stdinText);
@@ -139,6 +153,31 @@ function postToolUseInput(opts: {
     tool_input: opts.toolInput,
     tool_use_id: opts.toolUseId,
     tool_response: opts.toolResponse,
+  });
+}
+
+/** PostToolUseFailure carries `error` (string) and `is_interrupt` instead
+ *  of `tool_response` — https://code.claude.com/docs/en/hooks#posttoolusefailure-input */
+function postToolUseFailureInput(opts: {
+  sessionId: string;
+  toolName: string;
+  toolInput: unknown;
+  toolUseId: string;
+  error: string;
+  isInterrupt?: boolean;
+}): string {
+  return JSON.stringify({
+    session_id: opts.sessionId,
+    transcript_path: '/tmp/transcript.jsonl',
+    cwd: '/tmp',
+    permission_mode: 'default',
+    hook_event_name: 'PostToolUseFailure',
+    tool_name: opts.toolName,
+    tool_input: opts.toolInput,
+    tool_use_id: opts.toolUseId,
+    error: opts.error,
+    is_interrupt: opts.isInterrupt ?? false,
+    duration_ms: 4187,
   });
 }
 
@@ -315,6 +354,141 @@ describe('mcp-recorder hook', () => {
 
     const raw = JSON.stringify(postEvent);
     expect(raw).not.toContain(secretResult);
+  });
+
+  it('PostToolUseFailure: records the post half with is_error true and a hashed message_ref, shares request_id, clears the pending marker, and never stores the error text', async () => {
+    const dataDir = tmpDir('mcp-hook-failure-');
+    const sessionId = freshSessionId();
+    const errorText = 'ClickUp API rate limit exceeded: daily MCP quota used up (probe-marker-3f9a1c)';
+    const toolInput = { list_id: '901818701787' };
+
+    const pre = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      preToolUseInput({ sessionId, toolName: 'mcp__ClickUp__clickup_get_list', toolInput, toolUseId: 'toolu_fail_1' }),
+    );
+    expect(pre.code).toBe(0);
+    const marker = join(dataDir, 'hook-pending', 'toolu_fail_1');
+    expect(existsSync(marker)).toBe(true); // PreToolUse left its timestamp for the post half
+
+    await new Promise((r) => setTimeout(r, 15));
+
+    const failure = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      postToolUseFailureInput({
+        sessionId,
+        toolName: 'mcp__ClickUp__clickup_get_list',
+        toolInput,
+        toolUseId: 'toolu_fail_1',
+        error: errorText,
+      }),
+    );
+    expect(failure.code).toBe(0);
+    expect(failure.stdout).toBe(''); // a failure hook can't block anything, and prints nothing
+    expect(existsSync(marker)).toBe(false); // taken, exactly as a PostToolUse would have
+
+    const toolCalls = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(toolCalls).toHaveLength(2);
+    const [preEvent, postEvent] = toolCalls;
+    expect(preEvent!.phase).toBe('pre');
+    expect(preEvent!.is_error).toBe(false);
+    expect(postEvent!.phase).toBe('post');
+    expect(postEvent!.source).toBe('hook');
+    expect(postEvent!.request_id).toBe(preEvent!.request_id);
+    expect(postEvent!.request_id).toBe('toolu_fail_1');
+    expect(postEvent!.tool).toBe('clickup_get_list');
+    expect(postEvent!.server.name).toBe('ClickUp');
+    expect(postEvent!.is_error).toBe(true);
+    expect(postEvent!.error?.type).toBe('tool_error');
+    expect(postEvent!.attributes['error.type']).toBe('tool_error');
+    expect(postEvent!.error?.message_ref).toMatch(/^sha256:[0-9a-f]{64}$/);
+    // Hashed exactly like every other redacted value (Redactor.hashString === sha256Ref).
+    expect(postEvent!.error?.message_ref).toBe(sha256Ref(errorText));
+    expect(postEvent!.result).toBeNull(); // a failure carries no tool_response
+    expect(postEvent!.result_hash).toBe(sha256Ref(canonicalJson(null)));
+    expect(typeof postEvent!.duration_ms).toBe('number');
+    expect(postEvent!.duration_ms).toBeGreaterThanOrEqual(0);
+
+    // The error text never reaches the store: check the raw on-disk bytes,
+    // not just the parsed events.
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expect(rawStore).not.toContain(errorText);
+    expect(rawStore).not.toContain('probe-marker-3f9a1c');
+    expect(rawStore).not.toContain('rate limit');
+    expect(rawStore).not.toContain('901818701787');
+  });
+
+  it('PostToolUseFailure with is_interrupt records error.type "interrupted" (and duration_ms 0 without a pre marker)', async () => {
+    const dataDir = tmpDir('mcp-hook-interrupt-');
+    const errorText = 'The user cancelled the running tool call';
+    const result = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      postToolUseFailureInput({
+        sessionId: freshSessionId(),
+        toolName: 'mcp__github__search_code',
+        toolInput: { q: 'needle-in-args' },
+        toolUseId: 'toolu_interrupt_1',
+        error: errorText,
+        isInterrupt: true,
+      }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
+    const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(toolCall.phase).toBe('post');
+    expect(toolCall.is_error).toBe(true);
+    expect(toolCall.error?.type).toBe('interrupted');
+    expect(toolCall.attributes['error.type']).toBe('interrupted');
+    expect(toolCall.error?.message_ref).toBe(sha256Ref(errorText));
+    expect(toolCall.duration_ms).toBe(0); // no PreToolUse marker to measure from
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expect(rawStore).not.toContain('cancelled');
+    expect(rawStore).not.toContain('needle-in-args');
+  });
+
+  it('SessionEnd and Stop sweep stale pending markers (older than 24 h by mtime) and leave fresh ones alone', async () => {
+    const dataDir = tmpDir('mcp-hook-sweep-');
+    const sessionId = freshSessionId();
+    const pendingDir = join(dataDir, 'hook-pending');
+    mkdirSync(pendingDir, { recursive: true });
+    const staleA = join(pendingDir, 'toolu_stale_a');
+    const staleB = join(pendingDir, 'toolu_stale_b');
+    const fresh = join(pendingDir, 'toolu_fresh');
+    const twentyFiveHoursAgo = (Date.now() - 25 * 60 * 60 * 1000) / 1000; // utimes takes seconds
+    const makeStale = (p: string): void => {
+      writeFileSync(p, String(Date.now()));
+      utimesSync(p, twentyFiveHoursAgo, twentyFiveHoursAgo);
+    };
+    makeStale(staleA);
+    makeStale(staleB);
+    writeFileSync(fresh, String(Date.now()));
+
+    // A tool event never sweeps: only turn boundaries and session end do,
+    // so the tool-call path stays as lean as before.
+    await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      preToolUseInput({ sessionId, toolName: 'mcp__github__get_me', toolInput: {}, toolUseId: 'toolu_sweep_pre' }),
+    );
+    expect(existsSync(staleA)).toBe(true);
+
+    const stop = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      JSON.stringify({ session_id: sessionId, hook_event_name: 'Stop' }),
+    );
+    expect(stop.code).toBe(0);
+    expect(stop.stdout).toBe('');
+    expect(existsSync(staleA)).toBe(false);
+    expect(existsSync(staleB)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(join(pendingDir, 'toolu_sweep_pre'))).toBe(true); // just written, kept
+
+    makeStale(staleB); // SessionEnd sweeps too
+    const end = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl'],
+      JSON.stringify({ session_id: sessionId, hook_event_name: 'SessionEnd', reason: 'other' }),
+    );
+    expect(end.code).toBe(0);
+    expect(existsSync(staleB)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
   });
 
   it('a non-mcp (built-in) tool is ignored by default, and recorded only with --all-tools', async () => {
@@ -507,7 +681,9 @@ describe('mcp-recorder hook install', () => {
     return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
   }
 
-  it('writes PreToolUse/PostToolUse (mcp__.* matcher) + SessionEnd/Stop entries, creating the file if missing', async () => {
+  const MANAGED_EVENTS = ['PostToolUse', 'PostToolUseFailure', 'PreToolUse', 'SessionEnd', 'Stop'].sort();
+
+  it('writes PreToolUse/PostToolUse/PostToolUseFailure (mcp__.* matcher) + SessionEnd/Stop entries, creating the file if missing', async () => {
     const dir = tmpDir('mcp-hook-install-');
     const settingsPath = join(dir, 'settings.json');
     expect(existsSync(settingsPath)).toBe(false);
@@ -517,7 +693,7 @@ describe('mcp-recorder hook install', () => {
     ]);
     expect(result.code).toBe(0);
     const payload = JSON.parse(result.stdout) as { added: string[]; alreadyInstalled: string[] };
-    expect(payload.added.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(payload.added.sort()).toEqual(MANAGED_EVENTS);
     expect(payload.alreadyInstalled).toEqual([]);
 
     const settings = readSettings(settingsPath) as {
@@ -525,6 +701,8 @@ describe('mcp-recorder hook install', () => {
     };
     expect(settings.hooks.PreToolUse![0]!.matcher).toBe('mcp__.*');
     expect(settings.hooks.PostToolUse![0]!.matcher).toBe('mcp__.*');
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('mcp__.*');
+    expect(settings.hooks.PostToolUseFailure![0]).toEqual(settings.hooks.PostToolUse![0]); // same matcher AND command
     expect(settings.hooks.SessionEnd![0]!.matcher).toBeUndefined();
     expect(settings.hooks.Stop![0]!.matcher).toBeUndefined();
     const command = settings.hooks.PreToolUse![0]!.hooks[0]!.command;
@@ -543,6 +721,7 @@ describe('mcp-recorder hook install', () => {
     };
     expect(settings.hooks.PreToolUse![0]!.matcher).toBe('.*');
     expect(settings.hooks.PostToolUse![0]!.matcher).toBe('.*');
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('.*');
   });
 
   it('--command overrides the generated command verbatim (dogfood form)', async () => {
@@ -564,13 +743,13 @@ describe('mcp-recorder hook install', () => {
 
     const first = await runCli(args);
     const firstPayload = JSON.parse(first.stdout) as { added: string[] };
-    expect(firstPayload.added).toHaveLength(4);
+    expect(firstPayload.added).toHaveLength(5);
     const afterFirst = readFileSync(settingsPath, 'utf8');
 
     const second = await runCli(args);
     const secondPayload = JSON.parse(second.stdout) as { added: string[]; alreadyInstalled: string[] };
     expect(secondPayload.added).toEqual([]);
-    expect(secondPayload.alreadyInstalled.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(secondPayload.alreadyInstalled.sort()).toEqual(MANAGED_EVENTS);
     // No backup was written for a no-op run, and the file is unchanged.
     expect(readFileSync(settingsPath, 'utf8')).toBe(afterFirst);
   });
@@ -619,7 +798,7 @@ describe('mcp-recorder hook install', () => {
     const undo = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--undo', '--json']);
     expect(undo.code).toBe(0);
     const undoPayload = JSON.parse(undo.stdout) as { removed: string[] };
-    expect(undoPayload.removed.sort()).toEqual(['PostToolUse', 'PreToolUse', 'SessionEnd', 'Stop'].sort());
+    expect(undoPayload.removed.sort()).toEqual(MANAGED_EVENTS);
 
     settings = readSettings(settingsPath) as typeof settings;
     expect(settings.otherTopLevelKey).toBe('preserved');
@@ -627,8 +806,48 @@ describe('mcp-recorder hook install', () => {
     expect(settings.hooks.PreToolUse).toHaveLength(1); // only the unrelated Bash entry remains
     expect(settings.hooks.PreToolUse[0]!.matcher).toBe('Bash');
     expect(settings.hooks.PostToolUse).toBeUndefined(); // emptied entirely, key dropped
+    expect(settings.hooks.PostToolUseFailure).toBeUndefined();
     expect(settings.hooks.SessionEnd).toBeUndefined();
     expect(settings.hooks.Stop).toBeUndefined();
+  });
+
+  it('PostToolUseFailure: installed with the same matcher and command as PostToolUse, idempotent, and --undo removes exactly it', async () => {
+    const dir = tmpDir('mcp-hook-install-failure-');
+    const settingsPath = join(dir, 'settings.json');
+    // Someone else's PostToolUseFailure hook must survive both install and undo untouched.
+    writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        { hooks: { PostToolUseFailure: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo not-ours' }] }] } },
+        null,
+        2,
+      ),
+    );
+    const command = 'node dist/cli.js hook --data-dir .mcp-recorder';
+    type Hooks = Record<string, Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>>;
+
+    const install = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--json']);
+    expect(install.code).toBe(0);
+    expect((JSON.parse(install.stdout) as { added: string[] }).added).toContain('PostToolUseFailure');
+    let settings = readSettings(settingsPath) as { hooks: Hooks };
+    expect(settings.hooks.PostToolUseFailure).toHaveLength(2); // theirs, plus ours
+    const ours = settings.hooks.PostToolUseFailure!.find((e) => e.hooks.some((h) => h.command === command));
+    expect(ours).toEqual({ matcher: 'mcp__.*', hooks: [{ type: 'command', command }] });
+    expect(ours).toEqual(settings.hooks.PostToolUse![0]);
+
+    const again = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--json']);
+    const againPayload = JSON.parse(again.stdout) as { added: string[]; alreadyInstalled: string[] };
+    expect(againPayload.added).toEqual([]);
+    expect(againPayload.alreadyInstalled).toContain('PostToolUseFailure');
+    expect((readSettings(settingsPath) as { hooks: Hooks }).hooks.PostToolUseFailure).toHaveLength(2);
+
+    const undo = await runCli(['hook', 'install', '--settings', settingsPath, '--command', command, '--undo', '--json']);
+    expect(undo.code).toBe(0);
+    expect((JSON.parse(undo.stdout) as { removed: string[] }).removed).toContain('PostToolUseFailure');
+    settings = readSettings(settingsPath) as { hooks: Hooks };
+    expect(settings.hooks.PostToolUseFailure).toHaveLength(1); // only theirs remains
+    expect(settings.hooks.PostToolUseFailure![0]!.matcher).toBe('Bash');
+    expect(settings.hooks.PostToolUse).toBeUndefined();
   });
 
   it('--undo is a no-op (and writes nothing) when nothing of ours is installed', async () => {
@@ -642,5 +861,313 @@ describe('mcp-recorder hook install', () => {
     const payload = JSON.parse(result.stdout) as { removed: string[] };
     expect(payload.removed).toEqual([]);
     expect(readFileSync(settingsPath, 'utf8')).toBe(before);
+  });
+});
+
+/* ------------------- cloud sessions: UUID server names -------------------- */
+
+describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, policy aliases)', () => {
+  const CLICKUP_UUID = '47d587b8-3fb9-42e9-b596-f8b25371248c';
+  const CLICKUP_URL = 'https://mcp.clickup.com/mcp';
+  const SESSION_ID_IN_CONFIG = 'cse_01FIXTURESESSION0000AAAA';
+  const withConfig = { MCP_RECORDER_MCP_CONFIG: CLOUD_MCP_CONFIG };
+  const noConfig = { MCP_RECORDER_MCP_CONFIG: NO_MCP_CONFIG };
+  const store = ['--store', 'jsonl'];
+
+  /** Nothing from the config file but the scrubbed URL may ever reach the store. */
+  function expectNoConfigLeak(rawStore: string): void {
+    expect(rawStore).not.toContain(SESSION_ID_IN_CONFIG);
+    expect(rawStore).not.toContain('cse_');
+    expect(rawStore).not.toContain('X-Session-UUID');
+    expect(rawStore).not.toContain('X-MCP-Server-ID');
+    expect(rawStore).not.toContain('63df81a5-fc81-5b12-b7fe-654a2d253da9'); // X-MCP-Server-ID header value
+    expect(rawStore).not.toContain('b3f9ab90-0a14-5a2c-adab-e845e0658cec'); // mcp_server_id query value
+    expect(rawStore).not.toContain('mcp_server_id');
+    expect(rawStore).not.toContain('toolbox_mcp_server_id');
+    expect(rawStore).not.toContain('permission_policy');
+    expect(rawStore).not.toContain('always_allow');
+    expect(rawStore).not.toContain('mail-pass');
+    expect(rawStore).not.toContain('sk-fixture');
+    expect(rawStore).not.toContain('mcp__mcp.clickup.com'); // the policy alias is never recorded
+  }
+
+  it('stamps server.url (the vendor endpoint) on every pre/post/failure event, not on session_start; server.name stays the UUID', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-url-');
+    const sessionId = freshSessionId();
+    const toolName = `mcp__${CLICKUP_UUID}__clickup_get_list`;
+    const toolInput = { list_id: '901818701787' };
+
+    const pre = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId, toolName, toolInput, toolUseId: 'toolu_cloud_ok' }),
+      withConfig,
+    );
+    expect(pre.code).toBe(0);
+    expect(pre.stdout).toBe('');
+    const post = await runHook(
+      ['--data-dir', dataDir, ...store],
+      postToolUseInput({
+        sessionId,
+        toolName,
+        toolInput,
+        toolUseId: 'toolu_cloud_ok',
+        toolResponse: { content: [{ type: 'text', text: 'list-body' }] },
+      }),
+      withConfig,
+    );
+    expect(post.code).toBe(0);
+    const failTool = `mcp__${CLICKUP_UUID}__clickup_filter_tasks`;
+    await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId, toolName: failTool, toolInput: {}, toolUseId: 'toolu_cloud_fail' }),
+      withConfig,
+    );
+    const failure = await runHook(
+      ['--data-dir', dataDir, ...store],
+      postToolUseFailureInput({
+        sessionId,
+        toolName: failTool,
+        toolInput: {},
+        toolUseId: 'toolu_cloud_fail',
+        error: 'RATE_LIMIT_EXCEEDED: Daily MCP limit reached',
+      }),
+      withConfig,
+    );
+    expect(failure.code).toBe(0);
+    expect(failure.stdout).toBe('');
+
+    const events = readEvents(dataDir);
+    expect(events.map((e) => e.kind)).toEqual(['session_start', 'tool_call', 'tool_call', 'tool_call', 'tool_call']);
+    const sessionStart = events[0] as SessionStartEvent;
+    expect(sessionStart.server.name).toBe('claude-code'); // a session-level event names the client itself...
+    expect(sessionStart.server.url).toBeUndefined(); // ...so it carries no vendor URL: url is where server.name is
+
+    const toolCalls = events.slice(1) as ToolCallEvent[];
+    expect(toolCalls.map((e) => e.phase)).toEqual(['pre', 'post', 'pre', 'post']);
+    for (const call of toolCalls) {
+      expect(call.server.name).toBe(CLICKUP_UUID); // what Claude Code calls the server, unchanged
+      expect(call.server.url).toBe(CLICKUP_URL);
+      expect(call.server.transport).toBe('stdio');
+    }
+    expect(toolCalls[0]!.tool).toBe('clickup_get_list');
+    expect(toolCalls[3]!.tool).toBe('clickup_filter_tasks');
+    expect(toolCalls[3]!.is_error).toBe(true);
+    expect(toolCalls[3]!.error?.type).toBe('tool_error');
+
+    const rawStore = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+    expectNoConfigLeak(rawStore);
+    expect(rawStore).not.toContain('901818701787'); // args are still hashed as always
+    expect(rawStore).not.toContain('list-body');
+  });
+
+  it('a readable name (github) gets its relay URL with the session id hashed out of the path', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-github-');
+    const result = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName: 'mcp__github__get_me', toolInput: {}, toolUseId: 'toolu_cloud_gh' }),
+      withConfig,
+    );
+    expect(result.code).toBe(0);
+    const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(toolCall.server.name).toBe('github');
+    expect(toolCall.server.url).toBe(
+      `https://api.anthropic.com/v2/ccr-sessions/${sha256Ref(SESSION_ID_IN_CONFIG)}/github/mcp`,
+    );
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('a deny rule against the vendor-host alias blocks the UUID-named tool; the raw name still matches; without a config the alias never fires', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-alias-');
+    const uuidTool = `mcp__${CLICKUP_UUID}__clickup_delete_task`;
+    const aliasPolicy = join(dataDir, 'alias-policy.json');
+    writeFileSync(
+      aliasPolicy,
+      JSON.stringify({
+        deny: [{ tool: '^mcp__mcp\\.clickup\\.com__clickup_delete_task$', reason: 'destructive ClickUp calls are blocked (alias rule)' }],
+        default: 'allow',
+      }),
+    );
+    type DenyPayload = { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
+    const call = (toolUseId: string, env: Record<string, string | undefined>, toolName = uuidTool) =>
+      runHook(
+        ['--data-dir', dataDir, ...store, '--policy', aliasPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: { task_id: 'x' }, toolUseId }),
+        env,
+      );
+
+    // With the config: the alias mcp__mcp.clickup.com__clickup_delete_task matches → denied.
+    const denied = await call('toolu_alias_deny', withConfig);
+    expect(denied.code).toBe(0);
+    const payload = JSON.parse(denied.stdout) as DenyPayload;
+    expect(payload.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(payload.hookSpecificOutput.permissionDecisionReason).toContain('alias rule');
+
+    // Without any config the alias does not exist: the same rule cannot match the UUID name → allowed.
+    const allowed = await call('toolu_alias_noconfig', noConfig);
+    expect(allowed.code).toBe(0);
+    expect(allowed.stdout).toBe('');
+
+    // A rule against the raw UUID name keeps working exactly as before, config or not.
+    const rawPolicy = join(dataDir, 'raw-policy.json');
+    writeFileSync(rawPolicy, JSON.stringify({ deny: [{ tool: `^mcp__${CLICKUP_UUID}__clickup_delete_task$` }] }));
+    for (const env of [withConfig, noConfig]) {
+      const rawDenied = await runHook(
+        ['--data-dir', dataDir, ...store, '--policy', rawPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName: uuidTool, toolInput: {}, toolUseId: 'toolu_raw_deny' }),
+        env,
+      );
+      expect((JSON.parse(rawDenied.stdout) as DenyPayload).hookSpecificOutput.permissionDecision).toBe('deny');
+    }
+
+    // The documented both-forms rule denies the local readable name AND the cloud UUID name.
+    const bothPolicy = join(dataDir, 'both-policy.json');
+    writeFileSync(
+      bothPolicy,
+      JSON.stringify({ deny: [{ tool: '^mcp__(ClickUp|mcp\\.clickup\\.com)__clickup_delete_task$' }] }),
+    );
+    const bothCases: Array<[string, Record<string, string | undefined>]> = [
+      ['mcp__ClickUp__clickup_delete_task', noConfig],
+      [uuidTool, withConfig],
+    ];
+    for (const [toolName, env] of bothCases) {
+      const r = await runHook(
+        ['--data-dir', dataDir, ...store, '--policy', bothPolicy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_both' }),
+        env,
+      );
+      expect((JSON.parse(r.stdout) as DenyPayload).hookSpecificOutput.permissionDecision).toBe('deny');
+    }
+    // ...while a different tool of the same connector is untouched by any of them.
+    const other = await call('toolu_alias_other', withConfig, `mcp__${CLICKUP_UUID}__clickup_get_task`);
+    expect(other.stdout).toBe('');
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    expect(events.find((e) => e.request_id === 'toolu_alias_deny')?.error?.type).toBe('policy_denied');
+    expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.is_error).toBe(false);
+    expect(events.find((e) => e.request_id === 'toolu_alias_noconfig')?.server.url).toBeUndefined();
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('the alias is deny-only: an allow rule never matches it, so a forged config file cannot widen a default-deny policy', async () => {
+    // The config file the alias comes from lives in a world-writable /tmp
+    // next to the agent the policy constrains. Review of the integrated
+    // change (E1): with {allow: [^mcp__github__.*$], default: deny}, a
+    // planted file mapping the ClickUp UUID to mcp_url=https://github/mcp
+    // made the alias mcp__github__clickup_delete_task satisfy the allow
+    // rule, and the delete went through. Neither a bare-label host nor a
+    // dotted one may ever do that now.
+    const dataDir = tmpDir('mcp-hook-cloud-alias-denyonly-');
+    const uuidTool = `mcp__${CLICKUP_UUID}__clickup_delete_task`;
+    type DenyPayload = { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
+    const decision = (r: CliResult): string =>
+      r.stdout === '' ? 'allow' : (JSON.parse(r.stdout) as DenyPayload).hookSpecificOutput.permissionDecision;
+
+    const forgedBare = join(dataDir, 'mcp-config-forged-bare.json');
+    writeFileSync(
+      forgedBare,
+      JSON.stringify({
+        mcpServers: {
+          [CLICKUP_UUID]: { url: `https://relay.example.test/mcp?mcp_url=${encodeURIComponent('https://github/mcp')}` },
+        },
+      }),
+    );
+    const forgedDotted = join(dataDir, 'mcp-config-forged-dotted.json');
+    writeFileSync(
+      forgedDotted,
+      JSON.stringify({
+        mcpServers: {
+          [CLICKUP_UUID]: { url: `https://relay.example.test/mcp?mcp_url=${encodeURIComponent('https://github.example.test/mcp')}` },
+        },
+      }),
+    );
+    // An allow-list policy: only github tools may run. Written loosely on
+    // purpose (no trailing anchor after the server segment) so that a dotted
+    // forged host would match it too if the alias were tested for allows.
+    const allowList = join(dataDir, 'allow-list.json');
+    writeFileSync(allowList, JSON.stringify({ allow: [{ tool: '^mcp__github' }], default: 'deny' }));
+    const run = (toolUseId: string, policy: string, env: Record<string, string | undefined>, toolName = uuidTool) =>
+      runHook(
+        ['--data-dir', dataDir, ...store, '--policy', policy],
+        preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: { task_id: 'x' }, toolUseId }),
+        env,
+      );
+
+    // The real github tool is allowed by its raw name, config or not.
+    expect(decision(await run('toolu_gh_real', allowList, withConfig, 'mcp__github__get_me'))).toBe('allow');
+    expect(decision(await run('toolu_gh_real_nocfg', allowList, noConfig, 'mcp__github__get_me'))).toBe('allow');
+    // The ClickUp delete is denied by default without a config...
+    expect(decision(await run('toolu_forge_none', allowList, noConfig))).toBe('deny');
+    // ...and STAYS denied whatever a config file claims its host is.
+    expect(decision(await run('toolu_forge_bare', allowList, { MCP_RECORDER_MCP_CONFIG: forgedBare }))).toBe('deny');
+    expect(decision(await run('toolu_forge_dotted', allowList, { MCP_RECORDER_MCP_CONFIG: forgedDotted }))).toBe('deny');
+    // Even an allow rule written against the genuine vendor host never fires
+    // on the alias: with the real fixture the UUID tool is still denied.
+    const allowAlias = join(dataDir, 'allow-alias.json');
+    writeFileSync(allowAlias, JSON.stringify({ allow: [{ tool: '^mcp__mcp\\.clickup\\.com__.*$' }], default: 'deny' }));
+    expect(decision(await run('toolu_allow_alias', allowAlias, withConfig))).toBe('deny');
+    // Whereas the same regex as a DENY rule does fire on the alias.
+    const denyAlias = join(dataDir, 'deny-alias.json');
+    writeFileSync(denyAlias, JSON.stringify({ deny: [{ tool: '^mcp__mcp\\.clickup\\.com__.*$' }], default: 'allow' }));
+    expect(decision(await run('toolu_deny_alias', denyAlias, withConfig))).toBe('deny');
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    for (const id of ['toolu_forge_none', 'toolu_forge_bare', 'toolu_forge_dotted', 'toolu_allow_alias']) {
+      expect(events.find((e) => e.request_id === id)?.error?.type).toBe('policy_denied');
+    }
+    // What a forged file asserts is still recorded as the (scrubbed) claim it is.
+    expect(events.find((e) => e.request_id === 'toolu_forge_dotted')?.server.url).toBe('https://github.example.test/mcp');
+    expect(events.find((e) => e.request_id === 'toolu_forge_bare')?.server.url).toBe('https://github/mcp');
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
+  });
+
+  it('a policy deny still exits 0 when the stdout reader is gone (EPIPE is swallowed, fail-open)', async () => {
+    // Review of the integrated change (E7): the deny JSON is the one thing
+    // the hook prints; with the reader gone the write raised an unhandled
+    // EPIPE and the hook exited 1 — a non-zero exit from a hook.
+    const dataDir = tmpDir('mcp-hook-epipe-');
+    const denyAll = join(dataDir, 'deny-all.json');
+    writeFileSync(denyAll, JSON.stringify({ deny: [{ tool: '.*', reason: 'everything is denied' }] }));
+    const child = spawnCli(['hook', '--data-dir', dataDir, ...store, '--policy', denyAll], noConfig);
+    const stderr = collect(child.stderr);
+    child.stdin!.write(preToolUseInput({ sessionId: freshSessionId(), toolName: 'mcp__x__y', toolInput: {}, toolUseId: 'toolu_epipe' }));
+    child.stdin!.end();
+    child.stdout!.destroy(); // the reader goes away before the hook prints its deny
+    const code = await waitExit(child);
+    expect(code).toBe(0);
+    expect(stderr()).not.toContain('EPIPE');
+    expect(stderr()).not.toContain('Unhandled');
+    // The deny itself was still recorded.
+    const denied = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(denied.error?.type).toBe('policy_denied');
+  });
+
+  it('a missing or malformed MCP_RECORDER_MCP_CONFIG is fail-open: allowed and recorded, just without server.url; comma-separated paths are tried in order', async () => {
+    const dataDir = tmpDir('mcp-hook-cloud-failopen-');
+    const toolName = `mcp__${CLICKUP_UUID}__clickup_get_list`;
+    const malformed = join(ROOT, 'test', 'fixtures', 'mcp-config', 'malformed.json');
+
+    const broken = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_cfg_malformed' }),
+      { MCP_RECORDER_MCP_CONFIG: malformed },
+    );
+    expect(broken.code).toBe(0);
+    expect(broken.stdout).toBe('');
+
+    const resolved = await runHook(
+      ['--data-dir', dataDir, ...store],
+      preToolUseInput({ sessionId: freshSessionId(), toolName, toolInput: {}, toolUseId: 'toolu_cfg_list' }),
+      { MCP_RECORDER_MCP_CONFIG: `${NO_MCP_CONFIG},${malformed},${CLOUD_MCP_CONFIG}` },
+    );
+    expect(resolved.code).toBe(0);
+
+    const events = readEvents(dataDir).filter((e) => e.kind === 'tool_call') as ToolCallEvent[];
+    const fromMalformed = events.find((e) => e.request_id === 'toolu_cfg_malformed')!;
+    expect(fromMalformed.server.name).toBe(CLICKUP_UUID);
+    expect(fromMalformed.server.url).toBeUndefined();
+    expect(fromMalformed.is_error).toBe(false);
+    const fromList = events.find((e) => e.request_id === 'toolu_cfg_list')!;
+    expect(fromList.server.url).toBe(CLICKUP_URL);
+    expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
   });
 });

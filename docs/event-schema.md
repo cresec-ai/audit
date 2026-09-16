@@ -145,6 +145,7 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `version` | `string?` | From the MCP `initialize` result serverInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
+| `url` | `string?` | Additive, optional (schema stays v1); hook-sourced, on `tool_call` events only. Where the server named by `name` is, **as asserted by the MCP config file `mcp-recorder hook` found** (`MCP_RECORDER_MCP_CONFIG`, else `/tmp/mcp-config-*.json` in a cloud session) — not observed on the wire; that file is writable by the agent running under the hook, see [docs/hooks.md](hooks.md#cloud-sessions-uuid-server-names-and-serverurl). The value is the vendor endpoint behind an Anthropic-hosted connector's relay (the relay URL's decoded `mcp_url`, e.g. `https://mcp.clickup.com/mcp`), else the config entry's own URL. Scrubbed like the http transport's target URL below — userinfo stripped, query string and fragment dropped — but the stripped pieces are dropped **without** `credential_fingerprints` (the hook never sends them), and more strictly on the path: every segment that is secret-shaped, **an opaque identifier** (a UUID, a cloud session id such as `cse_...`) **or not a short vocabulary token** (`[A-Za-z0-9._-]{1,32}`) is replaced in place by its `sha256:<hex>` ref, so a relay URL never carries the session id and no free text from the file reaches the store. A scrubbed URL over 2048 characters is not recorded at all. Undefined when unresolved, on session-level hook events (`session_start`/`session_end`/the Stop notification, whose `name` is the client), and on every proxy-captured event (the http proxy records its target in `command`). See [Hook-sourced events](#hook-sourced-events-additive). |
 
 **`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
 `--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`
@@ -213,7 +214,7 @@ Every event carries these fields:
 | `identity` | `IdentityContext` | Who acted. |
 | `server` | `ServerContext` | What was wrapped. |
 | `attributes` | `Attributes` | Flat semconv-named attribute bag. |
-| `source` | `'hook'?` | Additive, optional (schema stays v1). Set to `'hook'` when this event was captured by `mcp-recorder hook` (a Claude Code PreToolUse/PostToolUse/SessionEnd/Stop hook) rather than the stdio/http proxy tap. Undefined on every proxy-captured event. See [Hook-sourced events](#hook-sourced-events-additive) below. |
+| `source` | `'hook'?` | Additive, optional (schema stays v1). Set to `'hook'` when this event was captured by `mcp-recorder hook` (a Claude Code PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop hook) rather than the stdio/http proxy tap. Undefined on every proxy-captured event. See [Hook-sourced events](#hook-sourced-events-additive) below. |
 
 `EventKind` is one of: `session_start`, `initialize`, `tool_call`, `rpc`,
 `notification`, `protocol_error`, `session_end`, and — additive, recorded only in
@@ -258,10 +259,10 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
-| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field; a call the gateway refused carries `error.type: 'policy_denied'` (see [Gateway mode fields](#gateway-mode-fields-additive)), and `mcp-recorder hook` uses the same value for a call its `--policy` denied — see [Hook-sourced events](#hook-sourced-events-additive). A call the gateway refused because its JSON-RPC request id was still in flight (held for approval, or pending) carries `error.type: 'duplicate_id'`. |
+| `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field. Gateway mode records `'policy_denied'` for a call it refused (see [Gateway mode fields](#gateway-mode-fields-additive)) and `'duplicate_id'` for a call refused because its JSON-RPC request id was still in flight (held for approval, or pending). `mcp-recorder hook` records the additive values `'policy_denied'` (a `--policy` deny), `'tool_error'` (the call failed: a PostToolUseFailure) and `'interrupted'` (a PostToolUseFailure with `is_interrupt`) — see [Hook-sourced events](#hook-sourced-events-additive). |
 | `duration_ms` | `number` | Wall-clock ms between request and response crossing the proxy. |
 | `gateway` | `GatewayOutcome?` | Additive (v1). Present on every `tool_call` recorded in gateway mode — see [Gateway mode fields](#gateway-mode-fields-additive). |
-| `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
+| `phase` | `'pre' \| 'post'?` | Additive, optional (schema stays v1). `mcp-recorder hook` records a tool call as two separate correlated events sharing `request_id` (a PreToolUse event, before the tool runs, and a PostToolUse or PostToolUseFailure event, after) — this says which half. Undefined for proxy-captured `tool_call` events, which are already request+response correlated into one event. See [Hook-sourced events](#hook-sourced-events-additive). |
 
 ### `rpc`
 
@@ -393,12 +394,12 @@ A call the gateway refused has `duration_ms: 0` (it never reached the server);
 ## Hook-sourced events (additive)
 
 `mcp-recorder hook` (see [docs/hooks.md](hooks.md)) turns Claude Code
-PreToolUse/PostToolUse/SessionEnd/Stop hook invocations into events using
+PreToolUse/PostToolUse/PostToolUseFailure/SessionEnd/Stop hook invocations into events using
 the exact same `session_start` / `tool_call` / `session_end` / `notification`
 shapes above — no new event kind was needed. `Stop` (the end of an agent
 turn, which fires many times per session) becomes a `notification` event
 with `method: 'claude-code/stop'` and `direction: 'client_to_server'`, so
-that a session still has exactly one `session_end` (from `SessionEnd`). Three additive, optional fields distinguish a
+that a session still has exactly one `session_end` (from `SessionEnd`). Four additive, optional fields distinguish a
 hook-sourced event and its finer shape, none of which change any existing
 field:
 
@@ -409,11 +410,40 @@ field:
   one `request_id` (Claude Code's own `tool_use_id`), rather than the single
   request+response-correlated event the proxy records. `'pre'` carries
   redacted arguments with `result: null` and `duration_ms: 0`; `'post'`
-  carries the redacted result and the measured `duration_ms`.
-- **`ToolCallEvent.error.type: 'policy_denied'`** — a new value under the
-  already free-form `error.type` string field (no schema change), set when
-  `mcp-recorder hook --policy FILE` denies a PreToolUse call; `error.message_ref`
-  is the hash of the policy rule's `reason`.
+  carries the redacted result and the measured `duration_ms` (for a
+  PostToolUseFailure: `result: null`, `result_hash` of canonical `null`,
+  `is_error: true` and `error` as below — Claude Code fires exactly one of
+  PostToolUse / PostToolUseFailure per call). A hook `'post'` event's
+  `duration_ms` is the gap between the two hook invocations (Claude Code's
+  dispatch plus hook process spawn, about a second per call in cloud
+  dogfood 3), not the MCP server's latency the proxy measures — see
+  [docs/hooks.md](hooks.md#what-gets-recorded).
+- **`ToolCallEvent.error.type: 'policy_denied' | 'tool_error' | 'interrupted'`**
+  — additive values under the already free-form `error.type` string field
+  (no schema change; the same string is also set as the `error.type`
+  attribute). `'policy_denied'`: `mcp-recorder hook --policy FILE` denied
+  the PreToolUse call; `error.message_ref` is the hash of the policy rule's
+  `reason`. `'tool_error'`: the call failed (Claude Code fired
+  PostToolUseFailure instead of PostToolUse); `error.message_ref` is the
+  hash of the hook's `error` string, computed exactly like any redacted
+  value (`Redactor.hashString`, i.e. `sha256Ref`) — the text itself is
+  never stored. `'interrupted'`: the same, but the hook's `is_interrupt`
+  was true (the call was aborted rather than reporting an error). A
+  PostToolUse event whose `tool_response` is shaped `{isError: true}` (the
+  MCP CallToolResult convention) sets `is_error: true` and the
+  `'tool_error'` *attribute* only, with no `error` object.
+- **`ServerContext.url`** — the endpoint of the MCP server a hook-sourced
+  `tool_call` went to, as the MCP config file the hook found asserts it
+  (see the `ServerContext` table above for the value, its scrubbing and
+  its trust), set on both halves of the call and on nothing else: a
+  session-level event names the client itself, so it carries no vendor
+  URL. `server.name` itself is always what Claude Code calls the server —
+  in a cloud session an opaque UUID like
+  `47d587b8-3fb9-42e9-b596-f8b25371248c` (cloud dogfood 3, surprise 2) —
+  so that it matches Claude Code's own hook matchers and transcripts;
+  `url` is what makes such an event self-describing. Absent when the
+  config file was missing, malformed, oversized, or had no usable URL for
+  that server.
 
 `SessionEndEvent.reason` is a **frozen closed union**
 (`'child_exit' | 'stdin_closed' | 'signal' | 'error'`) with no member for

@@ -10,7 +10,9 @@
  * matching `allow` rule, else `default` (which itself defaults to "allow").
  * `tool` regexes match the FULL hook `tool_name` (e.g.
  * "mcp__ClickUp__clickup_delete_task"), the exact string Claude Code's own
- * hook `matcher` field is tested against.
+ * hook `matcher` field is tested against. A `deny` rule is ALSO tested
+ * against the host alias (`mcp__<host>__<tool>`, src/hook/names.ts) when
+ * one resolved; an `allow` rule never is — see `evaluatePolicy`.
  *
  * Fail-open: a missing --policy is not an error (no policy = allow
  * everything), and a PRESENT but invalid/malformed policy file is also
@@ -46,6 +48,26 @@ export interface LoadPolicyResult {
 /** Load a policy file from disk. `path: undefined` means "no policy
  *  configured" (`policy: null`, allow everything) — not a warning. */
 export declare function loadPolicy(path: string | undefined): LoadPolicyResult;
-/** Evaluate a policy against a hook's full `tool_name`. `policy: null` (no
+/** Evaluate a policy against a hook's full `tool_name`, and — when given —
+ *  its host alias (`mcp__<host>__<tool>`, see `hostAliasToolName` in
+ *  src/hook/names.ts). The first matching rule wins, in order: deny rules,
+ *  then allow rules, then `default`.
+ *
+ *  THE ALIAS IS DENY-ONLY. A `deny` rule matches when its regex matches
+ *  EITHER the raw name or the alias; an `allow` rule matches on the raw
+ *  name ONLY. The alias is derived from the MCP config file the hook finds
+ *  (`/tmp/mcp-config-*.json` in a cloud session), and that file lives in a
+ *  world-writable directory on the same host as the agent the policy is
+ *  meant to constrain — an agent with Bash can plant a file that maps any
+ *  UUID to any host, or delete the real one. Letting the alias satisfy an
+ *  allow rule would let such a file widen a `default: "deny"` policy
+ *  (review of the integrated change, E1: a forged `mcp_url` host turned a
+ *  denied ClickUp call into an allowed "github" one). Deny-only, a forged
+ *  or missing config can only ever ADD a deny or fail to add one — it can
+ *  never turn a deny into an allow. (A deny written against the alias alone
+ *  can still be dodged by removing the file, which is why docs/hooks.md
+ *  tells operators to write a deny that must hold against the raw name,
+ *  `[0-9a-f-]{36}` for a cloud UUID.) A policy written against raw names
+ *  behaves exactly as it did before aliases existed. `policy: null` (no
  *  policy configured, or one that failed to load) always allows. */
-export declare function evaluatePolicy(policy: CompiledPolicy | null, toolName: string): PolicyDecision;
+export declare function evaluatePolicy(policy: CompiledPolicy | null, toolName: string, alias?: string): PolicyDecision;

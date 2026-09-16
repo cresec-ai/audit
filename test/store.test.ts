@@ -23,6 +23,7 @@ import type {
   HeadSignature,
   IdentityContext,
   PolicyDecisionEvent,
+  NotificationEvent,
   ServerContext,
   SessionEndEvent,
   SessionStartEvent,
@@ -149,9 +150,9 @@ function seal(events: AnyEvent[], head: ChainHead = { seq: 0, hash: GENESIS_HASH
 const SESSION_A = '11111111-1111-4111-8111-111111111111';
 const SESSION_B = '22222222-2222-4222-8222-222222222222';
 
-/** Two realistic sessions: A is complete (with one failed call), B is still open. */
-function twoSessionFixture(): ChainRecord[] {
-  return seal([
+/** Two realistic proxy-captured sessions: A is complete (with one failed call), B is still open. */
+function twoSessionEvents(): AnyEvent[] {
+  return [
     sessionStart(SESSION_A, '2026-06-11T10:00:00.000Z'),
     toolCall(SESSION_A, '2026-06-11T10:00:01.000Z', 'list_issues', { requestId: 1 }),
     toolCall(SESSION_A, '2026-06-11T10:00:02.000Z', 'create_issue', {
@@ -161,7 +162,120 @@ function twoSessionFixture(): ChainRecord[] {
     sessionEnd(SESSION_A, '2026-06-11T10:00:03.000Z'),
     sessionStart(SESSION_B, '2026-06-11T11:00:00.000Z'),
     toolCall(SESSION_B, '2026-06-11T11:00:01.000Z', 'get_file_contents', { requestId: 1 }),
-  ]);
+  ];
+}
+
+function twoSessionFixture(): ChainRecord[] {
+  return seal(twoSessionEvents());
+}
+
+/* ----------------------- hook-captured session fixture ----------------------- */
+
+/** One Claude Code session (keyed by Claude Code's own session_id) as `mcp-recorder hook` records it. */
+const SESSION_HOOK = '33333333-3333-4333-8333-333333333333';
+
+function hookServer(name: string): ServerContext {
+  return { name, command: 'hook:claude-code', transport: 'stdio' };
+}
+
+/**
+ * A hook-sourced tool_call: one `pre` event per call, plus a `post` event
+ * sharing its request_id only when the tool ran to completion — the exact
+ * shape src/hook/run.ts records (`source: 'hook'`, `phase`, the MCP server
+ * split out of `mcp__<server>__<tool>` onto server.name).
+ */
+function hookToolCall(
+  timestamp: string,
+  server: string,
+  tool: string,
+  requestId: string,
+  phase: 'pre' | 'post',
+  opts: { isError?: boolean; errorType?: string } = {},
+): ToolCallEvent {
+  const isError = opts.isError ?? false;
+  const event: ToolCallEvent = {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: SESSION_HOOK,
+    timestamp,
+    kind: 'tool_call',
+    identity: IDENTITY,
+    server: hookServer(server),
+    attributes: {
+      'gen_ai.operation.name': 'execute_tool',
+      'gen_ai.tool.name': tool,
+      'gen_ai.tool.call.id': requestId,
+      'mcp.method.name': 'tools/call',
+      'rpc.system': 'hook',
+    },
+    source: 'hook',
+    tool,
+    request_id: requestId,
+    args: { task_id: { redacted: true, ref: sha256Ref('abc123'), len: 6 } },
+    result_hash: sha256Ref(phase === 'pre' ? 'null' : '{"ok":true}'),
+    result:
+      phase === 'pre'
+        ? null
+        : { content: [{ type: 'text', text: { redacted: true, ref: sha256Ref('result body'), len: 11 } }] },
+    is_error: isError,
+    duration_ms: phase === 'pre' ? 0 : 1164,
+    phase,
+  };
+  if (isError) {
+    event.error = { type: opts.errorType ?? 'tool_error', message_ref: sha256Ref('boom') };
+  }
+  return event;
+}
+
+/** The `Stop` turn boundary: a notification, not a second session_end. */
+function hookStop(timestamp: string): NotificationEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: SESSION_HOOK,
+    timestamp,
+    kind: 'notification',
+    identity: IDENTITY,
+    server: hookServer('claude-code'),
+    attributes: { 'mcp.method.name': 'claude-code/stop', 'rpc.system': 'hook' },
+    source: 'hook',
+    method: 'claude-code/stop',
+    direction: 'client_to_server',
+    params: { stop_hook_active: false },
+  };
+}
+
+/**
+ * Modelled on cloud dogfood 3: one Claude Code session whose tool calls
+ * went to two hosted connectors and one local server. Five CALLS in eight
+ * tool_call events —
+ *   1. ClickUp get_workspace_hierarchy: pre + post (completed)
+ *   2. ClickUp get_list:               pre only (the connector errored and
+ *                                      PostToolUse never fired)
+ *   3. github pull_request_read:       pre + post with is_error (failing post)
+ *   4. ClickUp delete_task:            pre denied by policy (is_error, no post)
+ *   5. corp-notes list_notes:          pre + post (completed)
+ * — so a correct summary reads 5 calls, 2 errors, and 3 distinct servers
+ * called (ClickUp, github, corp-notes; the claude-code session-level events
+ * are not a server the session called).
+ */
+function hookSessionEvents(): AnyEvent[] {
+  const t = (s: number) => `2026-09-15T21:02:${String(s).padStart(2, '0')}.000Z`;
+  return [
+    { ...sessionStart(SESSION_HOOK, t(0)), server: hookServer('claude-code'), source: 'hook' },
+    hookToolCall(t(1), 'ClickUp', 'clickup_get_workspace_hierarchy', 'toolu_1', 'pre'),
+    hookToolCall(t(2), 'ClickUp', 'clickup_get_workspace_hierarchy', 'toolu_1', 'post'),
+    hookToolCall(t(3), 'ClickUp', 'clickup_get_list', 'toolu_2', 'pre'),
+    hookToolCall(t(4), 'github', 'pull_request_read', 'toolu_3', 'pre'),
+    hookToolCall(t(5), 'github', 'pull_request_read', 'toolu_3', 'post', { isError: true }),
+    hookToolCall(t(6), 'ClickUp', 'clickup_delete_task', 'toolu_4', 'pre', {
+      isError: true,
+      errorType: 'policy_denied',
+    }),
+    hookToolCall(t(7), 'corp-notes', 'list_notes', 'toolu_5', 'pre'),
+    hookToolCall(t(8), 'corp-notes', 'list_notes', 'toolu_5', 'post'),
+    hookStop(t(9)),
+  ];
 }
 
 /* --- Gateway mode (additive v1): a denied call is a tool_call with is_error
@@ -403,6 +517,7 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(a.event_count).toBe(4);
     expect(a.tool_call_count).toBe(2);
     expect(a.error_count).toBe(1);
+    expect(a.server_count).toBe(1);
 
     const b = sessions.find((s) => s.session_id === SESSION_B)!;
     expect(b).toBeDefined();
@@ -413,6 +528,111 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(b.event_count).toBe(2);
     expect(b.tool_call_count).toBe(1);
     expect(b.error_count).toBe(0);
+    expect(b.server_count).toBe(1);
+  });
+
+  it('sessions() counts a hook-captured session per call, per failure and per server', () => {
+    const store = open();
+    // Proxy sessions and the hook session interleave in one chain, exactly
+    // as they do in a data dir shared by `record` wrappers and the hook.
+    store.append(seal([...twoSessionEvents(), ...hookSessionEvents()]));
+
+    const sessions = store.sessions();
+    expect(sessions.map((s) => s.session_id)).toEqual([SESSION_A, SESSION_B, SESSION_HOOK]);
+
+    // Proxy-only sessions keep exactly today's counts.
+    const a = sessions.find((s) => s.session_id === SESSION_A)!;
+    expect(a.event_count).toBe(4);
+    expect(a.tool_call_count).toBe(2);
+    expect(a.error_count).toBe(1);
+    expect(a.server_count).toBe(1);
+    const b = sessions.find((s) => s.session_id === SESSION_B)!;
+    expect(b.event_count).toBe(2);
+    expect(b.tool_call_count).toBe(1);
+    expect(b.error_count).toBe(0);
+    expect(b.server_count).toBe(1);
+
+    const hook = sessions.find((s) => s.session_id === SESSION_HOOK)!;
+    expect(hook).toBeDefined();
+    expect(hook.started_at).toBe('2026-09-15T21:02:00.000Z');
+    expect(hook.ended_at).toBeUndefined(); // Stop is a turn boundary, not a session_end
+    expect(hook.server_name).toBe('claude-code'); // first event: the session-level session_start
+    expect(hook.event_count).toBe(10); // session_start + 8 tool_call events + Stop
+    // Eight tool_call events, but five CALLS: pre+post pairs count once, a
+    // lone pre (never completed) counts once, a denied pre counts once.
+    expect(hook.tool_call_count).toBe(5);
+    // Exactly one is_error event per failed call: the denied pre and the
+    // failing post. The lone pre with no post is NOT an error here.
+    expect(hook.error_count).toBe(2);
+    // The servers the session's tool calls went to: ClickUp + github +
+    // corp-notes. The claude-code session_start/Stop events are not one.
+    expect(hook.server_count).toBe(3);
+  });
+
+  it('sessions() counts a proxy session recorded without --name as one server, and a session with no tool call as zero', () => {
+    // Without --name the proxy stamps the argv-derived basename on the
+    // events before the initialize handshake and the learned serverInfo.name
+    // after it (src/proxy/stdio.ts), so counting distinct names over EVERY
+    // event read 2 for the README's plain `record -- <server>` form (review
+    // of the integrated change). Only the servers actually called count.
+    const MIXED = '44444444-4444-4444-8444-444444444444';
+    const NO_CALLS = '55555555-5555-4555-8555-555555555555';
+    const named = (ev: AnyEvent, name: string): AnyEvent => ({ ...ev, server: { ...ev.server, name } });
+    const store = open();
+    store.append(
+      seal([
+        named(sessionStart(MIXED, '2026-09-15T22:10:28.020Z'), 'echo-server.cjs'),
+        named(toolCall(MIXED, '2026-09-15T22:10:28.050Z', 'echo', { requestId: 2 }), 'echo-server'),
+        named(toolCall(MIXED, '2026-09-15T22:10:28.060Z', 'echo', { requestId: 3 }), 'echo-server'),
+        named(sessionEnd(MIXED, '2026-09-15T22:10:28.072Z'), 'echo-server'),
+        sessionStart(NO_CALLS, '2026-09-15T22:11:00.000Z'),
+        sessionEnd(NO_CALLS, '2026-09-15T22:11:01.000Z'),
+      ]),
+    );
+    const sessions = store.sessions();
+    const mixed = sessions.find((s) => s.session_id === MIXED)!;
+    expect(mixed.server_name).toBe('echo-server.cjs'); // SERVER stays the first event's name
+    expect(mixed.server_count).toBe(1);
+    expect(mixed.tool_call_count).toBe(2);
+    const noCalls = sessions.find((s) => s.session_id === NO_CALLS)!;
+    expect(noCalls.server_count).toBe(0);
+    expect(noCalls.tool_call_count).toBe(0);
+  });
+
+  it('sessions() reads non-conforming records the same way on both backends', () => {
+    // Shapes no writer of ours produces, pinned so the two backends cannot
+    // drift apart on them: an explicit `phase: null` (a call, like an
+    // absent phase), a server.name that is not a string (not a server),
+    // and is_error on a kind that is neither tool_call nor rpc (not an
+    // error).
+    const ODD = '66666666-6666-4666-8666-666666666666';
+    const t = (s: number) => `2026-09-15T22:12:${String(s).padStart(2, '0')}.000Z`;
+    const phaseNull = { ...toolCall(ODD, t(1), 'a', { requestId: 1 }), phase: null } as unknown as AnyEvent;
+    const numericName = {
+      ...toolCall(ODD, t(2), 'b', { requestId: 2 }),
+      server: { ...SERVER, name: 42 },
+    } as unknown as AnyEvent;
+    const erroringNotification = {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: ODD,
+      timestamp: t(3),
+      kind: 'notification',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: {},
+      method: 'notifications/message',
+      direction: 'server_to_client',
+      params: {},
+      is_error: true,
+    } as unknown as AnyEvent;
+    const store = open();
+    store.append(seal([sessionStart(ODD, t(0)), phaseNull, numericName, erroringNotification]));
+    const odd = store.sessions().find((s) => s.session_id === ODD)!;
+    expect(odd.event_count).toBe(4);
+    expect(odd.tool_call_count).toBe(2); // phase null and the numeric-name call both count as calls
+    expect(odd.server_count).toBe(1); // github-mcp; 42 is not a server name
+    expect(odd.error_count).toBe(0); // is_error on a notification is not an error
   });
 
   it('sessions() counts a gateway session: a denied call is 1 tool call + 1 error, policy_decision adds only to event_count', () => {

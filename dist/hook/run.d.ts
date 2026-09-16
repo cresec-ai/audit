@@ -5,12 +5,18 @@
  * HOOK CONTRACT (verified against the current docs — cite these, not memory,
  * if this ever needs re-checking):
  *   https://code.claude.com/docs/en/hooks
+ *   https://code.claude.com/docs/en/hooks#posttoolusefailure-input
  *   https://code.claude.com/docs/en/hooks-guide
  * Claude Code spawns a fresh process per hook event and feeds it exactly one
  * JSON object on stdin. Every event carries `session_id`, `transcript_path`,
- * `cwd`, `hook_event_name`. PreToolUse/PostToolUse add `tool_name`,
- * `tool_input`, `tool_use_id`; PostToolUse also adds `tool_response`
- * (string | object). SessionEnd adds `reason`: one of
+ * `cwd`, `hook_event_name`. PreToolUse/PostToolUse/PostToolUseFailure add
+ * `tool_name`, `tool_input`, `tool_use_id`. PostToolUse fires ONLY for a
+ * tool call that succeeded and adds `tool_response` (string | object); a
+ * call that failed fires PostToolUseFailure INSTEAD, which carries no
+ * `tool_response` but `error` (a string whose format depends on the tool)
+ * and an optional `is_interrupt` boolean (true when the failure reached
+ * Claude Code as an abort — the running tool was cancelled — rather than as
+ * an error the tool reported). SessionEnd adds `reason`: one of
  * 'clear'|'resume'|'logout'|'prompt_input_exit'|'other'. Stop (end of an
  * agent turn, recorded as a 'claude-code/stop' notification) has no
  * `reason` field at all. MCP tools are named `mcp__<server>__<tool>` (see

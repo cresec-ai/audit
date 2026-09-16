@@ -1,0 +1,305 @@
+/**
+ * Resolve where a Claude Code MCP server segment actually points, from the
+ * MCP config file Claude Code itself was started with.
+ *
+ * WHY. In a Claude Code cloud session the Anthropic-hosted connectors are
+ * registered under opaque UUID names, so the hook sees tool names like
+ * `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_get_list` — only
+ * `github` keeps a readable name (cloud dogfood 3, surprise 2). Recorded
+ * as-is, `server.name` is the UUID, and a policy written the documented way
+ * (`^mcp__ClickUp__…`) never matches. The UUID → service mapping exists in
+ * exactly one place: the config file Claude Code was started with,
+ * `/tmp/mcp-config-<session>.json` in a cloud session, shaped like
+ *
+ *   {"mcpServers":{
+ *     "github":{"url":"https://api.anthropic.com/v2/ccr-sessions/<session>/github/mcp",
+ *               "type":"http","headers":{"X-Session-UUID":"<session>","X-MCP-Server-ID":"…"}},
+ *     "47d587b8-3fb9-42e9-b596-f8b25371248c":{
+ *               "url":"https://api.anthropic.com/v2/ccr-sessions/<session>/mcp?mcp_server_id=…&mcp_url=https%3A%2F%2Fmcp.clickup.com%2Fmcp&toolbox_mcp_server_id=47d587b8-…",
+ *               "type":"http","tools":[{"name":"clickup_get_list","permission_policy":"always_allow"},…]},
+ *     …}}
+ *
+ * WHAT IS TAKEN from it — for the ONE entry named exactly like the segment,
+ * and nothing else: the vendor endpoint carried (URL-encoded) in the relay
+ * URL's `mcp_url` query parameter when present (`https://mcp.clickup.com/mcp`),
+ * else the entry's own `url` (the Anthropic relay); scrubbed by
+ * `scrubOriginUrl` below; plus that URL's hostname, which `run.ts` turns
+ * into the policy alias `mcp__<host>__<tool>`. No headers (they carry the
+ * session id and server ids), no session ids (the relay PATH embeds one —
+ * it is hashed in place, see `scrubOriginUrl`), no tool lists, no
+ * permission policies, no other entries.
+ *
+ * SOURCES, in order: `MCP_RECORDER_MCP_CONFIG` (one path, or comma-separated
+ * paths, tried in order) when set; else the files matching
+ * `/tmp/mcp-config-*.json` (what a cloud session has). The first file whose
+ * `mcpServers` has the segment wins. Resolution is attempted for every MCP
+ * tool event — a UUID segment is the case this exists for, and a readable
+ * name (`github`) still gets its relay URL — but it is cheap: a file that
+ * does not even contain the quoted segment is skipped before parsing.
+ *
+ * FAIL-OPEN, ALWAYS: `resolveServerOrigin` never throws and never blocks.
+ * A missing, unreadable, oversized (> `MCP_CONFIG_MAX_BYTES`), malformed or
+ * oddly-shaped file is simply skipped; an entry with no usable URL yields
+ * `{}`. The hook records the same event either way, just without `url`.
+ * `env`, `readFile` and `glob` are injectable so tests never touch the
+ * real `/tmp` or the real environment.
+ *
+ * TRUST. What this returns is ASSERTED by a file, never observed on the
+ * wire: the hook sends nothing anywhere. In a cloud session `/tmp` is
+ * world-writable and the hook runs as the same user as the agent, so an
+ * agent with Bash can rewrite, shadow (a name that sorts first) or delete
+ * `/tmp/mcp-config-*.json`; `MCP_RECORDER_MCP_CONFIG` names a path in that
+ * same environment and changes nothing about that. Consumers therefore
+ * treat `url` as the config file's claim about the server, and the policy
+ * alias built from `host` is DENY-ONLY (src/hook/policy.ts): a forged file
+ * can add a deny or make one miss, never turn a deny into an allow.
+ */
+
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+
+import { sha256Ref } from '../chain/hash.js';
+import { looksSecret } from '../redact/redactor.js';
+import { ENV } from '../types.js';
+
+/** Where a cloud session's Claude Code MCP config lives (one per session). */
+export const CLOUD_MCP_CONFIG_GLOB = '/tmp/mcp-config-*.json';
+
+/** A config file larger than this is ignored, never read or parsed. The
+ *  real cloud file is a few hundred KB at most (one entry per connector,
+ *  each listing its tools); anything past 4 MiB is not that file. */
+export const MCP_CONFIG_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Upper bound on the candidate files one resolution consults, so a
+ *  pathological `/tmp` (or env value) cannot turn a hook invocation into a
+ *  directory walk. */
+export const MCP_CONFIG_MAX_FILES = 16;
+
+/** An origin URL longer than this (after scrubbing) is not usable: the whole
+ *  origin — `url` AND `host`, so "no url, no alias" always holds — is
+ *  dropped, and `originFromEntryUrl` falls back to the relay exactly as for
+ *  a non-http `mcp_url`. Defense in depth against a config file stuffing
+ *  arbitrary text into every event through a URL, mirroring
+ *  `structuralString`'s cap on wire-level strings. */
+export const MAX_ORIGIN_URL_LEN = 2048;
+
+/** A path segment recorded verbatim must be a short vocabulary token —
+ *  `v2`, `ccr-sessions`, `github`, `mcp`; everything else (readable free
+ *  text, percent-encoded bytes, anything over 32 chars) is replaced by its
+ *  `sha256:` ref, in addition to the secret/opaque rules below. Mirrors
+ *  `structuralString`'s caps: the file is agent-writable (see TRUST above),
+ *  so no readable text it chooses may reach the store through a path. */
+const PATH_VOCAB_RE = /^[A-Za-z0-9._-]{1,32}$/;
+
+export interface ServerOrigin {
+  /** The server's endpoint, scrubbed (see `scrubOriginUrl`): the vendor
+   *  `mcp_url` of a hosted connector, else the config entry's own URL. */
+  url?: string;
+  /** `url`'s hostname, e.g. `mcp.clickup.com` — the policy alias segment.
+   *  Always set together with `url`, never without it. */
+  host?: string;
+}
+
+export interface ResolveServerOriginOpts {
+  /** Environment to read `MCP_RECORDER_MCP_CONFIG` from (default: process.env). */
+  env?: Record<string, string | undefined>;
+  /** Read a file's full text, or return undefined to skip it (unreadable,
+   *  oversized, not a file). Default: `readConfigText` (bounded by
+   *  `MCP_CONFIG_MAX_BYTES`). May throw — the caller swallows it. */
+  readFile?: (path: string) => string | undefined;
+  /** Expand one glob pattern into matching paths, sorted. Default:
+   *  `simpleGlob` (a single `*` in the basename). May throw — swallowed. */
+  glob?: (pattern: string) => string[];
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/* ------------------------------- sources -------------------------------- */
+
+/** The config files to consult, in order — see the file-level comment. */
+export function candidateConfigPaths(
+  env: Record<string, string | undefined>,
+  glob: (pattern: string) => string[],
+): string[] {
+  const fromEnv = env[ENV.MCP_CONFIG];
+  let paths: string[];
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') {
+    paths = fromEnv
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p !== '');
+  } else {
+    paths = glob(CLOUD_MCP_CONFIG_GLOB);
+  }
+  return paths.slice(0, MCP_CONFIG_MAX_FILES);
+}
+
+/** Expand a pattern whose basename holds exactly one `*` (e.g.
+ *  `/tmp/mcp-config-*.json`) by listing its directory. Anything else — no
+ *  `*`, a `*` in a directory component, an unreadable directory — yields
+ *  the literal path (no `*`) or nothing. Sorted, so resolution order is
+ *  deterministic. Node 20 (the engine floor) has no `fs.globSync`. */
+export function simpleGlob(pattern: string): string[] {
+  if (!pattern.includes('*')) return [pattern];
+  const dir = dirname(pattern);
+  const base = basename(pattern);
+  const star = base.indexOf('*');
+  if (dir.includes('*') || star < 0 || base.indexOf('*', star + 1) >= 0) return [];
+  const prefix = base.slice(0, star);
+  const suffix = base.slice(star + 1);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((n) => n.length >= prefix.length + suffix.length && n.startsWith(prefix) && n.endsWith(suffix))
+    .sort()
+    .map((n) => join(dir, n));
+}
+
+/** Read a config file's text, or undefined when it is not a regular file or
+ *  is larger than `MCP_CONFIG_MAX_BYTES` (checked by size BEFORE reading,
+ *  so an oversized file is never loaded, and again on the text read, in
+ *  case it grew in between). Throws on a missing/unreadable path — callers
+ *  treat that as "skip". */
+export function readConfigText(path: string): string | undefined {
+  const st = statSync(path);
+  if (!st.isFile() || st.size > MCP_CONFIG_MAX_BYTES) return undefined;
+  const text = readFileSync(path, 'utf8');
+  // UTF-16 code units never outnumber UTF-8 bytes, so this is a safe
+  // (conservative) re-check without a second byte count.
+  return text.length > MCP_CONFIG_MAX_BYTES ? undefined : text;
+}
+
+/* ------------------------------ scrubbing ------------------------------- */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** An opaque identifier: 16+ chars of [A-Za-z0-9_-] mixing letters and
+ *  digits — the shape of a cloud session id (`cse_01NRTz…`) and of the
+ *  server ids in relay URLs, which `looksSecret` (tuned for credential
+ *  shapes) does not catch on its own. Short vocabulary segments like `v2`,
+ *  `ccr-sessions`, `github`, `mcp` are untouched. */
+const OPAQUE_TOKEN_RE = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_-]{16,}$/;
+
+function isOpaqueSegment(seg: string): boolean {
+  return UUID_RE.test(seg) || OPAQUE_TOKEN_RE.test(seg) || looksSecret(seg) || !PATH_VOCAB_RE.test(seg);
+}
+
+/**
+ * The recorded form of an origin URL. Same rules the http proxy applies to
+ * its `--target` before stamping it on events (docs/event-schema.md,
+ * "`command` target-URL handling"), plus the opaque-token rule above:
+ *  - userinfo (`user:pass@`) is stripped;
+ *  - every path segment that is secret-shaped, an opaque identifier (a
+ *    UUID, a cloud session id) or not a short vocabulary token
+ *    (`PATH_VOCAB_RE`) is replaced in place by its `sha256:<hex>` ref —
+ *    computed exactly like every other redacted value (`sha256Ref`), so a
+ *    blast-radius `query` for a session id still finds the event;
+ *  - the query string and fragment are dropped unconditionally (any single
+ *    parameter can be a bearer credential — `?api_key=…`);
+ *  - only http(s) URLs qualify, and a scrubbed URL longer than
+ *    `MAX_ORIGIN_URL_LEN` is not usable either; both yield undefined.
+ * Unlike the http proxy's `--target`, the stripped pieces are NOT
+ * fingerprinted (`identity.credential_fingerprints`): the proxy fingerprints
+ * a credential it goes on to send, while the hook sends nothing — a
+ * credential sitting in this file is dropped, not attested.
+ * The hostname is never altered: it is the whole point (the policy alias).
+ */
+export function scrubOriginUrl(u: URL): ServerOrigin | undefined {
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+  if (u.hostname === '') return undefined;
+  const clean = new URL(u.href);
+  clean.username = '';
+  clean.password = '';
+  const segments = clean.pathname.split('/');
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (seg !== '' && isOpaqueSegment(seg)) segments[i] = sha256Ref(seg);
+  }
+  clean.pathname = segments.join('/');
+  clean.search = '';
+  clean.hash = '';
+  const url = clean.toString();
+  if (url.length > MAX_ORIGIN_URL_LEN) return undefined;
+  return { host: clean.hostname, url };
+}
+
+/** The origin of one config entry's `url`: the decoded `mcp_url` query
+ *  parameter (the vendor endpoint behind an Anthropic relay) when it is a
+ *  usable http(s) URL, else the entry URL itself. Undefined when neither
+ *  parses. Exported for tests; `resolveServerOrigin` is the entry point. */
+export function originFromEntryUrl(entryUrl: string): ServerOrigin | undefined {
+  let entry: URL;
+  try {
+    entry = new URL(entryUrl);
+  } catch {
+    return undefined;
+  }
+  const mcpUrl = entry.searchParams.get('mcp_url');
+  if (mcpUrl !== null && mcpUrl !== '') {
+    try {
+      const vendor = scrubOriginUrl(new URL(mcpUrl));
+      if (vendor !== undefined) return vendor;
+    } catch {
+      /* not a URL: fall through to the relay */
+    }
+  }
+  return scrubOriginUrl(entry);
+}
+
+/* ------------------------------ resolution ------------------------------ */
+
+/** Look `segment` up in one config file's text. Undefined when the file
+ *  does not contain it, is not JSON, is not shaped `{mcpServers:{…}}`, or
+ *  the entry has no usable `url` (a stdio server, for instance). */
+export function originFromConfigText(text: string, segment: string): ServerOrigin | undefined {
+  // Cheap pre-check: the segment must appear as a quoted JSON key before
+  // the (comparatively costly) parse is worth doing. A miss here is only
+  // ever "unresolved", never an error.
+  if (!text.includes(JSON.stringify(segment))) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isPlainObject(raw) || !isPlainObject(raw.mcpServers)) return undefined;
+  // Own-property check: a segment like `constructor` or `__proto__` must
+  // never resolve through the prototype chain.
+  if (!Object.prototype.hasOwnProperty.call(raw.mcpServers, segment)) return undefined;
+  const entry = raw.mcpServers[segment];
+  if (!isPlainObject(entry) || typeof entry.url !== 'string' || entry.url === '') return undefined;
+  return originFromEntryUrl(entry.url);
+}
+
+/**
+ * Resolve the origin of the MCP server Claude Code calls `segment` (the
+ * `<server>` in `mcp__<server>__<tool>`). `{}` whenever nothing usable is
+ * found. Never throws.
+ */
+export function resolveServerOrigin(segment: string, opts: ResolveServerOriginOpts = {}): ServerOrigin {
+  try {
+    if (typeof segment !== 'string' || segment === '') return {};
+    const env = opts.env ?? process.env;
+    const readFile = opts.readFile ?? readConfigText;
+    const glob = opts.glob ?? simpleGlob;
+    for (const path of candidateConfigPaths(env, glob)) {
+      let text: string | undefined;
+      try {
+        text = readFile(path);
+      } catch {
+        continue; // missing / unreadable: skip
+      }
+      if (text === undefined) continue;
+      const origin = originFromConfigText(text, segment);
+      if (origin !== undefined) return origin;
+    }
+  } catch {
+    /* fail-open: an origin is a nice-to-have, never a reason to fail a hook */
+  }
+  return {};
+}

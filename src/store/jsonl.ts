@@ -593,31 +593,61 @@ export class JsonlStore implements EvidenceStore {
     return this.records.length;
   }
 
+  /**
+   * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL
+   * — test/store.test.ts runs the same fixtures through both backends; the
+   * counting rules are spelled out on SessionSummary (src/types.ts).
+   */
   sessions(): SessionSummary[] {
     this.syncRecords();
-    const byId = new Map<string, SessionSummary>();
+    const byId = new Map<string, { summary: SessionSummary; servers: Set<string> }>();
     for (const record of this.records) {
       const ev = record.event;
-      let summary = byId.get(ev.session_id);
-      if (summary === undefined) {
+      let entry = byId.get(ev.session_id);
+      if (entry === undefined) {
         // First record of the session in seq order — same semantics as the
         // sqlite backend's "first event JSON of the session" subquery.
-        summary = {
-          session_id: ev.session_id,
-          started_at: ev.timestamp,
-          server_name: ev.server?.name ?? '',
-          identity_fingerprint: ev.identity?.fingerprint ?? '',
-          event_count: 0,
-          tool_call_count: 0,
-          error_count: 0,
+        entry = {
+          summary: {
+            session_id: ev.session_id,
+            started_at: ev.timestamp,
+            server_name: ev.server?.name ?? '',
+            identity_fingerprint: ev.identity?.fingerprint ?? '',
+            event_count: 0,
+            tool_call_count: 0,
+            error_count: 0,
+            server_count: 0,
+          },
+          servers: new Set<string>(),
         };
-        byId.set(ev.session_id, summary);
+        byId.set(ev.session_id, entry);
       }
+      const { summary, servers } = entry;
       if (ev.timestamp < summary.started_at) summary.started_at = ev.timestamp;
       summary.event_count += 1;
-      if (ev.kind === 'tool_call') summary.tool_call_count += 1;
-      if ((ev.kind === 'tool_call' || ev.kind === 'rpc') && ev.is_error) {
+      // One per CALL: a proxy event (no phase) or a hook 'pre' event; the
+      // hook 'post' twin (same request_id) is the same call, and a lone pre
+      // (the call never completed) still counts once. An explicit
+      // `phase: null` reads as "no phase", exactly as SQL's `IS NULL` does.
+      if (
+        ev.kind === 'tool_call' &&
+        (ev.phase === undefined || ev.phase === null || ev.phase === 'pre')
+      ) {
+        summary.tool_call_count += 1;
+      }
+      // is_error on any phase: a failed hook call carries exactly one such
+      // event (a denied pre, or a failing post). A post whose pre was never
+      // recorded is an error here but not a call above.
+      if ((ev.kind === 'tool_call' || ev.kind === 'rpc') && ev.is_error === true) {
         summary.error_count += 1;
+      }
+      // Distinct servers actually CALLED: tool_call events only, so a proxy
+      // session recorded without --name (argv basename before the initialize
+      // handshake, learned serverInfo.name after) reads 1, not 2, and a hook
+      // session does not count its own claude-code session-level events.
+      if (ev.kind === 'tool_call' && typeof ev.server?.name === 'string') {
+        servers.add(ev.server.name);
+        summary.server_count = servers.size;
       }
       if (ev.kind === 'session_end') {
         if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {
@@ -625,7 +655,7 @@ export class JsonlStore implements EvidenceStore {
         }
       }
     }
-    return [...byId.values()];
+    return [...byId.values()].map((entry) => entry.summary);
   }
 
   close(): void {

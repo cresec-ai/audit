@@ -31,6 +31,10 @@ export const ENV = {
     DISABLE: 'MCP_RECORDER_DISABLE',
     /** Additive (gateway mode): policy.yaml path honoured by `record` when `--policy` is absent. */
     POLICY: 'MCP_RECORDER_POLICY',
+    /** `hook`: MCP config file(s) to resolve server origins from — one path or
+     *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
+     *  See src/hook/mcp-config.ts. */
+    MCP_CONFIG: 'MCP_RECORDER_MCP_CONFIG',
 };
 /** File names inside the data dir. */
 export const FILES = {
