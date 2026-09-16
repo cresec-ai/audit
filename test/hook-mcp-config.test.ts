@@ -25,6 +25,10 @@ import {
 
 const FIXTURES = fileURLToPath(new URL('./fixtures/mcp-config/', import.meta.url));
 const CLOUD = join(FIXTURES, 'cloud-session.json');
+/** The OTHER convention: a config keyed by FRIENDLY connector name, with
+ *  friendly tool names — a local session, and the cloud session this test
+ *  was written in (`ClickUp`, `Gmail`, `Claude_Code_Remote`, `github`). */
+const FRIENDLY = join(FIXTURES, 'friendly-session.json');
 const ALT = join(FIXTURES, 'cloud-session-alt.json');
 const MALFORMED = join(FIXTURES, 'malformed.json');
 const MISSING = join(FIXTURES, 'does-not-exist.json');
@@ -32,12 +36,22 @@ const MISSING = join(FIXTURES, 'does-not-exist.json');
 const CLICKUP_UUID = '47d587b8-3fb9-42e9-b596-f8b25371248c';
 const GMAIL_UUID = 'ce5e992d-730d-4f07-95c8-4ba759ea3e3b';
 const SESSION_ID = 'cse_01FIXTURESESSION0000AAAA';
+const FRIENDLY_SESSION_ID = 'cse_01FRIENDLYSESSION0000DDDD';
 
 /** Every test names its sources explicitly: never the real environment,
  *  never the real /tmp. */
 const noGlob = (): string[] => [];
 function fromEnv(value: string | undefined) {
   return { env: { MCP_RECORDER_MCP_CONFIG: value }, glob: noGlob };
+}
+/** Resolution as the hook actually asks for it: both halves of
+ *  `mcp__<server>__<tool>` (see `parseToolName`). */
+function fromEnvTool(value: string | undefined, tool: string) {
+  return { env: { MCP_RECORDER_MCP_CONFIG: value }, glob: noGlob, tool };
+}
+/** One in-memory config file: no real /tmp, no real environment. */
+function fromText(text: string, tool: string) {
+  return { env: {}, glob: (): string[] => ['config.json'], readFile: (): string => text, tool };
 }
 
 const cleanups: Array<() => void> = [];
@@ -177,6 +191,166 @@ describe('resolveServerOrigin', () => {
     expect(resolveServerOrigin(CLICKUP_UUID, { env: { MCP_RECORDER_MCP_CONFIG: CLOUD }, readFile: boom })).toEqual(
       {},
     );
+  });
+});
+
+/* ---------- route 2: the declared-tool fallback (cloud dogfood 4) --------- */
+
+describe('resolveServerOrigin (declared-tool fallback)', () => {
+  it('cloud dogfood 4: a UUID-keyed file resolves a FRIENDLY segment through the entry that declares the tool', () => {
+    // Dogfood 4's session: the config was keyed by UUID while Claude Code
+    // handed the hook `mcp__ClickUp__clickup_filter_tasks`. The key lookup
+    // misses (that much is unchanged)...
+    expect(resolveServerOrigin('ClickUp', fromEnv(CLOUD))).toEqual({});
+    // ...and the tool name is what maps the call to its vendor.
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(CLOUD, 'clickup_filter_tasks'))).toEqual({
+      url: 'https://mcp.clickup.com/mcp',
+      host: 'mcp.clickup.com',
+    });
+    // That run's other denied tool, and another connector's tool in the same
+    // file, each resolve to their own vendor.
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(CLOUD, 'clickup_get_workspace_members')).host).toBe(
+      'mcp.clickup.com',
+    );
+    expect(resolveServerOrigin('Gmail', fromEnvTool(CLOUD, 'send_message')).host).toBe('gmail.mcp.example.test');
+    // Still nothing but url and host is taken from the file.
+    const origin = resolveServerOrigin('ClickUp', fromEnvTool(CLOUD, 'clickup_filter_tasks'));
+    expect(Object.keys(origin).sort()).toEqual(['host', 'url']);
+    const raw = JSON.stringify(origin);
+    expect(raw).not.toContain(SESSION_ID);
+    expect(raw).not.toContain('permission_policy');
+    expect(raw).not.toContain('clickup_filter_tasks');
+  });
+
+  it('a friendly-keyed file (a local session, and the cloud session this was written in) still resolves by key', () => {
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(FRIENDLY, 'clickup_filter_tasks'))).toEqual({
+      url: 'https://mcp.clickup.com/mcp',
+      host: 'mcp.clickup.com',
+    });
+    expect(resolveServerOrigin('Gmail', fromEnvTool(FRIENDLY, 'send_message')).host).toBe('gmail.mcp.example.test');
+    expect(resolveServerOrigin('Claude_Code_Remote', fromEnvTool(FRIENDLY, 'create_session')).host).toBe(
+      'ccr.mcp.example.test',
+    );
+    // `github` carries `tools: null` and no `mcp_url`: the key route still
+    // gives it its relay URL, and route 2 can never match it.
+    expect(resolveServerOrigin('github', fromEnvTool(FRIENDLY, 'get_me')).url).toBe(
+      `https://api.anthropic.com/v2/ccr-sessions/${sha256Ref(FRIENDLY_SESSION_ID)}/github/mcp`,
+    );
+    expect(resolveServerOrigin('whatever', fromEnvTool(FRIENDLY, 'get_me'))).toEqual({});
+    // The key stays authoritative when the two routes disagree: `a` is keyed
+    // by the segment, `b` declares the tool.
+    const text = JSON.stringify({
+      mcpServers: {
+        a: { url: 'https://by-key.example.test/mcp' },
+        b: { url: 'https://by-tool.example.test/mcp', tools: [{ name: 't' }] },
+      },
+    });
+    expect(resolveServerOrigin('a', fromText(text, 't')).host).toBe('by-key.example.test');
+    // ...including when the keyed entry has no usable URL of its own: an
+    // entry Claude Code names IS the server, so there is nothing to fall
+    // back to for it.
+    const stdioKeyed = JSON.stringify({
+      mcpServers: {
+        a: { command: 'npx', type: 'stdio', tools: [{ name: 't' }] },
+        b: { url: 'https://by-tool.example.test/mcp', tools: [{ name: 't' }] },
+      },
+    });
+    expect(resolveServerOrigin('a', fromText(stdioKeyed, 't'))).toEqual({});
+  });
+
+  it('a tool TWO entries declare, and a tool NO entry declares, both resolve to nothing', () => {
+    const twice = JSON.stringify({
+      mcpServers: {
+        one: { url: 'https://one.example.test/mcp', tools: [{ name: 'shared_tool' }] },
+        two: { url: 'https://two.example.test/mcp', tools: [{ name: 'shared_tool' }] },
+      },
+    });
+    expect(resolveServerOrigin('ClickUp', fromText(twice, 'shared_tool'))).toEqual({});
+    // Ambiguity is counted over DECLARATIONS, not over usable URLs: a file
+    // cannot resolve its own ambiguity by leaving a `url` off one of them.
+    const twiceOneUrl = JSON.stringify({
+      mcpServers: {
+        one: { url: 'https://one.example.test/mcp', tools: [{ name: 'shared_tool' }] },
+        two: { tools: [{ name: 'shared_tool' }] },
+      },
+    });
+    expect(resolveServerOrigin('ClickUp', fromText(twiceOneUrl, 'shared_tool'))).toEqual({});
+    // Nobody declares it: nothing — never "the first entry".
+    expect(resolveServerOrigin('ClickUp', fromText(twice, 'other_tool'))).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(CLOUD, 'not_a_declared_tool'))).toEqual({});
+    // A declared tool whose entry has no usable URL: no url, no alias.
+    const stdio = JSON.stringify({
+      mcpServers: { 'corp-notes': { command: 'npx', type: 'stdio', tools: [{ name: 'read_note' }] } },
+    });
+    expect(resolveServerOrigin('corp-notes-renamed', fromText(stdio, 'read_note'))).toEqual({});
+  });
+
+  it('`tools: null` and every malformed `tools` shape resolve to nothing, without throwing', () => {
+    const shapes: unknown[] = [
+      null,
+      undefined,
+      'clickup_filter_tasks',
+      42,
+      { name: 'clickup_filter_tasks' },
+      [null, 'clickup_filter_tasks', 42, []],
+      [{ name: 42 }, { name: null }, { nome: 'clickup_filter_tasks' }, {}],
+    ];
+    for (const tools of shapes) {
+      const text = JSON.stringify({ mcpServers: { anything: { url: 'https://wrong.example.test/mcp', tools } } });
+      expect(resolveServerOrigin('ClickUp', fromText(text, 'clickup_filter_tasks'))).toEqual({});
+    }
+    // A declaration with no own `name` never inherits one from the prototype
+    // chain, so no prototype-named tool can ever match it.
+    const empty = JSON.stringify({ mcpServers: { anything: { url: 'https://wrong.example.test/mcp', tools: [{}] } } });
+    for (const tool of ['__proto__', 'constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+      expect(resolveServerOrigin('ClickUp', fromText(empty, tool))).toEqual({});
+    }
+    // A `__proto__` NAME is just a string, and it matches nothing else.
+    const proto = JSON.stringify({
+      mcpServers: { anything: { url: 'https://wrong.example.test/mcp', tools: [{ name: '__proto__' }] } },
+    });
+    for (const tool of ['clickup_filter_tasks', 'constructor', 'toString']) {
+      expect(resolveServerOrigin('ClickUp', fromText(proto, tool))).toEqual({});
+    }
+  });
+
+  it('the exact key wins over a declared-tool match even when the match sits in an EARLIER file', () => {
+    // /tmp holds one mcp-config-<session>.json per live session, so several
+    // files can match the glob: another session's file must never out-rank
+    // this session's key.
+    const byTool = JSON.stringify({
+      mcpServers: { 'other-session-uuid': { url: 'https://other.example.test/mcp', tools: [{ name: 'shared_tool' }] } },
+    });
+    const byKey = JSON.stringify({ mcpServers: { ClickUp: { url: 'https://mine.example.test/mcp' } } });
+    const files: Record<string, string> = { '/first.json': byTool, '/second.json': byKey };
+    const opts = {
+      env: {},
+      glob: (): string[] => Object.keys(files),
+      readFile: (p: string): string | undefined => files[p],
+      tool: 'shared_tool',
+    };
+    expect(resolveServerOrigin('ClickUp', opts).host).toBe('mine.example.test');
+    // With no file keying the segment at all, the fallback resolves — in file order.
+    delete files['/second.json'];
+    expect(resolveServerOrigin('ClickUp', opts).host).toBe('other.example.test');
+  });
+
+  it('never throws through the fallback either: a throwing reader, a truncated file or an empty tool yields {}', () => {
+    const boom = (): never => {
+      throw new Error('boom');
+    };
+    const tool = 'clickup_filter_tasks';
+    expect(resolveServerOrigin('ClickUp', { env: {}, glob: () => ['x'], readFile: boom, tool })).toEqual({});
+    expect(resolveServerOrigin('ClickUp', { env: {}, glob: boom, tool })).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(MALFORMED, tool))).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(MISSING, tool))).toEqual({});
+    const truncated = `{"mcpServers":{"a":{"url":"https://x.example.test/mcp","tools":[{"name":"${tool}"}]`;
+    expect(resolveServerOrigin('ClickUp', fromText(truncated, tool))).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromText('{"mcpServers":[]}', tool))).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromText('null', tool))).toEqual({});
+    // Neither half of the name may be empty.
+    expect(resolveServerOrigin('', fromEnvTool(CLOUD, tool))).toEqual({});
+    expect(resolveServerOrigin('ClickUp', fromEnvTool(CLOUD, ''))).toEqual({});
   });
 });
 

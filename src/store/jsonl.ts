@@ -613,10 +613,16 @@ export class JsonlStore implements EvidenceStore {
       if (entry === undefined) {
         // First record of the session in seq order — same semantics as the
         // sqlite backend's "first event JSON of the session" subquery.
+        // Key insertion order is part of the contract with SqliteStore:
+        // both backends must produce byte-identical JSON for the same
+        // chain (test/store.test.ts compares JSON.stringify across the
+        // two), so last_event_at is set here, after started_at, in both —
+        // and ended_at is added last in both, where it has always been.
         entry = {
           summary: {
             session_id: ev.session_id,
             started_at: ev.timestamp,
+            last_event_at: ev.timestamp,
             server_name: ev.server?.name ?? '',
             identity_fingerprint: ev.identity?.fingerprint ?? '',
             event_count: 0,
@@ -630,6 +636,13 @@ export class JsonlStore implements EvidenceStore {
       }
       const { summary, servers } = entry;
       if (ev.timestamp < summary.started_at) summary.started_at = ev.timestamp;
+      // MAX over EVERY event, whatever its kind — the instant the counts
+      // below run through. A session_end is not necessarily last: a client
+      // session resumed under the same session_id records more events
+      // after it, and that is what tells `ended_at` apart from an end.
+      if (summary.last_event_at === undefined || ev.timestamp > summary.last_event_at) {
+        summary.last_event_at = ev.timestamp;
+      }
       summary.event_count += 1;
       // One per CALL: a proxy event (no phase) or a hook 'pre' event; the
       // hook 'post' twin (same request_id) is the same call, and a lone pre

@@ -199,16 +199,21 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
     // Where the MCP server actually is, from the config file Claude Code was
     // started with (src/hook/mcp-config.ts). In a cloud session the hosted
     // connectors are named by opaque UUIDs (mcp__47d587b8-…__clickup_get_list),
-    // and that file is the only place the UUID maps to a vendor endpoint. The
-    // resolved URL is stamped as the additive `server.url`; the host also
-    // forms the policy alias `mcp__<host>__<tool>`, which is tested against
-    // DENY rules only (that file is writable by the agent under policy — see
-    // the TRUST note in mcp-config.ts and `evaluatePolicy`). `server.name`
-    // stays what Claude Code calls the server (the UUID), so it matches
-    // Claude Code's own matchers and transcripts. Fail-open: `{}` when
-    // nothing resolves, and no alias for a host that is not a plausible
-    // dotted hostname (`hostAliasToolName`).
-    const origin = parsed !== undefined && parsed.isMcp ? resolveServerOrigin(parsed.server) : {};
+    // and that file is the only place a connector maps to a vendor endpoint.
+    // The TOOL name goes in as well as the segment: the config key and the
+    // tool-name segment are NOT always the same convention (dogfood 4 had a
+    // UUID-keyed file and friendly tool names, so the key lookup missed and
+    // nothing resolved), and `opts.tool` lets resolution fall back to the one
+    // entry that declares this exact tool. The resolved URL is stamped as the
+    // additive `server.url`; the host also forms the policy alias
+    // `mcp__<host>__<tool>`, which is tested against DENY rules only (that
+    // file is writable by the agent under policy — see the TRUST note in
+    // mcp-config.ts and `evaluatePolicy`). `server.name` stays what Claude
+    // Code calls the server, so it matches Claude Code's own matchers and
+    // transcripts. Fail-open: `{}` when nothing resolves, and no alias for a
+    // host that is not a plausible dotted hostname (`hostAliasToolName`).
+    const origin =
+      parsed !== undefined && parsed.isMcp ? resolveServerOrigin(parsed.server, { tool: parsed.tool }) : {};
     const policyAlias =
       parsed !== undefined && parsed.isMcp && origin.host !== undefined
         ? hostAliasToolName(origin.host, parsed.tool)

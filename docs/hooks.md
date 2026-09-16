@@ -172,17 +172,29 @@ detail stays on each event's `server.name`, which `query`, `ui` and
   call too: a failed call has exactly one such event. A failing `post`
   whose `pre` was never recorded (the hook installed mid-call) counts here
   but not in `TOOL_CALLS`, so `ERRORS` can exceed `TOOL_CALLS`.
+- `ENDED` is an end time only when the session's `session_end` is genuinely
+  its LAST event. A Claude Code session resumed under the same `session_id`
+  goes on recording after its SessionEnd hook fired — cloud dogfood 4's
+  session recorded a `session_end` at 07:59:20 and then tool calls until
+  12:41:08 — and every count in the row is a live aggregate over all of it.
+  Such a row reads `(reopened)`, and `LAST_EVENT` (the last column;
+  additive `last_event_at` in `--json`) gives the instant the counts run
+  through; `--json` still reports the `session_end` itself as `ended_at`.
+  A session with no `session_end` at all reads `(open)`, as before. Nothing
+  about the event schema changes for this — a resumed session emits no
+  second `session_start`, and a `session_end` is recorded exactly as it
+  always was; only the summary stops presenting a superseded one as an end.
 - `SERVER` is the session's first event's `server.name`, which for a hook
-  session is the client itself (`claude-code`); `SERVERS` (the last column;
-  additive `server_count` in `--json`) is the number of distinct
-  `server.name` values over the session's **`tool_call` events** — the
-  servers actually called — so a session that called ClickUp, GitHub and a
-  local server reads `3` (the client's own session-level events are not a
-  server). A proxy session reads `1` with or without `--name` (without it,
-  `server.name` is the argv-derived basename until the `initialize`
-  handshake and the learned `serverInfo.name` after it, but every tool
-  call carries one name), and a session that never called a tool reads
-  `0`.
+  session is the client itself (`claude-code`); `SERVERS` (the
+  second-to-last column; additive `server_count` in `--json`) is the number
+  of distinct `server.name` values over the session's **`tool_call`
+  events** — the servers actually called — so a session that called
+  ClickUp, GitHub and a local server reads `3` (the client's own
+  session-level events are not a server). A proxy session reads `1` with or
+  without `--name` (without it, `server.name` is the argv-derived basename
+  until the `initialize` handshake and the learned `serverInfo.name` after
+  it, but every tool call carries one name), and a session that never
+  called a tool reads `0`.
 
 **MCP tool names.** Claude Code presents an MCP tool to hooks as
 `mcp__<server>__<tool>` (e.g. `mcp__ClickUp__clickup_get_task`). This is
@@ -218,9 +230,9 @@ readable payload string from a hook's stdin ever reaches the store.
 ## Cloud sessions: UUID server names and `server.url`
 
 In a Claude Code **cloud** session (Claude Code on the web) the
-Anthropic-hosted connectors are registered under opaque UUIDs, not the
-readable names the CLI and this document use elsewhere. What the hook
-sees there is
+Anthropic-hosted connectors may be registered under opaque UUIDs rather than
+the readable names the CLI and this document use elsewhere. What the hook
+saw in one such session is
 
 ```
 mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_get_list    ClickUp
@@ -250,13 +262,57 @@ Every hosted connector is reached through an Anthropic relay URL; for a
 UUID-named one the vendor endpoint rides along, URL-encoded, in the
 relay URL's `mcp_url` query parameter.
 
-For every MCP tool call, `mcp-recorder hook` looks the server segment up in
+**The naming convention is the platform's, it varies per session, and the
+two sides can disagree.** Cloud dogfood 3 saw UUID-keyed config *and*
+UUID-prefixed tool names. Cloud dogfood 4, on the same repository a day
+later, saw a **UUID-keyed config file and friendly tool names**
+(`mcp__ClickUp__clickup_filter_tasks`, `mcp__Gmail__*`,
+`mcp__Google_Calendar__*`, `mcp__Google_Drive__*`). Other sessions key the
+config by friendly name (`ClickUp`, `Gmail`, `github`) with friendly tool
+names. So the `<server>` segment of a tool name is **not** guaranteed to be
+a key of `mcpServers`, and resolution must not assume it is — the first
+shipped version did, which is exactly how dogfood 4's deny policy failed
+(see [Write deny rules against the tool](#write-deny-rules-against-the-tool-not-the-server-segment)).
+Resolution is best-effort either way: when it misses, the event is still
+recorded, just without `server.url` and without an alias.
+
+For every MCP tool call, `mcp-recorder hook` finds that connector's entry in
 that file and records what it finds as the additive `server.url`: the
 decoded `mcp_url` when present (`https://mcp.clickup.com/mcp`), else the
 entry's own URL — so `github` gets its relay,
 `https://api.anthropic.com/v2/ccr-sessions/sha256:.../github/mcp`. The
 URL's hostname also becomes the **policy alias** described under
-[Policy](#policy-allow--deny). The sources, in order:
+[Policy](#policy-allow--deny).
+
+**Which entry — and why it is not just the key.** The config key and the
+tool-name segment are not always the same convention, and which way a session
+goes varies:
+
+| session | `mcpServers` key | tool name the hook sees |
+| --- | --- | --- |
+| cloud dogfood 3 | UUID | `mcp__47d587b8-…__clickup_get_list` |
+| cloud dogfood 4 | UUID | `mcp__ClickUp__clickup_filter_tasks` |
+| a local session | `ClickUp` | `mcp__ClickUp__clickup_filter_tasks` |
+
+So the entry is looked for two ways, in this order:
+
+1. **By key** — the entry whose `mcpServers` key is exactly the segment. The
+   precise route, tried in every candidate file before route 2 is.
+2. **By declared tool** — the entry whose `tools[]` declares exactly the tool
+   being called, used only when **exactly one** entry of the file declares it
+   and that file keys no entry by the segment at all. Zero declarations, or
+   two or more, resolve to nothing: an ambiguous file is never guessed at,
+   because a wrong attribution would produce a **wrong** `deny`. An entry
+   with `tools: null` or no `tools` (the shape `github` has) never matches
+   this route.
+
+Route 2 is what cloud dogfood 4 was missing: that run's config was UUID-keyed
+while Claude Code named the tools `mcp__ClickUp__…`, the key lookup missed,
+and so nothing resolved — no `server.url` on a single hosted-connector event,
+no policy alias, and both of the run's `deny` rules failed to fire while the
+calls ran against the real workspace.
+
+The sources, in order:
 
 1. **`MCP_RECORDER_MCP_CONFIG`** — one path, or comma-separated paths tried
    in order. Set it in the environment the hook runs in to pin a specific
@@ -264,13 +320,18 @@ URL's hostname also becomes the **policy alias** described under
 2. Otherwise **the files matching `/tmp/mcp-config-*.json`** — what a cloud
    session has, so cloud sessions need no configuration at all.
 
-The first file whose `mcpServers` has the segment wins; at most 16
-candidate files are consulted. **Nothing else from the file is recorded**:
+The first file whose `mcpServers` keys the segment wins; only when no
+candidate file does is route 2 tried, again in file order, so the precise
+route beats the fallback even across files (`/tmp` holds one
+`mcp-config-<session>.json` per live session, so several can match). At most
+16 candidate files are consulted. **Nothing else from the file is recorded**:
 not the `headers` (they carry the session id and server ids), not the
 session id embedded in the relay URL's path (it is replaced in place by its
 `sha256:` ref, computed exactly like every other redacted value, so a
 blast-radius `query` for the session id still finds the events), not the
-`tools` list or its permission policies, not any other entry. The recorded
+`tools` list or its permission policies (route 2 compares a `tools[].name`
+against the tool being called and records nothing from it), not any other
+entry. The recorded
 URL is scrubbed the way the http proxy scrubs its `--target` before
 stamping it on events — userinfo stripped, query string and fragment
 dropped — and then more strictly: every path segment that is secret-shaped,
@@ -299,7 +360,10 @@ claim about where a server is, and the policy alias built from it is a
 **convenience, not a security boundary**: it is tested against `deny`
 rules only, never `allow` rules (a forged file can add a deny or make one
 miss, never turn a deny into an allow — see [Policy](#policy-allow--deny)),
-and a deny that must hold is written against the raw name too.
+and a deny that must hold is written against the raw name too. Route 2
+inherits that unchanged — it only decides which entry of the same untrusted
+file is read — and its uniqueness requirement is there so a forged or sloppy
+file cannot attribute a tool to the wrong vendor and produce a wrong deny.
 
 ## Policy: allow / deny
 
@@ -311,8 +375,8 @@ Claude Code then never runs the tool at all.
 ```json
 {
   "deny": [
-    { "tool": "^mcp__(ClickUp|[0-9a-f-]{36}|mcp\\.clickup\\.com)__clickup_delete_task$", "reason": "destructive ClickUp calls are blocked" },
-    { "tool": "^mcp__(Gmail|[0-9a-f-]{36})__(send_message|trash_.*)$" }
+    { "tool": "^mcp__.*__clickup_delete_task$", "reason": "destructive ClickUp calls are blocked" },
+    { "tool": "^mcp__.*__(send_message|trash_message|trash_thread)$", "reason": "no sending or trashing mail — from any connector that has these tools" }
   ],
   "allow": [
     { "tool": "^mcp__github__.*$" }
@@ -323,8 +387,14 @@ Claude Code then never runs the tool at all.
 
 - `tool` is a **regex tested against the full hook `tool_name`** — the same
   string Claude Code's own hook `matcher` field is tested against (e.g.
-  `mcp__ClickUp__clickup_delete_task`, or `Bash` for a built-in). A
-  **`deny` rule is also tested**, when the server's origin was resolved
+  `mcp__ClickUp__clickup_delete_task`, or `Bash` for a built-in). Write the
+  `<server>` segment open (`^mcp__.*__<tool>$`) as the example above does:
+  that segment is platform-controlled and changes between sessions, and a
+  rule anchored to one spelling of it silently stops matching when it
+  changes — see [Write deny rules against the
+  tool](#write-deny-rules-against-the-tool-not-the-server-segment), which is
+  the part of this page to read before writing a policy you intend to rely
+  on. A **`deny` rule is also tested**, when the server's origin was resolved
   (see [Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl)),
   **against the alias `mcp__<host>__<tool>`**: a cloud session's
   `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_delete_task` is
@@ -334,17 +404,14 @@ Claude Code then never runs the tool at all.
   agent under policy can write (see **Who can write that file** above), so
   it may add a deny but must never satisfy an allow — otherwise a forged
   `mcp_url` host could turn a `default: "deny"` policy's denial of a
-  ClickUp call into an allowed "github" one. That is why the example spells
-  the ClickUp rule `(ClickUp|[0-9a-f-]{36}|mcp\.clickup\.com)`: `ClickUp`
-  is the name a local Claude Code gives the connector; `[0-9a-f-]{36}` is
-  any UUID a cloud session may give it — the **raw** form, the only one
-  that still holds when the config file is forged, shadowed or gone (the
-  tool name is specific enough on its own: only ClickUp has a
-  `clickup_delete_task`), so a deny that must hold always includes it, as
-  the Gmail rule does; and `mcp.clickup.com` is the host every cloud
-  session resolves it to, a readable convenience for the reader of the
-  policy. Read `server.url` off a recorded event (`query --json`, `ui`), or
-  the `mcp_url` in `/tmp/mcp-config-*.json`, to learn a connector's host.
+  ClickUp call into an allowed "github" one. So the alias is a
+  **convenience, deny-only and best-effort**: it exists only when the
+  config file was found, parsed and matched to this server, it is derived
+  from a file the agent under policy can rewrite, and it is never the thing
+  a deny should rest on — an open `<server>` segment costs nothing and
+  holds whether or not resolution worked. Read `server.url` off a recorded
+  event (`query --json`, `ui`), or the `mcp_url` in
+  `/tmp/mcp-config-*.json`, to learn a connector's host.
   An alias exists only for a host that looks like one — lowercase, dotted
   (`mcp.clickup.com`; never `github`, `localhost` or an IPv6 literal), no
   `_`, at most 253 characters — so it can never collide with the raw
@@ -376,6 +443,125 @@ and behaves exactly as if no policy were configured, rather than failing the
 tool call over a typo in a config file. Recording, and this policy engine,
 must never be the reason a tool call breaks — only a genuinely configured
 `deny` rule ever blocks anything.
+
+### Write deny rules against the tool, not the server segment
+
+The `<server>` segment of `mcp__<server>__<tool>` is chosen by the platform,
+not by you and not by this tool. It has been observed as a UUID
+(`mcp__47d587b8-…__clickup_filter_tasks`) in one cloud session and as a
+friendly name (`mcp__ClickUp__clickup_filter_tasks`) in another on the same
+repository a day later, and the MCP config file's own keying is a separate
+choice that can disagree with the segment. **Treat it as unstable.**
+
+This is not hypothetical. Cloud dogfood 4 ran a live Claude Code session
+with the hook installed on
+`PreToolUse`/`PostToolUse`/`PostToolUseFailure`/`SessionEnd`/`Stop` and this
+policy committed at session start:
+
+```json
+{
+  "deny": [
+    { "tool": "^mcp__mcp\\.clickup\\.com__clickup_filter_tasks$" },
+    { "tool": "^mcp__[0-9a-f-]{36}__clickup_get_workspace_members$" }
+  ],
+  "default": "allow"
+}
+```
+
+Two deliberately independent routes to the same block: the resolved host
+alias, and the raw UUID form. **Both failed.** Both ClickUp calls executed
+against the real workspace and returned real data, twice each. Claude Code
+presented the tools as `mcp__ClickUp__clickup_filter_tasks` and
+`mcp__ClickUp__clickup_get_workspace_members`: `ClickUp` is not a UUID, so
+the second rule could not match; the config file was keyed by UUID, so the
+segment `ClickUp` resolved to nothing and there was no host alias for the
+first rule to match either. The session's signed bundle
+(`evidence/cloud-dogfood-4/incident.zip`, 62 events, `verify --bundle` and
+the bundle's standalone `verify.cjs` both PASS) contains **zero
+`policy_denied` events**, and no `server.url` on any hosted-connector event
+except `github`'s. The hook itself ran throughout and recorded all 16
+pre/post pairs with correctly hashed arguments — observation worked,
+enforcement did not.
+
+**The robust shape leaves the segment open.** `tool` is a regex tested
+against the whole `tool_name` (`evaluatePolicy`, `src/hook/policy.ts`), so
+`.*` in the segment position is all it takes.
+
+Not like this — each of these is anchored to one spelling of a name you do
+not control:
+
+```json
+{ "tool": "^mcp__ClickUp__clickup_filter_tasks$" }
+{ "tool": "^mcp__[0-9a-f-]{36}__clickup_get_workspace_members$" }
+{ "tool": "^mcp__mcp\\.clickup\\.com__clickup_filter_tasks$" }
+```
+
+Like this — anchored to the tool, which is the vendor's name for the
+operation and the part that actually decides what happens:
+
+```json
+{ "tool": "^mcp__.*__clickup_filter_tasks$", "reason": "bulk task reads are blocked" }
+{ "tool": "^mcp__.*__clickup_get_workspace_members$" }
+```
+
+Worked through the namings dogfood 3 and dogfood 4 each saw:
+
+| `tool_name` the hook receives | alias resolved | dogfood 4's rules | `^mcp__.*__…$` |
+| --- | --- | --- | --- |
+| `mcp__ClickUp__clickup_filter_tasks` | none (what happened live) | allow | **deny** |
+| `mcp__ClickUp__clickup_get_workspace_members` | none (what happened live) | allow | **deny** |
+| `mcp__47d587b8-…__clickup_filter_tasks` | `mcp__mcp.clickup.com__…` | deny | **deny** |
+| `mcp__47d587b8-…__clickup_get_workspace_members` | `mcp__mcp.clickup.com__…` | deny | **deny** |
+| `mcp__ClickUp__clickup_filter_tasks` | `mcp__mcp.clickup.com__…` | deny | **deny** |
+
+The last row is the friendly name once the connector-resolution fix lets the
+alias resolve: it repairs one of dogfood 4's two routes. The open rule
+already held in every row, including the two that happened live, with no
+resolution at all.
+
+Three things follow.
+
+- **An open segment denies that tool on every MCP server**, hosted or local.
+  For a `deny` that is the safe direction of error, and many connector tool
+  names are vendor-prefixed (`clickup_…`, `drive_…`) so collisions are rare.
+  Where a name is generic (`send_message`, `search`, `read_file`),
+  an open segment is a wider block than you may have meant — widen it
+  deliberately rather than narrowing it back to a server segment.
+- **The host alias is not a second line of defence.** It is deny-only,
+  best-effort, and exists only when the server resolved against the MCP
+  config — so it can vanish for exactly the reason a segment-anchored rule
+  stops matching, which is what made dogfood 4's two "independent" routes
+  fail together. Use it to make a policy readable, never to make it hold.
+- **`allow` rules are segment-anchored by necessity** (they are never tested
+  against the alias). `^mcp__github__.*$` stops matching if that server is
+  ever renamed: under `default: "allow"` nothing changes, under
+  `default: "deny"` the call is denied. That fails closed, which is right,
+  but it will surprise you if you are not expecting it.
+
+**Smoke-test a rule instead of assuming it matches.** A policy that never
+fires looks exactly like a policy with nothing to block — dogfood 4's only
+signal was a zero count in the evidence. Take the tool name from a recorded
+event (`query --json`, `ui`, or `server.name` plus the tool in `sessions`)
+or from Claude Code's own transcript, and feed it to the hook directly:
+
+```sh
+printf '%s' '{"hook_event_name":"PreToolUse","session_id":"policy-smoke",
+  "tool_name":"mcp__ClickUp__clickup_filter_tasks","tool_input":{}}' \
+  | mcp-recorder hook --policy .claude/policy.json --data-dir /tmp/policy-smoke
+```
+
+A matching rule prints exactly one line:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"mcp-recorder policy: bulk task reads are blocked"}}
+```
+
+Empty output means the call was allowed — the rule does not match that name.
+(The smoke test records the synthetic call like any other, which is why it
+points at a throwaway `--data-dir`.) After a real session,
+`grep -c '"policy_denied"' events.jsonl` in an
+unzipped bundle (or a `query` for the call) says whether the deny fired for
+real, and that check is worth doing once per policy you rely on.
 
 ## Fail-open guarantees
 

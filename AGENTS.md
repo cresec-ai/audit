@@ -61,8 +61,24 @@ dashboard instead; the exact JSON is in `docs/install.md`. Never commit
 
 A dogfood run proves what the test suite cannot: real clients, real hosted
 connectors, real failures. Past runs are on `evidence/cloud-dogfood-*`
-branches, each with a `REPORT.md` and a signed bundle. Two practical notes
-for anyone setting up the next one.
+branches, each with a `REPORT.md` and a signed bundle. Three practical notes
+from the runs so far.
+
+**The platform's names are not a stable interface, and the two sides of them
+can disagree.** Claude Code picks both the `<server>` segment in
+`mcp__<server>__<tool>` and the keys in `/tmp/mcp-config-<session>.json`, and
+nothing makes them match. Dogfood 3 saw UUID keys with UUID tool names;
+dogfood 4, a day later, saw UUID keys with *friendly* tool names
+(`mcp__ClickUp__…`), and that one mismatch defeated both deny rules the run
+existed to prove — both live ClickUp calls executed against the real
+workspace, twice each, and the 62-event signed bundle (chain PASS) holds zero
+policy decisions. Anything that resolves a connector must be tested against
+BOTH orderings, key-matches-segment and key-does-not, and a dogfood that only
+exercises synthetic JSON shaped like last session's convention goes green
+while the product fails. The failure mode is an *absence* — no `server.url`,
+no deny event — which no command reports as an error, so an expectation like
+"it blocked" is checked against the recorded evidence, never inferred from
+the session finishing.
 
 **Hooks are captured at session start.** Claude Code snapshots its hooks when
 the session begins, so installing a policy part-way through does not take
