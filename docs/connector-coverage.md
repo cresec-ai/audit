@@ -62,11 +62,41 @@ than resolved.
 |---|---|---|---|
 | claude.ai web chat | Anthropic relay to the vendor's MCP endpoint | Enterprise: inference hooks (real time, after the call), Compliance API (minutes). Team and below: nothing per call. | Org per-tool policy (allow / needs approval / blocked); the user-facing "needs approval" prompt is the only per-call gate. |
 | Claude Desktop chat | Same as web. `claude_desktop_config.json` governs local stdio servers only; remote connectors are not in it. [observed: `setup` finds no connector entries] | Same as web. | Same as web. `setup --bridge` (PR #9) replaces a connector with a local `mcp-remote` bridge the recorder wraps, at the cost of the user re-authorising through the bridge. |
-| Cowork (Desktop, local or remote) | Anthropic-side for connectors; local MCP servers in-process | Compliance API transcripts, Cowork OpenTelemetry (Team+Enterprise), local `audit.jsonl` transcripts HMAC-chained by Anthropic. Whether Claude Code hooks fire for connectors delivered to Cowork as in-process `sdk` servers is inferred from the OTel `decision_source: "hook"` field and needs an empirical test. [docs] | Org per-tool policy. |
+| Cowork (Desktop, local or remote) | Anthropic-side for connectors; local MCP servers in-process | Compliance API transcripts, Cowork OpenTelemetry (Team+Enterprise), local `audit.jsonl` transcripts HMAC-chained by Anthropic. **Claude Code hooks are not known to fire here, and the evidence points against it** (see below). [docs] | Org per-tool policy. Our hook tap should be assumed NOT to apply until the probe says otherwise. |
 | Claude Code cloud session | Connectors are `type: http` MCP servers in `/tmp/mcp-config-<session>.json`, pointing at `api.anthropic.com/v2/ccr-sessions/<session>/mcp?mcp_url=<vendor>` with `X-MCP-Server-ID`, `X-MCP-Server-Origin` and `X-Session-UUID` headers; the relay forwards to the vendor. [observed] | PreToolUse/PostToolUse/PostToolUseFailure hooks from the repository's `.claude/settings.json` fire with full `tool_input` and `tool_response`, or the error string on PostToolUseFailure; the session transcript JSONL holds every `tool_use`/`tool_result`. [observed] | Hooks can deny or rewrite. `mcp-recorder hook` records and enforces. |
 | Claude Code CLI, IDE, Desktop Code tab | Connector JSON-RPC leaves the machine for Anthropic's relay over HTTPS | Same hooks; Claude Code OpenTelemetry `tool_result` events with MCP server and tool names (and input when enabled). [docs] | Hooks; managed settings can lock them (`allowManagedHooksOnly`); `disableClaudeAiConnectors`, allowed/denied MCP server lists. [docs] |
 | Agent SDK | Loads claude.ai connectors under claude.ai login | Hooks are callbacks with the same payloads; `canUseTool`. [docs] | Same. |
 | Managed Agents (beta) | Customer-visible event stream | `agent.mcp_tool_use` / `agent.mcp_tool_result` with full input and content; MCP tools default to `always_ask`. First-party connectors (Gmail, Drive) are not offered there. [docs] | Per-call confirmation. |
+
+### Cowork and our hook tap: a correction
+
+An earlier draft of this memo inferred that Claude Code hooks fire in Cowork,
+reasoning from the `decision_source: "hook"` value in Cowork's OpenTelemetry
+events. That inference does not survive contact with the primary sources, and
+the row above has been corrected. What is actually known:
+
+- Anthropic's own Cowork documentation states that Cowork **does not read the
+  Claude Code CLI's `~/.claude` directory** on the machine. Skills, plugins and
+  connectors are synced from the claude.ai account at session start instead.
+  That sentence is about skills, plugins and connectors rather than hooks
+  specifically, and it is about `~/.claude` rather than a repository's own
+  `.claude/settings.json`, so it is strong but not conclusive. [docs]
+- Two open issues on `anthropics/claude-code`, **#63360** and **#77708**, both
+  labelled for Cowork and for hooks, report empirically that Claude Code hooks
+  do not fire there. Both are community reports, neither is confirmed by
+  Anthropic, and neither concerns this tool. [docs]
+- The OpenTelemetry field that prompted the original inference says only that
+  Cowork's own event schema has a value for a hook-sourced decision. It does
+  not establish that a third party's repository-level hook is dispatched.
+
+Treat Cowork as **unmonitored by `mcp-recorder hook` until proven otherwise**.
+If the probe confirms it, Cowork joins claude.ai web and Desktop chat as a
+surface where the only customer-side taps are Anthropic's own feeds, which
+strengthens the case for option C below rather than weakening it. The probe is
+read-only and takes a few minutes: run one connector call inside Cowork in a
+directory containing this repository and check whether `.mcp-recorder` gains
+anything and whether the repository's own `.mcp.json` servers are visible at
+all.
 
 ## Anthropic-provided controls and feeds
 
@@ -152,8 +182,9 @@ can ingest them as evidence sources but cannot replace them. [docs]
 4. **Ask Anthropic** for a supported egress webhook or a configurable
    connector endpoint on the server-side hop, and for Compliance API coverage
    of Claude Code on the web. Until then, C is the only lever we own there.
-5. **Two experiments to run next:** (a) whether Claude Code hooks fire for
-   connectors delivered to Cowork as in-process servers; (b) which
+5. **Two experiments to run next:** (a) the Cowork probe described above,
+   which now looks likely to come back negative and would make Cowork a
+   confirmed blind spot rather than an assumed-covered surface; (b) which
    `tool_use` fields the Compliance API chat-messages endpoint actually
    returns.
 
