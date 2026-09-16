@@ -325,6 +325,8 @@ export function checkRe2Subset(pattern: string): string | undefined {
       if (why !== undefined) return why;
     }
   }
+  const nested = repeatBudgetProblem(pattern, 0, pattern.length, RE2_MAX_REPEAT, matchingParens(pattern));
+  if (nested !== undefined) return nested;
   try {
     new RegExp(pattern);
   } catch (err) {
@@ -377,6 +379,110 @@ function checkRepeat(pattern: string, at: number): string | undefined {
         `repeat count ${c} is above RE2's limit of ${RE2_MAX_REPEAT}: the compiled policy would fail to` +
         ' evaluate in OPA and the rule would be dropped from the decision'
       );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The count Go charges a `{n,m}` against its budget. `{n}` and `{n,}` are
+ * both `n` — an unbounded repeat has `Max == -1`, and `repeatIsValid` falls
+ * back to `Min` for it.
+ */
+function repeatCharge(m: RegExpExecArray): number {
+  const min = Number(m[1]);
+  return m[2] === undefined || m[2] === '' ? min : Number(m[2]);
+}
+
+/** Where each `(` is closed, skipping escapes and character classes. */
+function matchingParens(pattern: string): Map<number, number> {
+  const out = new Map<number, number>();
+  const open: number[] = [];
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false;
+      continue;
+    }
+    if (ch === '[') inClass = true;
+    else if (ch === '(') open.push(i);
+    else if (ch === ')') {
+      const start = open.pop();
+      if (start !== undefined) out.set(start, i);
+    }
+  }
+  return out;
+}
+
+/**
+ * Go's nested-repeat budget over `pattern[from, to)`, with `budget` left from
+ * the repeats enclosing it. The per-count check above is the top level of
+ * this and nothing more: `{32}` passes it, and `(?:a{32}){32}` is 1024 copies
+ * of `a`, which Go refuses with the same "invalid repeat count" error the
+ * per-count case gives. Verified against the pinned OPA: product 1000 loads,
+ * 1024 does not.
+ *
+ * `*`, `+` and `?` are different operators in Go and do not spend the
+ * budget — only `{n,m}` does.
+ */
+function repeatBudgetProblem(
+  pattern: string,
+  from: number,
+  to: number,
+  budget: number,
+  parens: Map<number, number>,
+): string | undefined {
+  const tooBig = (charge: number, left: number): string =>
+    `nested repeat counts multiply to more than RE2's limit of ${RE2_MAX_REPEAT} ` +
+    `({${charge}} inside repeats that leave room for ${left}): the compiled policy would fail to ` +
+    'evaluate in OPA and the rule would be dropped from the decision';
+  let inClass = false;
+  for (let i = from; i < to; i++) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false;
+      continue;
+    }
+    if (ch === '[') {
+      inClass = true;
+      continue;
+    }
+    if (ch === '(') {
+      const close = parens.get(i);
+      if (close === undefined || close >= to) continue; // unbalanced: `new RegExp` rejects it
+      const q = REPEAT_AT.exec(pattern.slice(close + 1));
+      let inner = budget;
+      if (q !== null) {
+        const charge = repeatCharge(q);
+        // `{0}` matches nothing, so Go stops descending: there is no copy of
+        // the body to count.
+        if (charge === 0) {
+          i = close + q[0].length;
+          continue;
+        }
+        if (charge > budget) return tooBig(charge, budget);
+        inner = Math.floor(budget / charge);
+      }
+      const why = repeatBudgetProblem(pattern, i + 1, close, inner, parens);
+      if (why !== undefined) return why;
+      i = close + (q === null ? 0 : q[0].length);
+      continue;
+    }
+    if (ch === '{') {
+      const q = REPEAT_AT.exec(pattern.slice(i));
+      if (q === null) continue;
+      const charge = repeatCharge(q);
+      if (charge > budget) return tooBig(charge, budget);
+      i += q[0].length - 1;
     }
   }
   return undefined;

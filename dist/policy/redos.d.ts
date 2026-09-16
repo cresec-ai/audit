@@ -68,6 +68,34 @@ export declare const MAX_LINEAR_REPEATS = 2;
 /** Max product of alternation branch counts a pattern may have to stay in-thread runnable. */
 export declare const MAX_LINEAR_BRANCHES = 64;
 /**
+ * Work an in-thread match may cost before it is refused instead.
+ *
+ * {@link MAX_LINEAR_REPEATS} repeated atoms cost about `valueLength` to that
+ * power: two of them over a 4096-character value is 16.7 million steps —
+ * certified as linear, run on the proxy's only thread, with no deadline that
+ * can interrupt it, blocking every concurrent call until it finishes. It is
+ * polynomial rather than exponential, which is why it is not a shape
+ * problem, but "not exponential" is not the same as "safe to run
+ * uninterruptibly".
+ *
+ * The number is deliberately far inside the deadline rather than level with
+ * it. A step costs 0.5-1 ns here — `^.{0,4096}a.{0,4096}b$` at the value cap
+ * measured 13 ms for its 16.7 million — but that constant moves with the
+ * pattern, the machine and the load, and the whole point of this path is
+ * that nothing can interrupt a bad guess. 400k steps is two orders of
+ * magnitude under a 25 ms deadline on this hardware, which is the margin
+ * that buys.
+ *
+ * It bounds cost that grows with the value, not absolute time: one repeated
+ * atom over a big enough value still overruns, which is why the deadline
+ * check after the match stays.
+ *
+ * Only the no-worker fallback consults it, and a value it refuses denies —
+ * the same fail-closed answer that path already gives a pattern it cannot
+ * prove linear.
+ */
+export declare const MAX_IN_THREAD_STEPS = 400000;
+/**
  * Why `pattern` has a clearly exponential (or badly polynomial) shape under a
  * backtracking engine, or undefined when it does not. Never throws: an
  * unparseable pattern (a dangling `(`, a stray `)`) is somebody else's error
@@ -93,4 +121,4 @@ export declare function checkCatastrophicShape(pattern: string): string | undefi
  * - at most {@link MAX_LINEAR_BRANCHES} alternation paths, so a pattern
  *   cannot multiply its way to an exponential number of them.
  */
-export declare function checkProvablyLinear(pattern: string): string | undefined;
+export declare function checkProvablyLinear(pattern: string, valueLength?: number): string | undefined;

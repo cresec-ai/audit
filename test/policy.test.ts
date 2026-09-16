@@ -38,6 +38,7 @@ import {
   globMatch,
   globToRegExp,
   jsonEqual,
+  matchBounded,
   loadPolicyFile,
   normalizePolicy,
   parsePolicyText,
@@ -1671,18 +1672,42 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
     expect(run(fine, 'http://x')).toEqual({ action: 'allow', matched: false });
   });
 
-  it('with no worker, an in-thread match that still overruns the deadline poisons its pattern', () => {
-    // The in-thread path cannot be interrupted, so the guarantee is that it
-    // can cost the proxy one over-budget match and never two: the answer is
-    // thrown away (a fail-closed deny, never an allow) and the pattern is off
-    // for the rest of the process.
+  it('with no worker, a quadratic pattern at the value cap is refused BEFORE it runs', () => {
+    // This used to be where `^.*x.*y$` on 4 KiB ran uninterruptibly and was
+    // only caught afterwards, by the deadline, having already blocked every
+    // concurrent call for as long as it took. The cost is knowable up front
+    // — two repeated atoms over n characters is n^2 — so the fallback path
+    // now answers from the cost rather than from the stopwatch.
+    configureRegexGuard({ startupMs: 0 });
+    const slow = handBuilt('^.*x.*y$', 'slow');
+    expect(checkProvablyLinear('^.*x.*y$')).toBeUndefined(); // the SHAPE is fine
+    expect(run(slow, 'x'.repeat(4_000))).toMatchObject({
+      action: 'deny',
+      failClosed: true,
+      reason: 'policy evaluation error: regex could not be evaluated safely (guard worker unavailable) (slow)',
+    });
+    expect(regexGuardState().poisoned).toBe(0); // nothing ran, so nothing to poison
+    // An argument of ordinary size still evaluates: this is a budget on the
+    // value, not a ban on the pattern.
+    expect(run(slow, 'x'.repeat(100))).toEqual({ action: 'allow', matched: false });
+  });
+
+  it('an in-thread match that still overruns the deadline poisons its pattern', () => {
+    // The budget above bounds cost that grows with the value; it cannot
+    // bound absolute time, because the per-step constant moves with the
+    // machine. One repeated atom over a big enough value is linear, passes
+    // every gate, and still takes 5 ms. So the deadline check after the
+    // match stays, and this is its guarantee: an over-budget match can cost
+    // the proxy once and never twice — the answer is thrown away (a
+    // fail-closed deny, never an allow) and the pattern is off for the rest
+    // of the process.
     configureRegexGuard({ startupMs: 0, deadlineMs: 1 });
-    const slow = handBuilt('^.*x.*y$', 'slow'); // provably linear (quadratic), but 1 ms is not enough for 4 KiB
-    const first = run(slow, 'x'.repeat(4_000));
-    expect(first).toMatchObject({ action: 'deny', failClosed: true, reason: 'policy evaluation error: regex timed out (slow)' });
+    const huge = 'a'.repeat(4_000_000);
+    expect(checkProvablyLinear('^.*x$', huge.length)).toBeUndefined(); // cleared, however long
+    expect(() => matchBounded('^.*x$', huge)).toThrow(/timed out/);
     expect(regexGuardState().poisoned).toBe(1);
     const t0 = Date.now();
-    expect(run(slow, 'x'.repeat(4_000)).reason).toBe('policy evaluation error: regex timed out (slow)');
+    expect(() => matchBounded('^.*x$', huge)).toThrow(/timed out/);
     expect(Date.now() - t0).toBeLessThan(50); // poisoned: no second over-budget match
   });
 
@@ -1810,6 +1835,46 @@ describe('checkRe2Subset: shapes that would break RE2 at evaluation time', () =>
     expect(checkRe2Subset('^\\d{1,3}\\.\\d{1,3}$')).toBeUndefined();
   });
 
+  it('rejects nested repeats whose PRODUCT is above 1000, which is Go’s real rule', () => {
+    // The per-count check was only the top level of Go's test.
+    // `repeatIsValid` starts from 1000 and integer-divides the budget by
+    // each enclosing repeat, so `(?:a{32}x){32}` — 1024 copies of `a`, every
+    // count of it well under 1000 — fails to load with the same "invalid
+    // repeat count" error, and the rule leaves the OPA decision silently.
+    // Measured against the pinned OPA: the boundary is exact.
+    expect(checkRe2Subset('^(?:a{31}x){32}$')).toBeUndefined(); // 992
+    expect(checkRe2Subset('^(?:a{32}x){32}$')).toMatch(/nested repeat counts multiply/); // 1024
+    expect(checkRe2Subset('^(?:a{2}x){500}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{2}x){501}$')).toMatch(/nested repeat counts multiply/);
+    expect(checkRe2Subset('^(?:a{125}x){8}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{125}x){9}$')).toMatch(/nested repeat counts multiply/);
+    // Three levels divide twice, exactly as Go does. (Its sibling at {10} is
+    // 1000 exactly and clears the budget, but a doubly-nested repeated group
+    // is rejected by the catastrophic-shape rule before RE2 ever sees it, so
+    // only the budget direction is asserted here.)
+    expect(checkRe2Subset('^(?:(?:a{10}x){10}y){11}z$')).toMatch(/nested repeat counts multiply/);
+    // An unbounded inner repeat is charged its MINIMUM, which is what Go
+    // falls back to when Max is -1.
+    expect(checkRe2Subset('^(?:a{2,}x){400}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{2,}x){501}$')).toMatch(/nested repeat counts multiply/);
+  });
+
+  it('charges the budget to `{n,m}` alone, and to the right nesting', () => {
+    // `*`, `+` and `?` are different operators in Go: they do not multiply.
+    expect(checkRe2Subset('^(?:a{1000}x)*$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{1000}x)+$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{1000}x)?$')).toBeUndefined();
+    // Siblings are not nested, so they add rather than multiply.
+    expect(checkRe2Subset('^a{1000}b{1000}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:a{1000})(?:b{1000})$')).toBeUndefined();
+    // `{0}` has no copies to count, so Go stops descending there.
+    expect(checkRe2Subset('^(?:a{1000}x){0}$')).toBeUndefined();
+    // A `{` that is not a quantifier, or one inside a class, is neither.
+    expect(checkRe2Subset('^(?:[a{1001}]x){2}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:\\{{4}x){250}$')).toBeUndefined();
+    expect(checkRe2Subset('^(?:\\{{4}x){251}$')).toMatch(/nested repeat counts multiply/);
+  });
+
   it('rejects a capture-group name RE2 cannot parse, and a duplicate name', () => {
     expect(checkRe2Subset('^(?<ok_1>secret)$')).toBeUndefined();
     expect(checkRe2Subset('^(?<café>secret)$')).toMatch(/not valid in RE2/);
@@ -1857,6 +1922,57 @@ describe('checkCatastrophicShape: a repeated group ending in an ambiguous altern
   });
 });
 
+describe('checkCatastrophicShape: an ambiguous alternation anywhere in the body', () => {
+  // The rule above only ever looked at the body's LAST atom, and only tested
+  // two branches for overlap when each was a single atom. Both neighbours of
+  // the shape it rejected were therefore accepted, and each backtracks
+  // exponentially: measured at 55 ms on a 61-character non-match, doubling
+  // every three characters, against a 4096-character value cap.
+  it.each([
+    ['one trailing character after it', '^(?:a(?:b|b)c)+$', 'abc'],
+    ['nested one group deeper', '^(?:a(?:x(?:b|b))c)+$', 'axbc'],
+    ['branches of two atoms that overlap', '^(?:x(?:a[bc]|a[cd]))+$', 'xac'],
+    ['a literal overlapping a class', '^(?:x(?:ab|a[bd]))+$', 'xab'],
+    ['both at once', '^(?:x(?:a[bc]|a[cd])y)+$', 'xacy'],
+  ])('%s is rejected', (_label, pattern, unit) => {
+    expect(checkCatastrophicShape(pattern)).toMatch(/alternation whose branches can match the same text/);
+    // And the shape really is exponential: doubling the iterations is far
+    // worse than doubling the work.
+    const re = new RegExp(pattern);
+    const time = (n: number): number => {
+      const input = unit.repeat(n) + 'X';
+      const t = performance.now();
+      re.test(input);
+      return performance.now() - t;
+    };
+    time(6); // warm
+    const short = Math.max(time(12), 0.01);
+    expect(time(18)).toBeGreaterThan(short * 4);
+  });
+
+  it.each([
+    ['disjoint branches, mid-body', '^(?:x(?:ab|cd))+$'],
+    ['classes that share nothing', '^(?:x(?:a[bc]|a[de]))+$'],
+    ['branches that differ in their last atom', '^(?:x(?:abc|abd)y)+$'],
+    ['a prefix ambiguity the following atoms pin', '^(?:(?:a|ab)c)+$'],
+    ['the documented good example', '^([a-z0-9-]+\\.)*$'],
+    ['a named-group date', '^(?<year>[0-9]{4})-(?<m>[0-9]{2})$'],
+    ['an alternation with no repeat around it', '^(title|body)$'],
+  ])('%s stays accepted', (_label, pattern) => {
+    expect(checkCatastrophicShape(pattern)).toBeUndefined();
+    expect(checkRe2Subset(pattern)).toBeUndefined();
+  });
+
+  it('a prefix ambiguity still counts when the alternation ENDS the body', () => {
+    // `(?:(?:a|ab))+` is the classic `(a|ab)+`: the next iteration picks up
+    // the difference, so the two ways to split the boundary are real. In the
+    // middle of a body the following atoms pin it, which is why the
+    // same-span rules alone apply there.
+    expect(checkCatastrophicShape('^(?:x(?:a|ab))+$')).toMatch(/alternation whose branches can match the same text/);
+    expect(checkCatastrophicShape('^(?:x(?:a|ab)c)+$')).toBeUndefined();
+  });
+});
+
 describe('overlap: an absence of probes is not proof of disjointness', () => {
   it('rejects adjacent repeats over a band no probe used to reach', () => {
     // Two of the five non-ASCII probes were plain ASCII spaces, so the
@@ -1887,5 +2003,27 @@ describe('checkProvablyLinear: an optional group has one more path than it has b
     expect(checkProvablyLinear('^https?://')).toBeUndefined();
     expect(checkProvablyLinear('^rm -rf .+$')).toBeUndefined();
     expect(checkProvablyLinear('^(?:GET|POST|HEAD)$')).toBeUndefined();
+  });
+
+  it('refuses a polynomial pattern on a value big enough to make it cost', () => {
+    // Two repeated atoms are linear in SHAPE and quadratic in the value:
+    // `valueLength^2` steps, uninterruptibly, on the proxy's only thread.
+    // The shape question is unchanged — `policy validate` asks it without a
+    // value and still accepts these — but the no-worker fallback asks with
+    // one and denies rather than block every concurrent call.
+    for (const pattern of ['^.*a.*b$', '^[a-z]*x[a-z]*y$', '^.{1,4096}a.{1,4096}b$']) {
+      expect(checkProvablyLinear(pattern)).toBeUndefined();
+      expect(checkProvablyLinear(pattern, REGEX_VALUE_CAP)).toMatch(/steps on a/);
+      // An ordinary-sized argument still runs: this is a budget, not a ban.
+      expect(checkProvablyLinear(pattern, 120)).toBeUndefined();
+    }
+  });
+
+  it('never refuses a single repeat, however long the value', () => {
+    // One repeated atom is genuinely linear, so the value cannot make it
+    // expensive and the budget must not fire on it.
+    for (const pattern of ['^rm -rf .+$', '^https?://', '^[a-z]+$', '^.*$']) {
+      expect(checkProvablyLinear(pattern, REGEX_VALUE_CAP)).toBeUndefined();
+    }
   });
 });

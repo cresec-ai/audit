@@ -448,7 +448,7 @@ function noteRefusal(pattern: string, why: string): void {
  * an allow.
  */
 function matchInThread(pattern: string, re: RegExp, value: string): boolean {
-  const why = checkProvablyLinear(pattern);
+  const why = checkProvablyLinear(pattern, value.length);
   if (why !== undefined) {
     noteRefusal(pattern, why);
     throw new RegexGuardError('unavailable', 'regex could not be evaluated safely (guard worker unavailable)');

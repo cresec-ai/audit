@@ -70,6 +70,34 @@ export const MAX_LINEAR_REPEATS = 2;
 /** Max product of alternation branch counts a pattern may have to stay in-thread runnable. */
 export const MAX_LINEAR_BRANCHES = 64;
 /**
+ * Work an in-thread match may cost before it is refused instead.
+ *
+ * {@link MAX_LINEAR_REPEATS} repeated atoms cost about `valueLength` to that
+ * power: two of them over a 4096-character value is 16.7 million steps —
+ * certified as linear, run on the proxy's only thread, with no deadline that
+ * can interrupt it, blocking every concurrent call until it finishes. It is
+ * polynomial rather than exponential, which is why it is not a shape
+ * problem, but "not exponential" is not the same as "safe to run
+ * uninterruptibly".
+ *
+ * The number is deliberately far inside the deadline rather than level with
+ * it. A step costs 0.5-1 ns here — `^.{0,4096}a.{0,4096}b$` at the value cap
+ * measured 13 ms for its 16.7 million — but that constant moves with the
+ * pattern, the machine and the load, and the whole point of this path is
+ * that nothing can interrupt a bad guess. 400k steps is two orders of
+ * magnitude under a 25 ms deadline on this hardware, which is the margin
+ * that buys.
+ *
+ * It bounds cost that grows with the value, not absolute time: one repeated
+ * atom over a big enough value still overruns, which is why the deadline
+ * check after the match stays.
+ *
+ * Only the no-worker fallback consults it, and a value it refuses denies —
+ * the same fail-closed answer that path already gives a pattern it cannot
+ * prove linear.
+ */
+export const MAX_IN_THREAD_STEPS = 400_000;
+/**
  * Characters the overlap test probes: all of ASCII plus representative
  * non-ASCII ones. Two of the five non-ASCII probes used to be plain ASCII
  * spaces — a non-breaking and an ideographic space that had been normalized
@@ -233,10 +261,30 @@ function overlap(a, b) {
  * True when two branches of an alternation can match the same input, which
  * makes a repetition around it ambiguous: the engine has more than one way
  * to consume the same characters, and on a non-matching tail it tries all of
- * them. `(?:b|b)`, `(?:[b]|b)` and `(?:ab|a)` are all ambiguous; `(?:b|c)`
- * is not, which is why a trailing alternation is not rejected outright.
+ * them. `(?:b|b)`, `(?:[b]|b)`, `(?:a[bc]|a[cd])` and `(?:ab|a)` are all
+ * ambiguous; `(?:b|c)` is not, which is why a trailing alternation is not
+ * rejected outright.
+ *
+ * The rules split by WHERE the ambiguity leaves the engine, because that is
+ * what decides whether the alternation's position in the body matters:
+ *
+ * - SAME-SPAN ambiguity — the branches can match the same text, so the
+ *   engine has two ways to consume one span and the atoms after it see the
+ *   same position either way. Two branches are same-span ambiguous when they
+ *   are written identically, or when they have the same number of atoms and
+ *   every atom can match a character its opposite can. This holds wherever
+ *   the alternation sits.
+ * - PREFIX ambiguity — one branch is the start of the other, so the two ways
+ *   differ in how much they consume. That is only exponential when the next
+ *   thing along can pick up the difference, which is the case when the
+ *   alternation ENDS the repeated body and the next iteration follows it. In
+ *   the middle of a body the following atoms pin the boundary and the match
+ *   is deterministic: `(?:(?:a|ab)c)+` has one way to match each iteration.
+ *
+ * `sameSpanOnly` asks for the first kind alone, for an alternation somewhere
+ * inside the body rather than at the end of it.
  */
-function ambiguousAlternation(frame) {
+function ambiguousAlternation(frame, sameSpanOnly = false) {
     const branches = frame.branches.map((b) => b.filter((a) => !a.zeroWidth));
     const key = (branch) => branch.map(atomText).join('\u0000');
     for (let i = 0; i < branches.length; i++) {
@@ -247,8 +295,14 @@ function ambiguousAlternation(frame) {
                 continue; // an empty branch is `?`, not ambiguity
             if (key(a) === key(b))
                 return true;
-            if (a.length === 1 && b.length === 1 && overlap(a[0], b[0]))
+            // Atom for atom, each can match a character the other can: the two
+            // branches can consume the same span. Testing this only when both
+            // branches were a SINGLE atom left `(?:a[bc]|a[cd])` — same defect,
+            // one atom wider — accepted, at 56 ms on 61 characters.
+            if (a.length === b.length && a.every((atom, k) => overlap(atom, b[k])))
                 return true;
+            if (sameSpanOnly)
+                continue;
             const short = a.length <= b.length ? a : b;
             const long = a.length <= b.length ? b : a;
             if (short.every((atom, k) => atomText(atom) === atomText(long[k])))
@@ -256,6 +310,27 @@ function ambiguousAlternation(frame) {
         }
     }
     return false;
+}
+/**
+ * Every alternation frame strictly inside `frame`, innermost last. The body
+ * of a repeated group is ambiguous wherever one of these is, not only when
+ * one ends it.
+ */
+function innerAlternations(frame) {
+    const out = [];
+    const walk = (f) => {
+        for (const branch of f.branches) {
+            for (const atom of branch) {
+                if (atom.frame === undefined)
+                    continue;
+                if (atom.frame.branches.length > 1)
+                    out.push(atom.frame);
+                walk(atom.frame);
+            }
+        }
+    };
+    walk(frame);
+    return out;
 }
 const ADVICE = 'JavaScript backtracks exponentially on a non-matching input, where RE2 (the compiled Rego) stays linear;' +
     ' end each repetition with something the repeated part cannot match, e.g. "([a-z0-9-]+\\.)*"';
@@ -313,6 +388,18 @@ function shapeProblem(frame, label, depth) {
             return (`regex shape ${group} repeats a group ending in an alternation whose branches can match the same ` +
                 `text (like "(?:a(?:b|b))+"): ${ADVICE}`);
         }
+    }
+    // An ambiguous alternation ANYWHERE in the body makes the body ambiguous,
+    // not only one that ends it. The check above reaches an alternation only
+    // as the body's last atom, so a single trailing character re-hid the
+    // shape: `(?:a(?:b|b))+` was rejected and `(?:a(?:b|b)c)+` — the same two
+    // ways to match every iteration — was accepted, at 55 ms on 61 characters
+    // and doubling every three.
+    for (const inner of innerAlternations(frame)) {
+        if (!ambiguousAlternation(inner, true))
+            continue;
+        return (`regex shape ${group} repeats a group containing an alternation whose branches can match the same ` +
+            `text (like "(?:a(?:b|b)c)+"): ${ADVICE}`);
     }
     let repeatedAt = -1;
     for (let i = atoms.length - 1; i >= 0; i--) {
@@ -536,7 +623,7 @@ export function checkCatastrophicShape(pattern) {
  * - at most {@link MAX_LINEAR_BRANCHES} alternation paths, so a pattern
  *   cannot multiply its way to an exponential number of them.
  */
-export function checkProvablyLinear(pattern) {
+export function checkProvablyLinear(pattern, valueLength) {
     const parsed = parsePattern(pattern);
     const shape = checkCatastrophicShape(pattern);
     if (shape !== undefined)
@@ -567,6 +654,16 @@ export function checkProvablyLinear(pattern) {
     }
     if (repeatedAtoms > MAX_LINEAR_REPEATS) {
         return `the pattern has ${repeatedAtoms} repeated quantifiers (more than ${MAX_LINEAR_REPEATS}), which cannot be proved linear`;
+    }
+    // Linear in the pattern is not the same as cheap on THIS value: see
+    // MAX_IN_THREAD_STEPS. Asked without a value this stays the pure shape
+    // question, which is what `policy validate` wants.
+    if (valueLength !== undefined && repeatedAtoms > 1 && valueLength > 1) {
+        const steps = Math.pow(valueLength, repeatedAtoms);
+        if (steps > MAX_IN_THREAD_STEPS) {
+            return (`the pattern's ${repeatedAtoms} repeated quantifiers cost up to ${valueLength}^${repeatedAtoms} steps on a ` +
+                `${valueLength}-character value, over the ${MAX_IN_THREAD_STEPS} an uninterruptible match may take`);
+        }
     }
     return undefined;
 }
