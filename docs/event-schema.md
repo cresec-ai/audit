@@ -289,7 +289,7 @@ One-way JSON-RPC notification in either direction.
 | `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `direction` | `'client_to_server' \| 'server_to_client'` | Which way it flowed. |
 | `params` | `Scrubbed` | Redacted params tree. |
-| `gateway` | `GatewayOutcome?` | Additive (v1), gateway mode only. Present on the two `tools/call` shapes the gateway refuses that have no usable request id: a **notification** the policy denied, and a request whose `id` is not a `string` or a `number` (`refusal: 'invalid_request_id'`) — the one enforcement decision that cannot be a `policy_decision` event, because a notification has no request id and `request_id` is `string \| number`. Without it the refusal left nothing but a line on stderr: the chain held an ordinary `notification` event, indistinguishable from a forwarded one. `mcp-recorder sessions` counts it in `policy_decision_count`. |
+| `gateway` | `GatewayOutcome?` | Additive (v1), gateway mode only. Present on the two `tools/call` shapes the gateway refuses that have no usable request id: a **notification** the policy denied, and a request whose `id` is not a `string` or a `number` (`refusal: 'invalid_request_id'`). Neither can be a `policy_decision` event, because `request_id` is `string \| number` and neither message has a value that fits it. Without this field a refusal left nothing but a line on stderr: the chain held an ordinary `notification` event, indistinguishable from a forwarded one. `mcp-recorder sessions` counts it in `policy_decision_count`. |
 
 ### `protocol_error`
 
