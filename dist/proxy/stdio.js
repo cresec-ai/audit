@@ -28,63 +28,97 @@
  *    string would silently rewrite unrelated numbers in it).
  * Enforcement fails CLOSED (an evaluation throw or an unwritable hold is a
  * deny); recording stays fail-open exactly as in record mode. Every
- * `tools/call` REQUEST (one carrying an id) is evaluated, including one
- * whose `params.name` is missing or not a string: it is evaluated as the
- * tool name '' so the section default — and any glob matching the empty
- * string — applies, and one whose `params.name` is longer than
- * `MAX_EVALUATED_TOOL_NAME_LEN`, which is a fail-closed deny WITHOUT
- * consulting the policy (the engine's tool globs are backtracking regexes
- * on this thread; an uncapped name off the wire is a remote freeze). Known
- * v1 limits, on purpose: a `hold` inside a JSON-RPC batch is treated as
- * deny, a `tools/call` with no `id` property at all (a notification) is
- * forwarded unevaluated, and a line over the 32 MiB tap cap cannot be
- * parsed so it is forwarded unchanged and recorded as `protocol_error` —
- * as in record mode.
+ * `tools/call` the client sends is evaluated — REQUEST or NOTIFICATION,
+ * standalone or inside a batch — including one whose `params.name` is
+ * missing or not a string: it is evaluated as the tool name '' so the
+ * section default (and any glob matching the empty string) applies, and one
+ * whose `params.name` is longer than `MAX_EVALUATED_TOOL_NAME_LEN`, which
+ * is a fail-closed deny WITHOUT consulting the policy (the engine's tool
+ * globs are backtracking regexes on this thread; an uncapped name off the
+ * wire is a remote freeze). Known v1 limit, on purpose: a `hold` that has
+ * nowhere to park — inside a JSON-RPC batch, or on a notification — is
+ * treated as a fail-closed deny.
  *
- * A JSON-RPC BATCH IS NOT A WAY IN. Every `tools/call` element of a batch
- * goes through the same gate a standalone one does, in the same order: the
- * duplicate-id refusal, the null-id refusal, then the policy. A refused
- * element is never forwarded and its refusal comes back as an element of
- * the batch response; the elements that ARE forwarded travel as the client
- * wrote them. Ids taken by earlier elements of the same batch count as in
- * flight, because the batch is forwarded (and registered) as a unit.
+ * NO CLIENT BYTE REACHES THE SERVER UNEVALUATED. That is the whole promise,
+ * and every shape that used to get around it is now gated:
+ *
+ * LINES TOO BIG TO EVALUATE. A line past the scanner's cap cannot be
+ * buffered, so it cannot be parsed, so the policy cannot see it. Record mode
+ * streams it through untouched and records a `protocol_error` `oversized`,
+ * which is right for a recorder. Gateway mode must not: padding a batch past
+ * the cap was enough to run a policy-DENIED tool, with nothing but an
+ * `oversized` protocol_error in the chain to show for it. In gateway mode
+ * the client->server splitter therefore DROPS an oversized line's bytes
+ * instead of forwarding them, records the same `protocol_error`, and
+ * answers the client with `{"jsonrpc":"2.0","id":null,"error":{"code":
+ * -32600,...}}` — wrapped in an array when the line started with '[', so a
+ * batch gets a batch response. The server->client direction is unchanged:
+ * an oversized server line still streams through.
+ *
+ * A JSON-RPC BATCH IS NOT A WAY IN. Every element of a batch goes through
+ * the same gate its standalone form does, in the same order. That includes
+ * an element that is ITSELF AN ARRAY — not a request at all, but a server
+ * that flattens nested arrays would run whatever is inside it, so it is
+ * refused — and a `tools/call` NOTIFICATION, which is evaluated like any
+ * other. A refused element is never forwarded and its refusal comes back as
+ * an element of the batch response; the elements that ARE forwarded travel
+ * as the client wrote them, and a batch with nothing refused crosses
+ * byte-for-byte. Ids taken by earlier elements of the same batch count as in
+ * flight — both the ones being forwarded and the ones the GATEWAY ANSWERED
+ * ON, so a batch that denies id 5 and then allows id 5 does not send the
+ * client two responses for one request id.
  *
  * DUPLICATE REQUEST IDS. `pending` and `holds` are both keyed by the
  * request id, and a held call sits on its key for as long as a human takes
- * to answer. A second `tools/call` reusing an id that is still in flight
+ * to answer. A second request reusing an id that is still in flight
  * (JSON-RPC forbids it) would take that key over, so the first call's real
  * response would arrive uncorrelated — delivered to the client but recorded
  * as an orphan `protocol_error`, with no tool_call, no args hash and no
  * gateway outcome for a call that did execute. Gateway mode therefore fails
- * CLOSED on id reuse: a `tools/call` whose id is currently held, or already
- * pending, is refused immediately with a synthesized isError result and
- * recorded as a `policy_decision` (deny) plus a synthetic `tool_call` with
- * `error.type: 'duplicate_id'` — it is never forwarded, so the in-flight
- * call keeps its slot. This runs for a batch element too (`refuseReusedId`
- * is the one gate): a batch used to skip it, which put the clobber straight
- * back and wrote a FALSE record on top of it — a `tool_call` carrying one
- * call's arguments with another call's result. Belt and braces, an approved
- * hold that still finds a pending entry on its key (one that slipped in
- * through a path with no such check) seals that entry as `duplicate_id`
- * before taking the slot back, so nothing is ever silently overwritten;
- * that seal is a last resort, not the mitigation — it writes a record for a
- * call whose real result was lost, so the refusal above must happen first.
- * Record mode is untouched: without a policy the tap keeps its
- * last-writer-wins `pending` map.
+ * CLOSED on id reuse, for EVERY c2s request and not only `tools/call`: a
+ * same-id `tools/list` clobbering an in-flight tool call's slot loses that
+ * call from the chain just as thoroughly. A `tools/call` on a live id is
+ * refused with a synthesized isError result and recorded as a
+ * `policy_decision` (deny) plus a synthetic `tool_call` with
+ * `error.type: 'duplicate_id'`; any other method is refused with a plain
+ * JSON-RPC -32600 and recorded as an `rpc` event with the same error type.
+ * Neither is forwarded, so the in-flight call keeps its slot. Both gates run
+ * for a batch element too, routed exactly as the standalone path routes
+ * them. Belt and braces, `registerPending` itself seals a live entry it
+ * would displace (and an approved hold reclaiming its key does the same), so
+ * nothing is ever silently overwritten; those seals are a last resort, not
+ * the mitigation — they write a record for a call whose real result was
+ * lost, so the refusals above must happen first. Record mode is untouched:
+ * without a policy the tap keeps its last-writer-wins `pending` map.
  *
- * NULL REQUEST IDS. `{"id": null}` is not a valid MCP request (the official
- * SDK rejects it) and is not a notification either, so a `tools/call`
- * carrying it is refused, fail-closed, whatever the policy says — a `hold`
- * rule matching it is a deny like any other decision, and the call is not
- * even evaluated. It is NEVER forwarded; the client gets
+ * UNUSABLE REQUEST IDS. `{"id": null}` is not a valid MCP request (the
+ * official SDK rejects it) and is not a notification either — and neither is
+ * `{"id": true}`, `{"id": {}}` or `{"id": []}`. A `tools/call` carrying ANY
+ * id that is not a string or a number is refused, fail-closed, whatever the
+ * policy says — a `hold` rule matching it is a deny like any other decision,
+ * and the call is not even evaluated. It is NEVER forwarded; the client gets
  * `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,...}}` (JSON-RPC
- * permits a null id on an error response). It is recorded exactly as the
- * tap has always recorded an id-less message — one `notification` event —
+ * permits a null id on an error response, and is the only honest answer when
+ * the request's own id cannot be echoed). It is recorded exactly as the tap
+ * has always recorded an id-less message — one `notification` event —
  * because the frozen schema's `request_id` is `string | number` and cannot
- * describe it; the refusal itself is visible on stderr. This holds inside a
- * JSON-RPC batch as well, both for a batch that mixes one in and for a
- * batch that contains nothing else. Without `--policy` it is forwarded
- * unevaluated, as before.
+ * describe it; the refusal itself is visible on stderr. Testing `id === null`
+ * alone left every other shape crossing unevaluated AND landing in the chain
+ * with a `request_id` that violated the schema, so the tap's own id test is
+ * `isRpcId` too, in record mode as well: a message whose id is not a string
+ * or a number is recorded as id-less rather than writing an impossible
+ * `request_id`. This holds inside a JSON-RPC batch as well. Without
+ * `--policy` such a line is still forwarded unevaluated, as before.
+ *
+ * `tools/call` NOTIFICATIONS. A `tools/call` with no `id` property at all
+ * asks the server to run a tool and expects nothing back. Forwarding it
+ * unevaluated was the same hole the id refusals close, one shape over, so it
+ * is evaluated too — standalone and inside a batch. A deny simply DROPS it,
+ * which is precisely what "notification" already promises its sender: no
+ * response either way. Nothing can be answered on it and the frozen schema's
+ * `request_id` is `string | number`, so no `policy_decision` can be written
+ * for it; the attempt is recorded as the one `notification` event the tap
+ * has always written for an id-less message, and the decision is on stderr.
  */
 import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
@@ -116,14 +150,24 @@ const RULE_ID_SHAPE = /^(?:[A-Za-z0-9_.:/-]{1,64}|rule\[[0-9]+\])$/;
 class GatewayLineSplitter {
     forward;
     onLine;
+    refuseOversized;
     scanner = new LineScanner();
     /** Segments of the current partial line, in case it turns out oversized (or empty). */
     carry = [];
-    /** True while streaming an oversized line straight through. */
+    /** True while an oversized line is in flight (streamed through, or dropped). */
     passthrough = false;
-    constructor(forward, onLine) {
+    constructor(forward, onLine, 
+    /**
+     * `refuseOversized` (client->server only): a line past the cap cannot be
+     * parsed, so the policy cannot see it — and enforcement fails CLOSED, so
+     * NONE of its bytes may reach the server. They are dropped here and
+     * `onLine` refuses the line. Without it (server->client, and record
+     * mode's own tap) an oversized line streams straight through as before.
+     */
+    refuseOversized = false) {
         this.forward = forward;
         this.onLine = onLine;
+        this.refuseOversized = refuseOversized;
     }
     hasPartialLine() {
         return this.scanner.hasPartialLine();
@@ -144,27 +188,33 @@ class GatewayLineSplitter {
     partial(bytes) {
         this.scanner.push(bytes);
         if (this.passthrough) {
-            this.forward(bytes);
+            this.oversizedBytes(bytes);
             return;
         }
         this.carry.push(bytes);
         if (this.scanner.partialLineOversized())
-            this.flushCarry(true);
+            this.enterOversized();
     }
     /** A segment ending in '\n' — completes exactly one (possibly empty) line. */
     segment(bytes) {
         const lines = this.scanner.push(bytes);
         const line = lines[0];
         if (this.passthrough) {
-            this.forward(bytes); // the oversized line's tail
+            this.oversizedBytes(bytes); // the oversized line's tail
             this.passthrough = false;
             this.carry = [];
         }
-        else if (line === undefined || line.oversized) {
-            // Empty line (nothing to evaluate) or a line that crossed the cap
-            // inside this very segment: its bytes exist only here — forward them.
-            this.flushCarry(false);
+        else if (line === undefined) {
+            // An empty line (or a bare "\r"): nothing to evaluate, and its bytes
+            // exist only here — they cross exactly as the peer wrote them.
+            this.flushCarry();
             this.forward(bytes);
+        }
+        else if (line.oversized) {
+            // A line that crossed the cap inside this very segment.
+            this.enterOversized();
+            this.passthrough = false;
+            this.oversizedBytes(bytes);
         }
         else {
             this.carry = []; // a normal line: the handler forwards `line.raw` or not
@@ -172,11 +222,24 @@ class GatewayLineSplitter {
         if (line !== undefined)
             this.onLine(line);
     }
-    flushCarry(enterPassthrough) {
+    /** Bytes belonging to an oversized line: streamed through, or dropped when refusing. */
+    oversizedBytes(bytes) {
+        if (this.refuseOversized)
+            return;
+        this.forward(bytes);
+    }
+    /** The current line just crossed the cap: release (or drop) what is buffered. */
+    enterOversized() {
+        if (!this.refuseOversized)
+            for (const bytes of this.carry)
+                this.forward(bytes);
+        this.carry = [];
+        this.passthrough = true;
+    }
+    flushCarry() {
         for (const bytes of this.carry)
             this.forward(bytes);
         this.carry = [];
-        this.passthrough = enterPassthrough;
     }
     end() {
         this.carry = [];
@@ -189,20 +252,44 @@ class GatewayLineSplitter {
 function cappedRuleId(id) {
     return RULE_ID_SHAPE.test(id) ? id : sha256Ref(id);
 }
+/**
+ * A usable JSON-RPC request id, and the ONLY thing that may ever be written
+ * to a frozen-schema `request_id` (`string | number`). Everything the proxy
+ * keys, correlates or records an id by goes through this predicate first:
+ * `true`, `{}`, `[]` and a bare `null` are not ids, and a message carrying
+ * one is treated as id-less rather than smuggled into an event.
+ */
 function isRpcId(v) {
     return typeof v === 'string' || typeof v === 'number';
 }
-/** A `tools/call` REQUEST (has an id) — the only thing the policy evaluates. */
+/** A `tools/call` REQUEST (has a usable id) — the only thing the policy answers on. */
 function isToolsCallRequest(msg) {
     return isPlainObject(msg) && msg.method === 'tools/call' && isRpcId(msg.id);
 }
 /**
- * A `tools/call` carrying an explicit `id: null`. Neither a request (MCP
- * forbids a null id and the official SDK rejects it) nor a notification, so
- * gateway mode refuses it instead of forwarding it — see the module header.
+ * A `tools/call` carrying an `id` PROPERTY whose value is not a usable
+ * JSON-RPC id — `null`, but equally `true`, `1`-less shapes like `{}` and
+ * `[]`. None of them is a request (MCP forbids them and the official SDK
+ * rejects them) and none is a notification either, so gateway mode refuses
+ * them instead of forwarding them — see the module header. Testing only
+ * `=== null` left every other shape crossing UNEVALUATED and then landing
+ * in the chain with a `request_id` the frozen schema cannot describe.
  */
-function isNullIdToolsCall(msg) {
-    return isPlainObject(msg) && msg.method === 'tools/call' && msg.id === null;
+function isInvalidIdToolsCall(msg) {
+    return isPlainObject(msg) && msg.method === 'tools/call' && 'id' in msg && !isRpcId(msg.id);
+}
+/**
+ * A `tools/call` NOTIFICATION: no `id` property at all, so nothing can be
+ * answered on it. Gateway mode still evaluates it against the policy — a
+ * deny simply drops it, which is exactly what "no response" already
+ * promises the client. See the module header.
+ */
+function isToolsCallNotification(msg) {
+    return isPlainObject(msg) && msg.method === 'tools/call' && !('id' in msg);
+}
+/** A c2s REQUEST of any method that takes a `pending` slot (gateway duplicate-id gate). */
+function isRpcRequest(msg) {
+    return isPlainObject(msg) && typeof msg.method === 'string' && isRpcId(msg.id);
 }
 /**
  * The `params` object and tool name of a `tools/call` request. A missing or
@@ -217,9 +304,25 @@ function toolsCallParts(msg) {
 function asBuffer(chunk) {
     return Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
 }
-/** Beyond this many separate edits on one line, re-serialize the whole message. */
-const MAX_LINE_EDITS = 32;
-/** Thrown internally by the span scanner; never escapes `jsonValueSpan`. */
+/**
+ * Structural guard on the number of separate edits collected for one line.
+ *
+ * It is NOT a work bound: the spans of every edit are resolved in a single
+ * walk of the line (`jsonValueSpans`), so the cost of splicing is bounded by
+ * the SIZE OF THE LINE, not by how many edits it carries. It only stops
+ * `collectDivergences` from building an unbounded path list for a message
+ * whose every leaf changed, and it is far above anything the boundary filter
+ * produces (one edit per rewritten `content[].text`).
+ *
+ * The old bound was 32 EDITS, and past it the splice fell back to
+ * re-serializing the whole message — which reintroduced exactly the number
+ * corruption the splice exists to prevent (`12345678901234567890` ->
+ * `...567000`, `1e400` -> `null`, `9007199254740993` -> `...992`) on any
+ * result with 33 redactable strings in it. A result that busy is precisely
+ * the one most likely to also carry a big integer.
+ */
+const MAX_LINE_EDIT_PATHS = 100_000;
+/** Thrown internally by the span scanner; never escapes `jsonValueSpans`. */
 class JsonScanError extends Error {
 }
 /**
@@ -338,16 +441,20 @@ class JsonSpanScanner {
         }
     }
     /**
-     * Span of `key`'s value in the object starting at `i`. The LAST member
-     * with that key wins, exactly as `JSON.parse` resolves duplicate keys.
+     * Spans of SEVERAL keys of the object starting at `i`, in ONE pass. The
+     * last member with a given key wins, exactly as `JSON.parse` resolves
+     * duplicate keys. This is what makes the number of edits on a line
+     * irrelevant to the cost of splicing them in.
      */
-    member(key) {
-        const wanted = JSON.stringify(key);
+    members(keys) {
+        const wanted = new Map();
+        for (const k of keys)
+            wanted.set(JSON.stringify(k), k);
+        const found = new Map();
         this.ws();
         if (this.s[this.i] !== '{')
             this.fail();
         this.i++;
-        let found;
         this.ws();
         if (this.s[this.i] === '}')
             return found;
@@ -361,11 +468,15 @@ class JsonSpanScanner {
             this.ws();
             const start = this.i;
             this.skipValue();
-            // `raw === wanted` covers every unescaped key; only an escaped one
-            // (`"result"`) needs decoding to be compared.
-            if (raw === wanted || (raw.includes('\\') && JSON.parse(raw) === key)) {
-                found = [start, this.i];
+            let key = wanted.get(raw);
+            // `raw` covers every unescaped key; only an escaped one needs decoding.
+            if (key === undefined && raw.includes('\\')) {
+                const decoded = JSON.parse(raw);
+                if (keys.has(decoded))
+                    key = decoded;
             }
+            if (key !== undefined)
+                found.set(key, [start, this.i]);
             this.ws();
             const c = this.s[this.i];
             if (c === ',') {
@@ -373,37 +484,6 @@ class JsonSpanScanner {
                 continue;
             }
             if (c === '}') {
-                this.i++;
-                return found;
-            }
-            this.fail();
-        }
-    }
-    /** Span of element `index` in the array starting at `i`. */
-    element(index) {
-        this.ws();
-        if (this.s[this.i] !== '[')
-            this.fail();
-        this.i++;
-        let found;
-        let at = 0;
-        this.ws();
-        if (this.s[this.i] === ']')
-            return found;
-        for (;;) {
-            this.ws();
-            const start = this.i;
-            this.skipValue();
-            if (at === index)
-                found = [start, this.i];
-            at++;
-            this.ws();
-            const c = this.s[this.i];
-            if (c === ',') {
-                this.i++;
-                continue;
-            }
-            if (c === ']') {
                 this.i++;
                 return found;
             }
@@ -437,23 +517,74 @@ class JsonSpanScanner {
         }
     }
 }
-/** Character span `[start, end)` of the value at `path`, or undefined when it cannot be located exactly. */
-function jsonValueSpan(text, path) {
+function newSpanTrieNode() {
+    return { children: new Map(), terminals: [] };
+}
+/**
+ * Character spans of MANY paths at once, resolved in a single walk.
+ *
+ * Locating each path on its own re-scans the line from the start, so N edits
+ * cost N x line — which is why the splice used to give up past a fixed edit
+ * count and re-serialize the whole message instead (silently rewriting every
+ * number in it). Here the paths are merged into a prefix tree and each
+ * container is scanned ONCE for all of the children wanted inside it, so the
+ * cost is bounded by the size of the line and the number of edits stops
+ * mattering. Entries that cannot be located exactly come back undefined; the
+ * caller decides what to do about them.
+ */
+function jsonValueSpans(text, paths) {
+    const out = paths.map(() => undefined);
+    const root = newSpanTrieNode();
+    paths.forEach((path, index) => {
+        let node = root;
+        for (const seg of path) {
+            let child = node.children.get(seg);
+            if (child === undefined) {
+                child = newSpanTrieNode();
+                node.children.set(seg, child);
+            }
+            node = child;
+        }
+        node.terminals.push(index);
+    });
     try {
         const sc = new JsonSpanScanner(text);
-        let span = [0, text.length];
-        for (const seg of path) {
+        const walk = (node, span) => {
+            for (const index of node.terminals)
+                out[index] = span;
+            if (node.children.size === 0)
+                return;
+            // A JSON value is either an array or an object, so every child key of
+            // one node has the same kind.
+            const first = node.children.keys().next().value;
             sc.i = span[0];
-            const found = typeof seg === 'number' ? sc.element(seg) : sc.member(seg);
-            if (found === undefined)
-                return undefined;
-            span = found;
-        }
-        return span;
+            if (typeof first === 'number') {
+                const all = sc.elements();
+                for (const [seg, child] of node.children) {
+                    const found = typeof seg === 'number' ? all[seg] : undefined;
+                    if (found !== undefined)
+                        walk(child, found);
+                }
+            }
+            else {
+                const keys = new Set();
+                for (const seg of node.children.keys())
+                    if (typeof seg === 'string')
+                        keys.add(seg);
+                const found = sc.members(keys);
+                for (const [seg, child] of node.children) {
+                    const at = typeof seg === 'string' ? found.get(seg) : undefined;
+                    if (at !== undefined)
+                        walk(child, at);
+                }
+            }
+        };
+        walk(root, [0, text.length]);
     }
     catch {
-        return undefined;
+        /* whatever was resolved before the failure stands; the rest stay undefined */
     }
+    return out;
 }
 /** Character spans of every top-level array element, or undefined. */
 function jsonElementSpans(text) {
@@ -476,7 +607,7 @@ function jsonElementSpans(text) {
 function collectDivergences(prev, next, path, out) {
     if (prev === next)
         return true;
-    if (out.length >= MAX_LINE_EDITS)
+    if (out.length >= MAX_LINE_EDIT_PATHS)
         return false;
     if (Array.isArray(prev) && Array.isArray(next) && prev.length === next.length) {
         for (let i = 0; i < prev.length; i++) {
@@ -548,8 +679,13 @@ function spliceRewrittenLine(line, before, after) {
     if (text !== null && collectDivergences(before, after, [], paths) && paths.length > 0) {
         const edits = [];
         let ok = true;
-        for (const path of paths) {
-            const span = path.length === 0 ? undefined : jsonValueSpan(text, path);
+        // One walk of the line for EVERY edit: the number of edits does not
+        // change the cost, so there is no edit count past which the splice has
+        // to give up and re-serialize (and thereby corrupt) the whole message.
+        const spans = jsonValueSpans(text, paths);
+        for (let i = 0; i < paths.length; i++) {
+            const path = paths[i];
+            const span = path.length === 0 ? undefined : spans[i];
             const json = span === undefined ? undefined : tryStringify(valueAtPath(after, path));
             if (span === undefined || json === undefined) {
                 ok = false;
@@ -595,6 +731,60 @@ function keptBatchBytes(line, raw, batch, keptIndexes) {
     }
     return Buffer.from(JSON.stringify(keptIndexes.map((i) => batch[i])) + lineTerminator(line), 'utf8');
 }
+/* ---------------------------- bounded hashing ----------------------------- */
+/**
+ * Depth past which the proxy stops descending a tree it read off the wire
+ * when hashing it.
+ *
+ * `canonicalJson` recurses, and a result nested a few thousand levels deep
+ * overflows the stack. That throw used to take the WHOLE `tool_call` event
+ * with it: `handleResponse` hashes before it records, the throw escaped into
+ * the fail-open `guarded()` wrapper, the pending entry had already been
+ * deleted, and the call vanished from the chain while `verify` still
+ * reported PASS — evidence gone, silently, for a hash. A depth-bounded
+ * hasher removes the throw: it is byte-identical to `canonicalJson` for
+ * every tree within the cap (so `result_hash` still equals
+ * `sha256Ref(canonicalJson(result))` for anything an MCP server really
+ * sends), and substitutes one marker string for a subtree deeper than this.
+ * The recursion is therefore bounded by the constant, not by the wire.
+ *
+ * 256 is far below Node's stack limit and far above any real MCP payload.
+ */
+const MAX_HASH_DEPTH = 256;
+/** What a subtree deeper than `MAX_HASH_DEPTH` hashes as. Not a payload string: a fixed marker. */
+const HASH_DEPTH_CAPPED_MARKER = '[mcp-recorder:hash-depth-capped]';
+/**
+ * `canonicalJson` with a hard depth bound (see `MAX_HASH_DEPTH`). Identical
+ * output for every value within the bound; a deeper subtree becomes
+ * `HASH_DEPTH_CAPPED_MARKER`.
+ */
+function boundedCanonicalJson(value, depth = 0) {
+    if (value === null || value === undefined)
+        return 'null';
+    const t = typeof value;
+    if (t === 'number')
+        return Number.isFinite(value) ? JSON.stringify(value) : 'null';
+    if (t === 'string' || t === 'boolean')
+        return JSON.stringify(value);
+    const container = Array.isArray(value) || t === 'object';
+    if (container && depth >= MAX_HASH_DEPTH)
+        return JSON.stringify(HASH_DEPTH_CAPPED_MARKER);
+    if (Array.isArray(value)) {
+        return ('[' +
+            value.map((v) => (v === undefined ? 'null' : boundedCanonicalJson(v, depth + 1))).join(',') +
+            ']');
+    }
+    if (t === 'object') {
+        const obj = value;
+        const keys = Object.keys(obj)
+            .filter((k) => obj[k] !== undefined)
+            .sort();
+        return ('{' +
+            keys.map((k) => JSON.stringify(k) + ':' + boundedCanonicalJson(obj[k], depth + 1)).join(',') +
+            '}');
+    }
+    throw new TypeError(`boundedCanonicalJson: unsupported type ${t}`);
+}
 const CREDENTIAL_NAME_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
 const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
 // Runner flags with no value (skipped outright) vs. flags that consume the
@@ -620,6 +810,14 @@ const DUPLICATE_ID_REASON = {
 };
 /** `error.type` of both events recorded for a refused duplicate id (free-form string, v1). */
 const DUPLICATE_ID_ERROR_TYPE = 'duplicate_id';
+/**
+ * `error.type` on an event whose `result_hash` could not be computed (free-
+ * form string, v1). The event is recorded anyway with `result_hash` set to
+ * the hash of canonical `null`; this marker is what tells a reader that the
+ * hash does not describe the result. Losing the whole event instead is the
+ * bug this exists to prevent.
+ */
+const RESULT_HASH_FAILED_ERROR_TYPE = 'result_hash_failed';
 /**
  * Cap on the `params.name` a `tools/call` may carry INTO the policy engine.
  *
@@ -673,14 +871,55 @@ export function duplicateIdText(tool, id, state) {
 /**
  * A `tools/call` with `id: null` is refused with this JSON-RPC error
  * (-32600 Invalid Request); JSON-RPC permits a null id on an error
- * response. See the module header (NULL REQUEST IDS).
+ * response. See the module header (UNUSABLE REQUEST IDS).
  */
 export const NULL_ID_TOOLS_CALL_MESSAGE = 'mcp-recorder gateway: tools/call with a null id is not a valid request';
-const NULL_ID_ERROR_RESPONSE = {
-    jsonrpc: '2.0',
-    id: null,
-    error: { code: -32600, message: NULL_ID_TOOLS_CALL_MESSAGE },
-};
+/**
+ * The same refusal for every OTHER unusable `id` value — `true`, `{}`, `[]`
+ * and anything else JSON can carry that is not a string or a number.
+ */
+export const INVALID_ID_TOOLS_CALL_MESSAGE = 'mcp-recorder gateway: tools/call with an id that is neither a string nor a number is not a valid request';
+/**
+ * The -32600 response for a `tools/call` whose id is unusable. The response
+ * id is ALWAYS `null`: the request carried no id JSON-RPC could answer on,
+ * and echoing the offending value back would put it on the wire again.
+ */
+function invalidIdErrorResponse(id) {
+    return {
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+            code: -32600,
+            message: id === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE,
+        },
+    };
+}
+/**
+ * A client line the gateway could not evaluate — it grew past the line cap,
+ * so it was never buffered and never parsed — is REFUSED with this
+ * -32600 error and none of its bytes reach the server. See the module
+ * header (LINES TOO BIG TO EVALUATE).
+ */
+export const OVERSIZED_LINE_MESSAGE = 'mcp-recorder gateway: this line is larger than the gateway can buffer, so it could not be' +
+    ' evaluated against the policy and was refused (enforcement fails closed); send a smaller request';
+/**
+ * A non-`tools/call` request refused for reusing a JSON-RPC id that is still
+ * in flight. A tool call gets an isError tool RESULT (the model reads it);
+ * every other method gets a plain JSON-RPC error, which is what its caller
+ * is waiting for.
+ */
+export const DUPLICATE_REQUEST_ID_MESSAGE = 'mcp-recorder gateway: a request with this id is already in flight; JSON-RPC request ids must be' +
+    ' unique while in flight — retry with a fresh id';
+/**
+ * A JSON-RPC batch element that is ITSELF an array is not a request, and a
+ * server that flattens nested arrays would run whatever is inside it — past
+ * a gateway that never looked. Refused.
+ */
+export const NESTED_BATCH_MESSAGE = 'mcp-recorder gateway: a nested array inside a JSON-RPC batch is not a valid request and was refused';
+/** `{"jsonrpc":"2.0","id":<id|null>,"error":{"code":-32600,...}}`. */
+function invalidRequestResponse(id, message) {
+    return { jsonrpc: '2.0', id, error: { code: -32600, message } };
+}
 // Must cover the recorder's full retry run (~6s, src/capture/recorder.ts) so a
 // contended store delays session_end rather than losing it.
 const CLOSE_TIMEOUT_MS = 8_000;
@@ -1034,6 +1273,27 @@ export async function runStdioProxy(opts) {
     const registerPending = (key, entry) => {
         if (pending.size >= MAX_PENDING)
             evictOnePending();
+        // Gateway mode NEVER silently overwrites a live pending slot. The
+        // duplicate-id refusals upstream mean this should be unreachable; if a
+        // path ever does reach it, the displaced request is sealed as
+        // `duplicate_id` rather than vanishing from the chain with its real
+        // response left to land as an orphan. Record mode keeps its documented
+        // last-writer-wins map.
+        if (gateway !== undefined) {
+            const displaced = pending.get(key);
+            if (displaced !== undefined && displaced !== entry) {
+                pending.delete(key);
+                try {
+                    sealPending(displaced, DUPLICATE_ID_ERROR_TYPE, round2(performance.now() - displaced.t0));
+                }
+                catch (err) {
+                    tapError(err);
+                }
+                diag(`gateway: a "${displaced.method}" request was still in flight on id` +
+                    ` ${structuralString(String(displaced.id), 'identifier')}; sealed as` +
+                    ` ${DUPLICATE_ID_ERROR_TYPE} before the slot was reused`);
+            }
+        }
         pending.set(key, entry);
     };
     /**
@@ -1128,7 +1388,7 @@ export async function runStdioProxy(opts) {
     const handleResponse = (msg, arrivedOn, line, 
     /** Gateway mode: what the boundary filter did to this tools/call result. */
     boundary) => {
-        const id = msg.id;
+        const id = msg.id; // guaranteed by the isRpcId gate in handleMessage
         // Client-initiated requests are answered server->client and vice versa.
         const key = pendingKey(arrivedOn === 'server_to_client' ? 'c2s:' : 's2c:', id);
         const entry = pending.get(key);
@@ -1141,7 +1401,21 @@ export async function runStdioProxy(opts) {
         const rawError = 'error' in msg ? msg.error : undefined;
         const isError = rawError !== undefined ||
             (isPlainObject(rawResult) && rawResult.isError === true);
-        const resultHash = sha256Ref(canonicalJson(rawResult ?? rawError ?? null));
+        // The hash must never cost us the event. `boundedCanonicalJson` cannot
+        // overflow the stack on a deep tree, and if hashing fails anyway the
+        // event is still recorded — with `error.type` saying the hash is a
+        // placeholder — instead of disappearing from the chain behind a
+        // fail-open catch while `verify` reports PASS.
+        let resultHash;
+        let hashFailed = false;
+        try {
+            resultHash = sha256Ref(boundedCanonicalJson(rawResult ?? rawError ?? null));
+        }
+        catch (err) {
+            resultHash = NULL_RESULT_HASH;
+            hashFailed = true;
+            tapError(err);
+        }
         const durationMs = round2(performance.now() - entry.t0);
         if (entry.method === 'initialize') {
             const reqParams = isPlainObject(entry.params) ? entry.params : {};
@@ -1203,6 +1477,8 @@ export async function runStdioProxy(opts) {
             };
             if (rawError !== undefined)
                 attributes['error.type'] = 'jsonrpc_error';
+            else if (hashFailed)
+                attributes['error.type'] = RESULT_HASH_FAILED_ERROR_TYPE;
             // Gateway mode (additive): the decision taken at request time plus the
             // boundary report. `result`/`result_hash` stay the RAW server result;
             // a rewritten delivery is only ever described by
@@ -1231,6 +1507,8 @@ export async function runStdioProxy(opts) {
             };
             if (rawError !== undefined)
                 ev.error = errorInfo(rawError);
+            else if (hashFailed)
+                ev.error = { type: RESULT_HASH_FAILED_ERROR_TYPE };
             if (gatewayOutcome !== undefined)
                 ev.gateway = gatewayOutcome;
             record(ev);
@@ -1252,6 +1530,8 @@ export async function runStdioProxy(opts) {
         };
         if (rawError !== undefined)
             ev.error = errorInfo(rawError);
+        else if (hashFailed)
+            ev.error = { type: RESULT_HASH_FAILED_ERROR_TYPE };
         record(ev);
     };
     const handleMessage = (msg, direction, line) => {
@@ -1265,7 +1545,14 @@ export async function runStdioProxy(opts) {
             return; // not a JSON-RPC message; ignore quietly
         const hasMethod = typeof msg.method === 'string';
         const id = msg.id;
-        const hasId = id !== undefined && id !== null;
+        // `isRpcId`, not `!= null`: the frozen schema's `request_id` is
+        // `string | number`, so a message carrying `true`, `{}` or `[]` there is
+        // recorded as an id-LESS message (one `notification` event) rather than
+        // writing a value into `request_id` the schema cannot describe. This is
+        // the recording half of the gateway's unusable-id refusal, and it holds
+        // in record mode too — where nothing is refused, but nothing invalid is
+        // written either.
+        const hasId = isRpcId(id);
         if (hasMethod && hasId) {
             // Request: register pending under the direction it was sent on. The
             // method/tool name is capped HERE (P0), once, at capture time: every
@@ -1641,7 +1928,7 @@ export async function runStdioProxy(opts) {
                 tool: call.tool,
                 request_id: call.id,
                 args: scrubToolArguments(redactor, call.args),
-                result_hash: sha256Ref(canonicalJson(result)),
+                result_hash: sha256Ref(boundedCanonicalJson(result)),
                 result: redactor.scrub(result),
                 is_error: true,
                 duration_ms: 0,
@@ -1712,44 +1999,116 @@ export async function runStdioProxy(opts) {
             return response;
         };
         /**
+         * The `id` state of a c2s request: which map is already sitting on it.
+         */
+        const idInUse = (id, claimed) => {
+            const key = pendingKey('c2s:', id);
+            if (holds.has(key))
+                return 'held';
+            if (pending.has(key) || claimed?.has(key) === true)
+                return 'pending';
+            return undefined;
+        };
+        /**
          * THE protocol gate every `tools/call` REQUEST passes before the policy
          * is consulted, whether it arrived on its own line or as an element of
          * a JSON-RPC batch. `pendingKey` folds the id's TYPE in, so the number
          * 7 and the string "7" are different ids here too.
          *
-         * `claimed` carries the ids taken by EARLIER elements of the same batch:
-         * those calls are forwarded together at the end of the loop, so
-         * `pending` does not know about them yet, and without this a batch could
-         * clobber its own slots.
+         * `claimed` carries the ids taken by EARLIER elements of the same batch
+         * — both the ones forwarded together at the end of the loop (`pending`
+         * does not know about them yet) and the ones the gateway ANSWERED on
+         * itself. Without the second kind, a batch that denies element 1 on id 5
+         * and allows element 2 on id 5 sends the client TWO responses for one
+         * request id.
          *
          * Returns the refusal response when the id is not usable, `undefined`
          * when the call may proceed to the policy.
          */
         const refuseReusedId = (msg, claimed) => {
-            const key = pendingKey('c2s:', msg.id);
-            if (holds.has(key))
-                return refuseDuplicateId(msg, 'held');
-            if (pending.has(key) || claimed?.has(key) === true)
-                return refuseDuplicateId(msg, 'pending');
-            return undefined;
+            const state = idInUse(msg.id, claimed);
+            return state === undefined ? undefined : refuseDuplicateId(msg, state);
         };
         /**
-         * A `tools/call` carrying `id: null` (see the module header): refused
-         * with a JSON-RPC -32600 error and NOT forwarded, whatever the policy
-         * says. There is no request id to record a `policy_decision` or a
-         * `tool_call` against, so it is recorded exactly as the tap records any
-         * id-less message — one `notification` event — and the refusal itself
-         * is visible on stderr.
+         * The same fail-closed gate for a c2s request that is NOT a
+         * `tools/call`. It used to be missing entirely, and that was a way to
+         * make an EXECUTED tool call vanish: a same-id `tools/list` overwrote
+         * the in-flight call's `pending` slot, so the tool's real result was
+         * recorded as that other request's response (or landed as an orphan)
+         * with no `tool_call`, no args hash and no gateway outcome. The
+         * reclaim-seal on the hold path is the last resort the source always
+         * said it was; this is the mitigation.
+         *
+         * The refusal is a plain JSON-RPC -32600 (no model reads it, so an
+         * isError tool result would be the wrong shape), and the attempt is
+         * recorded as an `rpc` event with `error.type: 'duplicate_id'` — the
+         * same seal `sealPending` writes for a request that never got an answer.
+         */
+        const refuseReusedRequestId = (msg, claimed) => {
+            const state = idInUse(msg.id, claimed);
+            if (state === undefined)
+                return undefined;
+            const entry = {
+                method: structuralString(msg.method, 'identifier'),
+                params: msg.params,
+                t0: performance.now(),
+                id: msg.id,
+            };
+            guarded(() => sealPending(entry, DUPLICATE_ID_ERROR_TYPE, 0));
+            diag(`gateway: refused a "${entry.method}" request — ${DUPLICATE_ID_REASON[state]}` +
+                ` (id ${structuralString(String(msg.id), 'identifier')})`);
+            return invalidRequestResponse(msg.id, DUPLICATE_REQUEST_ID_MESSAGE);
+        };
+        /**
+         * A `tools/call` whose `id` property is not a usable JSON-RPC id — the
+         * `null` the module header describes, and equally `true`, `{}` or `[]`
+         * (see the module header): refused with a JSON-RPC -32600 error and NOT
+         * forwarded, whatever the policy says. There is no request id to record
+         * a `policy_decision` or a `tool_call` against — and writing one anyway
+         * would put a value in `request_id` the frozen schema cannot describe —
+         * so it is recorded exactly as the tap records any id-less message (one
+         * `notification` event) and the refusal is visible on stderr.
          *
          * Returns the error response, which the caller delivers on its own line
          * or inside the batch response array (a batch element gets exactly the
          * same treatment as a standalone one).
          */
-        const refuseNullIdToolsCall = (msg, line, inBatch = false) => {
-            diag(`gateway: refused a tools/call with a null id${inBatch ? ' inside a JSON-RPC batch' : ''}` +
+        const refuseInvalidIdToolsCall = (msg, line, inBatch = false) => {
+            const shape = msg['id'] === null ? 'a null id' : 'an id that is neither a string nor a number';
+            diag(`gateway: refused a tools/call with ${shape}${inBatch ? ' inside a JSON-RPC batch' : ''}` +
                 ' (not a valid request); not forwarded');
             guarded(() => handleMessage(msg, 'client_to_server', line));
-            return NULL_ID_ERROR_RESPONSE;
+            return invalidIdErrorResponse(msg['id']);
+        };
+        /**
+         * A `tools/call` NOTIFICATION (no `id` property at all). It is evaluated
+         * against the policy exactly like a request; a deny simply DROPS it,
+         * which is what "notification" already promises the caller — nothing
+         * comes back either way. Forwarding it unevaluated was the same hole the
+         * null-id refusal closed, one shape over.
+         *
+         * The frozen schema's `request_id` is `string | number`, so a
+         * `policy_decision` cannot be written for a message that has no id: the
+         * attempt is recorded the way the tap has always recorded an id-less
+         * message (one `notification` event) and the decision is on stderr.
+         *
+         * Returns true when the notification may be forwarded.
+         */
+        const allowToolsCallNotification = (msg, inBatch) => {
+            const params = isPlainObject(msg['params']) ? msg['params'] : {};
+            const name = typeof params['name'] === 'string' ? params['name'] : '';
+            const args = params['arguments'] ?? {};
+            const { decision } = evaluate(name, args);
+            if (decision.action === 'allow')
+                return true;
+            const tool = name === '' ? '' : structuralString(name, 'identifier');
+            // A `hold` has nowhere to park and nothing to answer on, so it is a
+            // deny — the gateway failing closed, exactly as a hold inside a batch.
+            diag(`gateway: denied tools/call NOTIFICATION "${tool}"` +
+                ` (rule ${decision.ruleId === undefined ? 'default' : cappedRuleId(decision.ruleId)})` +
+                `${decision.action === 'hold' ? ' — a hold cannot be parked on a notification' : ''}` +
+                `${inBatch ? ' inside a JSON-RPC batch' : ''}; not forwarded`);
+            return false;
         };
         /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
         const registerCall = (call, gatewayOutcome) => {
@@ -2009,27 +2368,34 @@ export async function runStdioProxy(opts) {
             startHold(call, raw);
         };
         /**
-         * JSON-RPC batch: each tools/call element goes through the SAME gate a
-         * standalone one does — the protocol checks first (a reused request id,
-         * a null id), then the policy. Allowed elements and every non-tools/call
-         * element are forwarded as a batch; refused ones (a duplicate id, a null
-         * id, a deny, and a hold — not supported inside a batch) get their
-         * refusal back as elements of the batch response and are never
+         * JSON-RPC batch: EVERY element goes through the same gate its
+         * standalone form does, in the same order — the protocol checks first
+         * (an element that is itself an array, an unusable id, a reused request
+         * id), then the policy. Allowed elements are forwarded as a batch, as
+         * the client wrote them; refused ones (a nested array, an unusable id, a
+         * duplicate id, a deny, and a hold — not supported inside a batch) get
+         * their refusal back as elements of the batch response and are never
          * forwarded.
          *
-         * A batch is NOT a way in: a `tools/call` inside one used to skip the
-         * duplicate-id refusal and the null-id refusal entirely, which put the
-         * original id clobber back on the table (both calls execute, one
-         * `tool_call` ends up carrying one call's arguments with the other's
-         * result) and let a policy-denied tool run unevaluated as long as it
-         * carried `"id": null`.
+         * A batch is NOT a way in. Every element kind that used to slip past
+         * here is now gated:
+         *  - a `tools/call` REQUEST — the duplicate-id and policy gates;
+         *  - a `tools/call` with an unusable `id` (`null`, `true`, `{}`, `[]`);
+         *  - a `tools/call` NOTIFICATION, which has no id but is still evaluated;
+         *  - a NESTED ARRAY, which is not a request at all but which a server
+         *    that flattens its input would happily run;
+         *  - any OTHER request, which takes a `pending` slot and could therefore
+         *    clobber an in-flight tool call's slot.
+         * There is no fast path around this loop: when nothing is refused
+         * `keptBatchBytes` returns the ORIGINAL bytes, so an untouched batch
+         * still crosses byte-for-byte.
          */
         const c2sBatch = (batch, raw, line) => {
-            // Null-id elements count too: a batch whose ONLY tools/call carries
-            // `"id": null` must not be waved through on the fast path.
-            if (!batch.some((el) => isToolsCallRequest(el) || isNullIdToolsCall(el))) {
+            if (batch.length === 0) {
+                // An empty array carries nothing to evaluate. JSON-RPC calls it an
+                // invalid request and the server may answer it however it likes;
+                // the gateway has no opinion, so it crosses as the client wrote it.
                 forwardC2s(raw);
-                guarded(() => handleMessage(batch, 'client_to_server', line));
                 return;
             }
             const kept = [];
@@ -2037,25 +2403,52 @@ export async function runStdioProxy(opts) {
             const forwardedCalls = [];
             const responses = [];
             /**
-             * Request ids already taken by earlier elements of THIS batch.
-             * `registerCall`/`handleMessage` only run once the whole batch has
-             * been forwarded, so `pending` cannot answer for them yet.
+             * Request ids THIS batch has already taken — whether by an element
+             * that is being forwarded (`registerCall`/`handleMessage` only run
+             * once the whole batch has gone out, so `pending` cannot answer for
+             * them yet) or by one the gateway ANSWERED on itself. Both count: a
+             * batch that denies id 5 and then allows id 5 would otherwise send the
+             * client two responses for one request id.
              */
             const claimed = new Set();
             const claim = (el) => {
-                if (isPlainObject(el) && typeof el.method === 'string' && isRpcId(el.id)) {
+                if (isRpcRequest(el))
                     claimed.add(pendingKey('c2s:', el.id));
-                }
+            };
+            const keep = (el, index) => {
+                kept.push(el);
+                keptIndexes.push(index);
+                claim(el);
             };
             batch.forEach((el, index) => {
-                if (isNullIdToolsCall(el)) {
-                    responses.push(refuseNullIdToolsCall(el, line, true));
+                if (Array.isArray(el)) {
+                    // Not a JSON-RPC request. A server that flattens nested arrays
+                    // would execute whatever is inside it, so it never crosses.
+                    diag('gateway: refused a nested array inside a JSON-RPC batch; not forwarded');
+                    responses.push(invalidRequestResponse(null, NESTED_BATCH_MESSAGE));
+                    return;
+                }
+                if (isInvalidIdToolsCall(el)) {
+                    responses.push(refuseInvalidIdToolsCall(el, line, true));
+                    return;
+                }
+                if (isToolsCallNotification(el)) {
+                    if (allowToolsCallNotification(el, true))
+                        keep(el, index);
+                    else
+                        guarded(() => handleMessage(el, 'client_to_server', line));
                     return;
                 }
                 if (!isToolsCallRequest(el)) {
-                    kept.push(el);
-                    keptIndexes.push(index);
-                    claim(el);
+                    if (isRpcRequest(el)) {
+                        const reused = refuseReusedRequestId(el, claimed);
+                        if (reused !== undefined) {
+                            claimed.add(pendingKey('c2s:', el.id));
+                            responses.push(reused);
+                            return;
+                        }
+                    }
+                    keep(el, index);
                     return;
                 }
                 const reused = refuseReusedId(el, claimed);
@@ -2065,9 +2458,7 @@ export async function runStdioProxy(opts) {
                 }
                 const { call, action } = buildCall(el);
                 if (action === 'allow') {
-                    kept.push(el);
-                    keptIndexes.push(index);
-                    claim(el);
+                    keep(el, index);
                     forwardedCalls.push(call);
                     return;
                 }
@@ -2080,6 +2471,9 @@ export async function runStdioProxy(opts) {
                 if (action === 'hold') {
                     diag(`gateway: hold inside a JSON-RPC batch is treated as deny (tools/call "${call.tool}")`);
                 }
+                // The gateway has now answered on this id: a later element reusing
+                // it gets the duplicate-id refusal instead of a second response.
+                claimed.add(pendingKey('c2s:', call.id));
                 responses.push(synthesizeDeny(refused));
                 diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
             });
@@ -2096,10 +2490,34 @@ export async function runStdioProxy(opts) {
             if (responses.length > 0)
                 writeToClient(Buffer.from(JSON.stringify(responses) + '\n'));
         };
+        /**
+         * A client line the gateway could not evaluate because it grew past the
+         * line cap. NONE of its bytes reached the server (the splitter drops
+         * them, see `GatewayLineSplitter`'s `refuseOversized`), so the client is
+         * answered here instead of being left waiting: enforcement fails CLOSED,
+         * and an unparseable line is by definition unevaluated.
+         *
+         * The line's content was never buffered, so its request id is unknown —
+         * the refusal carries `id: null`, which is exactly what JSON-RPC
+         * prescribes for a request whose id could not be determined. The one
+         * thing the scanner does keep is the line's first non-whitespace byte,
+         * so a batch ('[') is answered with a batch, as a client that sent one
+         * expects.
+         */
+        const refuseOversizedC2sLine = (line) => {
+            const response = invalidRequestResponse(null, OVERSIZED_LINE_MESSAGE);
+            const body = line.firstByte === 0x5b ? [response] : response;
+            diag(`gateway: refused a ${line.bytesLen}-byte client line: too large to buffer, so the policy` +
+                ' could not see it; not forwarded');
+            writeToClient(Buffer.from(JSON.stringify(body) + '\n'));
+        };
         const c2sLine = (line) => {
             if (line.oversized) {
-                // Bytes already streamed through by the splitter; only the record remains.
+                // Fail closed: the splitter dropped the bytes rather than streaming
+                // them to the server, so nothing crossed unevaluated. Record the
+                // line exactly as record mode does, then answer the client.
                 guarded(() => protocolError('client_to_server', 'oversized', line.bytesLen, line.lineHashHex));
+                refuseOversizedC2sLine(line);
                 return;
             }
             const raw = line.raw;
@@ -2122,16 +2540,37 @@ export async function runStdioProxy(opts) {
                 c2sToolsCall(msg, raw);
                 return;
             }
-            if (isNullIdToolsCall(msg)) {
-                writeToClient(Buffer.from(JSON.stringify(refuseNullIdToolsCall(msg, line)) + '\n'));
+            if (isInvalidIdToolsCall(msg)) {
+                writeToClient(Buffer.from(JSON.stringify(refuseInvalidIdToolsCall(msg, line)) + '\n'));
                 return;
+            }
+            if (isToolsCallNotification(msg)) {
+                if (allowToolsCallNotification(msg, false))
+                    forwardC2s(raw);
+                guarded(() => handleMessage(msg, 'client_to_server', line));
+                return;
+            }
+            if (isRpcRequest(msg)) {
+                // Every request takes a `pending` slot, so every request goes
+                // through the duplicate-id gate — not just `tools/call`. Letting a
+                // same-id `tools/list` take the slot of an in-flight tool call is
+                // how an executed call disappears from the chain.
+                const reused = refuseReusedRequestId(msg);
+                if (reused !== undefined) {
+                    writeToClient(Buffer.from(JSON.stringify(reused) + '\n'));
+                    return;
+                }
             }
             forwardC2s(raw);
             if (isPlainObject(msg) && msg.method === 'notifications/cancelled')
                 cancelHold(msg);
             guarded(() => handleMessage(msg, 'client_to_server', line));
         };
-        const c2sSplitter = new GatewayLineSplitter(forwardC2s, c2sLine);
+        // `true`: a client line the policy could not see never reaches the
+        // server (BLOCKING A). The s2c splitter keeps streaming an oversized
+        // server line through — buffering the server's output has no bearing on
+        // what the client is allowed to ask for.
+        const c2sSplitter = new GatewayLineSplitter(forwardC2s, c2sLine, true);
         /* ---- server -> client ---- */
         const forwardS2c = (bytes) => {
             if (bytes.length > 0)
@@ -2180,21 +2619,26 @@ export async function runStdioProxy(opts) {
                 // so the canonical JSON of the delivered result, and therefore this
                 // hash, is the same either way.
                 //
-                // This is RECORDING, and it runs on the forwarding path, so it is
-                // guarded: `canonicalJson` recurses, and a pathological result tree
+                // This is RECORDING, and it runs on the forwarding path, so it must
+                // not throw: `canonicalJson` recurses and a pathological result tree
                 // overflows the stack. Unguarded, that throw escaped `s2cLine` into
                 // the Transform's catch and the client lost the line — and the rest
-                // of the chunk it arrived in — for a hash. AGENTS.md: nothing about
-                // recording may block, delay, corrupt or kill forwarded traffic.
-                // Enforcement (applyBoundary, self-guarded) has already decided.
+                // of the chunk it arrived in — for a hash.
+                //
+                // `boundedCanonicalJson` removes the overflow (a subtree past
+                // MAX_HASH_DEPTH hashes as a fixed marker), so the hash is normally
+                // present even for a hostile tree. The catch below is now the last
+                // resort it always claimed to be — and it costs only this ONE FIELD:
+                // `handleResponse` records the `tool_call` either way, carrying
+                // `error.type: 'result_hash_failed'`. The earlier arrangement lost
+                // the whole event and left `verify` reporting PASS over the gap.
                 try {
                     const delivered = isPlainObject(outcome.message) ? outcome.message['result'] : null;
-                    report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+                    report.delivered_result_hash = sha256Ref(boundedCanonicalJson(delivered ?? null));
                 }
                 catch (err) {
-                    // Fail open, the way every other recording failure here does: the
-                    // report simply carries no `delivered_result_hash` (its absence on
-                    // a changed result IS the signal, and `scanned`/`action` still say
+                    // The report carries no `delivered_result_hash` (its absence on a
+                    // changed result IS the signal, and `scanned`/`action` still say
                     // what the client got), and `tapError` puts it on stderr and in
                     // the recorder's error accounting.
                     tapError(err);

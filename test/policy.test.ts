@@ -731,6 +731,77 @@ describe('validatePolicyObject: error paths', () => {
     }
   });
 
+  it('args regexes: parentheses that are pure concatenation cannot hide adjacent quantifiers', () => {
+    // A group with no quantifier and no top-level alternation means exactly
+    // what its body means, so `([a-z]+)([a-z]+)([a-z]+)x` IS the
+    // `[a-z]*[a-z]*[a-z]*x` shape rejected above. It used to validate with
+    // exit 0 because the analysis treated every group as opaque unless the
+    // group itself was repeated. Measured on a 4096-character value (the most
+    // one argument can carry, `REGEX_VALUE_CAP`): `^([a-z]+)([a-z]+)([a-z]+)x$`
+    // takes 8.2 s, the `(?:...)` spelling 8.7 s, `^(\w+)(\w+)(\w+)$` 8.8 s,
+    // and a fourth group needs 22 s at 512 characters alone — RE2 answers all
+    // of them instantly, which is why they are refused at authoring time.
+    const parenthesised: Array<[string, string]> = [
+      ['^([a-z]+)([a-z]+)([a-z]+)x$', '([a-z]+)([a-z]+)'],
+      ['^(?:[a-z]+)(?:[a-z]+)(?:[a-z]+)x$', '(?:[a-z]+)(?:[a-z]+)'],
+      ['^(\\w+)(\\w+)(\\w+)$', '(\\w+)(\\w+)'],
+      ['^([a-z]+)([a-z]+)([a-z]+)([a-z]+)x$', '([a-z]+)([a-z]+)'],
+      ['^((a+))((a*))b$', '((a+))((a*))'], // wrappers around each one, seen through
+      ['^(?<a>[a-z]+)(?<b>[a-z]+)x$', '(?<a>[a-z]+)(?<b>[a-z]+)'],
+      ['^([a-z]+)[a-z]+x$', '([a-z]+)[a-z]+'], // one side parenthesised, one side bare
+      ['^[a-z]+([a-z]+)x$', '[a-z]+([a-z]+)'],
+      ['^(x[a-z]+)([a-z]+y)z$', '[a-z]+[a-z]+'], // a multi-atom body is spliced in, atom by atom
+    ];
+    for (const [pattern, shown] of parenthesised) {
+      const why = checkCatastrophicShape(pattern);
+      expect(why, pattern).toMatch(/repeats two adjacent atoms that can match the same characters/);
+      // The message quotes the offending piece as the author wrote it.
+      expect(why, pattern).toContain(JSON.stringify(shown));
+      expect(why, pattern).toMatch(/make the character sets disjoint or drop one of the quantifiers/);
+      // The validator, not the matcher, is where this is refused — and both
+      // engines see the same policy, so the Rego side never gets the pattern.
+      expect(checkRe2Subset(pattern), pattern).toBe(why);
+      expectError(
+        errorsFor((d) => (rule0(d).match.args = { url: pattern })),
+        '/mcp/rules/0/match/args/url',
+        'regex',
+        /two adjacent atoms/,
+      );
+    }
+    // Parentheses that are NOT pure concatenation stay opaque to this rule: a
+    // repeated group is the other family's business (it anchors each iteration
+    // with something the repeat cannot match), and an alternation is a choice,
+    // not a concatenation. Disjoint classes and an intervening literal are
+    // still fine however they are spelled. All of these must keep validating.
+    const stillFine = [
+      '(\\d{1,3}\\.){3}\\d{1,3}',
+      '([a-z0-9-]+\\.)*example\\.com',
+      '(?:[a-z]+\\.)+',
+      '(^|/)(\\.env|id_rsa)$',
+      '(^|/)(\\.env|secrets\\.env|id_rsa|\\.npmrc)$',
+      '(?<year>[0-9]{4})-(?<m>[0-9]{2})',
+      '([a-z]+)([0-9]+)x',
+      '([a-z]+)-([a-z]+)x',
+      '(a+b)*',
+      '(.*a)',
+      '(a+)',
+      '(?:a(?:b|c))+',
+      '^(title|body)$',
+    ];
+    for (const pattern of stillFine) {
+      expect(checkCatastrophicShape(pattern), pattern).toBeUndefined();
+      expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+      const ok = designExample();
+      ok.mcp!.rules![0]!.match.args = { url: pattern };
+      expect(validatePolicyObject(ok).ok, pattern).toBe(true);
+    }
+    // The shipped example policies are the real over-rejection guard.
+    for (const file of ['policy.demo.yaml', 'policy.laptop.yaml']) {
+      const parsed = parsePolicyText(readFileSync(join(ROOT, 'docs', 'examples', file), 'utf8'), 'yaml', file);
+      expect(validatePolicyObject(parsed as PolicyInput).ok, file).toBe(true);
+    }
+  });
+
   it('checkProvablyLinear is the fail-closed twin: it PROVES a bound instead of spotting bad shapes', () => {
     // What the runtime guard consults when it has no worker thread. Absence of
     // a known-bad shape is not enough there: a repeated group, too many

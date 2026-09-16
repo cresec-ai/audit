@@ -26,6 +26,15 @@
  * shapes were missing (or, for the assignment, blinded by a `\b` that `_`
  * defeats).
  *
+ * Nor may the widening that puts them back rewrite ordinary output: an affix
+ * of any 62 characters riding the bare keyword made `MAX_TOKEN_LENGTH = 512`
+ * and `secret_scanning_enabled: true` "credentials". The assignment shape is
+ * therefore TWO families — a permissive BARE one where the keyword is the
+ * whole name (which also reaches the JSON shape `{"password": "hunter2"}`,
+ * the commonest one in an MCP tool result) and an AFFIXED one that also
+ * requires the value to look like a credential — plus a third for a flag
+ * whose value is the next argument (`--password hunter2`).
+ *
  * Invariants:
  *  - `applyBoundary()` NEVER throws and NEVER mutates its input; a changed
  *    message is a fresh tree that shares only untouched subtrees.

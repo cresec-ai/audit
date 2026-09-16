@@ -21,6 +21,8 @@ export class LineScanner {
     hash = null;
     /** Once the cap is exceeded we stop buffering but keep counting/hashing. */
     oversized = false;
+    /** First non-whitespace byte of the current line; -1 until one is seen. */
+    firstByte = -1;
     constructor(opts) {
         this.maxLineBytes = opts?.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
     }
@@ -60,6 +62,15 @@ export class LineScanner {
     append(bytes) {
         if (bytes.length === 0)
             return;
+        if (this.firstByte === -1) {
+            for (const b of bytes) {
+                // space, \t, \r (a \n would have ended the line)
+                if (b !== 0x20 && b !== 0x09 && b !== 0x0d) {
+                    this.firstByte = b;
+                    break;
+                }
+            }
+        }
         if (this.hash === null)
             this.hash = createHash('sha256');
         this.hash.update(bytes);
@@ -79,16 +90,20 @@ export class LineScanner {
      * `terminated` says whether a `\n` ended the line (so `raw` includes it).
      */
     finishLine(terminated) {
-        const { parts, bytesLen, hash, oversized } = this;
+        const { parts, bytesLen, hash, oversized, firstByte } = this;
         this.parts = [];
         this.bytesLen = 0;
         this.hash = null;
         this.oversized = false;
+        this.firstByte = -1;
         if (bytesLen === 0)
             return null; // empty line — skip silently
         const lineHashHex = hash.digest('hex');
         if (oversized) {
-            return { text: null, oversized: true, bytesLen, lineHashHex };
+            const line = { text: null, oversized: true, bytesLen, lineHashHex };
+            if (firstByte !== -1)
+                line.firstByte = firstByte;
+            return line;
         }
         // One allocation: the line bytes plus room for the terminating '\n'
         // (`raw`); `text` is decoded from the same buffer's line-only view.
@@ -100,7 +115,10 @@ export class LineScanner {
             text = text.slice(0, -1);
         if (text.length === 0)
             return null; // bare "\r\n" — also empty
-        return { text, oversized: false, bytesLen, lineHashHex, raw };
+        const line = { text, oversized: false, bytesLen, lineHashHex, raw };
+        if (firstByte !== -1)
+            line.firstByte = firstByte;
+        return line;
     }
 }
 //# sourceMappingURL=framing.js.map

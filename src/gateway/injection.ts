@@ -8,12 +8,16 @@
  * injection" and a pure `findInjectionSpans()` that locates them.
  *
  * Scanning happens on a NORMALIZED COPY of the text (`normalizeForScan()`):
- * invisible characters are dropped (every `Default_Ignorable_Code_Point` and
- * every `\p{Cf}` format character — which is all of Bidi_Control — plus
- * U+034F), NFKC folds homoglyph look-alikes (fullwidth, mathematical, compatibility forms) onto their
- * ASCII equivalents, and whitespace runs collapse to one space. Every span
- * is mapped back onto the ORIGINAL text before it is returned, so callers
- * report and redact exactly the original bytes and nothing else.
+ * invisible characters are dropped (every `Default_Ignorable_Code_Point`,
+ * every `\p{Cf}` format character — which is all of Bidi_Control — every
+ * `\p{Cc}` control character except the five whitespace ones, whole ANSI CSI
+ * escape sequences, plus U+034F), NFKC folds homoglyph look-alikes
+ * (fullwidth, mathematical, compatibility forms) onto their ASCII
+ * equivalents, and whitespace runs collapse to one space. Text carrying
+ * combining marks is scanned a SECOND time on a copy folded with NFKD and
+ * stripped of `\p{Mn}`/`\p{Me}`, and the two span sets are unioned. Every
+ * span is mapped back onto the ORIGINAL text before it is returned, so
+ * callers report and redact exactly the original bytes and nothing else.
  *
  * Out of scope (documented in docs/policy.md): base64-encoded instructions
  * and keywords split by markdown or HTML markup are NOT decoded or
@@ -230,6 +234,27 @@ export interface NormalizedScan {
   changed: boolean;
   /** Present only when `changed`; ordered, contiguous in both coordinates. */
   runs?: Run[];
+  /**
+   * Present (and `true`) only when some character of the input carries a
+   * combining mark — itself an `Mn`/`Me`, or a precomposed character whose
+   * NFKD decomposition contains one. It is the trigger for the SECOND,
+   * marks-dropped copy in `findInjectionSpans`; text without a mark (the
+   * overwhelmingly common case) never pays for that pass.
+   */
+  sawMark?: true;
+}
+
+/** Options for {@link normalizeForScan}. */
+export interface NormalizeOptions {
+  /**
+   * Fold with NFKD and drop every combining mark (`\p{Mn}`/`\p{Me}`) instead
+   * of folding with NFKC. `i̇gnore` (i + COMBINING DOT ABOVE) and `ignoré`
+   * (a precomposed é) both become `ignore` in this copy, so a marker hidden
+   * behind stacked or substituted accents is still found. Used for the
+   * second scan copy only — a mark is a VISIBLE character, so dropping it
+   * unconditionally would fold distinct words together for everybody.
+   */
+  dropMarks?: boolean;
 }
 
 /**
@@ -256,11 +281,41 @@ export interface NormalizedScan {
  * Every Bidi_Control code point (U+061C, U+200E–U+200F, U+202A–U+202E,
  * U+2066–U+2069) is `Cf`, so "bidi control characters are stripped" is now
  * true of the whole class, which is what docs/policy.md claims.
+ *
+ * `\p{Cc}` — the C0 and C1 control characters, DEL, and the ESC that starts
+ * an ANSI escape sequence — joins them for the same reason: a terminal, a
+ * log viewer and a chat client all render them as nothing, so
+ * `sys<U+0001>tem override` READS as the marker while a scan of the raw
+ * bytes saw two harmless fragments. The five whitespace controls
+ * (\t \n \v \f \r) are deliberately NOT dropped here: they are visible as
+ * layout, and the whitespace collapse below already folds them to a single
+ * space, which is what keeps `ignore\nall previous instructions` matching.
+ *
+ * Exported so the astral table below can be re-derived from it in the tests
+ * rather than restated there (a second copy would drift).
  */
-const INVISIBLE_RE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u034F]/u;
+export const INVISIBLE_RE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cc}͏]/u;
 
-/** Lowest invisible code point (U+00AD); everything below it is visible. */
-const INVISIBLE_MIN = 0x00ad;
+/**
+ * The ONLY astral ranges `INVISIBLE_RE` contains, so an astral code point
+ * costs a few integer comparisons instead of a `String.fromCodePoint`
+ * allocation plus a property-escape regex test on every occurrence. Plane 14
+ * (tags, variation selectors supplement) is NOT the only one, which is why
+ * the list is spelled out rather than short-circuited on that block: the
+ * Kaithi number signs, the Egyptian Hieroglyph and Shorthand format
+ * controls, and the musical-symbol format characters are all `Cf` outside
+ * it. `test/gateway-boundary.test.ts` re-derives this table from
+ * `INVISIBLE_RE` across all of U+10000–U+10FFFF, so Unicode drift is a test
+ * failure rather than a silent hole.
+ */
+export const ASTRAL_INVISIBLE_RANGES: readonly (readonly [number, number])[] = [
+  [0x110bd, 0x110bd], // KAITHI NUMBER SIGN
+  [0x110cd, 0x110cd], // KAITHI NUMBER SIGN ABOVE
+  [0x13430, 0x1343f], // Egyptian Hieroglyph format controls
+  [0x1bca0, 0x1bca3], // Shorthand format controls
+  [0x1d173, 0x1d17a], // Musical symbol beam/slur/phrase/tie format characters
+  [0xe0000, 0xe0fff], // Plane 14: tag characters, variation selectors supplement
+];
 
 /**
  * Memo over the BMP (0 = unknown, 1 = visible, 2 = invisible), allocated on
@@ -271,14 +326,76 @@ let invisibleMemo: Uint8Array | undefined;
 
 /** True when the CODE POINT `cp` renders as nothing and must be dropped. */
 function isInvisible(cp: number): boolean {
-  if (cp < INVISIBLE_MIN) return false;
-  if (cp > 0xffff) return INVISIBLE_RE.test(String.fromCodePoint(cp));
+  // Fast-path minimum: below DEL the only invisibles are the C0 controls,
+  // minus the five whitespace ones the collapse below handles as layout.
+  if (cp < 0x20) return cp < 0x09 || cp > 0x0d;
+  if (cp < 0x7f) return false;
+  if (cp > 0xffff) {
+    for (const [lo, hi] of ASTRAL_INVISIBLE_RANGES) {
+      if (cp < lo) return false; // sorted, non-overlapping
+      if (cp <= hi) return true;
+    }
+    return false;
+  }
   const memo = (invisibleMemo ??= new Uint8Array(0x10000));
   const cached = memo[cp];
   if (cached !== 0) return cached === 2;
   const invisible = INVISIBLE_RE.test(String.fromCharCode(cp));
   memo[cp] = invisible ? 2 : 1;
   return invisible;
+}
+
+/**
+ * Combining marks: `\p{Mn}`/`\p{Me}` themselves, and the precomposed
+ * characters that decompose to one under NFKD. A mark is VISIBLE, so it is
+ * not in the invisible set — dropping it for everybody would fold distinct
+ * words together — but `igno<U+0301>re` and `ignoré` both read as the marker
+ * to a human, so the marks-dropped SECOND copy has to exist. This predicate
+ * is only the trigger for building it.
+ */
+const MARK_RE = /[\p{Mn}\p{Me}]/u;
+/** Same class, global, for stripping marks out of a decomposed character. */
+const MARK_STRIP_RE = /[\p{Mn}\p{Me}]/gu;
+/**
+ * Memo over the BMP AND plane 1 (0x00000–0x1FFFF), where every astral
+ * character ordinary text uses lives — emoji, the mathematical alphabets,
+ * the astral combining marks. Above it the regex runs, which costs a
+ * `String.fromCodePoint` allocation and a normalize, the exact per-code-point
+ * cost the invisible table exists to avoid; plane 2+ text is rare enough
+ * that a 128 KiB table for it would not pay for itself.
+ */
+let markMemo: Uint8Array | undefined;
+
+/** True when `cp` is a combining mark or decomposes to one under NFKD. */
+function isMarkish(cp: number): boolean {
+  if (cp < 0x00c0) return false; // no mark, and nothing decomposing to one, below À
+  if (cp > 0x1ffff) return MARK_RE.test(String.fromCodePoint(cp).normalize('NFKD'));
+  const memo = (markMemo ??= new Uint8Array(0x20000));
+  const cached = memo[cp];
+  if (cached !== 0) return cached === 2;
+  const markish = MARK_RE.test(String.fromCodePoint(cp).normalize('NFKD'));
+  memo[cp] = markish ? 2 : 1;
+  return markish;
+}
+
+/**
+ * Index just past the ANSI CSI sequence starting at `i` (an ESC), or `i`
+ * when what follows is not one. The ESC itself is already a control
+ * character and dropped; this drops the `[0m`-style parameter and final
+ * bytes with it, which would otherwise stay behind and let
+ * `ig<ESC>[0mnore all previous instructions` read as the marker while
+ * scanning as two fragments. Every character is examined at most twice, so
+ * the scan stays linear.
+ */
+function ansiSequenceEnd(s: string, i: number): number {
+  if (s.charCodeAt(i + 1) !== 0x5b) return i; // not "ESC ["
+  for (let j = i + 2; j < s.length; j++) {
+    const c = s.charCodeAt(j);
+    if (c >= 0x20 && c <= 0x3f) continue; // parameter + intermediate bytes
+    if (c >= 0x40 && c <= 0x7e) return j + 1; // final byte
+    return i; // malformed: leave it to the lone-control-character drop
+  }
+  return i; // unterminated
 }
 
 const WS_RE = /\s/;
@@ -302,13 +419,15 @@ const NEEDS_NORMALIZE_RE = /[^\x20-\x7e]|\x20\x20/;
  * with the run mapping that puts spans back on the original text. Pure and
  * total: any string is accepted, nothing throws.
  */
-export function normalizeForScan(original: string): NormalizedScan {
+export function normalizeForScan(original: string, opts: NormalizeOptions = {}): NormalizedScan {
   if (typeof original !== 'string' || !NEEDS_NORMALIZE_RE.test(original)) {
     return { text: typeof original === 'string' ? original : '', changed: false };
   }
+  const dropMarks = opts.dropMarks === true;
   const runs: Run[] = [];
   let out = '';
   let changed = false;
+  let sawMark = false;
 
   const emit = (chunk: string, oStart: number, oEnd: number, identity: boolean): void => {
     if (!identity) changed = true;
@@ -344,6 +463,16 @@ export function normalizeForScan(original: string): NormalizedScan {
     // in which case its UTF-16 units are two surrogates and neither is.
     const cp = original.codePointAt(i) ?? original.charCodeAt(i);
     const width = cp > 0xffff ? 2 : 1;
+    if (cp === 0x1b) {
+      // ESC: drop the whole CSI sequence, not just the ESC, so its parameter
+      // and final bytes cannot stay behind between two halves of a marker.
+      const end = ansiSequenceEnd(original, i);
+      if (end > i) {
+        i = end;
+        changed = true;
+        continue;
+      }
+    }
     if (isInvisible(cp)) {
       i += width;
       changed = true;
@@ -354,6 +483,17 @@ export function normalizeForScan(original: string): NormalizedScan {
       while (j < len) {
         const c = original.codePointAt(j) ?? original.charCodeAt(j);
         const w = c > 0xffff ? 2 : 1;
+        // An ANSI sequence inside a whitespace run has to be consumed WHOLE
+        // here too: its ESC is an invisible, so without this the run would
+        // swallow the ESC and leave `[0m` standing in the middle of the
+        // normalized text.
+        if (c === 0x1b) {
+          const end = ansiSequenceEnd(original, j);
+          if (end > j) {
+            j = end;
+            continue;
+          }
+        }
         if (isWhitespace(c) || isInvisible(c)) j += w;
         else break;
       }
@@ -362,11 +502,16 @@ export function normalizeForScan(original: string): NormalizedScan {
       continue;
     }
     const ch = original.slice(i, i + width);
-    const folded = ch.normalize('NFKC');
+    if (isMarkish(cp)) sawMark = true;
+    const folded = dropMarks
+      ? ch.normalize('NFKD').replace(MARK_STRIP_RE, '')
+      : ch.normalize('NFKC');
     emit(folded, i, i + width, folded === ch);
     i += width;
   }
-  return changed ? { text: out, changed, runs } : { text: out, changed: false };
+  const scan: NormalizedScan = changed ? { text: out, changed, runs } : { text: out, changed: false };
+  if (sawMark) scan.sawMark = true;
+  return scan;
 }
 
 /** The run holding normalized offset `p`, or undefined when past the end. */
@@ -416,22 +561,46 @@ function mapSpan(span: Span, runs: readonly Run[]): Span {
 }
 
 /**
+ * Every marker found in one normalized copy, as spans ON THE ORIGINAL TEXT.
+ */
+function scanCopy(normalized: NormalizedScan): Span[] {
+  const found: Span[] = [];
+  for (const p of INJECTION_PATTERNS) {
+    for (const s of matchSpans(p.re, normalized.text, p.id)) found.push(s);
+  }
+  const runs = normalized.runs;
+  return runs === undefined ? found : found.map((s) => mapSpan(s, runs));
+}
+
+/**
  * Locate every injection marker in `text`. Returns merged, sorted,
  * non-overlapping spans ON THE ORIGINAL TEXT. Scanning runs on the
  * normalized copy (see `normalizeForScan`), so markers hidden behind
- * zero-width characters or NFKC-foldable homoglyphs are found too. Never
+ * invisible characters or NFKC-foldable homoglyphs are found too. Never
  * throws; non-string input yields `[]`, and text beyond `MAX_SCAN_CHARS` is
  * not examined.
+ *
+ * Combining marks need a SECOND copy. A mark is a visible character, so
+ * dropping it for everyone would fold distinct words together, but
+ * `igno<U+0301>re all previous instructions` and `ignoré all previous
+ * instructions` both read as the marker to whoever looks at the rendered
+ * text. The second copy folds with NFKD and drops `\p{Mn}`/`\p{Me}`
+ * instead, and the two span sets are unioned. It is built only when the
+ * first pass actually saw a mark, and it carries its OWN run table, so the
+ * mapping guarantee is unchanged: a span from either copy lands exactly on
+ * the original characters its normalized match came from. (A mark hanging
+ * off the LAST matched character is therefore outside the span, the same way
+ * a trailing zero-width character always was: the span covers what matched,
+ * so a redaction can leave a stray accent behind but never eats a neighbour.)
  */
 export function findInjectionSpans(text: string): Span[] {
   if (typeof text !== 'string' || text.length === 0) return [];
   const scanned = text.length > MAX_SCAN_CHARS ? text.slice(0, MAX_SCAN_CHARS) : text;
   const normalized = normalizeForScan(scanned);
-  const found: Span[] = [];
-  for (const p of INJECTION_PATTERNS) {
-    for (const s of matchSpans(p.re, normalized.text, p.id)) found.push(s);
+  const found = scanCopy(normalized);
+  if (normalized.sawMark === true) {
+    for (const s of scanCopy(normalizeForScan(scanned, { dropMarks: true }))) found.push(s);
   }
   if (found.length === 0) return [];
-  const runs = normalized.runs;
-  return mergeSpans(runs === undefined ? found : found.map((s) => mapSpan(s, runs)));
+  return mergeSpans(found);
 }

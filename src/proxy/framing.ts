@@ -20,6 +20,14 @@ export interface ScannedLine {
   /** sha256 hex of the raw line bytes (no trailing newline). */
   lineHashHex: string;
   /**
+   * First non-whitespace byte of the raw line, or undefined for a line that
+   * is nothing but whitespace. Present even when the line is OVERSIZED (its
+   * content is not buffered, but this one byte is), which is the only thing
+   * gateway mode knows about a line it had to refuse: `0x5b` ('[') means the
+   * client sent a JSON-RPC batch, so the refusal must come back as a batch.
+   */
+  firstByte?: number;
+  /**
    * The exact bytes of the line as they crossed the wire — including any
    * trailing `\r` and the terminating `\n` (absent only for a trailing
    * unterminated line flushed by `end()`). Present only when the line was
@@ -43,6 +51,8 @@ export class LineScanner {
   private hash: Hash | null = null;
   /** Once the cap is exceeded we stop buffering but keep counting/hashing. */
   private oversized = false;
+  /** First non-whitespace byte of the current line; -1 until one is seen. */
+  private firstByte = -1;
 
   constructor(opts?: { maxLineBytes?: number }) {
     this.maxLineBytes = opts?.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
@@ -85,6 +95,15 @@ export class LineScanner {
 
   private append(bytes: Buffer): void {
     if (bytes.length === 0) return;
+    if (this.firstByte === -1) {
+      for (const b of bytes) {
+        // space, \t, \r (a \n would have ended the line)
+        if (b !== 0x20 && b !== 0x09 && b !== 0x0d) {
+          this.firstByte = b;
+          break;
+        }
+      }
+    }
     if (this.hash === null) this.hash = createHash('sha256');
     this.hash.update(bytes);
     this.bytesLen += bytes.length;
@@ -103,17 +122,20 @@ export class LineScanner {
    * `terminated` says whether a `\n` ended the line (so `raw` includes it).
    */
   private finishLine(terminated: boolean): ScannedLine | null {
-    const { parts, bytesLen, hash, oversized } = this;
+    const { parts, bytesLen, hash, oversized, firstByte } = this;
     this.parts = [];
     this.bytesLen = 0;
     this.hash = null;
     this.oversized = false;
+    this.firstByte = -1;
 
     if (bytesLen === 0) return null; // empty line — skip silently
 
     const lineHashHex = (hash as Hash).digest('hex');
     if (oversized) {
-      return { text: null, oversized: true, bytesLen, lineHashHex };
+      const line: ScannedLine = { text: null, oversized: true, bytesLen, lineHashHex };
+      if (firstByte !== -1) line.firstByte = firstByte;
+      return line;
     }
     // One allocation: the line bytes plus room for the terminating '\n'
     // (`raw`); `text` is decoded from the same buffer's line-only view.
@@ -122,6 +144,8 @@ export class LineScanner {
     let text = raw.toString('utf8', 0, bytesLen);
     if (text.endsWith('\r')) text = text.slice(0, -1);
     if (text.length === 0) return null; // bare "\r\n" — also empty
-    return { text, oversized: false, bytesLen, lineHashHex, raw };
+    const line: ScannedLine = { text, oversized: false, bytesLen, lineHashHex, raw };
+    if (firstByte !== -1) line.firstByte = firstByte;
+    return line;
   }
 }

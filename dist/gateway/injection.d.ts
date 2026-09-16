@@ -8,12 +8,16 @@
  * injection" and a pure `findInjectionSpans()` that locates them.
  *
  * Scanning happens on a NORMALIZED COPY of the text (`normalizeForScan()`):
- * invisible characters are dropped (every `Default_Ignorable_Code_Point` and
- * every `\p{Cf}` format character — which is all of Bidi_Control — plus
- * U+034F), NFKC folds homoglyph look-alikes (fullwidth, mathematical, compatibility forms) onto their
- * ASCII equivalents, and whitespace runs collapse to one space. Every span
- * is mapped back onto the ORIGINAL text before it is returned, so callers
- * report and redact exactly the original bytes and nothing else.
+ * invisible characters are dropped (every `Default_Ignorable_Code_Point`,
+ * every `\p{Cf}` format character — which is all of Bidi_Control — every
+ * `\p{Cc}` control character except the five whitespace ones, whole ANSI CSI
+ * escape sequences, plus U+034F), NFKC folds homoglyph look-alikes
+ * (fullwidth, mathematical, compatibility forms) onto their ASCII
+ * equivalents, and whitespace runs collapse to one space. Text carrying
+ * combining marks is scanned a SECOND time on a copy folded with NFKD and
+ * stripped of `\p{Mn}`/`\p{Me}`, and the two span sets are unioned. Every
+ * span is mapped back onto the ORIGINAL text before it is returned, so
+ * callers report and redact exactly the original bytes and nothing else.
  *
  * Out of scope (documented in docs/policy.md): base64-encoded instructions
  * and keywords split by markdown or HTML markup are NOT decoded or
@@ -91,20 +95,104 @@ export interface NormalizedScan {
     changed: boolean;
     /** Present only when `changed`; ordered, contiguous in both coordinates. */
     runs?: Run[];
+    /**
+     * Present (and `true`) only when some character of the input carries a
+     * combining mark — itself an `Mn`/`Me`, or a precomposed character whose
+     * NFKD decomposition contains one. It is the trigger for the SECOND,
+     * marks-dropped copy in `findInjectionSpans`; text without a mark (the
+     * overwhelmingly common case) never pays for that pass.
+     */
+    sawMark?: true;
 }
+/** Options for {@link normalizeForScan}. */
+export interface NormalizeOptions {
+    /**
+     * Fold with NFKD and drop every combining mark (`\p{Mn}`/`\p{Me}`) instead
+     * of folding with NFKC. `i̇gnore` (i + COMBINING DOT ABOVE) and `ignoré`
+     * (a precomposed é) both become `ignore` in this copy, so a marker hidden
+     * behind stacked or substituted accents is still found. Used for the
+     * second scan copy only — a mark is a VISIBLE character, so dropping it
+     * unconditionally would fold distinct words together for everybody.
+     */
+    dropMarks?: boolean;
+}
+/**
+ * Characters removed outright, as ONE code point each (not one UTF-16 unit:
+ * the plane-14 tag characters U+E0000–U+E0FFF are astral).
+ *
+ * The set is Unicode's own answer to "renders as nothing", not a hand-kept
+ * list of ranges: `Default_Ignorable_Code_Point` (zero-width space/joiners,
+ * the LTR/RTL marks, SOFT HYPHEN U+00AD, the variation selectors U+FE00–
+ * U+FE0F, the Hangul fillers, the tag characters, the BOM) united with every
+ * format character `\p{Cf}` (the bidi embedding/override controls U+202A–
+ * U+202E, the bidi ISOLATES U+2066–U+2069, the ARABIC LETTER MARK U+061C,
+ * the Arabic number signs, the interlinear-annotation anchors). Both
+ * properties are available in V8 on Node 20+, this repo's floor.
+ *
+ * U+034F COMBINING GRAPHEME JOINER is named explicitly. It is `Mn`, so
+ * `\p{Cf}` does not reach it, and while it is default-ignorable today that
+ * is a DERIVED property this security check should not silently depend on.
+ *
+ * Hand-kept ranges covered five of these families and missed the rest, so an
+ * identical marker carrying U+061C, U+2066, U+00AD, U+FE0F, U+E0061 or
+ * U+034F walked past the scanner that stopped U+200B and U+202E.
+ *
+ * Every Bidi_Control code point (U+061C, U+200E–U+200F, U+202A–U+202E,
+ * U+2066–U+2069) is `Cf`, so "bidi control characters are stripped" is now
+ * true of the whole class, which is what docs/policy.md claims.
+ *
+ * `\p{Cc}` — the C0 and C1 control characters, DEL, and the ESC that starts
+ * an ANSI escape sequence — joins them for the same reason: a terminal, a
+ * log viewer and a chat client all render them as nothing, so
+ * `sys<U+0001>tem override` READS as the marker while a scan of the raw
+ * bytes saw two harmless fragments. The five whitespace controls
+ * (\t \n \v \f \r) are deliberately NOT dropped here: they are visible as
+ * layout, and the whitespace collapse below already folds them to a single
+ * space, which is what keeps `ignore\nall previous instructions` matching.
+ *
+ * Exported so the astral table below can be re-derived from it in the tests
+ * rather than restated there (a second copy would drift).
+ */
+export declare const INVISIBLE_RE: RegExp;
+/**
+ * The ONLY astral ranges `INVISIBLE_RE` contains, so an astral code point
+ * costs a few integer comparisons instead of a `String.fromCodePoint`
+ * allocation plus a property-escape regex test on every occurrence. Plane 14
+ * (tags, variation selectors supplement) is NOT the only one, which is why
+ * the list is spelled out rather than short-circuited on that block: the
+ * Kaithi number signs, the Egyptian Hieroglyph and Shorthand format
+ * controls, and the musical-symbol format characters are all `Cf` outside
+ * it. `test/gateway-boundary.test.ts` re-derives this table from
+ * `INVISIBLE_RE` across all of U+10000–U+10FFFF, so Unicode drift is a test
+ * failure rather than a silent hole.
+ */
+export declare const ASTRAL_INVISIBLE_RANGES: readonly (readonly [number, number])[];
 /**
  * Build the normalized copy of `original` used for marker scanning, together
  * with the run mapping that puts spans back on the original text. Pure and
  * total: any string is accepted, nothing throws.
  */
-export declare function normalizeForScan(original: string): NormalizedScan;
+export declare function normalizeForScan(original: string, opts?: NormalizeOptions): NormalizedScan;
 /**
  * Locate every injection marker in `text`. Returns merged, sorted,
  * non-overlapping spans ON THE ORIGINAL TEXT. Scanning runs on the
  * normalized copy (see `normalizeForScan`), so markers hidden behind
- * zero-width characters or NFKC-foldable homoglyphs are found too. Never
+ * invisible characters or NFKC-foldable homoglyphs are found too. Never
  * throws; non-string input yields `[]`, and text beyond `MAX_SCAN_CHARS` is
  * not examined.
+ *
+ * Combining marks need a SECOND copy. A mark is a visible character, so
+ * dropping it for everyone would fold distinct words together, but
+ * `igno<U+0301>re all previous instructions` and `ignoré all previous
+ * instructions` both read as the marker to whoever looks at the rendered
+ * text. The second copy folds with NFKD and drops `\p{Mn}`/`\p{Me}`
+ * instead, and the two span sets are unioned. It is built only when the
+ * first pass actually saw a mark, and it carries its OWN run table, so the
+ * mapping guarantee is unchanged: a span from either copy lands exactly on
+ * the original characters its normalized match came from. (A mark hanging
+ * off the LAST matched character is therefore outside the span, the same way
+ * a trailing zero-width character always was: the span covers what matched,
+ * so a redaction can leave a stray accent behind but never eats a neighbour.)
  */
 export declare function findInjectionSpans(text: string): Span[];
 export {};

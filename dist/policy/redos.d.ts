@@ -43,6 +43,18 @@
  * against a 4096-character value (the `REGEX_VALUE_CAP` a single argument can
  * reach) takes 8.6 s here, where RE2 answers instantly.
  *
+ * That second rule looks THROUGH parentheses that are pure concatenation. A
+ * group carrying no quantifier and no top-level alternation means exactly what
+ * its body means — `([a-z]+)([a-z]+)([a-z]+)x` IS `[a-z]+[a-z]+[a-z]+x`, and
+ * the same 4096-character value takes 8.2 s against the first spelling and
+ * 8.6 s against the second (measured; with a fourth group, 22 s at 512
+ * characters alone). Such a group is therefore inlined into its parent branch
+ * before the adjacency scan, so the two spellings of one regex get one answer
+ * instead of the group form slipping through as "opaque". Parentheses that are
+ * repeated (`([a-z0-9-]+\.)*`) or that alternate (`(^|/)`) are NOT pure
+ * concatenation and stay opaque here; the first family above is what looks
+ * inside those.
+ *
  * {@link checkProvablyLinear} is the stricter, POSITIVE form of the same
  * analysis: it is what the runtime guard consults when it has no worker
  * thread and has to decide whether a pattern may be run on the proxy thread

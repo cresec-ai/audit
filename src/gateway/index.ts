@@ -11,6 +11,7 @@ export {
   mergeSpans,
   normalizeForScan,
   type InjectionPattern,
+  type NormalizeOptions,
   type NormalizedScan,
   type Span,
 } from './injection.js';

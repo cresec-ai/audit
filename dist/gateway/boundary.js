@@ -26,6 +26,15 @@
  * shapes were missing (or, for the assignment, blinded by a `\b` that `_`
  * defeats).
  *
+ * Nor may the widening that puts them back rewrite ordinary output: an affix
+ * of any 62 characters riding the bare keyword made `MAX_TOKEN_LENGTH = 512`
+ * and `secret_scanning_enabled: true` "credentials". The assignment shape is
+ * therefore TWO families — a permissive BARE one where the keyword is the
+ * whole name (which also reaches the JSON shape `{"password": "hunter2"}`,
+ * the commonest one in an MCP tool result) and an AFFIXED one that also
+ * requires the value to look like a credential — plus a third for a flag
+ * whose value is the next argument (`--password hunter2`).
+ *
  * Invariants:
  *  - `applyBoundary()` NEVER throws and NEVER mutates its input; a changed
  *    message is a fresh tree that shares only untouched subtrees.
@@ -132,8 +141,10 @@ export const BOUNDARY_SECRET_FAMILIES = [
     },
     {
         id: 'github-fine-grained-pat',
-        re: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/,
-        note: 'A `github_pat_` prefix plus 22+ token characters is a fine-grained PAT and nothing else.',
+        re: /\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b/,
+        note: 'The real fine-grained PAT shape: `github_pat_` + a 22-character base62 id + `_` + a ' +
+            '59-character base62 secret. Spelling it out keeps ordinary snake_case identifiers that ' +
+            'merely start with the prefix (`github_pat_token_refresh_helper_result`) out.',
     },
     {
         id: 'slack-token',
@@ -147,17 +158,37 @@ export const BOUNDARY_SECRET_FAMILIES = [
     },
     {
         id: 'url-userinfo',
-        re: /(?<=:\/\/)[^\s:/?#@]{1,128}:[^\s/?#@]{1,128}(?=@)/,
+        re: /(?<=:\/\/)[^\s:/?#@]{1,128}:[^\s/?#@]{1,128}(?=@(?:\[[0-9A-Fa-f:.]{2,45}\]|[\w.-]{1,255})(?::\d{1,5})?(?![\w.:-]))/,
         note: 'The `user:pass` of a URL that carries userinfo (`postgres://user:pass@host/db`). ' +
-            'Only the userinfo is the span, so the scheme, host and path the model needs stay readable.',
+            'Only the userinfo is the span, so the scheme, host and path the model needs stay readable. ' +
+            'What follows the `@` must look like a host, so a container reference ' +
+            '(`oci://redis:7.2@sha256:…`) is not mistaken for userinfo.',
     },
     {
         id: 'secret-assignment',
-        re: /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?\s*[:=]\s*\S+/i,
-        note: '`password=`, `passwd:`, `secret=`, `token:`, `api_key=` with a value, including the ' +
-            'env-var-shaped names that carry them (`AWS_SECRET_ACCESS_KEY=`, `DB_PASSWORD=`, ' +
-            '`X-Api-Key:`). The affixes must be separated from the keyword by `_`/`-`, so ' +
-            '`secretary_id=5` and `tokenizer_count=3` are not credentials.',
+        re: /(?<![\w-])-{0,2}(?:password|passwd|secret|token|api[_-]?key)["']?\s*[:=]\s*(?:"[^"\s]+"|'[^'\s]+'|\S+)/i,
+        note: '`password=`, `passwd:`, `secret=`, `token:`, `api_key=` with a value, where the keyword ' +
+            'IS the whole name — including the JSON shape an MCP tool result carries it in ' +
+            '(`{"password": "hunter2"}`), where the closing quote sits between the keyword and the ' +
+            'separator. Nothing else is called `password`, so any value counts.',
+    },
+    {
+        id: 'secret-assignment-affixed',
+        re: /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/i,
+        note: 'The env-var-shaped names that carry a credential (`AWS_SECRET_ACCESS_KEY=`, ' +
+            '`DB_PASSWORD=`, `X-Api-Key:`). The affix must be separated from the keyword by `_`/`-` ' +
+            'AND the value must look like a credential (8+ characters with a digit, or 16+), so ' +
+            '`MAX_TOKEN_LENGTH = 512`, `access_token_expires_in: 3600` and ' +
+            '`secret_scanning_enabled: true` are left alone.',
+    },
+    {
+        id: 'credential-flag-value',
+        re: /(?<![\w-])-{1,2}(?:[A-Za-z0-9-]{0,62}-)?(?:password|passwd|secret|token|api-?key)(?:-[A-Za-z0-9-]{0,62})?[ \t]+(?:(?=\S{0,255}\d)[^\s<$]\S{5,}|[^\s<$]\S{15,})/i,
+        note: 'A command line in tool output that passes the credential as the NEXT argument ' +
+            '(`--password hunter2`). The value must look like a credential (6+ characters with a ' +
+            'digit, or 16+) and may not start with `<` or `$`, which keeps `--secret-scanning ' +
+            'enabled`, `--token to authenticate`, `--api-key <your-key-here>` and ' +
+            '`--token $GITHUB_TOKEN` out.',
     },
 ];
 const BOUNDARY_SOURCES = new Set(BOUNDARY_SECRET_FAMILIES.map((f) => f.re.source));

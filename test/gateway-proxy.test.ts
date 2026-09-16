@@ -34,8 +34,12 @@ import type { LoadedPolicy } from '../src/policy/load.js';
 import type { Policy, PolicyInput } from '../src/policy/types.js';
 import { validatePolicyObject } from '../src/policy/validate.js';
 import {
+  DUPLICATE_REQUEST_ID_MESSAGE,
+  INVALID_ID_TOOLS_CALL_MESSAGE,
   MAX_HOLDS,
+  NESTED_BATCH_MESSAGE,
   NULL_ID_TOOLS_CALL_MESSAGE,
+  OVERSIZED_LINE_MESSAGE,
   duplicateIdText,
   runStdioProxy,
 } from '../src/proxy/stdio.js';
@@ -1244,43 +1248,43 @@ describe('gateway: framing, EPIPE and shutdown', () => {
     expect(call.gateway).toEqual({ decision: 'allow' });
   });
 
-  it('a line above the 32 MiB tap cap streams through unchanged in both directions (documented v1 limit), and traffic recovers', async () => {
-    const s = startProxy(standardPolicy());
-    await handshake(s);
+  it('a line above the 32 MiB tap cap streams through unchanged SERVER->CLIENT (documented v1 limit), and a synthesized line waits for it to finish', async () => {
+    // The client->server direction is no longer part of this limit: a line
+    // the policy cannot see is refused fail-closed (see G1 below). Coming
+    // BACK, an oversized line still streams through — buffering the server's
+    // output has no bearing on what the client is allowed to ask for.
     const pad = 'p'.repeat(32 * 1024 * 1024 + 1024);
-    // Even a tool the policy DENIES rides through: the line cannot be parsed, so it cannot be evaluated.
-    const line = JSON.stringify(toolsCall(2, 'delete_huge', { pad })) + '\n';
-    const bytes = Buffer.from(line);
-    const third = Math.floor(bytes.length / 3);
-    s.sendRaw(bytes.subarray(0, third).toString('latin1'));
-    s.sendRaw(bytes.subarray(third, 2 * third).toString('latin1'));
-    s.sendRaw(bytes.subarray(2 * third).toString('latin1'));
-    // While the oversized RESPONSE is streaming through (it is forwarded piecewise, so the client
-    // holds a partial line), a denied call's synthesized line must wait for that line to complete.
-    await waitFor(() => s.out.raw().length > 1024 * 1024, 'huge echo streaming', 120_000);
+    const huge =
+      JSON.stringify({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: pad }] } }) + '\n';
+    const s = startProxy(standardPolicy(), {
+      command: scriptServer(
+        "'use strict';\n" +
+          'process.stdin.resume();\n' +
+          `process.stdout.write(${JSON.stringify(huge)});\n` +
+          "process.stdin.on('end', () => process.exit(0));\n",
+      ),
+    });
+    // While the oversized RESPONSE is streaming through (it is forwarded
+    // piecewise, so the client holds a partial line), a denied call's
+    // synthesized line must wait for that line to complete.
+    await waitFor(() => s.out.raw().length > 1024 * 1024, 'huge line streaming', 120_000);
     s.send(toolsCall(4, 'delete_mid_stream', {}));
-    await waitFor(() => s.out.raw().length > bytes.length, 'huge echo back', 120_000);
     await waitFor(() => s.responded(2)() && s.responded(4)(), 'huge response + deferred deny parseable', 120_000);
     const res = s.response(2).result as { content: { text: string }[] };
-    expect(res.content[0]!.text.length).toBe(JSON.stringify({ pad }).length);
+    expect(res.content[0]!.text).toBe(pad); // byte-for-byte, all 32 MiB of it
     const ids = s.out.lines().map((l) => parseLine(l)?.id);
     expect(ids.indexOf(4)).toBeGreaterThan(ids.indexOf(2)); // deferred until the oversized line was whole
-    s.send(toolsCall(3, 'echo', { after: true }));
-    await waitFor(s.responded(3), 'traffic after the oversized line');
     s.stdin.end();
     await s.done;
     for (const l of s.out.lines()) expect(parseLine(l)).toBeDefined(); // every line intact
     const errs = s.events().filter((e): e is ProtocolErrorEvent => e.kind === 'protocol_error');
-    expect(errs.map((e) => [e.direction, e.reason])).toEqual([
-      ['client_to_server', 'oversized'],
-      ['server_to_client', 'oversized'],
-    ]);
-    expect(errs[0]!.bytes_len).toBe(bytes.length - 1);
+    expect(errs.map((e) => [e.direction, e.reason])).toEqual([['server_to_client', 'oversized']]);
+    expect(errs[0]!.bytes_len).toBe(Buffer.byteLength(huge) - 1);
     expect(decisions(s.events()).map((d) => d.request_id)).toEqual([4]);
-    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([4, 3]);
-  }, 180_000); // 32 MiB each way through a real child: slow on a loaded 2-vCPU runner
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([4]);
+  }, 180_000); // 32 MiB through a real child: slow on a loaded 2-vCPU runner
 
-  it('a tools/call notification (no id) is forwarded unevaluated; one without a name is evaluated as the empty tool name (allowed by this policy default)', async () => {
+  it('a tools/call notification (no id) is evaluated and a deny DROPS it; one without a name is evaluated as the empty tool name (allowed by this policy default)', async () => {
     const s = startProxy(standardPolicy());
     await handshake(s);
     s.send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'delete_x', arguments: {} } });
@@ -1288,6 +1292,10 @@ describe('gateway: framing, EPIPE and shutdown', () => {
     await waitFor(s.responded(2), 'nameless call answered by the server');
     s.stdin.end();
     await s.done;
+    // The denied notification never reached the server; see G5 for the proof
+    // from a server that reports what it executed. No `policy_decision` can
+    // be written for it: the frozen schema's request_id is `string | number`.
+    expect(s.err.raw()).toContain('gateway: denied tools/call NOTIFICATION "delete_x"');
     expect(decisions(s.events())).toHaveLength(0);
     const call = toolCalls(s.events())[0]!;
     expect(call.request_id).toBe(2);
@@ -1604,7 +1612,7 @@ describe('gateway: adversarial regressions', () => {
     assertChainIntact(s.store);
   });
 
-  it('F4: an approved hold is never spliced into an oversized client line still streaming through', async () => {
+  it('F4: an approved hold is never spliced into a client line still arriving', async () => {
     const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)), {
       // Reports the exact byte length of every line it managed to parse.
       command: lineServer("  if (msg && msg.id !== undefined) answer(msg.id, 'len=' + Buffer.byteLength(line));"),
@@ -1614,7 +1622,11 @@ describe('gateway: adversarial regressions', () => {
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
     const [pending] = s.holdStore.list();
 
-    const line = Buffer.from(JSON.stringify(toolsCall(2, 'echo', { pad: 'p'.repeat(32 * 1024 * 1024) })) + '\n');
+    // Under the line cap, so it IS forwarded (an oversized one is now refused
+    // fail-closed and never reaches the server at all — see G1); big enough
+    // that the client holds a partial line for a quarter of a second, which
+    // is the condition the deferral guards.
+    const line = Buffer.from(JSON.stringify(toolsCall(2, 'echo', { pad: 'p'.repeat(4 * 1024 * 1024) })) + '\n');
     const half = Math.floor(line.length / 2);
     s.stdin.write(line.subarray(0, half));
     await sleep(250); // a partial (oversized) client line is now in flight
@@ -1869,10 +1881,13 @@ describe('gateway: duplicate and null request ids', () => {
     assertChainIntact(s.store);
   });
 
-  it('E1: an approved hold reclaims its pending slot and seals whatever took it as duplicate_id (nothing silently lost)', async () => {
-    // Answers tools/call only: the tools/list below stays in flight, sitting
-    // on the same id as the parked hold (the gateway guards tools/call, so
-    // that is how another request can still reach the same pending key).
+  it('E1: a NON-tools/call request may not take a held id either — it is refused, sealed, and never forwarded', async () => {
+    // This used to be the one way another request could still reach a
+    // pending key the gateway was holding: the duplicate-id gate only
+    // guarded `tools/call`, so a same-id `tools/list` crossed, took the
+    // slot, and the reclaim-seal on the hold path was the only thing
+    // standing between that and an executed call vanishing from the chain.
+    // The gate now runs for EVERY c2s request, so the clobber never happens.
     const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)), {
       command: lineServer(`
   if (!msg || msg.id === undefined) return;
@@ -1884,16 +1899,23 @@ describe('gateway: duplicate and null request ids', () => {
     await waitFor(() => s.holdStore.list().length === 1, 'hold file');
     const [parked] = s.holdStore.list();
     s.send({ jsonrpc: '2.0', id: 7, method: 'tools/list' });
-    await waitFor(() => s.out.raw().includes('notifications/saw'), 'the server has the tools/list');
+    await waitFor(() => responsesFor(s, 7).length === 1, 'the duplicate-id refusal');
 
+    // Refused with a plain JSON-RPC error — no model reads this one — and
+    // the server never saw it.
+    const refusal = responsesFor(s, 7)[0]!;
+    expect(refusal.error).toEqual({ code: -32600, message: DUPLICATE_REQUEST_ID_MESSAGE });
+    expect(s.out.raw()).not.toContain('notifications/saw');
+
+    // The hold still owns its id and still answers correctly.
     s.holdStore.decide(parked!.approval_id, 'approved', 'alice');
-    await waitFor(() => responsesFor(s, 7).length === 1, 'the approved call, forwarded and answered');
-    expect((responsesFor(s, 7)[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe('{"n":1}');
+    await waitFor(() => responsesFor(s, 7).length === 2, 'the approved call, forwarded and answered');
+    expect((responsesFor(s, 7)[1]!.result as { content: { text: string }[] }).content[0]!.text).toBe('{"n":1}');
     s.stdin.end();
     expect(await s.done).toBe(0);
 
     const events = s.events();
-    // The displaced request was sealed with its own evidence, not overwritten.
+    // The refused request is sealed with its own evidence, not silently dropped.
     const sealed = events.filter((e): e is RpcEvent => e.kind === 'rpc' && e.error?.type === 'duplicate_id');
     expect(sealed).toHaveLength(1);
     expect(sealed[0]).toMatchObject({
@@ -1909,7 +1931,10 @@ describe('gateway: duplicate and null request ids', () => {
     expect(call.is_error).toBe(false);
     expect(call.gateway).toMatchObject({ decision: 'hold', outcome: 'approved', approval_id: parked!.approval_id });
     expect(events.indexOf(sealed[0]!)).toBeLessThan(events.indexOf(call));
-    expect(s.err.raw()).toContain('sealed as duplicate_id before the approved tools/call took the slot back');
+    expect(s.err.raw()).toContain('gateway: refused a "tools/list" request — a tools/call with this id is already held for approval (id 7)');
+    // Nothing landed uncorrelated: the seal is the last resort, not the mitigation.
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    expect(s.err.raw()).not.toContain('before the approved tools/call took the slot back');
     assertChainIntact(s.store);
   });
 
@@ -2441,8 +2466,8 @@ describe('F7: a boundary rewrite edits only what it redacted', () => {
   });
 });
 
-describe('gateway: hashing what was delivered is recording, and recording fails open', () => {
-  it('a result tree too deep to hash still reaches the client redacted, and the rest of its chunk with it', async () => {
+describe('gateway: hashing what was delivered is recording, and it never costs the event', () => {
+  it('a result tree too deep for a recursive hash still reaches the client redacted, AND still lands in the chain', async () => {
     const s = startProxy(ALLOW_SCAN, { command: reportingServer() });
     await handshake(s);
     // 100,000 levels of nesting (a 200 KB line, well under the 1 MiB default
@@ -2469,12 +2494,466 @@ describe('gateway: hashing what was delivered is recording, and recording fails 
     s.stdin.end();
     expect(await s.done).toBe(0);
 
-    // RECORDING is what degraded: building the event for a tree this deep
-    // throws too, so the guarded tap drops it and says so on stderr. The
-    // call that followed is recorded normally and the chain still verifies.
-    expect(s.err.raw()).toContain('tap error (recording degraded, traffic unaffected)');
-    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([3]);
+    // RECORDING no longer degrades either. The hashing path is depth-bounded
+    // (`boundedCanonicalJson`), so a tree this deep costs a marker inside one
+    // hash and nothing else: BOTH calls are recorded, with a real
+    // `delivered_result_hash`. The arrangement this replaces lost the entire
+    // `tool_call` for id 2 behind a fail-open catch — evidence gone while
+    // `verify` still reported PASS.
+    expect(s.err.raw()).not.toContain('tap error (recording degraded, traffic unaffected)');
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([2, 3]);
+    const deepCall = toolCalls(s.events()).find((c) => c.request_id === 2)!;
+    expect(deepCall.result_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(deepCall.gateway?.boundary).toMatchObject({ scanned: true, action: 'redact', secrets_found: 1 });
+    expect(deepCall.gateway?.boundary?.delivered_result_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(s.recorder.stats().dropped).toBe(0);
     assertNoLeak(s, AWS_KEY);
+    assertChainIntact(s.store);
+  });
+});
+
+/* ---------- adversarial-review regressions, round 3 (G1-G8) -------------- */
+
+/**
+ * A server that ANNOUNCES every `tools/call` it sees as a
+ * `notifications/executed` line, so a test can assert what actually reached
+ * it rather than inferring it from a response. With `flatten` it also
+ * recurses into nested arrays, the way a lenient server that flattens its
+ * input does — which is what makes a nested batch a real bypass and not a
+ * theoretical one. `delayMs` in the arguments defers the answer, so a call
+ * can be left genuinely in flight.
+ */
+function witnessServer(opts: { flatten?: boolean } = {}): string[] {
+  return lineServer(`
+  const run = (m) => {
+    if (Array.isArray(m)) { ${opts.flatten === true ? 'm.forEach(run);' : ''} return; }
+    if (!m || typeof m !== 'object') return;
+    if (m.method === 'tools/call') {
+      send({ jsonrpc: '2.0', method: 'notifications/executed', params: { name: (m.params || {}).name } });
+    }
+    if (m.id === undefined || m.id === null) return;
+    if (m.method === 'initialize') {
+      send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2024-11-05', serverInfo: { name: 'witness', version: '1.0.0' }, capabilities: {} } });
+      return;
+    }
+    const text = m.method === 'tools/call' ? 'ran ' + (m.params || {}).name : 'ok ' + m.method;
+    const wait = ((m.params || {}).arguments || {}).delayMs;
+    if (wait) setTimeout(() => answer(m.id, text), wait);
+    else answer(m.id, text);
+  };
+  if (Array.isArray(msg)) msg.forEach(run); else run(msg);
+`);
+}
+
+/** The tool names the witness server actually executed, in order. */
+function executed(s: Session): string[] {
+  const names: string[] = [];
+  for (const l of s.out.lines()) {
+    const m = parseLine(l);
+    if (m?.method !== 'notifications/executed') continue;
+    names.push(String((m.params as { name?: unknown }).name));
+  }
+  return names;
+}
+
+/** Every response element the client received, batch arrays flattened out. */
+function clientMessages(s: Session): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const l of s.out.lines()) {
+    let v: unknown;
+    try {
+      v = JSON.parse(l);
+    } catch {
+      continue;
+    }
+    for (const el of Array.isArray(v) ? v : [v]) {
+      if (typeof el === 'object' && el !== null && !Array.isArray(el)) out.push(el as Record<string, unknown>);
+    }
+  }
+  return out;
+}
+
+/** The JSON-RPC error object of a response, or undefined. */
+function errorOf(msg: Record<string, unknown>): { code?: number; message?: string } | undefined {
+  const e = msg['error'];
+  return typeof e === 'object' && e !== null ? (e as { code?: number; message?: string }) : undefined;
+}
+
+describe('G1: a client line the policy could not see never reaches the server', () => {
+  it('a batch padded past the line cap is refused fail-closed (batch response), the denied tool never runs, and traffic recovers', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    expect(executed(s)).toEqual([]);
+
+    // The bypass: a policy-DENIED tools/call inside a batch, padded past the
+    // 32 MiB cap so the line can never be buffered, parsed or evaluated.
+    const pad = 'x'.repeat(32 * 1024 * 1024 + 1024);
+    const batch = [toolsCall(2, 'delete_everything', { pad })];
+    s.sendRaw(JSON.stringify(batch) + '\n');
+    await waitFor(() => clientMessages(s).some((m) => errorOf(m)?.code === -32600), 'the fail-closed refusal', 120_000);
+
+    // Nothing of that line reached the server: no execution, and the tool
+    // the policy denies most certainly did not run.
+    expect(executed(s)).toEqual([]);
+    const refusal = clientMessages(s).find((m) => errorOf(m)?.code === -32600)!;
+    expect(refusal['id']).toBeNull(); // the line was never parsed: its id is unknowable
+    expect(errorOf(refusal)!.message).toBe(OVERSIZED_LINE_MESSAGE);
+    // A batch gets a batch response: the client sent '[', so the refusal is an array element.
+    const refusalLine = s.out.lines().find((l) => l.includes(OVERSIZED_LINE_MESSAGE))!;
+    expect(JSON.parse(refusalLine)).toEqual([
+      { jsonrpc: '2.0', id: null, error: { code: -32600, message: OVERSIZED_LINE_MESSAGE } },
+    ]);
+
+    // The stream is not poisoned: the very next call is evaluated normally.
+    s.send(toolsCall(3, 'echo', { after: true }));
+    await waitFor(s.responded(3), 'traffic after the refused line');
+    expect(executed(s)).toEqual(['echo']);
+    s.stdin.end();
+    await s.done;
+
+    // Recorded exactly as record mode records it — the evidence of the line
+    // is unchanged, only its fate is.
+    const errs = s.events().filter((e): e is ProtocolErrorEvent => e.kind === 'protocol_error');
+    expect(errs.map((e) => [e.direction, e.reason])).toEqual([['client_to_server', 'oversized']]);
+    expect(errs[0]!.bytes_len).toBe(Buffer.byteLength(JSON.stringify(batch)));
+    expect(s.err.raw()).toContain('too large to buffer, so the policy could not see it; not forwarded');
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([3]);
+    assertChainIntact(s.store);
+  }, 180_000);
+
+  it('a standalone oversized line gets a single-object refusal, not a batch one', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.sendRaw(JSON.stringify(toolsCall(2, 'delete_huge', { pad: 'y'.repeat(32 * 1024 * 1024 + 8) })) + '\n');
+    await waitFor(() => s.out.lines().some((l) => l.includes(OVERSIZED_LINE_MESSAGE)), 'the refusal', 120_000);
+    expect(executed(s)).toEqual([]);
+    const line = s.out.lines().find((l) => l.includes(OVERSIZED_LINE_MESSAGE))!;
+    expect(JSON.parse(line)).toEqual({ jsonrpc: '2.0', id: null, error: { code: -32600, message: OVERSIZED_LINE_MESSAGE } });
+    s.stdin.end();
+    await s.done;
+    assertChainIntact(s.store);
+  }, 180_000);
+
+});
+
+describe('G2: a tools/call id that is not a string or a number', () => {
+  it('true / {} / [] are refused standalone and inside a batch, never forwarded, and never reach request_id', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+
+    s.sendRaw(JSON.stringify({ jsonrpc: '2.0', id: true, method: 'tools/call', params: { name: 'delete_bool', arguments: {} } }) + '\n');
+    s.sendRaw(
+      JSON.stringify([
+        { jsonrpc: '2.0', id: {}, method: 'tools/call', params: { name: 'delete_obj', arguments: {} } },
+        { jsonrpc: '2.0', id: [], method: 'tools/call', params: { name: 'delete_arr', arguments: {} } },
+        toolsCall(2, 'echo', { ok: true }),
+      ]) + '\n',
+    );
+    await waitFor(s.responded(2), 'the valid element of the batch');
+    s.stdin.end();
+    await s.done;
+
+    // Not one of them ran; only the element with a usable id did.
+    expect(executed(s)).toEqual(['echo']);
+
+    const refusals = clientMessages(s).filter((m) => errorOf(m)?.message === INVALID_ID_TOOLS_CALL_MESSAGE);
+    expect(refusals).toHaveLength(3);
+    for (const r of refusals) {
+      expect(r['id']).toBeNull(); // the offending id is never echoed back
+      expect(errorOf(r)!.code).toBe(-32600);
+    }
+    // The two batch refusals came back as elements of a batch response.
+    const batchLine = s.out.lines().find((l) => l.trimStart().startsWith('[') && l.includes(INVALID_ID_TOOLS_CALL_MESSAGE))!;
+    expect((JSON.parse(batchLine) as unknown[]).length).toBe(2);
+
+    // The frozen schema says request_id is `string | number`. Nothing else
+    // may ever appear there — that was the second half of this bypass.
+    for (const e of s.events()) {
+      const rid = (e as { request_id?: unknown }).request_id;
+      if (rid !== undefined) expect(['string', 'number']).toContain(typeof rid);
+    }
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([2]);
+    // Recorded the way the tap has always recorded an id-less message.
+    expect(s.events().filter((e) => e.kind === 'notification' && e.method === 'tools/call')).toHaveLength(3);
+    expect(s.err.raw()).toContain('an id that is neither a string nor a number');
+    assertChainIntact(s.store);
+  });
+
+  it('id: null keeps its own message, and a fractional number IS a usable id, so it is evaluated like any other', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.sendRaw(JSON.stringify({ jsonrpc: '2.0', id: null, method: 'tools/call', params: { name: 'delete_null', arguments: {} } }) + '\n');
+    // 1.5 is a JSON number, so `isRpcId` accepts it, the policy evaluates it
+    // and `request_id: 1.5` is schema-legal. It is NOT part of the bypass.
+    s.send(toolsCall(1.5, 'delete_frac', {}));
+    await waitFor(() => s.out.lines().some((l) => parseLine(l)?.id === 1.5), 'the fractional-id deny');
+    s.stdin.end();
+    await s.done;
+
+    expect(executed(s)).toEqual([]);
+    expect(clientMessages(s).some((m) => errorOf(m)?.message === NULL_ID_TOOLS_CALL_MESSAGE)).toBe(true);
+    const deny = decisions(s.events()).find((d) => d.request_id === 1.5)!;
+    expect(deny).toMatchObject({ decision: 'deny', rule_id: 'no-delete', tool: 'delete_frac' });
+    assertChainIntact(s.store);
+  });
+});
+
+describe('G3: a same-id request of ANY method may not take an in-flight tools/call slot', () => {
+  it('a standalone tools/list reusing a live tools/call id is refused; the executed call keeps its tool_call event', async () => {
+    const s = startProxy(ALLOW_ALL, { command: witnessServer() });
+    await handshake(s);
+    s.send(toolsCall(7, 'transfer_funds', { delayMs: 400 }));
+    await waitFor(() => executed(s).includes('transfer_funds'), 'the call to be in flight');
+    s.send({ jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} });
+    await waitFor(() => clientMessages(s).some((m) => errorOf(m)?.message === DUPLICATE_REQUEST_ID_MESSAGE), 'the refusal');
+    // NB: a response with id 7 already exists (the refusal), so wait for the
+    // one carrying the tool's real RESULT.
+    await waitFor(
+      () => clientMessages(s).some((m) => m['id'] === 7 && m['result'] !== undefined),
+      'the real tools/call result',
+    );
+    s.stdin.end();
+    await s.done;
+
+    // The clobbering request never reached the server...
+    expect(clientMessages(s).some((m) => m['id'] === 7 && errorOf(m)?.code === -32600)).toBe(true);
+    // ...and the call that DID execute is in the chain, correlated, with its
+    // own arguments and its own result — not attributed to tools/list.
+    const call = toolCalls(s.events()).find((c) => c.request_id === 7)!;
+    expect(call.tool).toBe('transfer_funds');
+    expect(call.is_error).toBe(false);
+    expect(call.gateway).toMatchObject({ decision: 'allow' });
+    // The refused request is sealed rather than silently dropped.
+    const rpc = s.events().find((e): e is RpcEvent => e.kind === 'rpc' && e.request_id === 7)!;
+    expect(rpc.method).toBe('tools/list');
+    expect(rpc.error?.type).toBe('duplicate_id');
+    expect(s.events().some((e) => e.kind === 'protocol_error' && e.reason === 'orphan_response')).toBe(false);
+    assertChainIntact(s.store);
+  });
+
+  it('the same refusal runs for a batch element, routed exactly like the standalone path', async () => {
+    const s = startProxy(ALLOW_ALL, { command: witnessServer() });
+    await handshake(s);
+    s.send(toolsCall(8, 'wire_money', { delayMs: 400 }));
+    await waitFor(() => executed(s).includes('wire_money'), 'the call to be in flight');
+    s.sendRaw(JSON.stringify([{ jsonrpc: '2.0', id: 8, method: 'tools/list', params: {} }]) + '\n');
+    await waitFor(() => clientMessages(s).some((m) => errorOf(m)?.message === DUPLICATE_REQUEST_ID_MESSAGE), 'the refusal');
+    await waitFor(
+      () => clientMessages(s).some((m) => m['id'] === 8 && m['result'] !== undefined),
+      'the real tools/call result',
+    );
+    s.stdin.end();
+    await s.done;
+
+    expect(executed(s)).toEqual(['wire_money']);
+    const call = toolCalls(s.events()).find((c) => c.request_id === 8)!;
+    expect(call.tool).toBe('wire_money');
+    expect(call.is_error).toBe(false);
+    const rpc = s.events().find((e): e is RpcEvent => e.kind === 'rpc' && e.request_id === 8)!;
+    expect(rpc.error?.type).toBe('duplicate_id');
+    assertChainIntact(s.store);
+  });
+});
+
+describe('G4: a nested array inside a batch is not a way in', () => {
+  it('[[tools/call]] is refused even though the server would flatten it', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer({ flatten: true }) });
+    await handshake(s);
+    s.sendRaw(JSON.stringify([[toolsCall(9, 'delete_nested', {})], toolsCall(10, 'echo', { ok: true })]) + '\n');
+    await waitFor(s.responded(10), 'the sibling element');
+    s.stdin.end();
+    await s.done;
+
+    expect(executed(s)).toEqual(['echo']); // the nested denied call never ran
+    const refusal = clientMessages(s).find((m) => errorOf(m)?.message === NESTED_BATCH_MESSAGE)!;
+    expect(refusal).toBeDefined();
+    expect(refusal['id']).toBeNull();
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([10]);
+    expect(s.err.raw()).toContain('refused a nested array inside a JSON-RPC batch');
+    assertChainIntact(s.store);
+  });
+
+  it('an EMPTY batch still crosses as the client wrote it (there is nothing to evaluate)', async () => {
+    const s = startProxy(standardPolicy(), { command: reportingServer() });
+    await handshake(s);
+    s.sendRaw('[]\n');
+    s.send(toolsCall(20, 'echo', {}));
+    await waitFor(s.responded(20), 'the call after the empty batch');
+    const { raw } = await askServer(s, 21);
+    expect(raw).toContain('[]');
+    s.stdin.end();
+    await s.done;
+    assertChainIntact(s.store);
+  });
+});
+
+describe('G5: a tools/call NOTIFICATION is evaluated like any other tools/call', () => {
+  it('a denied notification inside a batch is dropped; an allowed one is forwarded', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.sendRaw(
+      JSON.stringify([
+        { jsonrpc: '2.0', method: 'tools/call', params: { name: 'delete_notification', arguments: {} } },
+        { jsonrpc: '2.0', method: 'tools/call', params: { name: 'echo_notification', arguments: {} } },
+        toolsCall(11, 'echo', { ok: true }),
+      ]) + '\n',
+    );
+    await waitFor(s.responded(11), 'the request element');
+    s.stdin.end();
+    await s.done;
+
+    expect(executed(s)).toEqual(['echo_notification', 'echo']);
+    expect(s.err.raw()).toContain('denied tools/call NOTIFICATION "delete_notification"');
+    // No id to answer on, so nothing is synthesized back for either one.
+    expect(clientMessages(s).some((m) => m['id'] === null)).toBe(false);
+    // Recorded as the tap has always recorded an id-less message.
+    expect(s.events().filter((e) => e.kind === 'notification' && e.method === 'tools/call')).toHaveLength(2);
+    assertChainIntact(s.store);
+  });
+
+  it('a standalone denied notification is dropped too', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'delete_x', arguments: {} } });
+    s.send(toolsCall(12, 'echo', { ok: true }));
+    await waitFor(s.responded(12), 'the following call');
+    s.stdin.end();
+    await s.done;
+    expect(executed(s)).toEqual(['echo']);
+    expect(s.err.raw()).toContain('denied tools/call NOTIFICATION "delete_x"');
+    assertChainIntact(s.store);
+  });
+});
+
+describe('G6: the splice never falls back to re-serializing a whole message', () => {
+  const LOSSY = '{"bigint":12345678901234567890,"huge":1e400,"token":9007199254740993';
+
+  /** A server that answers with N redactable text blocks plus numbers that do not round-trip. */
+  function lossyNumberServer(blocks: number): string[] {
+    const content: string[] = [];
+    for (let i = 0; i < blocks; i++) {
+      content.push(`{"type":"text","text":"leak ${i} ${AWS_KEY} end"}`);
+    }
+    return scriptServer(
+      "'use strict';\n" +
+        "let buf = '';\n" +
+        "process.stdin.setEncoding('utf8');\n" +
+        "process.stdin.on('data', (c) => { buf += c; let i;\n" +
+        "  while ((i = buf.indexOf('\\n')) !== -1) { const line = buf.slice(0, i); buf = buf.slice(i + 1);\n" +
+        '    let m; try { m = JSON.parse(line); } catch { continue; }\n' +
+        '    if (!m || m.id === undefined || m.id === null) continue;\n' +
+        `    process.stdout.write('{"jsonrpc":"2.0","id":' + JSON.stringify(m.id) + ',"result":${LOSSY},"content":[${content.join(',')}]}}' + '\\n');\n` +
+        '  } });\n' +
+        "process.stdin.on('end', () => process.exit(0));\n",
+    );
+  }
+
+  it('33 redactions on one line still redact, and still leave every number exactly as the server wrote it', async () => {
+    // 33 is one past the old MAX_LINE_EDITS: at 32 the splice worked, at 33 it
+    // re-serialized the whole message and silently rewrote every number in it.
+    const s = startProxy(ALLOW_SCAN, { command: lossyNumberServer(33) });
+    s.send(toolsCall(2, 'fetch', {}));
+    await waitFor(s.responded(2), 'the filtered result');
+    s.stdin.end();
+    await s.done;
+
+    const line = s.out.lines().find((l) => parseLine(l)?.id === 2)!;
+    // The filter did its job: 33 secrets gone.
+    expect(line).not.toContain(AWS_KEY);
+    expect(line.split(AWS_MARKER).length - 1).toBe(33);
+    // And nothing it did not touch changed. These are the exact corruptions
+    // whole-message re-serialization produces.
+    expect(line).toContain('"bigint":12345678901234567890');
+    expect(line).toContain('"huge":1e400');
+    expect(line).toContain('"token":9007199254740993');
+    expect(line).not.toContain('12345678901234567000');
+    expect(line).not.toContain('"huge":null');
+    expect(line).not.toContain('9007199254740992');
+    assertNoLeak(s, AWS_KEY);
+    assertChainIntact(s.store);
+  });
+
+  it('the same holds far past the old cap (500 redactions on one line)', async () => {
+    const s = startProxy(ALLOW_SCAN, { command: lossyNumberServer(500) });
+    s.send(toolsCall(2, 'fetch', {}));
+    await waitFor(s.responded(2), 'the filtered result');
+    s.stdin.end();
+    await s.done;
+    const line = s.out.lines().find((l) => parseLine(l)?.id === 2)!;
+    expect(line.split(AWS_MARKER).length - 1).toBe(500);
+    expect(line).toContain('"bigint":12345678901234567890');
+    expect(line).toContain('"huge":1e400');
+    expect(line).toContain('"token":9007199254740993');
+    assertNoLeak(s, AWS_KEY);
+  });
+});
+
+describe('G7: a result too deep to hash costs one field, never the whole event', () => {
+  /** Answers with a result nested far deeper than `canonicalJson` can recurse. */
+  function deepResultServer(depth: number): string[] {
+    return scriptServer(
+      "'use strict';\n" +
+        `const deep = '['.repeat(${depth}) + '1' + ']'.repeat(${depth});\n` +
+        "let buf = '';\n" +
+        "process.stdin.setEncoding('utf8');\n" +
+        "process.stdin.on('data', (c) => { buf += c; let i;\n" +
+        "  while ((i = buf.indexOf('\\n')) !== -1) { const line = buf.slice(0, i); buf = buf.slice(i + 1);\n" +
+        '    let m; try { m = JSON.parse(line); } catch { continue; }\n' +
+        '    if (!m || m.id === undefined || m.id === null) continue;\n' +
+        `    process.stdout.write('{"jsonrpc":"2.0","id":' + JSON.stringify(m.id) + ',"result":{"content":[{"type":"text","text":"leak ${AWS_KEY} end"}],"deep":' + deep + '}}' + '\\n');\n` +
+        '  } });\n' +
+        "process.stdin.on('end', () => process.exit(0));\n",
+    );
+  }
+
+  it('the client still gets the filtered result AND the tool_call still reaches the chain', async () => {
+    const s = startProxy(ALLOW_SCAN, { command: deepResultServer(6000) });
+    s.send(toolsCall(2, 'fetch_deep', {}));
+    await waitFor(s.responded(2), 'the filtered deep result');
+    s.stdin.end();
+    await s.done;
+
+    // Enforcement still happened.
+    const line = s.out.lines().find((l) => parseLine(l)?.id === 2)!;
+    expect(line).not.toContain(AWS_KEY);
+    expect(line).toContain(AWS_MARKER);
+
+    // The evidence survived. This is the regression: `canonicalJson` blew the
+    // stack inside handleResponse, the throw was swallowed fail-open, and the
+    // ENTIRE tool_call vanished while `verify` still reported PASS.
+    const calls = toolCalls(s.events());
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.request_id).toBe(2);
+    expect(calls[0]!.tool).toBe('fetch_deep');
+    expect(calls[0]!.result_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(calls[0]!.gateway?.boundary?.action).toBe('redact');
+    expect(calls[0]!.gateway?.boundary?.delivered_result_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    // Nothing was degraded: no tap error, no dropped event.
+    expect(s.err.raw()).not.toContain('tap error');
+    expect(s.recorder.stats().dropped).toBe(0);
+    assertNoLeak(s, AWS_KEY);
+    assertChainIntact(s.store);
+  }, 60_000);
+});
+
+describe('G8: one request id gets at most one gateway answer inside a batch', () => {
+  it('a later element reusing an id the gateway already denied gets the duplicate-id refusal, not execution', async () => {
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.sendRaw(JSON.stringify([toolsCall(5, 'delete_it', {}), toolsCall(5, 'echo_it', {})]) + '\n');
+    await waitFor(() => clientMessages(s).some((m) => m['id'] === 5), 'the batch response');
+    s.stdin.end();
+    await s.done;
+
+    // The second element never ran: the id was already answered on.
+    expect(executed(s)).toEqual([]);
+    const answers = clientMessages(s).filter((m) => m['id'] === 5);
+    expect(answers).toHaveLength(2);
+    const texts = answers.map((m) => ((m['result'] as { content: { text: string }[] }).content[0]!.text));
+    expect(texts[0]).toBe(deniedText({ tool: 'delete_it', ruleId: 'no-delete', reason: 'destructive' }));
+    expect(texts[1]).toBe(duplicateIdText('echo_it', 5, 'pending'));
+    const calls = toolCalls(s.events()).filter((c) => c.request_id === 5);
+    expect(calls.map((c) => c.error?.type)).toEqual(['policy_denied', 'duplicate_id']);
     assertChainIntact(s.store);
   });
 });

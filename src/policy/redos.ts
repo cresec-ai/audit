@@ -43,6 +43,18 @@
  * against a 4096-character value (the `REGEX_VALUE_CAP` a single argument can
  * reach) takes 8.6 s here, where RE2 answers instantly.
  *
+ * That second rule looks THROUGH parentheses that are pure concatenation. A
+ * group carrying no quantifier and no top-level alternation means exactly what
+ * its body means — `([a-z]+)([a-z]+)([a-z]+)x` IS `[a-z]+[a-z]+[a-z]+x`, and
+ * the same 4096-character value takes 8.2 s against the first spelling and
+ * 8.6 s against the second (measured; with a fourth group, 22 s at 512
+ * characters alone). Such a group is therefore inlined into its parent branch
+ * before the adjacency scan, so the two spellings of one regex get one answer
+ * instead of the group form slipping through as "opaque". Parentheses that are
+ * repeated (`([a-z0-9-]+\.)*`) or that alternate (`(^|/)`) are NOT pure
+ * concatenation and stay opaque here; the first family above is what looks
+ * inside those.
+ *
  * {@link checkProvablyLinear} is the stricter, POSITIVE form of the same
  * analysis: it is what the runtime guard consults when it has no worker
  * thread and has to decide whether a pattern may be run on the proxy thread
@@ -64,6 +76,12 @@ interface Atom {
   zeroWidth: boolean;
   /** For a group: the parsed body, so a redundant wrapper can be seen through. */
   frame?: Frame;
+  /**
+   * Set when {@link inlinePlainGroups} lifted this atom out of a group it was
+   * the whole of: the group source as the author wrote it (`([a-z]+)` for an
+   * atom whose own text is `[a-z]+`), so a message names the pattern text.
+   */
+  written?: string;
 }
 
 interface Frame {
@@ -216,6 +234,11 @@ function atomText(a: Atom): string {
   return `${a.text}${a.quant ?? ''}`;
 }
 
+/** How an atom is named in a message: the group it was the whole of, when it had one. */
+function shownText(a: Atom): string {
+  return a.written ?? atomText(a);
+}
+
 /**
  * Why the group whose body is `frame`, repeated by the quantifier that makes
  * `label` (the group source plus that quantifier), is exponential — or
@@ -273,11 +296,50 @@ function shapeProblem(frame: Frame, label: string, depth: number): string | unde
 }
 
 /**
+ * `branch` with every PLAIN group — one that carries no quantifier and has no
+ * top-level alternation — replaced by the atoms of its body, recursively.
+ *
+ * Such parentheses are pure concatenation: `(a)(b)` matches exactly what `ab`
+ * matches, and `([a-z]+)([a-z]+)x` exactly what `[a-z]+[a-z]+x` matches. The
+ * adjacency rule below therefore has to see through them, or the identical
+ * regex is judged twice over — rejected written with bare atoms, accepted
+ * written with a pair of redundant parentheses around each one.
+ *
+ * A group with a quantifier is left alone: inlining `(ab)?` or `(ab)*` would
+ * change what the branch matches, and a REPEATED group is {@link shapeProblem}'s
+ * business. A group with a top-level alternation is left alone too: its
+ * branches are alternatives, not a concatenation, so there is no single list of
+ * atoms to splice in. When the inlined body is a single atom the group source
+ * rides along in {@link Atom.written} so the message can quote the pattern as
+ * the author typed it.
+ */
+function inlinePlainGroups(branch: readonly Atom[], depth: number): Atom[] {
+  const out: Atom[] = [];
+  for (const atom of branch) {
+    const frame = atom.frame;
+    const plain = atom.group && atom.quant === undefined && frame !== undefined && frame.branches.length === 1;
+    if (!plain || frame === undefined || depth >= MAX_WRAPPER_DEPTH) {
+      out.push(atom);
+      continue;
+    }
+    const inner = inlinePlainGroups(frame.branches[0] as Atom[], depth + 1);
+    const consuming = inner.filter((a) => !a.zeroWidth);
+    // `([a-z]+)` is one atom wearing parentheses: keep the source for the message.
+    if (consuming.length === 1) out.push({ ...(consuming[0] as Atom), written: atom.text });
+    else out.push(...inner);
+  }
+  return out;
+}
+
+/**
  * Why one alternation branch has two repeated atoms that can match the same
  * characters, with nothing in between that has to be consumed — or undefined.
  * `[a-z]*[a-z]*x` is the shape; `[a-z]+\.` and `.*secret.*` are not (the
  * second atom of each pair is anchored by text the first cannot swallow, or
  * separated by a literal that must be consumed).
+ *
+ * Call it on a branch that has been through {@link inlinePlainGroups}, so that
+ * `([a-z]+)([a-z]+)x` is seen as the `[a-z]+[a-z]+x` it is.
  */
 function adjacentProblem(branch: readonly Atom[]): string | undefined {
   for (let i = 0; i < branch.length; i++) {
@@ -289,8 +351,8 @@ function adjacentProblem(branch: readonly Atom[]): string | undefined {
       if (next.group) break; // opaque: `shapeProblem` is what looks inside groups
       if (isRepeated(next) && overlap(first, next)) {
         return (
-          `regex shape ${JSON.stringify(atomText(first) + atomText(next))} repeats two adjacent atoms that can match ` +
-          `the same characters (like "\\w+\\w+"): ${ADJACENT_ADVICE}`
+          `regex shape ${JSON.stringify(shownText(first) + shownText(next))} repeats two adjacent atoms that can match ` +
+          `the same characters (like "\\w+\\w+" or "([a-z]+)([a-z]+)x"): ${ADJACENT_ADVICE}`
         );
       }
       if (next.quant !== undefined && optional(next.quant)) continue; // can be skipped entirely
@@ -406,7 +468,7 @@ export function checkCatastrophicShape(pattern: string): string | undefined {
   if (!parsed.balanced) return undefined;
   for (const frame of allFrames(parsed.root)) {
     for (const branch of frame.branches) {
-      const why = adjacentProblem(branch);
+      const why = adjacentProblem(inlinePlainGroups(branch, 0));
       if (why !== undefined) return why;
     }
   }
