@@ -289,7 +289,7 @@ One-way JSON-RPC notification in either direction.
 | `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `direction` | `'client_to_server' \| 'server_to_client'` | Which way it flowed. |
 | `params` | `Scrubbed` | Redacted params tree. |
-| `gateway` | `GatewayOutcome?` | Additive (v1), gateway mode only. Present on a `tools/call` **notification** the policy refused — the one enforcement decision that cannot be a `policy_decision` event, because a notification has no request id and `request_id` is `string \| number`. Without it the refusal left nothing but a line on stderr: the chain held an ordinary `notification` event, indistinguishable from a forwarded one. `mcp-recorder sessions` counts it in `policy_decision_count`. |
+| `gateway` | `GatewayOutcome?` | Additive (v1), gateway mode only. Present on the two `tools/call` shapes the gateway refuses that have no usable request id: a **notification** the policy denied, and a request whose `id` is not a `string` or a `number` (`refusal: 'invalid_request_id'`) — the one enforcement decision that cannot be a `policy_decision` event, because a notification has no request id and `request_id` is `string \| number`. Without it the refusal left nothing but a line on stderr: the chain held an ordinary `notification` event, indistinguishable from a forwarded one. `mcp-recorder sessions` counts it in `policy_decision_count`. |
 
 ### `protocol_error`
 
@@ -347,6 +347,7 @@ exactly as before (canonical JSON drops nothing that was never there).
 | --- | --- | --- |
 | `decision` | `'allow' \| 'deny' \| 'hold'` | What the policy decided for the request. |
 | `rule_id` | `string?` | The rule that matched; absent when the section's `default` applied. An explicit id already matches the `structuralString` identifier shape and is kept as-is, and so is an auto-assigned `rule[<index>]`; only an off-shape id would be stored as its `sha256:<hex>` reference. |
+| `refusal` | `string?` | Additive (v1). Present when the gateway refused the MESSAGE rather than evaluating it against the policy, so a `deny` with no `rule_id` is not misread as the section default having applied. An identifier naming the refusal, the way `error.type` names an error class; `invalid_request_id` — a `tools/call` whose `id` property is not a usable JSON-RPC id — is the only value the proxy writes today. |
 | `outcome` | `'approved' \| 'denied' \| 'timeout' \| 'cancelled' \| 'session_end'?` | Holds only: how the hold was resolved (`session_end` = the proxy shut down while the call was still held). |
 | `approval_id` | `string?` | Holds only. Absent when the call was refused before a hold file existed (see `policy_decision`). |
 | `waited_ms` | `number?` | Holds only: how long the call was parked before it was resolved. |
@@ -379,10 +380,19 @@ session recorded without a policy reads `0`. The synthetic `tool_call` that
 carries a refusal back to the client is counted under `TOOL_CALLS` and
 `ERRORS` like any other failed call, never a second time here.
 
-It also counts the one decision that cannot BE a `policy_decision` event: a
-refused `tools/call` **notification**, whose outcome rides the additive
-`gateway` field on its `notification` event because a notification has no
-request id to write a decision event with.
+It also counts the decisions that cannot BE a `policy_decision` event,
+because `request_id` is `string | number` and these messages have no usable
+id to write one with. Their outcome rides the additive `gateway` field on
+the `notification` event each is recorded as:
+
+- a refused `tools/call` **notification** (no `id` property at all), and
+- a `tools/call` whose `id` is not a usable JSON-RPC id — `null`, but
+  equally `true`, `{}` or `[]` — which is refused with a JSON-RPC `-32600`
+  whatever the policy says, and carries `refusal: 'invalid_request_id'` so
+  the absent `rule_id` is not read as a default deny.
+
+Neither is ever forwarded to the server, and without the `gateway` field
+neither left anything in the chain but a line on stderr.
 
 | Field | Type | Description |
 | --- | --- | --- |

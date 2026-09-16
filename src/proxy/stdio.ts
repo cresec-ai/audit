@@ -985,6 +985,9 @@ const DUPLICATE_ID_REASON: Record<DuplicateIdState, string> = {
 };
 /** `error.type` of both events recorded for a refused duplicate id (free-form string, v1). */
 const DUPLICATE_ID_ERROR_TYPE = 'duplicate_id';
+
+/** `GatewayOutcome.refusal` for a `tools/call` whose id is not a usable one. */
+const INVALID_ID_REFUSAL = 'invalid_request_id';
 /**
  * `error.type` for an in-flight request dropped because `pending` hit
  * MAX_PENDING. Additive and free-form under the frozen schema, like
@@ -2332,8 +2335,16 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
      * forwarded, whatever the policy says. There is no request id to record
      * a `policy_decision` or a `tool_call` against — and writing one anyway
      * would put a value in `request_id` the frozen schema cannot describe —
-     * so it is recorded exactly as the tap records any id-less message (one
-     * `notification` event) and the refusal is visible on stderr.
+     * so it is recorded the way the tap records any id-less message, as one
+     * `notification` event, carrying the outcome on the same additive
+     * `gateway` field a refused `tools/call` notification uses.
+     *
+     * Without that field this was the last place enforcement happened and
+     * the chain said so nowhere: `sessions` reported DECISIONS 0 and an
+     * exported bundle held one ordinary `notification` event, structurally
+     * indistinguishable from a forwarded one, with a stderr line as the only
+     * trace. `refusal` says the gateway refused the message itself, so the
+     * absent `rule_id` is not read as the section default denying it.
      *
      * Returns the error response, which the caller delivers on its own line
      * or inside the batch response array (a batch element gets exactly the
@@ -2349,29 +2360,21 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         `gateway: refused a tools/call with ${shape}${inBatch ? ' inside a JSON-RPC batch' : ''}` +
           ' (not a valid request); not forwarded',
       );
-      guarded(() => handleMessage(msg, 'client_to_server', line));
+      guarded(() =>
+        handleMessage(msg, 'client_to_server', line, { decision: 'deny', refusal: INVALID_ID_REFUSAL }),
+      );
       return invalidIdErrorResponse(msg['id']);
     };
 
     /**
-     * A `tools/call` NOTIFICATION (no `id` property at all). It is evaluated
-     * against the policy exactly like a request; a deny simply DROPS it,
-     * which is what "notification" already promises the caller — nothing
-     * comes back either way. Forwarding it unevaluated was the same hole the
-     * null-id refusal closed, one shape over.
-     *
-     * The frozen schema's `request_id` is `string | number`, so a
-     * `policy_decision` cannot be written for a message that has no id: the
-     * attempt is recorded the way the tap has always recorded an id-less
-     * message (one `notification` event) and the decision is on stderr.
-     *
-     * Returns true when the notification may be forwarded.
-     */
-    /**
-     * Whether a `tools/call` notification may be forwarded, and — when it may
-     * not — the outcome to record on its `notification` event. The refusal
-     * used to leave nothing but a stderr line in its wake: enforcement
-     * happened and the chain said so nowhere.
+     * Whether a `tools/call` NOTIFICATION may be forwarded, and — when it may
+     * not — the outcome to record on its `notification` event. It is
+     * evaluated against the policy exactly like a request; a deny simply
+     * DROPS it, which is what "notification" already promises the caller.
+     * Forwarding it unevaluated was the same hole the null-id refusal
+     * closed, one shape over, and the refusal used to leave nothing but a
+     * stderr line in its wake: enforcement happened and the chain said so
+     * nowhere.
      */
     const evaluateToolsCallNotification = (
       msg: Record<string, unknown>,

@@ -2102,6 +2102,10 @@ describe('gateway: duplicate and null request ids', () => {
     const notes = events.filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
     expect(notes).toHaveLength(1);
     expect(notes[0]!.direction).toBe('client_to_server');
+    // ...carrying the refusal, or the event is indistinguishable from a
+    // notification that was forwarded. `refusal` says the gateway refused
+    // the MESSAGE, so the absent `rule_id` is not read as a default deny.
+    expect(notes[0]!.gateway).toEqual({ decision: 'deny', refusal: 'invalid_request_id' });
     expect(decisions(events)).toHaveLength(0);
     expect(toolCalls(events).map((c) => c.request_id)).toEqual([2]);
     expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
@@ -2949,6 +2953,45 @@ describe('G5: a tools/call NOTIFICATION is evaluated like any other tools/call',
     expect(notes.find((n) => n.gateway === undefined)).toBeDefined();
     // `sessions` counts it too — see test/store.test.ts, which runs the
     // same event through both store backends.
+    assertChainIntact(s.store);
+  });
+
+  it('an invalid-id refusal leaves the same EVIDENCE, one path over', async () => {
+    // The notification fix above closed one of the two `tools/call` shapes
+    // the gateway refuses without a usable request id. This is the other,
+    // and it was still recorded only on stderr: the chain held an ordinary
+    // `notification` event, `sessions` reported DECISIONS 0, and an exported
+    // bundle carried no trace that anything had been refused.
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    for (const id of [null, true, {}, []]) {
+      s.send({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'echo', arguments: {} } });
+    }
+    s.send(toolsCall(21, 'echo', { ok: true }));
+    await waitFor(s.responded(21), 'the following call');
+    s.stdin.end();
+    await s.done;
+
+    // None of the four reached the server; the one valid call did.
+    expect(executed(s)).toEqual(['echo']);
+    const notes = s
+      .events()
+      .filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
+    expect(notes).toHaveLength(4);
+    for (const n of notes) {
+      expect(n.gateway).toEqual({ decision: 'deny', refusal: 'invalid_request_id' });
+    }
+    // The frozen schema is untouched: no event claims a request_id it
+    // cannot describe, and no policy_decision was invented for one.
+    expect(decisions(s.events())).toHaveLength(0);
+    for (const e of s.events()) {
+      if ('request_id' in e) expect(['string', 'number']).toContain(typeof (e as { request_id: unknown }).request_id);
+    }
+    // And each is what `sessions` counts as a decision, so the column
+    // cannot read 0 for a session where four calls were refused. Both store
+    // backends compute that count from exactly this shape — see
+    // test/store.test.ts, which runs the fixture through each of them.
+    expect(notes.filter((n) => n.gateway?.decision !== undefined)).toHaveLength(4);
     assertChainIntact(s.store);
   });
 

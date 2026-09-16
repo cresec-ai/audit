@@ -226,6 +226,10 @@ function gatewayBadges(gw) {
     const cls = gatewayBadgeClass(gw.decision);
     const label = gw.outcome !== undefined ? `${escapeHtml(String(gw.decision))} · ${escapeHtml(String(gw.outcome))}` : escapeHtml(String(gw.decision));
     const title = [];
+    // Why, when the gateway refused the message rather than evaluating it —
+    // otherwise the absent rule id reads as the section default.
+    if (gw.refusal !== undefined)
+        title.push(`refused: ${gw.refusal}`);
     if (gw.rule_id !== undefined)
         title.push(`rule ${gw.rule_id}`);
     if (gw.approval_id !== undefined)

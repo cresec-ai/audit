@@ -167,6 +167,14 @@ export interface GatewayOutcome {
     decision: GatewayDecision;
     /** Matching rule id (capped identifier); absent when the section default applied. */
     rule_id?: string;
+    /**
+     * Set when the gateway refused the MESSAGE rather than evaluating it, so a
+     * `deny` with no `rule_id` is not misread as the section default having
+     * applied. An identifier naming the refusal, the way
+     * {@link RpcEvent.error}`.type` names an error; `invalid_request_id` is
+     * the only value the proxy writes today.
+     */
+    refusal?: string;
     /** Holds only. `session_end` = the proxy shut down while the call was still held. */
     outcome?: HoldOutcome;
     /** Holds only: the approval id the operator saw in `mcp-recorder holds`. */
