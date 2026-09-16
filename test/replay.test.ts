@@ -638,6 +638,15 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
       ...toolCall(SESSION_C, '2026-06-12T09:00:04.000Z', 'list_notes', {}),
       gateway: { decision: 'allow', boundary: { scanned: true, action: 'none', secrets_found: 0, injection_found: 0 } },
     };
+    // A refused `tools/call` NOTIFICATION: the one decision that cannot be a
+    // policy_decision event, so the timeline has to show it on the
+    // notification itself or a reader cannot tell it from a forwarded one.
+    const refusedNotification: NotificationEvent = {
+      ...notification(SESSION_C, '2026-06-12T09:00:04.500Z'),
+      method: 'tools/call',
+      direction: 'client_to_server',
+      gateway: { decision: 'deny', rule_id: 'no-delete' },
+    };
     store.append(
       seal([
         sessionStart(SESSION_C, '2026-06-12T09:00:00.000Z'),
@@ -655,6 +664,7 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
         }),
         heldThenFiltered,
         allowedClean,
+        refusedNotification,
         sessionEnd(SESSION_C, '2026-06-12T09:00:05.000Z'),
       ]),
     );
@@ -684,6 +694,16 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
     expect(html).not.toContain('evil.example');
   });
 
+  it('a refused tools/call NOTIFICATION carries its decision badge on the timeline', () => {
+    // Enforcement happened; without the badge the row read as an ordinary
+    // client notification and the refusal was visible only on stderr.
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    const row = html.split('<article').find((a) => a.includes('row notif'))!;
+    expect(row).toContain('<span class="badge gw gw-deny"');
+    expect(row).toContain('gateway deny');
+    expect(row).toContain('no-delete');
+  });
+
   it('tool_call cards carry gw-allow / gw-hold / gw-deny badges and a boundary summary', () => {
     const html = renderTimelineHtml(store, { sessionId: SESSION_C });
     expect(html).toContain('<span class="badge gw gw-deny"');
@@ -710,9 +730,11 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
 
   it('the page still lists every other kind (the new row is additive)', () => {
     const html = renderTimelineHtml(store, { sessionId: SESSION_C });
-    for (const tag of ['SESSION START', 'ACT', 'EFFECT', 'POLICY', 'SESSION END']) expect(html).toContain(tag);
+    for (const tag of ['SESSION START', 'ACT', 'EFFECT', 'POLICY', 'NOTIFY', 'SESSION END']) {
+      expect(html).toContain(tag);
+    }
     const data = extractEmbeddedJson(html) as EmbeddedData;
-    expect(data.events).toHaveLength(7);
+    expect(data.events).toHaveLength(8);
     expect(data.events.filter((r) => r.event.kind === 'policy_decision')).toHaveLength(2);
   });
 

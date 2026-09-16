@@ -229,6 +229,20 @@ const ALWAYS_PATTERNS: RegExp[] = [
   // API key header) and every counted false positive fails it. The digit
   // lookahead is bounded, so it cannot backtrack superlinearly.
   /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/i,
+  // The SAME shape in camelCase or PascalCase, which is the dominant style
+  // in real tool output and which neither arm above can see: both require
+  // the affix to be separated by `_` or `-`, so `SecretAccessKey`,
+  // `accessToken`, `refreshToken` and `clientSecret` match neither. An
+  // `aws sts assume-role` response therefore handed the model
+  // `"SecretAccessKey":"wJalrXUtnFEMI/..."` and its `SessionToken` in clear.
+  //
+  // This one is deliberately CASE-SENSITIVE: the capital letter IS the word
+  // boundary. A lowercase keyword is the other two arms' business, and a
+  // suffix must start with an upper-case letter or a digit so `Secretary`
+  // and `tokens` are not credentials. The value gate is the affixed arm's,
+  // so `{"accessTokenExpiresIn": 3600}`, `{"SecretName": "prod/db"}` and
+  // `PasswordPolicy: minimum length 12` stay untouched.
+  /(?:Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
   // A credential passed as a command-line FLAG whose value is the NEXT
   // argument ("--password hunter2", "--api-key 0123456789abcdef"): the
   // separator is whitespace, so neither assignment shape above can see it.

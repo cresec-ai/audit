@@ -389,6 +389,7 @@ const SESSION_HOLDS = '88888888-8888-4888-8888-888888888888';
 const SESSION_POLICY_MIX = '99999999-9999-4999-8999-999999999999';
 const SESSION_NO_ENFORCEMENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const SESSION_ODD_POLICY = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const SESSION_NOTIFICATION_DENY = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
 /**
  * Five sessions recorded in gateway mode, interleaved in one chain the way
@@ -479,7 +480,43 @@ function enforcementSessionEvents(): AnyEvent[] {
     odd(policyDecision(SESSION_ODD_POLICY, at(13, 1), 1), ['decision', 'tool'], {}),
     odd(policyDecision(SESSION_ODD_POLICY, at(13, 2), 2), [], { decision: 'maybe', outcome: 42 }),
     deniedToolCall(SESSION_ODD_POLICY, at(13, 3), 3),
+
+    // A refused `tools/call` NOTIFICATION is the one decision that cannot be
+    // a policy_decision event: a notification has no request id, and the
+    // frozen schema's request_id is `string | number`. It carries its
+    // outcome on the notification event instead, and counts all the same —
+    // otherwise the column reports 0 for a session where enforcement
+    // happened. The forwarded notification beside it carries nothing.
+    sessionStart(SESSION_NOTIFICATION_DENY, at(14, 0)),
+    deniedNotification(SESSION_NOTIFICATION_DENY, at(14, 1)),
+    plainNotification(SESSION_NOTIFICATION_DENY, at(14, 2)),
+    sessionEnd(SESSION_NOTIFICATION_DENY, at(14, 3)),
   ];
+}
+
+/** A `tools/call` notification the gateway refused, with its outcome on it. */
+function deniedNotification(sessionId: string, timestamp: string): NotificationEvent {
+  return {
+    ...plainNotification(sessionId, timestamp),
+    gateway: { decision: 'deny', rule_id: 'no-delete' },
+  };
+}
+
+/** The same shape, forwarded: no gateway field, so not a decision. */
+function plainNotification(sessionId: string, timestamp: string): NotificationEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: sessionId,
+    timestamp,
+    kind: 'notification',
+    identity: IDENTITY,
+    server: SERVER,
+    attributes: { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc' },
+    method: 'tools/call',
+    direction: 'client_to_server',
+    params: null,
+  };
 }
 
 function fakeSignature(record: ChainRecord, signedAt: string): HeadSignature {
@@ -842,6 +879,14 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(quiet.policy_decision_count).toBe(0);
     expect(quiet.tool_call_count).toBe(2);
 
+    // A refused tools/call NOTIFICATION counts, though it is not a
+    // policy_decision event and cannot be one; the forwarded notification
+    // beside it does not.
+    const noteDeny = byId.get(SESSION_NOTIFICATION_DENY)!;
+    expect(noteDeny.policy_decision_count).toBe(1);
+    expect(noteDeny.tool_call_count).toBe(0);
+    expect(noteDeny.event_count).toBe(4);
+
     // Malformed decisions still count (neither backend reads below the
     // kind); a tool_call that merely carries `gateway.decision: 'deny'`
     // does not.
@@ -955,8 +1000,11 @@ describe('sessions() is identical across backends for the same chain', () => {
       jsonl.append(records);
       const fromSqlite = sqlite.sessions();
       expect(fromSqlite).toEqual(jsonl.sessions());
-      // A, B (no policy at all), then denies / holds / mix / none / malformed.
-      expect(fromSqlite.map((s) => s.policy_decision_count)).toEqual([0, 0, 2, 3, 2, 0, 2]);
+      // A, B (no policy at all), then denies / holds / mix / none /
+      // malformed / a refused tools/call notification. The two backends
+      // agree on every one, including the notification, which sqlite counts
+      // in SQL and jsonl in TypeScript.
+      expect(fromSqlite.map((s) => s.policy_decision_count)).toEqual([0, 0, 2, 3, 2, 0, 2, 1]);
     } finally {
       sqlite.close();
       jsonl.close();

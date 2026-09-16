@@ -136,10 +136,12 @@ interface SessionRow {
  * answered by the proxy itself without waiting for the server. See
  * SessionSummary.server_count for the full account.
  * policy_decision_count is gateway mode's enforcement: one per deny and one
- * per resolved hold, an approved hold included. Like event_count it comes
- * off the kind alone — the synthetic tool_call that carries a refusal back
- * to the client is a tool_call, counted there and in error_count, never
- * here.
+ * per resolved hold, an approved hold included. It comes off the kind, plus
+ * the one decision that CANNOT be a `policy_decision` event — a refused
+ * `tools/call` NOTIFICATION, which has no request id to write one with and
+ * carries its outcome on the `notification` event instead. The synthetic
+ * tool_call that carries a refusal back to the client is a tool_call,
+ * counted there and in error_count, never here.
  *
  * Non-conforming records are read the same way jsonl.ts reads them: an
  * explicit `phase: null` counts as a call like an absent phase, a
@@ -163,7 +165,10 @@ SELECT
   COUNT(DISTINCT CASE WHEN r.kind = 'tool_call'
                        AND json_type(r.event, '$.server.name') = 'text'
                       THEN json_extract(r.event, '$.server.name') END) AS server_count,
-  SUM(CASE WHEN r.kind = 'policy_decision' THEN 1 ELSE 0 END) AS policy_decision_count,
+  SUM(CASE WHEN r.kind = 'policy_decision'
+            OR (r.kind = 'notification'
+                AND json_type(r.event, '$.gateway.decision') = 'text')
+           THEN 1 ELSE 0 END)                           AS policy_decision_count,
   (SELECT json_extract(f.event, '$.server.name')
      FROM records f WHERE f.session_id = r.session_id ORDER BY f.seq LIMIT 1) AS server_name,
   (SELECT json_extract(f.event, '$.identity.fingerprint')

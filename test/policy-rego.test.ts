@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { sha256Hex } from '../src/chain/hash.js';
 import {
   BUNDLE_FILE_ORDER,
@@ -17,8 +17,11 @@ import {
   bundleFileOrder,
   bundleRoots,
   compileToRego,
+  configureRegexGuard,
   evaluateEgress,
   evaluateMcp,
+  regexGuardState,
+  resetRegexGuard,
   loadPolicyFile,
   policyRevision,
   renderEgressModule,
@@ -429,7 +432,30 @@ const CASES: Array<McpCase | EgressCase> = [
   { kind: 'egress', fixture: 'empty.json', note: 'default deny: no rules', input: egressIn('h', 'GET', '/', 0) },
 ];
 
+/**
+ * The parity claim is about SEMANTICS: the TypeScript engine and the emitted
+ * Rego must reach the same decision. It is not about the regex guard's 25 ms
+ * deadline, which OPA has no equivalent of — and on a loaded runner (a full
+ * suite with a worker per file, each with its own guard thread) a match that
+ * takes 0.03 ms warm can overrun it, poison the pattern and turn an ALLOW
+ * into a fail-closed deny. That is correct gateway behaviour and a false
+ * parity failure: 5 cases failed that way once in five full-suite runs here.
+ *
+ * So these tests give the guard a deadline no scheduler hiccup can reach.
+ * The deadline itself is tested where it belongs, in test/policy.test.ts,
+ * including that it fires, poisons and denies.
+ */
+const PARITY_DEADLINE_MS = 5_000;
+
 describe('OPA parity (skipped when no opa binary is available, required in CI)', () => {
+  beforeAll(() => {
+    resetRegexGuard();
+    configureRegexGuard({ deadlineMs: PARITY_DEADLINE_MS });
+  });
+  afterAll(() => {
+    resetRegexGuard();
+  });
+
   const found = findOpa();
   if (found === undefined) {
     const required = opaRequired(process.env.MCP_RECORDER_REQUIRE_OPA);
@@ -720,7 +746,7 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
         { id: 'overlap', match: { tool: 'danger/**/run' }, action: 'deny', reason: 'prefix and suffix overlap' },
         { id: 'triple', match: { tool: 'sh***' }, action: 'deny', reason: 'odd wildcard run' },
         { id: 'replacement', match: { tool: 'bad�tool' }, action: 'deny', reason: 'U+FFFD' },
-        { id: 'nul', match: { tool: 'nul tool' }, action: 'deny', reason: 'U+0000' },
+        { id: 'nul', match: { tool: 'nul\u0000tool' }, action: 'deny', reason: 'U+0000' },
       ],
     },
     egress: {
@@ -741,7 +767,7 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     { note: 'G2 "sh***" matches "shell"', input: mcpIn('s', 'shell', {}, 2), ruleId: 'triple' },
     { note: 'G3 a U+FFFD in a glob is a literal in both engines', input: mcpIn('s', 'bad�tool', {}, 2), ruleId: 'replacement' },
     { note: 'G3 U+FFFD does not match another character', input: mcpIn('s', 'badxtool', {}, 2), ruleId: null },
-    { note: 'G4 a U+0000 in a glob is a literal in both engines', input: mcpIn('s', 'nul tool', {}, 2), ruleId: 'nul' },
+    { note: 'G4 a U+0000 in a glob is a literal in both engines', input: mcpIn('s', 'nul\u0000tool', {}, 2), ruleId: 'nul' },
   ];
 
   it('globs policy: opa check --strict and opa fmt stay green with regex-emitted globs', () => {
@@ -853,6 +879,9 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
   it.each(CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
     const policy = policies.get(c.fixture)!;
     const dir = dirs.get(c.fixture)!;
+    // A poisoned pattern would make the TS engine deny for a reason that has
+    // nothing to do with the Rego, so a mismatch below would be a mystery.
+    expect(regexGuardState().poisoned, 'a regex was poisoned: this is a guard timeout, not a parity gap').toBe(0);
     if (c.kind === 'mcp') {
       const ts = evaluateMcp(policy, c.input);
       const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };

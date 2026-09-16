@@ -189,6 +189,16 @@ export const BOUNDARY_SECRET_FAMILIES = [
             '`secret_scanning_enabled: true` are left alone.',
     },
     {
+        id: 'secret-assignment-camel',
+        re: /(?:Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
+        note: 'The same assignment shape in camelCase or PascalCase — the dominant style in real tool ' +
+            'output, and invisible to both arms above, which require the affix to be separated by `_` ' +
+            'or `-`. `SecretAccessKey`, `SessionToken`, `accessToken`, `refreshToken` and ' +
+            '`clientSecret` all reached the model in clear. CASE-SENSITIVE on purpose: the capital ' +
+            'letter is the word boundary, and a suffix must start upper-case or with a digit, so ' +
+            '`Secretary` and `tokens` are not credentials.',
+    },
+    {
         id: 'credential-flag-value',
         re: /(?<![\w-])-{1,2}(?:[A-Za-z0-9-]{0,62}-)?(?:password|passwd|secret|token|api-?key)(?:-[A-Za-z0-9-]{0,62})?[ \t]+(?:(?=\S{0,255}\d)[^\s<$]\S{5,}|[^\s<$]\S{15,})/i,
         note: 'A command line in tool output that passes the credential as the NEXT argument ' +

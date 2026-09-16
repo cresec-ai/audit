@@ -257,6 +257,7 @@ A completed `tools/call` (request + response correlated). The flagship event.
 | `request_id` | `string \| number` | JSON-RPC request id (`gen_ai.tool.call.id`). |
 | `args` | `Scrubbed` | Redacted argument tree. **Every string leaf is hashed, unconditionally, regardless of key or position or redaction mode** — see [Privacy posture](#privacy-posture). |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the **complete raw result, pre-redaction**. |
+| `result_hash_depth_capped` | `true?` | Additive, optional (schema stays v1). Present only when the result was nested deeper than the hash depth cap (256). `result_hash` is then **not** `sha256Ref(canonicalJson(result))`: every subtree below that depth hashed as one fixed marker, so two results differing only below it share a hash. The cap is what keeps a hostile payload from overflowing the stack; this field is what stops it being silent. |
 | `result` | `Scrubbed` | Redacted result tree (the position/value-aware allowlist applies here, unlike `args`). |
 | `is_error` | `boolean` | Whether the call returned an error. |
 | `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; the message is stored only as a hash ref. `error.type` is a free-form string field. Gateway mode records `'policy_denied'` for a call it refused (see [Gateway mode fields](#gateway-mode-fields-additive)) and `'duplicate_id'` for a call refused because its JSON-RPC request id was still in flight (held for approval, or pending). `mcp-recorder hook` records the additive values `'policy_denied'` (a `--policy` deny), `'tool_error'` (the call failed: a PostToolUseFailure) and `'interrupted'` (a PostToolUseFailure with `is_interrupt`) — see [Hook-sourced events](#hook-sourced-events-additive). |
@@ -274,6 +275,7 @@ Any other correlated JSON-RPC request/response (`tools/list`, `resources/read`, 
 | `request_id` | `string \| number` | JSON-RPC request id. |
 | `params` | `Scrubbed` | Redacted params tree. |
 | `result_hash` | `Sha256Ref` | `sha256:<hex>` of canonical JSON of the complete raw result, pre-redaction. |
+| `result_hash_depth_capped` | `true?` | Additive, optional (schema stays v1). Same meaning as on `tool_call`. |
 | `is_error` | `boolean` | Whether the call returned an error. |
 | `error` | `{ code?: number; type?: string; message_ref?: Sha256Ref }?` | Error details; message hashed. |
 | `duration_ms` | `number` | Wall-clock ms between request and response. |
@@ -287,6 +289,7 @@ One-way JSON-RPC notification in either direction.
 | `method` | `string` | JSON-RPC method (`mcp.method.name`). Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture); an oversized or oddly-shaped method is stored as its `sha256:<hex>` reference instead. |
 | `direction` | `'client_to_server' \| 'server_to_client'` | Which way it flowed. |
 | `params` | `Scrubbed` | Redacted params tree. |
+| `gateway` | `GatewayOutcome?` | Additive (v1), gateway mode only. Present on a `tools/call` **notification** the policy refused — the one enforcement decision that cannot be a `policy_decision` event, because a notification has no request id and `request_id` is `string \| number`. Without it the refusal left nothing but a line on stderr: the chain held an ordinary `notification` event, indistinguishable from a forwarded one. `mcp-recorder sessions` counts it in `policy_decision_count`. |
 
 ### `protocol_error`
 
@@ -375,6 +378,11 @@ counts exactly like a deny — the gateway ruled on the call either way — and 
 session recorded without a policy reads `0`. The synthetic `tool_call` that
 carries a refusal back to the client is counted under `TOOL_CALLS` and
 `ERRORS` like any other failed call, never a second time here.
+
+It also counts the one decision that cannot BE a `policy_decision` event: a
+refused `tools/call` **notification**, whose outcome rides the additive
+`gateway` field on its `notification` event because a notification has no
+request id to write a decision event with.
 
 | Field | Type | Description |
 | --- | --- | --- |

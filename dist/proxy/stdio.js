@@ -776,7 +776,7 @@ const HASH_DEPTH_CAPPED_MARKER = '[mcp-recorder:hash-depth-capped]';
  * output for every value within the bound; a deeper subtree becomes
  * `HASH_DEPTH_CAPPED_MARKER`.
  */
-function boundedCanonicalJson(value, depth = 0) {
+function boundedCanonicalJson(value, depth = 0, capped) {
     if (value === null || value === undefined)
         return 'null';
     const t = typeof value;
@@ -785,11 +785,16 @@ function boundedCanonicalJson(value, depth = 0) {
     if (t === 'string' || t === 'boolean')
         return JSON.stringify(value);
     const container = Array.isArray(value) || t === 'object';
-    if (container && depth >= MAX_HASH_DEPTH)
+    if (container && depth >= MAX_HASH_DEPTH) {
+        // Report it: past this point the hash no longer distinguishes subtrees,
+        // and the event has to say so rather than look like an ordinary one.
+        if (capped !== undefined)
+            capped.hit = true;
         return JSON.stringify(HASH_DEPTH_CAPPED_MARKER);
+    }
     if (Array.isArray(value)) {
         return ('[' +
-            value.map((v) => (v === undefined ? 'null' : boundedCanonicalJson(v, depth + 1))).join(',') +
+            value.map((v) => (v === undefined ? 'null' : boundedCanonicalJson(v, depth + 1, capped))).join(',') +
             ']');
     }
     if (t === 'object') {
@@ -798,7 +803,7 @@ function boundedCanonicalJson(value, depth = 0) {
             .filter((k) => obj[k] !== undefined)
             .sort();
         return ('{' +
-            keys.map((k) => JSON.stringify(k) + ':' + boundedCanonicalJson(obj[k], depth + 1)).join(',') +
+            keys.map((k) => JSON.stringify(k) + ':' + boundedCanonicalJson(obj[k], depth + 1, capped)).join(',') +
             '}');
     }
     throw new TypeError(`boundedCanonicalJson: unsupported type ${t}`);
@@ -1455,8 +1460,9 @@ export async function runStdioProxy(opts) {
         // fail-open catch while `verify` reports PASS.
         let resultHash;
         let hashFailed = false;
+        const hashCapped = { hit: false };
         try {
-            resultHash = sha256Ref(boundedCanonicalJson(rawResult ?? rawError ?? null));
+            resultHash = sha256Ref(boundedCanonicalJson(rawResult ?? rawError ?? null, 0, hashCapped));
         }
         catch (err) {
             resultHash = NULL_RESULT_HASH;
@@ -1551,6 +1557,7 @@ export async function runStdioProxy(opts) {
                 result: redactor.scrub(rawResult ?? null),
                 is_error: isError,
                 duration_ms: durationMs,
+                ...(hashCapped.hit ? { result_hash_depth_capped: true } : {}),
             };
             if (rawError !== undefined)
                 ev.error = errorInfo(rawError);
@@ -1572,6 +1579,7 @@ export async function runStdioProxy(opts) {
             request_id: id,
             params: redactor.scrub(entry.params ?? null),
             result_hash: resultHash,
+            ...(hashCapped.hit ? { result_hash_depth_capped: true } : {}),
             is_error: isError,
             duration_ms: durationMs,
         };
@@ -1581,7 +1589,7 @@ export async function runStdioProxy(opts) {
             ev.error = { type: RESULT_HASH_FAILED_ERROR_TYPE };
         record(ev);
     };
-    const handleMessage = (msg, direction, line) => {
+    const handleMessage = (msg, direction, line, gateway) => {
         if (Array.isArray(msg)) {
             // JSON-RPC batch — handle each element independently.
             for (const el of msg)
@@ -1633,6 +1641,10 @@ export async function runStdioProxy(opts) {
                 method,
                 direction,
                 params: redactor.scrub(msg.params ?? null),
+                // Only a refused `tools/call` notification carries this; see the
+                // field's comment in the schema for why it cannot be a
+                // `policy_decision` event instead.
+                ...(gateway === undefined ? {} : { gateway }),
             };
             record(ev);
             return;
@@ -2141,13 +2153,19 @@ export async function runStdioProxy(opts) {
          *
          * Returns true when the notification may be forwarded.
          */
-        const allowToolsCallNotification = (msg, inBatch) => {
+        /**
+         * Whether a `tools/call` notification may be forwarded, and — when it may
+         * not — the outcome to record on its `notification` event. The refusal
+         * used to leave nothing but a stderr line in its wake: enforcement
+         * happened and the chain said so nowhere.
+         */
+        const evaluateToolsCallNotification = (msg, inBatch) => {
             const params = isPlainObject(msg['params']) ? msg['params'] : {};
             const name = typeof params['name'] === 'string' ? params['name'] : '';
             const args = params['arguments'] ?? {};
             const { decision } = evaluate(name, args);
             if (decision.action === 'allow')
-                return true;
+                return { allowed: true };
             const tool = name === '' ? '' : structuralString(name, 'identifier');
             // A `hold` has nowhere to park and nothing to answer on, so it is a
             // deny — the gateway failing closed, exactly as a hold inside a batch.
@@ -2155,7 +2173,13 @@ export async function runStdioProxy(opts) {
                 ` (rule ${decision.ruleId === undefined ? 'default' : cappedRuleId(decision.ruleId)})` +
                 `${decision.action === 'hold' ? ' — a hold cannot be parked on a notification' : ''}` +
                 `${inBatch ? ' inside a JSON-RPC batch' : ''}; not forwarded`);
-            return false;
+            // A `hold` is recorded as the deny it became: nothing was parked, and
+            // no approver was ever asked.
+            const gateway = {
+                decision: 'deny',
+                ...(decision.ruleId === undefined ? {} : { rule_id: cappedRuleId(decision.ruleId) }),
+            };
+            return { allowed: false, gateway };
         };
         /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
         const registerCall = (call, gatewayOutcome) => {
@@ -2494,10 +2518,11 @@ export async function runStdioProxy(opts) {
                     return;
                 }
                 if (isToolsCallNotification(el)) {
-                    if (allowToolsCallNotification(el, true))
+                    const verdict = evaluateToolsCallNotification(el, true);
+                    if (verdict.allowed)
                         keep(el, index);
                     else
-                        guarded(() => handleMessage(el, 'client_to_server', line));
+                        guarded(() => handleMessage(el, 'client_to_server', line, verdict.gateway));
                     return;
                 }
                 if (!isToolsCallRequest(el)) {
@@ -2657,9 +2682,10 @@ export async function runStdioProxy(opts) {
                 return;
             }
             if (isToolsCallNotification(msg)) {
-                if (allowToolsCallNotification(msg, false))
+                const verdict = evaluateToolsCallNotification(msg, false);
+                if (verdict.allowed)
                     forwardC2s(raw);
-                guarded(() => handleMessage(msg, 'client_to_server', line));
+                guarded(() => handleMessage(msg, 'client_to_server', line, verdict.gateway));
                 return;
             }
             if (isRpcRequest(msg)) {

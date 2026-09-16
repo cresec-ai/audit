@@ -96,6 +96,13 @@ export interface SessionSummary {
      * like any other failed call, so a denied call adds 1 to each of the
      * three, and so does a call refused on protocol grounds rather than by
      * rule (a duplicate JSON-RPC id, recorded as a deny with no `rule_id`).
+     * ONE decision is not a `policy_decision` event and still counts: a
+     * refused `tools/call` NOTIFICATION. A notification has no request id,
+     * and the frozen schema's `request_id` is `string | number`, so the
+     * decision rides its `notification` event's additive `gateway` field
+     * instead. Leaving it out reported `0` for a session where enforcement
+     * had happened.
+     *
      * When the number is surprising, read the session's `policy_decision`
      * events themselves — the POLICY rows in `mcp-recorder ui` — each of
      * which names its tool, matching rule (or none), decision and hold

@@ -635,6 +635,14 @@ export class JsonlStore {
             // to the client is counted as a call and an error above, not here,
             // and a policy_decision with missing or off-shape decision/outcome
             // fields still counts because nothing below the kind is read.
+            // A refused `tools/call` NOTIFICATION is a decision with no request
+            // id, so it carries its outcome on the notification event rather than
+            // as a `policy_decision`. It counts here all the same, or the column
+            // reports 0 for a session where enforcement happened. Must stay in
+            // step with the sqlite backend's SQL.
+            if (ev.kind === 'notification' && ev.gateway?.decision !== undefined) {
+                summary.policy_decision_count += 1;
+            }
             if (ev.kind === 'policy_decision') {
                 summary.policy_decision_count += 1;
             }

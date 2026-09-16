@@ -317,8 +317,13 @@ function renderRpc(seq, e) {
 }
 function renderNotification(seq, e) {
     const arrow = e.direction === 'client_to_server' ? '→' : '←';
+    // A refused `tools/call` notification carries the decision the chain
+    // cannot hold as a `policy_decision` event (it has no request id). Without
+    // the badge the timeline showed it as an ordinary client notification, so
+    // a reader could not tell a blocked call from one that went through.
+    const badges = gatewayBadges(e.gateway);
     return `<article class="event row notif" data-seq="${num(seq)}">
-  <span class="kind tag-notif">NOTIFY</span> ${arrow} <code>${escapeHtml(e.method)}</code>
+  <span class="kind tag-notif">NOTIFY</span> ${arrow} <code>${escapeHtml(e.method)}</code>${badges}
   ${timeTag(e.timestamp)}
   <pre class="tree">${renderTree(e.params)}</pre>
 </article>`;

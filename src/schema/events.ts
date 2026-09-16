@@ -242,6 +242,16 @@ export interface ToolCallEvent extends EventBase {
   /** Wall-clock ms between request and response crossing the proxy. */
   duration_ms: number;
   /**
+   * Optional and additive (v1). Present only when the result was nested
+   * deeper than the hash depth cap (256), in which case `result_hash` is NOT
+   * `sha256Ref(canonicalJson(result))`: every subtree below that depth
+   * hashed as one fixed marker, so two results differing only below it share
+   * a hash. The cap is what keeps a hostile payload from overflowing the
+   * stack; this field is what stops it being silent, so a reader who
+   * recomputes the documented hash and gets a different answer knows why.
+   */
+  result_hash_depth_capped?: true;
+  /**
    * Optional and additive (v1). Present on every tool_call recorded in
    * gateway mode: the policy decision, hold outcome and boundary-filter
    * report for this call. See docs/event-schema.md.
@@ -290,6 +300,8 @@ export interface RpcEvent extends EventBase {
   request_id: string | number;
   params: Scrubbed;
   result_hash: Sha256Ref;
+  /** Same meaning as {@link ToolCallEvent.result_hash_depth_capped}. */
+  result_hash_depth_capped?: true;
   is_error: boolean;
   error?: { code?: number; type?: string; message_ref?: Sha256Ref };
   duration_ms: number;
@@ -301,6 +313,21 @@ export interface NotificationEvent extends EventBase {
   method: string;
   direction: 'client_to_server' | 'server_to_client';
   params: Scrubbed;
+  /**
+   * Gateway mode only, and only on a `tools/call` NOTIFICATION the policy
+   * refused. Additive and optional, like `ToolCallEvent.gateway`, which it
+   * shares a shape with.
+   *
+   * A notification has no request id, and the frozen schema's `request_id`
+   * is `string | number`, so no `policy_decision` event can be written for
+   * one. Without this field the only record of the refusal was a line on
+   * stderr: the chain held one ordinary `notification` event,
+   * indistinguishable from a forwarded one, so `sessions` reported no
+   * decisions and an auditor could not tell a blocked exfiltration attempt
+   * from a notification that went through. Enforcement without evidence is
+   * the failure this tool exists to prevent.
+   */
+  gateway?: GatewayOutcome;
 }
 
 /** Traffic the tap could not interpret. Forwarding is unaffected (fail-open). */

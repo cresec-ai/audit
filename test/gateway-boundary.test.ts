@@ -1840,3 +1840,79 @@ describe('findInjectionSpans: the scan budget is the operator’s', () => {
     expect(out.report.injection_found).toBeGreaterThan(0);
   });
 });
+
+/* ------------- camelCase and PascalCase credential keys -------------------
+ * Both assignment arms require the affix to be separated by `_` or `-`, so
+ * they only ever saw snake_case and kebab-case. camelCase and PascalCase —
+ * the dominant style in real tool output — matched neither, and an
+ * `aws sts assume-role` response handed the model its `SecretAccessKey` and
+ * `SessionToken` in clear.
+ */
+describe('boundary secrets: camelCase and PascalCase keys', () => {
+  const STS = JSON.stringify(
+    {
+      Credentials: {
+        AccessKeyId: 'ASIAIOSFODNN7EXAMPLE',
+        SecretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        SessionToken: 'FQoGZXIvYXdzEBYaDHRoaXNpc2Fub3RhcmVhbHNlc3Npb250b2tlbjEyMzQ1Ng==',
+        Expiration: '2026-09-16T20:00:00Z',
+      },
+    },
+    null,
+    2,
+  );
+
+  it.each([
+    ['an STS SecretAccessKey', STS, 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
+    ['an STS SessionToken', STS, 'FQoGZXIvYXdzEBYaDHRoaXNpc2Fub3RhcmVhbHNlc3Npb250b2tlbjEyMzQ1Ng=='],
+    ['an OAuth accessToken', '{"accessToken": "ya29.a0AfH6SMBx7Qk2rL9vN3pQ8wT5"}', 'ya29.a0AfH6SMBx7Qk2rL9vN3pQ8wT5'],
+    ['an OAuth refreshToken', '{"refreshToken": "1//0gK3xR7pQ2vN9wT5rL8mB4"}', '1//0gK3xR7pQ2vN9wT5rL8mB4'],
+    ['a clientSecret', '{"clientSecret": "GOCSPX-a1B2c3D4e5F6g7H8i9J0k"}', 'GOCSPX-a1B2c3D4e5F6g7H8i9J0k'],
+    ['a PascalCase UserPassword', '{"UserPassword": "hunter2-correct-horse"}', 'hunter2-correct-horse'],
+    ['a camelCase apiKey', '{"apiKey": "k9f8a7b6c5d4e3f2a1b0"}', 'k9f8a7b6c5d4e3f2a1b0'],
+  ])('%s never reaches the model', (_label, payload, secret) => {
+    const out = applyBoundary(textResult(payload), cfg(), deps);
+    expect(out.changed).toBe(true);
+    expect(contentText(out.message)).not.toContain(secret);
+    expect(JSON.stringify(out.message)).not.toContain(secret);
+    expect(out.report.secrets_found).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['a tokenizer', 'const tokenizer = new Tokenizer();'],
+    ['a length constant', 'MAX_TOKEN_LENGTH = 512'],
+    ['a feature flag', '{"secretScanningEnabled": true}'],
+    ['an expiry', '{"accessTokenExpiresIn": 3600}'],
+    ['a count', '{"tokenCount": 42}'],
+    ['a type annotation', 'interface Options { accessToken?: string }'],
+    ['a function declaration', 'function refreshToken(): Promise<void> {}'],
+    ['a short name', '{"SecretName": "prod/db"}'],
+    ['a policy sentence', 'PasswordPolicy: minimum length 12 characters'],
+    ['an array', '{"tokens": [1, 2, 3, 4, 5, 6, 7, 8]}'],
+    ['prose naming the field', 'This PascalCase SecretAccessKey field is documented above.'],
+  ])('%s is left alone', (_label, line) => {
+    const out = applyBoundary(textResult(line), cfg(), deps);
+    expect(out.changed).toBe(false);
+    expect(contentText(out.message)).toBe(line);
+  });
+
+  it('the family is case-SENSITIVE: the capital letter is the word boundary', () => {
+    // A lowercase keyword is the other two arms' business. `Secretary` is
+    // not a credential because a suffix has to start upper-case or with a
+    // digit.
+    const camel = BOUNDARY_SECRET_FAMILIES.find((f) => f.id === 'secret-assignment-camel');
+    expect(camel, 'the camel family is registered').toBeDefined();
+    expect(camel!.re.flags).not.toContain('i');
+    expect(findSecretSpans('{"Secretary": "was appointed in 2019 by the board"}', boundarySecretPatterns())).toEqual([]);
+  });
+
+  it('scans a hostile blob in linear time', () => {
+    // The obvious spelling of this family is a greedy prefix, an
+    // alternation and a greedy suffix, which tries every split of a long
+    // identifier. Word boundaries do the work instead.
+    const hostile = ('TokenTokenTokenTokenTokenTokenToken'.repeat(30) + ' ').repeat(900);
+    const started = performance.now();
+    findSecretSpans(hostile, boundarySecretPatterns());
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+});

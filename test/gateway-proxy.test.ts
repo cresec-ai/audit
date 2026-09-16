@@ -2540,6 +2540,43 @@ describe('F7: a boundary rewrite edits only what it redacted', () => {
 });
 
 describe('gateway: hashing what was delivered is recording, and it never costs the event', () => {
+  it('says so on the event when the hash depth cap was hit, because past it two results share a hash', async () => {
+    // The cap is what stops a hostile tree overflowing the stack, and it is
+    // right. Its SILENCE was the problem: past `MAX_HASH_DEPTH` every
+    // subtree hashes as one fixed marker, so two results differing only
+    // below that depth get byte-identical `result_hash`, `verify` PASSes,
+    // and a reader recomputing the documented
+    // `sha256Ref(canonicalJson(result))` gets a different answer with
+    // nothing to explain why.
+    const s = startProxy(ALLOW_ALL, { command: reportingServer() });
+    await handshake(s);
+    const deepA = '['.repeat(300) + '1' + ']'.repeat(300);
+    const deepB = '['.repeat(300) + '2' + ']'.repeat(300);
+    const shallow = '[[[1]]]';
+    const line = (id: number, body: string): string =>
+      `{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":"ok"}],"deep":${body}}}`;
+    s.send(toolsCall(2, 'echo', { raw: line(2, deepA) }));
+    s.send(toolsCall(3, 'echo', { raw: line(3, deepB) }));
+    s.send(toolsCall(4, 'echo', { raw: line(4, shallow) }));
+    await waitFor(() => [2, 3, 4].every((id) => s.responded(id)()), 'all three results');
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const byId = new Map(toolCalls(s.events()).map((c) => [c.request_id, c]));
+    const a = byId.get(2)!;
+    const b = byId.get(3)!;
+    const c = byId.get(4)!;
+    // The two deep results DO collide — that is the documented cost of the
+    // cap, and the flag is what makes it readable rather than silent.
+    expect(a.result_hash).toBe(b.result_hash);
+    expect(a.result_hash_depth_capped).toBe(true);
+    expect(b.result_hash_depth_capped).toBe(true);
+    // An ordinary result carries no flag and no collision.
+    expect(c.result_hash_depth_capped).toBeUndefined();
+    expect(c.result_hash).not.toBe(a.result_hash);
+    assertChainIntact(s.store);
+  });
+
   it('a result tree too deep for a recursive hash still reaches the client redacted, AND still lands in the chain', async () => {
     const s = startProxy(ALLOW_SCAN, { command: reportingServer() });
     await handshake(s);
@@ -2881,6 +2918,37 @@ describe('G5: a tools/call NOTIFICATION is evaluated like any other tools/call',
     expect(clientMessages(s).some((m) => m['id'] === null)).toBe(false);
     // Recorded as the tap has always recorded an id-less message.
     expect(s.events().filter((e) => e.kind === 'notification' && e.method === 'tools/call')).toHaveLength(2);
+    assertChainIntact(s.store);
+  });
+
+  it('a denied notification leaves EVIDENCE, not just a line on stderr', async () => {
+    // Enforcement was correct and silent: the chain held one ordinary
+    // `notification` event, structurally indistinguishable from a forwarded
+    // one, with no `policy_decision` (a notification has no request id, and
+    // the frozen schema's `request_id` is `string | number`). `sessions`
+    // reported DECISIONS 0 and an exported bundle carried no trace that
+    // anything had been blocked.
+    const s = startProxy(standardPolicy(), { command: witnessServer() });
+    await handshake(s);
+    s.send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'delete_evidence', arguments: {} } });
+    s.send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'echo_notification', arguments: {} } });
+    s.send(toolsCall(13, 'echo', { ok: true }));
+    await waitFor(s.responded(13), 'the following call');
+    s.stdin.end();
+    await s.done;
+
+    expect(executed(s)).toEqual(['echo_notification', 'echo']);
+    const notes = s
+      .events()
+      .filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
+    expect(notes).toHaveLength(2);
+    const denied = notes.filter((n) => n.gateway !== undefined);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]!.gateway).toMatchObject({ decision: 'deny', rule_id: 'no-delete' });
+    // The forwarded one stays bare, so the two are distinguishable.
+    expect(notes.find((n) => n.gateway === undefined)).toBeDefined();
+    // `sessions` counts it too — see test/store.test.ts, which runs the
+    // same event through both store backends.
     assertChainIntact(s.store);
   });
 
