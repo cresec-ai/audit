@@ -62,7 +62,7 @@ describe('boundary bench (smoke)', () => {
   // No skipIf here: unlike bench/latency.ts this bench spawns nothing of its
   // own, and spawnTsx is portable, so it runs on Windows like any other test.
   it(
-    'runs --smoke end to end, passes its own p99 gate, and reports every cell',
+    'runs --smoke end to end, passes its own superlinearity and p50 gates, and reports every cell',
     async () => {
       let stderr = '';
       const code = await new Promise<number>((resolveCode) => {
@@ -78,14 +78,24 @@ describe('boundary bench (smoke)', () => {
         child.on('close', (c) => resolveCode(c ?? 1));
       });
       process.stderr.write(stderr);
-      // Exit 0 is the gate: the bench exits 1 if the worst p99 is over
-      // P99_GATE_MS, and throws (also exit 1) if any cell failed to match
-      // what it claims or landed over max_scan_bytes.
+      // Exit 0 is the gate. The bench exits 1 if the scan went superlinear in
+      // input size (the ReDoS alarm — a ratio between cells of the same run,
+      // so a slow or loaded runner cannot trip it), if the worst cell p50 is
+      // over its ceiling, or if any cell failed to match what it claims or
+      // landed over max_scan_bytes. In --smoke a cell has too few samples for
+      // a real p99, so the tail is reported but NOT gated: gating a
+      // worst-of-24 against wall-clock flakes on a shared runner, which is
+      // exactly how this test failed the first time it ran in CI.
       expect(code).toBe(0);
       // One row per cell: 4 sizes x 2 shapes x 2 contents. The largest size is
       // FITTED to max_scan_bytes rather than round, so it is not a whole KiB.
       expect(stderr.match(/^ {2}[\d.]+(?:KiB|MiB)\s+\S+\s+(?:clean|dirty)\s.*ms/gm)).toHaveLength(16);
-      expect(stderr).toMatch(/worst p99 = [0-9.]+ms/);
+      expect(stderr).toMatch(/[0-9.]+x size falloff/);
+      expect(stderr).toMatch(/worst p50 [0-9.]+ms/);
+      // Smoke has too few samples to call anything a p99, and the report has
+      // to say so rather than print a maximum under a percentile's name.
+      expect(stderr).toMatch(/worst cell max [0-9.]+ms/);
+      expect(stderr).toMatch(/too few samples to gate a tail/);
       expect(stderr).toMatch(/\u2713 PASS/);
       // Every `dirty` cell must price BOTH steps the proxy pays only on a
       // CHANGED result — the evidence hash and the re-serialize. They are the

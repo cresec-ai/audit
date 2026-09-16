@@ -28,8 +28,10 @@ setup hook calls the same script:
   force, so gateway-mode added latency is comparable to record mode. Opt-in;
   it does not change `npm run bench` or its gate.
 - `npm run bench:boundary` — what the tool-result boundary filter costs
-  synchronously on the forwarding path, by result size and content. Gated on
-  p99 as a ReDoS alarm, and run by `npm test` and by CI.
+  synchronously on the forwarding path, by result size and content. Its ReDoS
+  alarm is a ratio between cells of the same run (a scan that goes
+  superlinear in input size), not a wall-clock threshold, so it holds on a
+  loaded runner. Run by `npm test` and by CI.
 
 ## Rules that must hold
 
