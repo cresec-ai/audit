@@ -58,6 +58,17 @@ export interface InjectionPattern {
  */
 export declare const INJECTION_PATTERNS: ReadonlyArray<InjectionPattern>;
 /**
+ * Default cap on scanned characters, for a caller that passes no budget of
+ * its own. It used to be a HARD cap: `max_scan_bytes` goes to 64 MiB, the
+ * secret scanner honoured it, and this one stopped at 1 MiB and still
+ * reported `scanned: true` — so a marker at offset 1,048,600 was delivered
+ * with `injection_found: 0` while the secret three words later in the same
+ * string was found and redacted. The boundary now passes its own
+ * `max_scan_bytes`, which it has already enforced on the whole line, so the
+ * limit never binds there and nothing is silently unscanned.
+ */
+export declare const MAX_SCAN_CHARS = 1048576;
+/**
  * Every match of `re` in `text` as a span, using a global clone so the
  * caller's regex keeps no lastIndex state. Zero-length matches are skipped
  * (and can never loop forever).
@@ -103,6 +114,14 @@ export interface NormalizedScan {
      * overwhelmingly common case) never pays for that pass.
      */
     sawMark?: true;
+    /**
+     * Present (and `true`) when an ANSI escape sequence carrying TEXT was
+     * consumed. That copy is the RENDERED view — a terminal shows none of the
+     * sequence — and a model reading the raw bytes sees the payload of an OSC
+     * or DCS string, so `findInjectionSpans` scans the raw view as well. Text
+     * with no escape sequence in it never pays for that pass.
+     */
+    sawEscapeText?: true;
 }
 /** Options for {@link normalizeForScan}. */
 export interface NormalizeOptions {
@@ -115,6 +134,21 @@ export interface NormalizeOptions {
      * unconditionally would fold distinct words together for everybody.
      */
     dropMarks?: boolean;
+    /**
+     * Keep the TEXT an escape sequence carries: the data string of an OSC,
+     * DCS, APC, PM or SOS, and the final byte of a bare two-character escape.
+     * CSI and the intermediate-form escapes are consumed as usual.
+     *
+     * The default copy is the RENDERED view — a terminal shows none of a
+     * sequence — and consuming one therefore also removes text a model reading
+     * the bytes still sees: a marker inside an OSC data string disappears from
+     * the scan, and a stray ESC in front of a marker letter takes that letter
+     * with it (`instr<ESC>uctions` scans as `instrctions`). This copy keeps
+     * exactly those two, so neither view can hide what the other shows, and
+     * the two agree everywhere else — which is why ordinary coloured output,
+     * all CSI, never pays for a second pass.
+     */
+    keepEscapeText?: boolean;
 }
 /**
  * Characters removed outright, as ONE code point each (not one UTF-16 unit:
@@ -194,5 +228,5 @@ export declare function normalizeForScan(original: string, opts?: NormalizeOptio
  * a trailing zero-width character always was: the span covers what matched,
  * so a redaction can leave a stray accent behind but never eats a neighbour.)
  */
-export declare function findInjectionSpans(text: string): Span[];
+export declare function findInjectionSpans(text: string, limit?: number): Span[];
 export {};

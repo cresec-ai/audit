@@ -660,7 +660,10 @@ function applyBoundaryUnsafe(
   for (const slot of slots) {
     const raw = scanSecrets ? rawSecretSpans(slot.text, deps.secretPatterns) : [];
     const secrets = mergeSpans(raw);
-    const injections = scanInjection ? findInjectionSpans(slot.text) : [];
+    // The operator's budget, not a second hidden one: `max_scan_bytes` has
+    // already been enforced on the whole line above, so this never truncates
+    // a slot that got this far — and `scanned: true` stays true.
+    const injections = scanInjection ? findInjectionSpans(slot.text, maxScan) : [];
     secretsFound += secrets.length;
     injectionFound += injections.length;
     for (const s of raw) {

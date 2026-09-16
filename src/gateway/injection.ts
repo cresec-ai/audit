@@ -161,8 +161,17 @@ export const INJECTION_PATTERNS: ReadonlyArray<InjectionPattern> = [
   },
 ];
 
-/** Hard cap on scanned characters; callers already cap at max_scan_bytes. */
-const MAX_SCAN_CHARS = 1_048_576;
+/**
+ * Default cap on scanned characters, for a caller that passes no budget of
+ * its own. It used to be a HARD cap: `max_scan_bytes` goes to 64 MiB, the
+ * secret scanner honoured it, and this one stopped at 1 MiB and still
+ * reported `scanned: true` — so a marker at offset 1,048,600 was delivered
+ * with `injection_found: 0` while the secret three words later in the same
+ * string was found and redacted. The boundary now passes its own
+ * `max_scan_bytes`, which it has already enforced on the whole line, so the
+ * limit never binds there and nothing is silently unscanned.
+ */
+export const MAX_SCAN_CHARS = 1_048_576;
 
 /**
  * Every match of `re` in `text` as a span, using a global clone so the
@@ -242,6 +251,14 @@ export interface NormalizedScan {
    * overwhelmingly common case) never pays for that pass.
    */
   sawMark?: true;
+  /**
+   * Present (and `true`) when an ANSI escape sequence carrying TEXT was
+   * consumed. That copy is the RENDERED view — a terminal shows none of the
+   * sequence — and a model reading the raw bytes sees the payload of an OSC
+   * or DCS string, so `findInjectionSpans` scans the raw view as well. Text
+   * with no escape sequence in it never pays for that pass.
+   */
+  sawEscapeText?: true;
 }
 
 /** Options for {@link normalizeForScan}. */
@@ -255,6 +272,21 @@ export interface NormalizeOptions {
    * unconditionally would fold distinct words together for everybody.
    */
   dropMarks?: boolean;
+  /**
+   * Keep the TEXT an escape sequence carries: the data string of an OSC,
+   * DCS, APC, PM or SOS, and the final byte of a bare two-character escape.
+   * CSI and the intermediate-form escapes are consumed as usual.
+   *
+   * The default copy is the RENDERED view — a terminal shows none of a
+   * sequence — and consuming one therefore also removes text a model reading
+   * the bytes still sees: a marker inside an OSC data string disappears from
+   * the scan, and a stray ESC in front of a marker letter takes that letter
+   * with it (`instr<ESC>uctions` scans as `instrctions`). This copy keeps
+   * exactly those two, so neither view can hide what the other shows, and
+   * the two agree everywhere else — which is why ordinary coloured output,
+   * all CSI, never pays for a second pass.
+   */
+  keepEscapeText?: boolean;
 }
 
 /**
@@ -378,24 +410,154 @@ function isMarkish(cp: number): boolean {
   return markish;
 }
 
+/** ESC, BEL, and the 8-bit C1 introducers an ANSI sequence can start with. */
+const ESC = 0x1b;
+const BEL = 0x07;
+const C1_CSI = 0x9b;
+const C1_ST = 0x9c;
+/** `]` OSC, `P` DCS, `_` APC, `^` PM, `X` SOS — the families with a payload. */
+const STRING_INTRODUCERS_7BIT: ReadonlySet<number> = new Set([0x5d, 0x50, 0x5f, 0x5e, 0x58]);
+/** The same five as single C1 characters: OSC, DCS, APC, PM, SOS. */
+const STRING_INTRODUCERS_8BIT: ReadonlySet<number> = new Set([0x9d, 0x90, 0x9f, 0x9e, 0x98]);
+
+/** Parameter bytes of a CSI sequence: digits, `;`, `:` and `<=>?`. */
+function isCsiParameter(c: number): boolean {
+  return c >= 0x30 && c <= 0x3f;
+}
+
+/** An ANSI escape sequence located in the text. */
+interface AnsiSequence {
+  /** Index just past the whole sequence, terminator included. */
+  end: number;
+  /**
+   * Index of the first character of the DATA STRING, for the families that
+   * carry one. Equal to `end` for the families that do not.
+   */
+  dataStart: number;
+  /** True for OSC / DCS / APC / PM / SOS: the families with a payload. */
+  isString: boolean;
+  /**
+   * True for a bare two-character escape (`ESC` + one final byte, no
+   * intermediates). Consuming one DELETES that byte, which is how a stray
+   * ESC in front of a marker letter takes the letter with it, so one
+   * normalized copy leaves these alone.
+   */
+  isBareEscape: boolean;
+}
+
 /**
- * Index just past the ANSI CSI sequence starting at `i` (an ESC), or `i`
- * when what follows is not one. The ESC itself is already a control
- * character and dropped; this drops the `[0m`-style parameter and final
- * bytes with it, which would otherwise stay behind and let
- * `ig<ESC>[0mnore all previous instructions` read as the marker while
- * scanning as two fragments. Every character is examined at most twice, so
- * the scan stays linear.
+ * The ANSI escape sequence starting at `i`, or undefined when what starts
+ * there is not one.
+ *
+ * The ESC (or 8-bit C1 introducer) is a control character and is dropped on
+ * its own anyway; what matters is the rest of the sequence, which would
+ * otherwise stay behind between two halves of a marker and let
+ * `ig<ESC>[0mnore all previous instructions` scan as two fragments while a
+ * terminal renders it as one. This used to recognise `ESC [` and nothing
+ * else, so every other family still split a marker:
+ *
+ *   ESC ( B              charset designation  ESC + intermediates + final
+ *   ESC 7                two-character escape ESC + final
+ *   ESC ] 8 ;; url BEL   OSC (hyperlink)      introducer + data + BEL/ST
+ *   ESC P q ... ESC \    DCS                  introducer + header + data + ST
+ *   U+009B 0 m           8-bit CSI            one-character introducer
+ *
+ * Every character is examined at most twice, so the scan stays linear.
  */
-function ansiSequenceEnd(s: string, i: number): number {
-  if (s.charCodeAt(i + 1) !== 0x5b) return i; // not "ESC ["
-  for (let j = i + 2; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c >= 0x20 && c <= 0x3f) continue; // parameter + intermediate bytes
-    if (c >= 0x40 && c <= 0x7e) return j + 1; // final byte
-    return i; // malformed: leave it to the lone-control-character drop
+function ansiSequenceAt(s: string, i: number): AnsiSequence | undefined {
+  const c0 = s.charCodeAt(i);
+  let body: number;
+  let kind: 'csi' | 'string' | 'escape';
+  let dcs = false;
+  if (c0 === ESC) {
+    const n = s.charCodeAt(i + 1);
+    if (Number.isNaN(n)) return undefined;
+    if (n === 0x5b) {
+      kind = 'csi';
+      body = i + 2;
+    } else if (STRING_INTRODUCERS_7BIT.has(n)) {
+      kind = 'string';
+      dcs = n === 0x50;
+      body = i + 2;
+    } else if (n >= 0x20 && n <= 0x7e) {
+      kind = 'escape';
+      body = i + 1;
+    } else {
+      return undefined;
+    }
+  } else if (c0 === C1_CSI) {
+    // The 8-bit introducer is ONE character, so any letter after it is a
+    // valid final byte and consuming the "sequence" would swallow it:
+    // `you<U+009B>r system` scanned as `yourystem`, with the marker's own
+    // `s` eaten. A parameter byte is therefore required here, where the
+    // 7-bit `ESC [` form needs none — its introducer is two characters, so
+    // dropping it leaves a `[` behind and consuming is what removes it. A
+    // lone C1 with nothing after it needs no consuming anyway: it drops as
+    // a control character and the halves either side rejoin.
+    if (!isCsiParameter(s.charCodeAt(i + 1))) return undefined;
+    kind = 'csi';
+    body = i + 1;
+  } else if (STRING_INTRODUCERS_8BIT.has(c0)) {
+    kind = 'string';
+    dcs = c0 === 0x90;
+    body = i + 1;
+  } else {
+    return undefined;
   }
-  return i; // unterminated
+
+  if (kind === 'csi') {
+    for (let j = body; j < s.length; j++) {
+      const c = s.charCodeAt(j);
+      // Parameter and intermediate bytes, EXCEPT the space: `CSI SP s` is a
+      // legal sequence nobody writes, and reading one lets ` s` be eaten out
+      // of the middle of a word.
+      if (c >= 0x21 && c <= 0x3f) continue;
+      // final byte
+      if (c >= 0x40 && c <= 0x7e) return { end: j + 1, dataStart: j + 1, isString: false, isBareEscape: false };
+      return undefined; // malformed: leave it to the lone-control drop
+    }
+    return undefined; // unterminated
+  }
+
+  if (kind === 'escape') {
+    // ESC + zero or more intermediates (0x21-0x2f) + one final (0x30-0x7e).
+    // The space is excluded for the reason above: `ESC SP i` is legal and
+    // unused, and reading one eats the space and the letter after it.
+    for (let j = body; j < s.length; j++) {
+      const c = s.charCodeAt(j);
+      if (c >= 0x21 && c <= 0x2f) continue;
+      if (c >= 0x30 && c <= 0x7e) {
+        return { end: j + 1, dataStart: j + 1, isString: false, isBareEscape: j === body };
+      }
+      return undefined;
+    }
+    return undefined; // unterminated
+  }
+
+  // A string family. DCS carries a header (parameters, intermediates and a
+  // final byte) before its data; the others start their data immediately.
+  let dataStart = body;
+  if (dcs) {
+    let j = body;
+    while (j < s.length) {
+      const c = s.charCodeAt(j);
+      if (c >= 0x20 && c <= 0x3f) {
+        j++;
+        continue;
+      }
+      if (c >= 0x40 && c <= 0x7e) j++; // the final byte
+      break;
+    }
+    dataStart = j;
+  }
+  for (let j = dataStart; j < s.length; j++) {
+    const c = s.charCodeAt(j);
+    if (c === BEL || c === C1_ST) return { end: j + 1, dataStart, isString: true, isBareEscape: false };
+    if (c === ESC && s.charCodeAt(j + 1) === 0x5c) {
+      return { end: j + 2, dataStart, isString: true, isBareEscape: false };
+    }
+  }
+  return undefined; // unterminated: nothing is consumed, so nothing is hidden
 }
 
 const WS_RE = /\s/;
@@ -424,10 +586,12 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
     return { text: typeof original === 'string' ? original : '', changed: false };
   }
   const dropMarks = opts.dropMarks === true;
+  const keepEscapeText = opts.keepEscapeText === true;
   const runs: Run[] = [];
   let out = '';
   let changed = false;
   let sawMark = false;
+  let sawEscapeText = false;
 
   const emit = (chunk: string, oStart: number, oEnd: number, identity: boolean): void => {
     if (!identity) changed = true;
@@ -463,14 +627,30 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
     // in which case its UTF-16 units are two surrogates and neither is.
     const cp = original.codePointAt(i) ?? original.charCodeAt(i);
     const width = cp > 0xffff ? 2 : 1;
-    if (cp === 0x1b) {
-      // ESC: drop the whole CSI sequence, not just the ESC, so its parameter
-      // and final bytes cannot stay behind between two halves of a marker.
-      const end = ansiSequenceEnd(original, i);
-      if (end > i) {
-        i = end;
-        changed = true;
-        continue;
+    if (cp === ESC || cp === C1_CSI || STRING_INTRODUCERS_8BIT.has(cp)) {
+      const seq = ansiSequenceAt(original, i);
+      if (seq !== undefined) {
+        // A sequence whose removal takes TEXT with it needs the second copy;
+        // a CSI does not, so coloured output never pays for one.
+        if (!sawEscapeText && (seq.isString || seq.isBareEscape)) sawEscapeText = true;
+        if (keepEscapeText && seq.isBareEscape) {
+          // Fall through: the ESC drops as a control and its final byte,
+          // which may be a letter of a marker, stays.
+        } else if (keepEscapeText && seq.isString) {
+          // Keep the data string a reader of the bytes sees; drop only the
+          // introducer and header, which cannot carry a marker but can glue
+          // onto one (`ESC P q` in front of `ignore all previous ...`).
+          i = seq.dataStart;
+          changed = true;
+          continue;
+        } else {
+          // Drop the whole sequence, not just its introducer, so parameter
+          // and final bytes cannot stay behind between two halves of a
+          // marker.
+          i = seq.end;
+          changed = true;
+          continue;
+        }
       }
     }
     if (isInvisible(cp)) {
@@ -484,14 +664,19 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
         const c = original.codePointAt(j) ?? original.charCodeAt(j);
         const w = c > 0xffff ? 2 : 1;
         // An ANSI sequence inside a whitespace run has to be consumed WHOLE
-        // here too: its ESC is an invisible, so without this the run would
-        // swallow the ESC and leave `[0m` standing in the middle of the
-        // normalized text.
-        if (c === 0x1b) {
-          const end = ansiSequenceEnd(original, j);
-          if (end > j) {
-            j = end;
-            continue;
+        // here too: its introducer is an invisible, so without this the run
+        // would swallow the introducer and leave `[0m` standing in the
+        // middle of the normalized text. In the raw-view copy a sequence is
+        // not consumed at all, so the run stops at it and the data string is
+        // scanned as the text it is.
+        if (c === ESC || c === C1_CSI || STRING_INTRODUCERS_8BIT.has(c)) {
+          const seq = ansiSequenceAt(original, j);
+          if (seq !== undefined) {
+            if (!sawEscapeText && (seq.isString || seq.isBareEscape)) sawEscapeText = true;
+            if (!(keepEscapeText && (seq.isString || seq.isBareEscape))) {
+              j = seq.end;
+              continue;
+            }
           }
         }
         if (isWhitespace(c) || isInvisible(c)) j += w;
@@ -511,6 +696,7 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
   }
   const scan: NormalizedScan = changed ? { text: out, changed, runs } : { text: out, changed: false };
   if (sawMark) scan.sawMark = true;
+  if (sawEscapeText) scan.sawEscapeText = true;
   return scan;
 }
 
@@ -593,13 +779,20 @@ function scanCopy(normalized: NormalizedScan): Span[] {
  * a trailing zero-width character always was: the span covers what matched,
  * so a redaction can leave a stray accent behind but never eats a neighbour.)
  */
-export function findInjectionSpans(text: string): Span[] {
+export function findInjectionSpans(text: string, limit: number = MAX_SCAN_CHARS): Span[] {
   if (typeof text !== 'string' || text.length === 0) return [];
-  const scanned = text.length > MAX_SCAN_CHARS ? text.slice(0, MAX_SCAN_CHARS) : text;
+  const cap = Number.isFinite(limit) && limit > 0 ? limit : MAX_SCAN_CHARS;
+  const scanned = text.length > cap ? text.slice(0, cap) : text;
   const normalized = normalizeForScan(scanned);
   const found = scanCopy(normalized);
-  if (normalized.sawMark === true) {
-    for (const s of scanCopy(normalizeForScan(scanned, { dropMarks: true }))) found.push(s);
+  const marks = normalized.sawMark === true;
+  const escapes = normalized.sawEscapeText === true;
+  const extras: NormalizeOptions[] = [];
+  if (marks) extras.push({ dropMarks: true });
+  if (escapes) extras.push({ keepEscapeText: true });
+  if (marks && escapes) extras.push({ dropMarks: true, keepEscapeText: true });
+  for (const opts of extras) {
+    for (const s of scanCopy(normalizeForScan(scanned, opts))) found.push(s);
   }
   if (found.length === 0) return [];
   return mergeSpans(found);

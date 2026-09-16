@@ -269,32 +269,76 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
 
 ## What gateway mode does not do
 
-- It does not touch anything but `tools/call` requests and their results;
-  every other JSON-RPC message is forwarded unchanged, like record mode.
-  Four consequences worth knowing: a `tools/call` sent as a notification (no
-  `id`) is forwarded unevaluated, since no response could be synthesized for
-  it and MCP servers do not execute tool notifications — but a `tools/call`
-  *request* is always evaluated, and one whose `params.name` is missing or is
-  not a string is evaluated as the tool name `""`, so `mcp.default` (and any
-  rule whose tool glob matches an empty string) decides it; a `hold` rule
-  matched inside a JSON-RPC batch is treated as `deny` and carries the
-  **fail-closed** clause rather than the policy-decision one, because a batch
-  element has nowhere to park and so no operator is ever asked — sending the
-  same call on its own is what reaches an approver (batching was removed
-  from MCP in 2025-06-18; allowed and denied batch elements are answered
-  individually, and when the server answers a forwarded batch with an array,
-  every element that answers a `tools/call` goes through the boundary filter,
-  with `max_scan_bytes` applied to the whole batch line); a single line larger
-  than 32 MiB cannot be parsed, so it crosses unchanged and unevaluated and is
-  recorded as `protocol_error` `oversized`, exactly as in record mode; and
-  synthesized deny/hold responses ride the server-to-client stream, so they are
-  never spliced into the middle of a server line and may be ordered after one
-  that was already in flight — an approved hold is released into the
-  client-to-server stream the same way, after any client line still streaming
-  through.
+Every bullet here describes the code at this commit. The module header of
+`src/proxy/stdio.ts` is the same statement in more detail; if the two ever
+disagree, the header is the one kept next to the code.
+
+- It does not touch anything but `tools/call` and its results. Every other
+  JSON-RPC message is forwarded unchanged, as in record mode — but
+  "unchanged" is not "unevaluated": **no client byte reaches the server
+  unevaluated**, so the shapes that are not `tools/call` requests are still
+  gated.
 - It does not enforce `egress` rules (the sidecar does; see
   [docs/policy.md](policy.md)).
 - It does not hide denied tools from `tools/list` (v1).
+- It does not forward a line the policy could not be shown. Two things stop
+  the policy seeing one: it is larger than the scanner can buffer (32 MiB),
+  or it is not JSON. In gateway mode neither is forwarded — none of its bytes
+  reach the server — and the client is answered
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,...}}`, wrapped in an
+  array when the line started with `[` so a batch gets a batch response. An
+  oversized line is still recorded as `protocol_error` `oversized`. This is
+  the one place an allow-all gateway is not byte-for-byte identical to the
+  unwrapped server: a non-JSON line comes back as a refusal, because the
+  gateway cannot know it was harmless without parsing it. **Record mode
+  forwards both, unchanged** — it promises byte-for-byte and enforces
+  nothing.
+- It does not treat a JSON-RPC batch as a way in. Every element goes through
+  the same gate its standalone form does, in the same order: a `tools/call`
+  request is evaluated, a `tools/call` **notification** is evaluated (a deny
+  simply drops it, which is what "notification" already promises its sender),
+  an element that is itself an array is refused, and both id gates below run
+  per element. A refused element is never forwarded and its refusal comes
+  back as an element of the batch response; a batch with nothing refused
+  crosses byte-for-byte. Ids taken by earlier elements of the same batch
+  count as in flight, including the ones the gateway answered on, so a batch
+  that denies id 5 and then reuses it does not send the client two responses
+  for one id. A `hold` rule matched inside a batch is treated as `deny` and
+  carries the **fail-closed** clause rather than the policy-decision one: a
+  batch element has nowhere to park, so no operator is ever asked, and
+  sending the same call on its own is what reaches an approver. (Batching was
+  removed from MCP in 2025-06-18. When the server answers a forwarded batch
+  with an array, every element answering a `tools/call` goes through the
+  boundary filter, with `max_scan_bytes` applied to the whole batch line.)
+- It does not let two in-flight calls share a request id, for **any** c2s
+  request and not only `tools/call`: a same-id `tools/list` taking an
+  in-flight tool call's slot loses that call from the chain just as
+  thoroughly. A `tools/call` on a live (pending or held) id is refused with a
+  synthesized `isError` result, recorded as a `policy_decision` (deny, no
+  `rule_id` — no rule was consulted) plus a `tool_call` carrying
+  `error.type: 'duplicate_id'`; any other method is refused with a plain
+  -32600 and recorded as an `rpc` event with the same error type. Neither is
+  forwarded, so the call that owns the id keeps its slot, its result stays
+  correlated, boundary-filtered and recorded. Both gates run for a batch
+  element too. The number `7` and the string `"7"` are different ids, and
+  record mode (no `--policy`) keeps its last-writer-wins behaviour.
+  `registerPending` also seals any live entry it would displace, and an
+  approved hold reclaiming its key does the same — a last resort rather than
+  the mitigation, since a seal writes a record for a call whose real result
+  was already lost.
+- It does not forward a `tools/call` whose id is not a string or a number.
+  `{"id": null}` is not a valid MCP request and not a notification either,
+  and neither is `{"id": true}`, `{"id": {}}` or `{"id": []}`. Any of them is
+  refused fail-closed whatever the policy says — a matching `hold` rule is a
+  deny, and the call is not evaluated at all — and the client gets
+  `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":
+  "mcp-recorder gateway: tools/call with a null id is not a valid request"}}`
+  (JSON-RPC permits a null id on an error response, and it is the only honest
+  answer when the request's own id cannot be echoed). Because the frozen
+  schema's `request_id` is `string | number`, such a message is recorded
+  exactly as any id-less message is — one `notification` event — with the
+  refusal itself on stderr. This holds inside a batch as well. Without
+  `--policy` it crosses unevaluated, as before.
 - It parks at most 256 held calls at once; a hold-matching call beyond that
   is refused as a deny ("too many pending holds") rather than buffered
   without bound.
@@ -303,34 +347,11 @@ opa build -b build/policy-bundle -o build/policy-bundle.tar.gz
   refused immediately, recorded with `outcome: session_end` and no
   `approval_id`, and no hold file is written — a hold can never outlive the
   session that created it.
-- It does not let two in-flight calls share a JSON-RPC request id. A
-  `tools/call` whose id is currently held for approval, or is already pending,
-  is refused immediately (fail-closed) with a synthesized `isError` result and
-  is never forwarded, so the call that owns the id keeps its slot and its own
-  result is still correlated, boundary-filtered and recorded. The refusal is
-  recorded as a `policy_decision` (`deny`, no `rule_id` — no rule was
-  consulted) plus a `tool_call` carrying `error.type: 'duplicate_id'`; the
-  reason appears in the text the model sees and on stderr, never as readable
-  event data. The number `7` and the string `"7"` are different ids, and
-  record mode (no `--policy`) keeps its last-writer-wins behaviour. Two paths
-  are not checked up front, because the gateway only guards `tools/call`
-  requests: a `tools/call` reusing an in-flight id inside a JSON-RPC batch,
-  and a non-`tools/call` request (`tools/list`, ...) on the same id. If either
-  is still pending when a hold on that id is approved, it is sealed first — a
-  `tool_call` or `rpc` event with `error.type: 'duplicate_id'`, `result:
-  null`, `result_hash` the hash of canonical `null` and `is_error: true` — so
-  an approved hold never silently overwrites another call's evidence.
-- It does not forward a `tools/call` with `id: null`. MCP forbids a null
-  request id (the official SDK rejects one) and such a message is not a
-  notification either, so gateway mode refuses it whatever the policy says — a
-  matching `hold` rule is a deny, and the call is not evaluated at all — and
-  answers `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":
-  "mcp-recorder gateway: tools/call with a null id is not a valid request"}}`
-  (JSON-RPC permits a null id on an error response). Because the event
-  schema's `request_id` is `string | number`, the message is recorded exactly
-  as any id-less message is — one `notification` event — with the refusal
-  itself visible on stderr. Without `--policy` it crosses unevaluated, as
-  before.
+- It does not splice a synthesized response into the middle of a server
+  line: deny and hold responses ride the server-to-client stream, so they may
+  be ordered after a line that was already in flight. An approved hold is
+  released into the client-to-server stream the same way, after any client
+  line still streaming through.
 - It is stdio-only in v1; `mcp-recorder http --policy` is rejected (exit 2),
   and `http` ignores an exported `MCP_RECORDER_POLICY` with a one-line note
   on stderr rather than refusing to start.

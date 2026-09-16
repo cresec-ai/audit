@@ -847,6 +847,39 @@ describe('gateway: hold', () => {
     expect(holdFiles(s.dataDir)[0]!.status).toBe('cancelled');
   });
 
+  it('cancelled by a notifications/cancelled sent INSIDE a batch, exactly as one sent on its own', async () => {
+    // `cancelHold` had a single call site, on the standalone path, so a
+    // batched cancellation was forwarded to the server while the gateway
+    // kept the call parked. With `on_timeout: allow` the call the client had
+    // already cancelled then executed when the hold timed out.
+    const s = startProxy(standardPolicy());
+    await handshake(s);
+    s.send(toolsCall(2, 'send_mail', {}));
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    s.sendRaw(
+      JSON.stringify([
+        { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 } },
+        { jsonrpc: '2.0', id: 30, method: 'tools/list' },
+        { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 2, reason: 'user' } },
+      ]) + '\n',
+    );
+    await waitFor(s.responded(2), 'cancelled deny');
+    const result = s.response(2).result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain('was cancelled');
+    s.stdin.end();
+    await s.done;
+    const events = s.events();
+    expect(decisions(events)[0]).toMatchObject({ decision: 'hold', outcome: 'cancelled', request_id: 2 });
+    expect(toolCalls(events)[0]!.gateway).toMatchObject({ decision: 'hold', outcome: 'cancelled' });
+    expect(holdFiles(s.dataDir)[0]!.status).toBe('cancelled');
+    // The batch is still forwarded whole: both notifications and the
+    // tools/list reach the server and are recorded.
+    expect(
+      events.filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'notifications/cancelled'),
+    ).toHaveLength(2);
+  });
+
   it('still pending when stdin ends: outcome session_end, ONE tool_call (no unanswered duplicate), session_end last', async () => {
     const s = startProxy(standardPolicy());
     await handshake(s);

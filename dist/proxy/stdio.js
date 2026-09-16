@@ -2526,6 +2526,17 @@ export async function runStdioProxy(opts) {
             });
             if (kept.length > 0)
                 forwardC2s(keptBatchBytes(line, raw, batch, keptIndexes));
+            // A `notifications/cancelled` settles its hold wherever it arrives.
+            // This loop is the batch's half of that: `cancelHold` had one call
+            // site, on the standalone path, so a batched cancel was forwarded to
+            // the server while the gateway kept the call parked — and under
+            // `on_timeout: allow` the call the client had cancelled then EXECUTED
+            // when the hold timed out. Outside `guarded`, like the standalone
+            // path: settling a hold is enforcement, not recording.
+            for (const el of kept) {
+                if (isPlainObject(el) && el.method === 'notifications/cancelled')
+                    cancelHold(el);
+            }
             guarded(() => {
                 for (const call of forwardedCalls)
                     registerCall(call, gatewayOutcomeFor(call));
