@@ -1736,3 +1736,31 @@ describe('evaluateEgress', () => {
     expect(evaluateEgress(mcp([]), { host: 'h', method: 'GET', path: '/', bodyBytes: 0 }).failClosed).toBeUndefined();
   });
 });
+
+/* ---------------- patterns RE2 cannot load (compile-direction) -------------
+ * A pattern V8 accepts and RE2 does not compiles into the bundle, passes
+ * `opa check --strict`, and then ERRORS when `regex.match` runs. An erroring
+ * builtin is `undefined` in Rego, so the rule leaves the decision silently:
+ * a deny rule the control plane simply does not have. Both shapes are
+ * refused where the author can see why.
+ */
+describe('checkRe2Subset: shapes that would break RE2 at evaluation time', () => {
+  it('rejects a repeat count above RE2 max (1000), keeping 1000 itself', () => {
+    expect(checkRe2Subset('^a{1000}$')).toBeUndefined();
+    expect(checkRe2Subset('^a{1000,}$')).toBeUndefined();
+    expect(checkRe2Subset('^a{1001}$')).toMatch(/above RE2's limit of 1000/);
+    expect(checkRe2Subset('^a{2,1001}$')).toMatch(/above RE2's limit of 1000/);
+    expect(checkRe2Subset('^a{1001,}$')).toMatch(/above RE2's limit of 1000/);
+    // A literal "{" is not a quantifier and stays allowed in both engines.
+    expect(checkRe2Subset('[{]{2}')).toBeUndefined();
+    expect(checkRe2Subset('a{,3}')).toBeUndefined();
+    expect(checkRe2Subset('^\\d{1,3}\\.\\d{1,3}$')).toBeUndefined();
+  });
+
+  it('rejects a capture-group name RE2 cannot parse, and a duplicate name', () => {
+    expect(checkRe2Subset('^(?<ok_1>secret)$')).toBeUndefined();
+    expect(checkRe2Subset('^(?<café>secret)$')).toMatch(/not valid in RE2/);
+    expect(checkRe2Subset('^(?<$x>secret)$')).toMatch(/not valid in RE2/);
+    expect(checkRe2Subset('^(?<x>a)|(?<x>b)$')).toMatch(/used twice/);
+  });
+});

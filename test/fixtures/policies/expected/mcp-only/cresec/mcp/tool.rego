@@ -16,33 +16,31 @@ rules := [
 
 # rule[0]
 rule_matches contains 0 if {
-	glob.match("corp-*", ["/"], input.server)
-	glob.match("read_note", ["/"], input.tool)
+	regex.match("^corp\\-[^\\/]*$", input.server)
+	regex.match("^read_note$", input.tool)
 }
 
 # rule[1]
 rule_matches contains 1 if {
-	glob.match("*", ["/"], input.server)
-	some p in ["list_notes", "search/**"]
-	glob.match(p, ["/"], input.tool)
-	v0 := object.get(input.args, ["filters", 0, "field"], null)
-	v0 != null
+	regex.match("^[^\\/]*$", input.server)
+	some p in ["^list_notes$", "^search\\/[\\s\\S]*$"]
+	regex.match(p, input.tool)
+	is_object(input.args)
+	v0 := input.args.filters[0].field
 	type_name(v0) in {"string", "number", "boolean"}
 	regex.match("^(title|body)$", scalar_text(v0))
-	v1 := object.get(input.args, ["limit"], null)
-	v1 != null
+	v1 := input.args.limit
 	type_name(v1) in {"string", "number", "boolean"}
 	regex.match("^[0-9]{1,2}$", scalar_text(v1))
-	v2 := object.get(input.args, ["dry_run"], null)
-	v2 != null
+	v2 := input.args.dry_run
 	type_name(v2) in {"string", "number", "boolean"}
 	regex.match("^true$", scalar_text(v2))
 }
 
 # rule[2]
 rule_matches contains 2 if {
-	glob.match("*", ["/"], input.server)
-	glob.match("*", ["/"], input.tool)
+	regex.match("^[^\\/]*$", input.server)
+	regex.match("^[^\\/]*$", input.tool)
 	input.args_bytes <= 1024
 }
 

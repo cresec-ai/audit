@@ -14,9 +14,9 @@ rules := [
 
 # github-read
 rule_matches contains 0 if {
-	glob.match("api.github.com", ["."], input.host)
+	regex.match("^api\\.github\\.com$", input.host)
 	input.method in ["GET", "HEAD"]
-	glob.match("/**", ["/"], input.path)
+	regex.match("^\\/[\\s\\S]*$", input.path)
 	input.body_bytes <= 1048576
 }
 

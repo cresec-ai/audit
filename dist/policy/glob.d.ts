@@ -34,6 +34,17 @@
 export type GlobDelimiter = '/' | '.';
 /** Max compiled globs retained; beyond this the least recently used is evicted. */
 export declare const GLOB_CACHE_SIZE = 512;
+/**
+ * Translate a glob into the SOURCE of an anchored, flag-less RegExp.
+ *
+ * This is the single definition of what a policy glob means. The local
+ * engine compiles it with `new RegExp`; `rego.ts` emits the same string to
+ * `regex.match`, so the control plane cannot read a glob differently from
+ * the gateway. It emits only three things — `[\s\S]*`, `[^<delim>]*` and
+ * escaped literals — all of which RE2 and V8 agree on, and `^`/`$` mean end
+ * of text in both (neither is in multiline mode).
+ */
+export declare function globToRegExpSource(glob: string, delimiter: GlobDelimiter): string;
 /** Translate a glob into an anchored, flag-less RegExp (uncached). */
 export declare function globToRegExp(glob: string, delimiter: GlobDelimiter): RegExp;
 /** Cached variant of `globToRegExp`. */

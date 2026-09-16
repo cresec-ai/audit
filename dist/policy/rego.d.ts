@@ -14,10 +14,10 @@
  * JSON.stringify (Rego string syntax accepts JSON escapes). Each rule body
  * mirrors `engine.ts` predicate for predicate:
  *
- *   glob.match(pattern, ["/"], input.server)         server / tool / path
- *   glob.match(pattern, ["."], input.host)           host
- *   some p in [...]; glob.match(p, ...)              lists with more than one glob
- *   v0 := object.get(input.args, ["a", 0, "c"], null); v0 != null;
+ *   regex.match(glob-as-regex, input.server)         server / tool / path
+ *   regex.match(glob-as-regex, input.host)           host
+ *   some p in [...]; regex.match(p, ...)             lists with more than one glob
+ *   v0 := input.args.a[0].c;
  *   type_name(v0) in {"string", "number", "boolean"}; regex.match(re, scalar_text(v0))
  *   input.args_bytes <= N / input.body_bytes <= N
  *   input.method in ["GET", "HEAD"]

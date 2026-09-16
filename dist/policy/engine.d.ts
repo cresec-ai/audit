@@ -79,12 +79,13 @@ export declare function dotPathSegments(dotPath: string): Array<string | number>
  * segments index arrays only, string segments read own keys of plain
  * objects only. Returns undefined when the path does not exist.
  *
- * The ROOT must be a plain (non-array) object, exactly like Rego's
- * `object.get(input.args, ...)`, which is undefined for every non-object
- * root — an array `params.arguments` (or a string, number, boolean or null)
- * therefore never matches any `args` condition. `params.arguments` is an
- * object per MCP, so this only bites on malformed requests, and both engines
- * now agree that those never match.
+ * The ROOT must be a plain (non-array) object: an array `params.arguments`
+ * (or a string, number, boolean or null) never matches any `args` condition.
+ * `params.arguments` is an object per MCP, so this only bites on malformed
+ * requests. The compiled Rego states the same rule as an explicit
+ * `is_object(input.args)` line — it used to inherit it from `object.get`
+ * erroring on a non-object root, which is undefined in Rego and so agreed
+ * with this by silent failure rather than by saying anything.
  */
 export declare function getPath(root: unknown, dotPath: string): unknown;
 /**

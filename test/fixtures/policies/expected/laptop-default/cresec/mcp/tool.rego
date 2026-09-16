@@ -15,11 +15,11 @@ rules := [
 
 # no-exfil
 rule_matches contains 0 if {
-	glob.match("*", ["/"], input.server)
-	some p in ["http_post", "send_*"]
-	glob.match(p, ["/"], input.tool)
-	v0 := object.get(input.args, ["url"], null)
-	v0 != null
+	regex.match("^[^\\/]*$", input.server)
+	some p in ["^http_post$", "^send_[^\\/]*$"]
+	regex.match(p, input.tool)
+	is_object(input.args)
+	v0 := input.args.url
 	type_name(v0) in {"string", "number", "boolean"}
 	regex.match("^https?://", scalar_text(v0))
 	input.args_bytes <= 65536
@@ -27,8 +27,8 @@ rule_matches contains 0 if {
 
 # hold-writes
 rule_matches contains 1 if {
-	glob.match("*", ["/"], input.server)
-	glob.match("write_*", ["/"], input.tool)
+	regex.match("^[^\\/]*$", input.server)
+	regex.match("^write_[^\\/]*$", input.tool)
 }
 
 # The exact text the TypeScript engine matches on: strings as-is, numbers and

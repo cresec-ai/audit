@@ -15,6 +15,7 @@ import {
   deniedText,
   findInjectionSpans,
   findSecretSpans,
+  isCodeShapedAssignment,
   mergeSpans,
   normalizeForScan,
   oversizeBlockedText,
@@ -1669,5 +1670,79 @@ describe('findInjectionSpans: spans still map back exactly under controls and ma
       }
     }
     expect(failures).toEqual([]);
+  });
+});
+
+/* ------------- source code is not a credential (blocking finding) ---------
+ * The bare assignment family takes any value, so `function f(token: string,
+ * ...)` read it as an assignment and the `\S+` value swallowed the type
+ * after it. Under the DEFAULT config — a policy with no `boundary:` section
+ * at all — an agent reading its own repository through a filesystem server
+ * got redaction markers where the code should be: 21 files and 188 lines of
+ * this repository's own sources.
+ */
+describe('boundary secrets: source code is delivered intact', () => {
+  it.each([
+    ['a TypeScript parameter list', 'export function escapePointerToken(token: string): string {'],
+    ['two annotated parameters', 'function child(path: string, token: string | number): string {'],
+    ['an awaited call', 'const secret = await loadSecret();'],
+    ['a member assignment', "clean.password = '';"],
+    ['a template literal', 'return `secret:${index}`;'],
+    ['an index expression', 'let token = m[0];'],
+    ['a call expression', 'const password = decode(url.password);'],
+    ['an interface body', 'interface Opts { token?: string; apiKey?: string }'],
+    ['a Python signature', 'def f(token: str, secret: bytes) -> None:'],
+    ['a None default', 'password = None'],
+    ['an Optional annotation', 'api_key: Optional[str] = None'],
+    ['a length constant', 'MAX_TOKEN_LENGTH = 512'],
+  ])('%s crosses the boundary byte-for-byte', (_label, line) => {
+    expect(findSecretSpans(line, boundarySecretPatterns())).toEqual([]);
+    const msg = textResult(line);
+    const out = applyBoundary(msg, cfg(), deps);
+    expect(out.changed).toBe(false);
+    expect(contentText(out.message)).toBe(line);
+    expect(out.report).toEqual({ scanned: true, action: 'none', secrets_found: 0, injection_found: 0 });
+  });
+
+  it.each([
+    ['the JSON shape of a credential', '{"password": "hunter2"}', 'hunter2'],
+    ['a bare assignment', 'password=hunter2-correct-horse', 'hunter2-correct-horse'],
+    ['an env-var-shaped one', 'DB_PASSWORD=hunter2-correct-horse', 'hunter2-correct-horse'],
+    ['a quoted word', 'password: "hunter"', 'hunter'],
+    ['a JWT-shaped value', 'token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig', 'eyJhbGciOiJIUzI1NiJ9'],
+    ['a hex value', 'api_key = 9f8a7b6c5d4e3f2a1b0c', '9f8a7b6c5d4e3f2a1b0c'],
+    ['a value with punctuation', 'secret: s3cr3t!value', 's3cr3t!value'],
+  ])('%s is still redacted', (_label, line, secretPart) => {
+    expect(findSecretSpans(line, boundarySecretPatterns()).length).toBeGreaterThan(0);
+    const out = applyBoundary(textResult(line), cfg(), deps);
+    expect(out.changed).toBe(true);
+    expect(contentText(out.message)).not.toContain(secretPart);
+    expect(JSON.stringify(out.message)).not.toContain(secretPart);
+  });
+
+  it('storage redaction is unchanged, so the boundary is still a strict subset', () => {
+    // Narrowing the PATTERN would have let a password containing "," or ")"
+    // match in PART and leave the rest of it in the store in clear. The
+    // boundary drops matches instead; storage keeps the permissive value and
+    // still hashes the whole leaf.
+    const line = 'function f(token: string, x: number) {';
+    expect(findSecretSpans(line, boundarySecretPatterns())).toEqual([]);
+    expect(redactor.scrub({ v: line })).toMatchObject({ v: { redacted: true, ref: sha256Ref(line) } });
+  });
+
+  it('the shape rules are linear in the value length', () => {
+    // The first draft used /[A-Za-z_$][A-Za-z0-9_$]*\s*[([]/, which restarts
+    // at every position: 4.8 s on 60 KiB, on the forwarding path.
+    const line = `password=${'a'.repeat(400_000)}`;
+    const started = performance.now();
+    const spans = findSecretSpans(line, boundarySecretPatterns());
+    const ms = performance.now() - started;
+    expect(spans.length).toBeGreaterThan(0); // a 400 KB value in a password field IS a credential
+    expect(ms).toBeLessThan(1_000);
+  });
+
+  it('isCodeShapedAssignment keeps a match whose shape it cannot split', () => {
+    // No separator to split on: the flag family's own gate decides, not this.
+    expect(isCodeShapedAssignment('--password hunter2', ' ')).toBe(false);
   });
 });

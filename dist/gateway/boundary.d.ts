@@ -162,6 +162,36 @@ export declare const BOUNDARY_SECRET_FAMILIES: readonly BoundarySecretFamily[];
  */
 export declare function boundarySecretPatterns(): readonly RegExp[];
 /**
+ * True when a BARE-family match is a fragment of source code rather than a
+ * credential.
+ *
+ * The bare family takes ANY value on purpose: a field whose whole name is
+ * `password` carries a credential whatever it looks like, and a value gate
+ * like the affixed family's would drop `{"password": "hunter2"}`, the
+ * commonest shape in a tool result. That premise holds for configuration and
+ * command output and fails for SOURCE CODE — the main thing an agent reads
+ * through a filesystem server. `function f(token: string, ...)` is an
+ * assignment by this pattern's reading, and because the value is `\S+` the
+ * span swallows the type after it, so the model is handed
+ * `function f([redacted:sha256:…] ...)` instead of the code it asked for.
+ * Measured over this repository's own sources before the fix: 21 files, 188
+ * lines rewritten.
+ *
+ * `preceding` is the character before the match, which separates a member
+ * assignment in code (`clean.password = ''`) from the same keyword in JSON,
+ * YAML or an env dump, where it is preceded by a quote, a brace, a dash or
+ * nothing.
+ *
+ * This runs at the BOUNDARY only. The storage pattern keeps the permissive
+ * `\S+`, because the two directions fail differently: hashing a type
+ * annotation costs readability in the evidence store, while narrowing what
+ * storage matches would let a password containing `,` or `)` match in PART
+ * and leave the rest of it in the store in clear. So the boundary drops
+ * matches rather than the pattern being changed, and `boundary ⊆ storage`
+ * still holds — now strictly.
+ */
+export declare function isCodeShapedAssignment(matched: string, preceding: string): boolean;
+/**
  * Locate secret-shaped tokens in `text`. Returns merged, sorted,
  * non-overlapping spans whose `id` is `secret:<pattern index>` of the
  * earliest contributing pattern. Never throws on non-string input.

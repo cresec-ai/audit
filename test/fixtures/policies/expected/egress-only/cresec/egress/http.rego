@@ -16,25 +16,25 @@ rules := [
 
 # github
 rule_matches contains 0 if {
-	some h in ["api.github.com", "*.githubusercontent.com"]
-	glob.match(h, ["."], input.host)
+	some h in ["^api\\.github\\.com$", "^[^\\.]*\\.githubusercontent\\.com$"]
+	regex.match(h, input.host)
 	input.method in ["GET", "HEAD"]
-	glob.match("/**", ["/"], input.path)
+	regex.match("^\\/[\\s\\S]*$", input.path)
 }
 
 # npm-publish
 rule_matches contains 1 if {
-	glob.match("registry.npmjs.org", ["."], input.host)
+	regex.match("^registry\\.npmjs\\.org$", input.host)
 	input.method in ["PUT"]
-	glob.match("/-/**", ["/"], input.path)
+	regex.match("^\\/\\-\\/[\\s\\S]*$", input.path)
 	input.body_bytes <= 4096
 }
 
 # telemetry
 rule_matches contains 2 if {
-	glob.match("*.telemetry.*", ["."], input.host)
-	some p in ["/v1/*", "/v2/**"]
-	glob.match(p, ["/"], input.path)
+	regex.match("^[^\\.]*\\.telemetry\\.[^\\.]*$", input.host)
+	some p in ["^\\/v1\\/[^\\/]*$", "^\\/v2\\/[\\s\\S]*$"]
+	regex.match(p, input.path)
 }
 
 first_match := min(rule_matches) if count(rule_matches) > 0

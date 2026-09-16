@@ -221,12 +221,129 @@ export function boundarySecretPatterns() {
 function secretId(index) {
     return `secret:${index}`;
 }
+/**
+ * The sources of the two families whose match is `<name><separator><value>`,
+ * taken from the table above so the two cannot drift apart. The flag family
+ * (`--password hunter2`) is NOT here: its value is already gated hard, and
+ * it has no separator to split on.
+ */
+const ASSIGNMENT_SOURCES = new Set(BOUNDARY_SECRET_FAMILIES.filter((f) => f.id.startsWith('secret-assignment')).map((f) => f.re.source));
+/**
+ * The value half of an assignment match: everything past the first `:` or
+ * `=`. No keyword and no affix contains either character, so the first one
+ * in the match IS the separator, whatever family matched and however the
+ * name was quoted (`"password": "hunter2"` splits at the `:` after the
+ * closing quote).
+ */
+function assignmentValue(matched) {
+    const at = matched.search(/[:=]/);
+    if (at < 0)
+        return undefined;
+    return matched.slice(at + 1).replace(/^\s+/, '');
+}
+/**
+ * A value that is a bare word: letters only, no digit, no `-`/`_`/`.`/`/`,
+ * optionally followed by the punctuation that ended the token in the source
+ * (`string,`, `string):`, `bool;`). This is what a type annotation, a
+ * keyword and an identifier look like — `token: string`, `secret = await`,
+ * `password = null` — and what a credential almost never looks like.
+ *
+ * The cost is stated rather than hidden: an UNQUOTED, letters-only,
+ * digit-free value in a BARE `password=`/`token:` field is no longer
+ * redacted at the boundary. Quoting it (`password: "hunter"`), an affix
+ * (`DB_PASSWORD=hunter`), any digit or separator, and every prefix family
+ * (`sk-`, `ghp_`, `AKIA`, `Bearer`, JWT, PEM, `xox`) are all unaffected, and
+ * storage still hashes it either way.
+ */
+const BARE_WORD_VALUE = /^[A-Za-z]+\W*$/;
+/**
+ * How much of a value the shape rules look at. A type name, a keyword and a
+ * placeholder are all short; past this the value is a blob, and a blob in a
+ * field called `password` is a credential, so the cap fails towards
+ * redacting. It also bounds the per-match cost: the first draft of
+ * `hasCallOrIndex` was the regex `/[A-Za-z_$][A-Za-z0-9_$]*\s*[([]/`, which
+ * restarts at every position and took 4.8 s on 60 KiB — a backtracking
+ * blowup on the forwarding path, which is the thing this filter exists to
+ * keep out of the gateway.
+ */
+const SHAPE_CAP = 512;
+/**
+ * True when `value` contains an identifier immediately followed by a call or
+ * an index (`decode(url.password);`, `m[0];`). Written as a scan rather than
+ * a regex so it is linear: each `(`/`[` walks back over its own run of
+ * spaces and nothing else.
+ */
+function hasCallOrIndex(value) {
+    for (let i = 1; i < value.length; i++) {
+        const c = value[i];
+        if (c !== '(' && c !== '[')
+            continue;
+        let j = i - 1;
+        while (j >= 0 && (value[j] === ' ' || value[j] === '\t'))
+            j--;
+        if (j >= 0 && /[A-Za-z0-9_$]/.test(value[j]))
+            return true;
+    }
+    return false;
+}
+/** A shell or template placeholder rather than a value: `${x}`, `$(x)`, `$VAR`, `<your-key>`. */
+const PLACEHOLDER_VALUE = /^(?:\$[{(]|\$[A-Z_][A-Za-z0-9_]*\W*$|<)/;
+/**
+ * True when a BARE-family match is a fragment of source code rather than a
+ * credential.
+ *
+ * The bare family takes ANY value on purpose: a field whose whole name is
+ * `password` carries a credential whatever it looks like, and a value gate
+ * like the affixed family's would drop `{"password": "hunter2"}`, the
+ * commonest shape in a tool result. That premise holds for configuration and
+ * command output and fails for SOURCE CODE — the main thing an agent reads
+ * through a filesystem server. `function f(token: string, ...)` is an
+ * assignment by this pattern's reading, and because the value is `\S+` the
+ * span swallows the type after it, so the model is handed
+ * `function f([redacted:sha256:…] ...)` instead of the code it asked for.
+ * Measured over this repository's own sources before the fix: 21 files, 188
+ * lines rewritten.
+ *
+ * `preceding` is the character before the match, which separates a member
+ * assignment in code (`clean.password = ''`) from the same keyword in JSON,
+ * YAML or an env dump, where it is preceded by a quote, a brace, a dash or
+ * nothing.
+ *
+ * This runs at the BOUNDARY only. The storage pattern keeps the permissive
+ * `\S+`, because the two directions fail differently: hashing a type
+ * annotation costs readability in the evidence store, while narrowing what
+ * storage matches would let a password containing `,` or `)` match in PART
+ * and leave the rest of it in the store in clear. So the boundary drops
+ * matches rather than the pattern being changed, and `boundary ⊆ storage`
+ * still holds — now strictly.
+ */
+export function isCodeShapedAssignment(matched, preceding) {
+    if (preceding === '.')
+        return true; // `clean.password = ''` — a member assignment
+    const value = assignmentValue(matched);
+    if (value === undefined)
+        return false; // a shape this function cannot split stays a match
+    if (PLACEHOLDER_VALUE.test(value))
+        return true;
+    if (!/[A-Za-z0-9]/.test(value))
+        return true; // `…`, a stray backtick, punctuation only
+    const head = value.length > SHAPE_CAP ? value.slice(0, SHAPE_CAP) : value;
+    // A template literal or an expression: code, where a credential is a literal.
+    if (head.includes('`') || hasCallOrIndex(head))
+        return true;
+    return value.length <= SHAPE_CAP && BARE_WORD_VALUE.test(value);
+}
 /** Every raw per-pattern match (may overlap), in pattern order. */
 function rawSecretSpans(text, patterns) {
     const out = [];
     patterns.forEach((re, i) => {
-        for (const s of matchSpans(re, text, secretId(i)))
+        const assignment = ASSIGNMENT_SOURCES.has(re.source);
+        for (const s of matchSpans(re, text, secretId(i))) {
+            const before = s.start === 0 ? '' : text.slice(s.start - 1, s.start);
+            if (assignment && isCodeShapedAssignment(text.slice(s.start, s.end), before))
+                continue;
             out.push(s);
+        }
     });
     return out;
 }

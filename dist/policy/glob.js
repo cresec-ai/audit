@@ -37,8 +37,17 @@ const cache = new Map();
 function escapeRegExp(ch) {
     return /[\\^$.*+?()[\]{}|/-]/.test(ch) ? '\\' + ch : ch;
 }
-/** Translate a glob into an anchored, flag-less RegExp (uncached). */
-export function globToRegExp(glob, delimiter) {
+/**
+ * Translate a glob into the SOURCE of an anchored, flag-less RegExp.
+ *
+ * This is the single definition of what a policy glob means. The local
+ * engine compiles it with `new RegExp`; `rego.ts` emits the same string to
+ * `regex.match`, so the control plane cannot read a glob differently from
+ * the gateway. It emits only three things — `[\s\S]*`, `[^<delim>]*` and
+ * escaped literals — all of which RE2 and V8 agree on, and `^`/`$` mean end
+ * of text in both (neither is in multiline mode).
+ */
+export function globToRegExpSource(glob, delimiter) {
     const d = escapeRegExp(delimiter);
     const crossing = '[\\s\\S]*'; // `**`: any run, delimiters included
     const segment = `[^${d}]*`; // `*`: any run of non-delimiters
@@ -71,7 +80,11 @@ export function globToRegExp(glob, delimiter) {
         parts.push(ch === '?' ? `[^${d}]` : escapeRegExp(ch));
         openRun = false;
     }
-    return new RegExp(`^${parts.join('')}$`);
+    return `^${parts.join('')}$`;
+}
+/** Translate a glob into an anchored, flag-less RegExp (uncached). */
+export function globToRegExp(glob, delimiter) {
+    return new RegExp(globToRegExpSource(glob, delimiter));
 }
 /** Cached variant of `globToRegExp`. */
 export function compileGlob(glob, delimiter) {

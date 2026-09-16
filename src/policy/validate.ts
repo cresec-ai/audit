@@ -270,6 +270,7 @@ export function toUnicodeSource(pattern: string): string {
  */
 export function checkRe2Subset(pattern: string): string | undefined {
   let inClass = false;
+  const groupNames = new Set<string>();
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
     if (ch === '\\') {
@@ -293,8 +294,13 @@ export function checkRe2Subset(pattern: string): string | undefined {
       inClass = true;
       continue;
     }
+    if (ch === '{') {
+      const why = checkRepeat(pattern, i);
+      if (why !== undefined) return why;
+      continue;
+    }
     if (ch === '(' && pattern[i + 1] === '?') {
-      const why = checkGroupPrefix(pattern, i + 2);
+      const why = checkGroupPrefix(pattern, i + 2, groupNames);
       if (why !== undefined) return why;
     }
   }
@@ -326,13 +332,66 @@ export function checkRe2Subset(pattern: string): string | undefined {
  * JavaScript and RE2 (Go regexp since 1.22), so they stay allowed; anything
  * else after `(?` is either lookaround or an inline flag / modifier group.
  */
-function checkGroupPrefix(pattern: string, at: number): string | undefined {
+/**
+ * RE2's repeat limit: Go's `regexp/syntax` refuses a count above 1000
+ * (`maxRepeat`), where V8 accepts anything up to 2^53. A pattern past it
+ * compiles here, compiles into the bundle, passes `opa check --strict` — and
+ * then `regex.match` ERRORS at evaluation time. An erroring builtin is
+ * `undefined` in Rego, so the whole rule drops out of the decision silently:
+ * a deny rule the control plane simply does not have. Refuse it here, where
+ * the author sees why.
+ */
+const RE2_MAX_REPEAT = 1000;
+
+/** `{n}` / `{n,}` / `{n,m}` starting at `at`, when it is a real quantifier. */
+const REPEAT_AT = /^\{(\d+)(?:,(\d*))?\}/;
+
+function checkRepeat(pattern: string, at: number): string | undefined {
+  const m = REPEAT_AT.exec(pattern.slice(at));
+  if (m === null) return undefined; // a literal "{", which both engines accept
+  const counts = [m[1], m[2]].filter((c): c is string => c !== undefined && c.length > 0);
+  for (const c of counts) {
+    if (Number(c) > RE2_MAX_REPEAT) {
+      return (
+        `repeat count ${c} is above RE2's limit of ${RE2_MAX_REPEAT}: the compiled policy would fail to` +
+        ' evaluate in OPA and the rule would be dropped from the decision'
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Go's grammar for a capture-group name is `[A-Za-z0-9_]+`, where JavaScript
+ * accepts any identifier — including `é` and `$`. The mismatch fails the
+ * same silent way as an over-long repeat, so the name is held to the
+ * narrower grammar. Go also refuses duplicate names, which V8 allows across
+ * alternation branches.
+ */
+const RE2_GROUP_NAME = /^[A-Za-z0-9_]+$/;
+
+function checkGroupPrefix(pattern: string, at: number, groupNames: Set<string>): string | undefined {
   const head = pattern.slice(at, at + 2);
   const first = head[0];
   if (first === ':') return undefined;
   if (first === '=' || first === '!') return `lookahead "(?${first}" is not supported (RE2 subset)`;
   if (head === '<=' || head === '<!') return `lookbehind "(?${head}" is not supported (RE2 subset)`;
-  if (first === '<') return undefined; // (?<name>...): validated by new RegExp below
+  if (first === '<') {
+    const close = pattern.indexOf('>', at);
+    if (close < 0) return undefined; // malformed: `new RegExp` below reports it
+    const name = pattern.slice(at + 1, close);
+    if (!RE2_GROUP_NAME.test(name)) {
+      return (
+        `capture-group name "${name}" is not valid in RE2, which allows only letters, digits and "_":` +
+        ' the compiled policy would fail to evaluate in OPA and the rule would be dropped from the decision'
+      );
+    }
+    if (groupNames.has(name)) {
+      return `capture-group name "${name}" is used twice, which RE2 rejects`;
+    }
+    groupNames.add(name);
+    return undefined;
+  }
   const shown = first === undefined ? '(?' : `(?${first}`;
   return `group "${shown}" is not supported (RE2 subset): only "(?:" non-capturing groups are allowed (no inline flags or modifier groups such as (?i), (?s), (?m), (?U), (?i:...), (?-i:...))`;
 }

@@ -176,8 +176,10 @@ describe('compileToRego: bundle layout', () => {
     expect(mcp).toContain('# Input:    {"server": "...", "tool": "...", "args": {...}, "args_bytes": 123}');
     expect(DECISION_SHAPE).toBe('{"allow": bool, "action": "allow"|"hold"|"deny", "rule_id": "...", "reason": "...", "matched": bool, "deny_reason": "..."}');
     expect(mcp).toContain(`# Decision: ${DECISION_SHAPE}`);
-    expect(mcp).toContain('\tsome p in ["http_post", "send_*"]\n\tglob.match(p, ["/"], input.tool)\n');
-    expect(mcp).toContain('\tv0 := object.get(input.args, ["url"], null)\n\tv0 != null\n');
+    // Globs are emitted as the REGEX `glob.ts` compiles them to, so OPA and
+    // the local engine cannot read the same pattern differently (F2).
+    expect(mcp).toContain('\tsome p in ["^http_post$", "^send_[^\\\\/]*$"]\n\tregex.match(p, input.tool)\n');
+    expect(mcp).toContain('\tis_object(input.args)\n\tv0 := input.args.url\n');
     expect(mcp).toContain('\tregex.match("^https?://", scalar_text(v0))\n\tinput.args_bytes <= 65536\n');
     // P1: json.marshal, never sprintf("%v") — Go's %v renders 1234567.5 as "1.2345675e+06".
     expect(mcp).not.toContain('sprintf("%v"');
@@ -189,7 +191,7 @@ describe('compileToRego: bundle layout', () => {
     expect(egress.startsWith('package cresec.egress\n\nimport rego.v1\n\n')).toBe(true);
     expect(egress).toContain(`# Decision: ${DECISION_SHAPE}`);
     expect(egress).toContain('# Input:    {"host": "...", "method": "GET", "path": "/...", "body_bytes": 123}');
-    expect(egress).toContain('\tglob.match("api.github.com", ["."], input.host)\n\tinput.method in ["GET", "HEAD"]\n\tglob.match("/**", ["/"], input.path)\n\tinput.body_bytes <= 1048576\n');
+    expect(egress).toContain('\tregex.match("^api\\\\.github\\\\.com$", input.host)\n\tinput.method in ["GET", "HEAD"]\n\tregex.match("^\\\\/[\\\\s\\\\S]*$", input.path)\n\tinput.body_bytes <= 1048576\n');
     expect(egress).toContain('default_action := "deny"');
     expect(policy.egress!.default).toBe('deny');
   });
@@ -259,11 +261,14 @@ describe('compileToRego: bundle layout', () => {
     expect(unnamed).toContain(`from policy "" (${goldenHash('laptop-default')})`);
   });
 
-  it('dot-path segments become object.get paths with numeric indexes as numbers', () => {
+  it('dot-path segments become a reference chain, numeric indexes as numbers', () => {
     const mcp = compileFixture('mcp-only.yaml').bundle.files[MCP_REGO_PATH]!;
-    expect(mcp).toContain('v0 := object.get(input.args, ["filters", 0, "field"], null)');
-    expect(mcp).toContain('v1 := object.get(input.args, ["limit"], null)');
-    expect(mcp).toContain('v2 := object.get(input.args, ["dry_run"], null)');
+    // NOT object.get, which errors on a non-object root and so drops the
+    // whole rule from the decision under --strict-builtin-errors (F-compile).
+    expect(mcp).not.toContain('object.get(');
+    expect(mcp).toContain('v0 := input.args.filters[0].field');
+    expect(mcp).toContain('v1 := input.args.limit');
+    expect(mcp).toContain('v2 := input.args.dry_run');
     expect(mcp).toContain('# rule[0]\nrule_matches contains 0 if {');
     expect(mcp).toContain('{"id": "rule[0]", "action": "allow", "reason": ""},');
   });
@@ -278,7 +283,7 @@ describe('compileToRego: bundle layout', () => {
     });
     if (!r.ok) throw new Error('fixture invalid');
     const out = compileToRego(r.policy, { policyHash: goldenHash('esc'), toolVersion: 'v' }).files[MCP_REGO_PATH]!;
-    expect(out).toContain('glob.match("say \\"hi\\"\\t", ["/"], input.tool)');
+    expect(out).toContain('regex.match("^say \\"hi\\"\\t$", input.tool)');
     expect(out).toContain('regex.match("^\\\\d+\\\\\\\\$", scalar_text(v0))');
     expect(out).toContain('"reason": "line\\nbreak \\"x\\" é"');
   });
@@ -343,8 +348,17 @@ interface OpaDecision {
   deny_reason: string;
 }
 
+/**
+ * `--strict-builtin-errors` is the load-bearing flag, not a detail. Without
+ * it a builtin that ERRORS — `regex.match` on a pattern RE2 cannot load,
+ * `glob.match` on a rune it cannot read — is `undefined` in Rego, the rule
+ * quietly drops out of `rule_matches`, and the decision comes back as a
+ * clean `default allow` that this suite would then compare happily against a
+ * TS engine that denies. Every emitted pattern has to survive evaluation for
+ * the parity claim to mean anything, so every eval in this file asserts it.
+ */
 function opaEval(opa: string, bundleDir: string, query: string, input: unknown): OpaDecision {
-  const r = spawnSync(opa, ['eval', '-b', bundleDir, '-I', '-f', 'json', query], { encoding: 'utf8', input: JSON.stringify(input) });
+  const r = spawnSync(opa, ['eval', '-b', bundleDir, '-I', '-f', 'json', '--strict-builtin-errors', query], { encoding: 'utf8', input: JSON.stringify(input) });
   expect(r.status, `opa eval failed: ${r.stderr}`).toBe(0);
   const parsed = JSON.parse(r.stdout) as { result?: Array<{ expressions: Array<{ value: OpaDecision }> }> };
   const value = parsed.result?.[0]?.expressions[0]?.value;
@@ -546,9 +560,9 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
       default: 'allow',
       rules: [
         { id: 'servers', match: { server: ['corp-*', 'fs'], tool: 'ls' }, action: 'deny', reason: 'two-entry server list' },
-        // A numeric FIRST segment: `params.arguments` is an object per MCP, so
-        // this can never match — object.get on an array is undefined in Rego
-        // and getPath refuses a non-object root in TypeScript.
+        // A numeric FIRST segment: `params.arguments` is an object per MCP,
+        // so this can never match — the emitted `is_object(input.args)` and
+        // `getPath`'s non-object-root refusal say so in their own engines.
         { id: 'array-root', match: { tool: 'http_post', args: { '0.url': '^https://' } }, action: 'deny', reason: 'numeric first segment' },
         { id: 'object-root', match: { tool: 'http_post', args: { url: '^https://' } }, action: 'deny', reason: 'object root' },
         { id: 'big-float', match: { tool: 'num', args: { n: '^1234567\\.5$' } }, action: 'deny', reason: 'float >= 1e6' },
@@ -604,7 +618,7 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     const module = readFileSync(join(parityDir, MCP_REGO_PATH), 'utf8');
     expect(module).toContain('scalar_text(v) := json.marshal(v) if not is_string(v)');
     expect(module).not.toContain('sprintf("%v"');
-    expect(module).toContain('some s in ["corp-*", "fs"]');
+    expect(module).toContain('some s in ["^corp\\\\-[^\\\\/]*$", "^fs$"]');
   });
 
   it.each(PARITY_CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
@@ -677,6 +691,77 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     expect(ts.ruleId ?? null, `TypeScript engine picked ${ruleLabel(ts)}`).toBe(c.ruleId);
     const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };
     expect(opaEval(opa, dotsDir, 'data.cresec.mcp.decision', opaInput)).toEqual(asOpa(ts));
+  });
+
+  /* ------------- globs decide identically in both engines ----------------
+   * OPA's glob library reads a pattern of the form A + crossing-wildcard + B
+   * as `HasPrefix(A) && HasSuffix(B)` with no requirement that the two not
+   * overlap, so `danger/[crossing]/run` matched `danger/run` there and not
+   * here: a deny rule the control plane enforced and the local gateway did
+   * not. An odd run of three or more `*` means "at least one character"
+   * there and "any run" here, and U+FFFD makes `glob.match` raise `could not
+   * read rune`, which is undefined in Rego and drops the rule. None of the
+   * three is reachable now: the compiler emits the REGEX `glob.ts` compiles
+   * the glob to, so there is one translation.
+   */
+  const globResult = validatePolicyObject({
+    version: 1,
+    name: 'globs',
+    mcp: {
+      default: 'allow',
+      rules: [
+        { id: 'overlap', match: { tool: 'danger/**/run' }, action: 'deny', reason: 'prefix and suffix overlap' },
+        { id: 'triple', match: { tool: 'sh***' }, action: 'deny', reason: 'odd wildcard run' },
+        { id: 'replacement', match: { tool: 'bad�tool' }, action: 'deny', reason: 'U+FFFD' },
+        { id: 'nul', match: { tool: 'nul tool' }, action: 'deny', reason: 'U+0000' },
+      ],
+    },
+    egress: {
+      default: 'deny',
+      rules: [{ id: 'host-overlap', match: { host: 'api.**.github.com', path: '/**' }, action: 'allow', reason: 'host overlap' }],
+    },
+  });
+  if (!globResult.ok) throw new Error(`globs fixture invalid: ${JSON.stringify(globResult.errors)}`);
+  const globPolicy = globResult.policy;
+  const globDir = join(tmp, 'globs');
+  writeBundle(globDir, compileToRego(globPolicy, { policyHash: goldenHash('globs'), toolVersion: TOOL_VERSION, policyName: 'globs' }));
+
+  const GLOB_CASES: Array<{ note: string; input: McpRequestInput; ruleId: string | null }> = [
+    { note: 'G1 the prefix and suffix of a crossing wildcard may not overlap ("danger/run")', input: mcpIn('s', 'danger/run', {}, 2), ruleId: null },
+    { note: 'G1 a crossing wildcard matches "danger/x/run"', input: mcpIn('s', 'danger/x/run', {}, 2), ruleId: 'overlap' },
+    { note: 'G1 a crossing wildcard matches "danger//run" (the run may be empty)', input: mcpIn('s', 'danger//run', {}, 2), ruleId: 'overlap' },
+    { note: 'G2 "sh***" matches "sh": an odd wildcard run is still just a run', input: mcpIn('s', 'sh', {}, 2), ruleId: 'triple' },
+    { note: 'G2 "sh***" matches "shell"', input: mcpIn('s', 'shell', {}, 2), ruleId: 'triple' },
+    { note: 'G3 a U+FFFD in a glob is a literal in both engines', input: mcpIn('s', 'bad�tool', {}, 2), ruleId: 'replacement' },
+    { note: 'G3 U+FFFD does not match another character', input: mcpIn('s', 'badxtool', {}, 2), ruleId: null },
+    { note: 'G4 a U+0000 in a glob is a literal in both engines', input: mcpIn('s', 'nul tool', {}, 2), ruleId: 'nul' },
+  ];
+
+  it('globs policy: opa check --strict and opa fmt stay green with regex-emitted globs', () => {
+    const module = readFileSync(join(globDir, MCP_REGO_PATH), 'utf8');
+    expect(module).not.toContain('glob.match(');
+    const check = spawnSync(opa, ['check', '--strict', '-b', globDir], { encoding: 'utf8' });
+    expect(check.status, check.stderr + check.stdout).toBe(0);
+    const fmt = spawnSync(opa, ['fmt', '--fail', '--list', join(globDir, 'cresec')], { encoding: 'utf8' });
+    expect(fmt.status, `opa fmt would reformat:\n${fmt.stdout}${fmt.stderr}`).toBe(0);
+  });
+
+  it.each(GLOB_CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
+    const ts = evaluateMcp(globPolicy, c.input);
+    expect(ts.ruleId ?? null, `TypeScript engine picked ${ruleLabel(ts)}`).toBe(c.ruleId);
+    const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };
+    expect(opaEval(opa, globDir, 'data.cresec.mcp.decision', opaInput)).toEqual(asOpa(ts));
+  });
+
+  it.each([
+    ['G5 a crossing wildcard in a host may not overlap ("api.github.com")', 'api.github.com', null],
+    ['G5 a crossing wildcard in a host matches "api.x.github.com"', 'api.x.github.com', 'host-overlap'],
+  ] as const)('%s', (_note, host, ruleId) => {
+    const input = egressIn(host, 'GET', '/x', 0);
+    const ts = evaluateEgress(globPolicy, input);
+    expect(ts.ruleId ?? null).toBe(ruleId);
+    const opaInput = { host: input.host, method: input.method, path: input.path, body_bytes: input.bodyBytes };
+    expect(opaEval(opa, globDir, 'data.cresec.egress.decision', opaInput)).toEqual(asOpa(ts));
   });
 
   it('a byte-order mark (and the rest of its class) is escaped, so the bundle loads and reads back unchanged', () => {

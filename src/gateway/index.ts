@@ -27,6 +27,7 @@ export {
   boundarySecretPatterns,
   deniedText,
   findSecretSpans,
+  isCodeShapedAssignment,
   oversizeBlockedText,
   redactSpans,
   synthesizeDeniedResult,
