@@ -1,0 +1,13 @@
+{
+  "deny": [
+    {
+      "tool": "^mcp__mcp\\.clickup\\.com__clickup_filter_tasks$",
+      "reason": "dogfood-4: denied via the RESOLVED HOST ALIAS ONLY (mcp.clickup.com), with no raw-UUID fallback in this rule — proves server.url resolution plus the deny-only alias from PR #13 blocks a live Claude Code call, not just a synthetic hook invocation"
+    },
+    {
+      "tool": "^mcp__[0-9a-f-]{36}__clickup_get_workspace_members$",
+      "reason": "dogfood-4 control: denied via the RAW UUID form only, with no alias — isolates whether a hook deny reaches Claude Code's live enforcement at all, independently of alias resolution"
+    }
+  ],
+  "default": "allow"
+}
