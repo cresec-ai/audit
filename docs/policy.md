@@ -165,7 +165,8 @@ every `match` condition holds decides the action. No rule → `default`.
 This is deliberately firewall-like: put specific rules first, broad ones last.
 
 **Globs** (identical in the TypeScript engine and in the emitted Rego, which
-uses `glob.match(pattern, [delimiter], subject)`):
+gets the glob as the REGEX this table translates it to — `regex.match`, not
+`glob.match`; see "Compiling to Rego" below for why):
 
 | Token | Meaning |
 | --- | --- |
@@ -178,11 +179,12 @@ Delimiters: `/` for `tool`, `server` and `path`; `.` for `host`. Patterns are
 anchored (they must match the whole subject). `[ ] { } \` are rejected too:
 OPA's glob library gives them a meaning this one does not.
 
-`?` is out because the two engines disagree about it: OPA's `glob.match`
-matches `?` against exactly one **ASCII** character, while the local engine
-(a UTF-16 regex) matches any non-delimiter character — `a?b` accepts `aéb`
-in the gateway and rejects it in OPA. `*` and `**` have no such split, so v1
-ships without `?` rather than with two meanings for it. Use `*` instead.
+`?` is out because it had two meanings when the bundle carried globs: OPA's
+`glob.match` matches `?` against exactly one **ASCII** character, while the
+local engine (a UTF-16 regex) matches any non-delimiter character — `a?b`
+accepted `aéb` in the gateway and rejected it in OPA. The emitted bundle no
+longer uses `glob.match`, so the split is gone with it, but v1 still rejects
+`?` rather than quietly changing what an existing policy means. Use `*`.
 
 **Regexes** (`match.args`) must stay inside the RE2 subset so that the local
 JavaScript engine and OPA's RE2 agree. `policy validate` rejects:
@@ -535,7 +537,25 @@ opa build -b ./bundle -o policy-bundle.tar.gz
 
 The TypeScript engine and the emitted Rego are kept semantically identical:
 the test suite evaluates the same inputs through both (`opa eval`) and
-requires the decisions to agree.
+requires the decisions to agree, with `--strict-builtin-errors` so that a
+pattern OPA cannot load fails the build instead of quietly dropping its rule
+from the decision. Two consequences are visible in the emitted Rego:
+
+- **A glob is emitted as the regex it translates to**, not as a glob to
+  `glob.match`. OPA's glob library reads `A**B` as
+  `HasPrefix(A) && HasSuffix(B)` with no requirement that the two not
+  overlap, so a `deny` on `danger/` + a crossing wildcard + `/run` blocked
+  the tool `danger/run` in the control plane and allowed it locally; an odd
+  run of three or more `*` means "at least one character" there and "any
+  run" here; and U+FFFD makes `glob.match` raise `could not read rune`,
+  which is `undefined` in Rego and drops the rule. One translation, shared
+  by both engines, removes the class.
+- **An args lookup is a reference chain** (`input.args.filters[0].field`)
+  behind an explicit `is_object(input.args)`, not
+  `object.get(input.args, [...], null)`. `object.get` ERRORS on a non-object
+  root, and an erroring builtin is `undefined` — so the agreement about a
+  malformed `params.arguments` rested on a silent failure rather than on
+  either engine saying anything.
 
 ## Evidence
 
