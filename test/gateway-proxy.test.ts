@@ -652,21 +652,26 @@ describe('gateway: deny', () => {
     expect(decision.rule_id).toBeUndefined();
   });
 
-  it('an oversized / malformed tool name is capped in events but the model still sees its own name', async () => {
-    const huge = 'delete_' + 'x'.repeat(5000);
+  it('a malformed but SHORT tool name is capped in events while the model still sees its own name', async () => {
+    // Off-shape (a space and a non-ASCII character) but well under
+    // MAX_EVALUATED_TOOL_NAME_LEN, so it is evaluated like any other name:
+    // the `delete_*` rule matches it and the refusal quotes it verbatim.
+    const odd = 'delete_me now \u2702';
+    expect(odd.length).toBeLessThanOrEqual(128);
     const s = startProxy(standardPolicy());
     await handshake(s);
-    s.send(toolsCall(2, huge, {}));
+    s.send(toolsCall(2, odd, {}));
     await waitFor(s.responded(2), 'deny');
-    expect((s.response(2).result as { content: { text: string }[] }).content[0]!.text).toContain(huge);
+    expect((s.response(2).result as { content: { text: string }[] }).content[0]!.text).toContain(odd);
     s.stdin.end();
     await s.done;
-    const ref = sha256Ref(huge);
-    expect(decisions(s.events())[0]!.tool).toBe(ref);
+    const ref = sha256Ref(odd);
+    // Evaluated: a RULE matched, so this is not the fail-closed cap path.
+    expect(decisions(s.events())[0]).toMatchObject({ tool: ref, rule_id: 'no-delete' });
     expect(toolCalls(s.events())[0]!.tool).toBe(ref);
-    expect(JSON.stringify(s.events())).not.toContain(huge.slice(0, 40));
-    expect(s.err.raw()).not.toContain(huge.slice(0, 40));
-    expect(queryStore(s.store, huge).matches.some((m) => m.path === '$.tool')).toBe(true);
+    expect(JSON.stringify(s.events())).not.toContain(odd);
+    expect(s.err.raw()).not.toContain(odd);
+    expect(queryStore(s.store, odd).matches.some((m) => m.path === '$.tool')).toBe(true);
   });
 });
 
@@ -2004,6 +2009,472 @@ describe('gateway: duplicate and null request ids', () => {
     expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
     expect(s.err.raw()).toContain('gateway: refused a tools/call with a null id (not a valid request); not forwarded');
     assertNoLeak(s, SECRET);
+    assertChainIntact(s.store);
+  });
+});
+
+/* ------------------ re-verification regressions (F3, F5, F7) ------------- */
+
+/**
+ * A server that REPORTS what it executed. `debug/seen` (deliberately not a
+ * `tools/call`, so the gateway never evaluates or filters it) answers with
+ * the ordered list of `tools/call` names that really reached the server and
+ * the raw client lines it read. That is the only direct evidence that a
+ * call was NOT forwarded — a `tools/call` carrying `"id": null` gets no
+ * response at all, so nothing on the client side can show whether it ran.
+ *
+ * `arguments.raw` makes it emit one literal line ({ID} -> the JSON request
+ * id) so a test can put exact bytes — number literals above all — on the
+ * server->client wire.
+ */
+function reportingServer(): string[] {
+  return lineServer(`
+  if (Array.isArray(msg)) { (globalThis.__raw = globalThis.__raw || []).push(line); msg.forEach((m) => handle(m, line)); return; }
+  if (!msg || msg.method === undefined) return;
+  if (msg.method === 'tools/call') {
+    (globalThis.__seen = globalThis.__seen || []).push(String(msg.params && msg.params.name));
+    if (msg.id === undefined || msg.id === null) return; // executed; no reply
+    const a = (msg.params && msg.params.arguments) || {};
+    if (typeof a.raw === 'string') { process.stdout.write(a.raw.split('{ID}').join(JSON.stringify(msg.id)) + '\\n'); return; }
+    answer(msg.id, JSON.stringify(a));
+    return;
+  }
+  if (msg.id === undefined || msg.id === null) return;
+  if (msg.method === 'debug/seen') { send({ jsonrpc: '2.0', id: msg.id, result: { seen: globalThis.__seen || [], raw: globalThis.__raw || [] } }); return; }
+  answer(msg.id, 'ok');
+`);
+}
+
+/** Ask the reporting server what it executed and what raw lines it read. */
+async function askServer(s: Session, id: number): Promise<{ seen: string[]; raw: string[] }> {
+  s.send({ jsonrpc: '2.0', id, method: 'debug/seen' });
+  await waitFor(s.responded(id), 'debug/seen');
+  return s.response(id).result as { seen: string[]; raw: string[] };
+}
+
+/** Every response line the client got for one id (batch arrays excluded). */
+function repliesFor(s: Session, id: unknown): Record<string, unknown>[] {
+  return s.out
+    .lines()
+    .map((l) => parseLine(l))
+    .filter((m): m is Record<string, unknown> => m !== undefined && m.id === id);
+}
+
+/** Every batch (array) line the client got. */
+function batchReplies(s: Session): unknown[][] {
+  return s.out
+    .lines()
+    .map((l) => {
+      try {
+        return JSON.parse(l) as unknown;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((v): v is unknown[] => Array.isArray(v));
+}
+
+describe('F3: an over-long tools/call name never reaches the policy engine', () => {
+  /**
+   * `*read*write*exec*` is three legal wildcards and validates clean, but
+   * `globMatch` compiles it to a BACKTRACKING RegExp that runs on the proxy
+   * thread. Its cost is cubic in the length of the subject when it fails to
+   * match ("readwrite" repeated, never an "exec"), so an uncapped
+   * `params.name` straight off the wire froze the whole gateway.
+   */
+  const GLOB_BOMB = loadedPolicy({
+    version: 1,
+    name: 'glob-bomb',
+    mcp: {
+      default: 'allow',
+      rules: [{ id: 'glob-bomb', match: { tool: '*read*write*exec*' }, action: 'deny', reason: 'nope' }],
+      boundary: { secrets: 'off', injection: 'off' },
+    },
+  });
+
+  it(
+    'an 18 KB params.name is refused fail-closed, is never forwarded, and a concurrent call is answered at once',
+    async () => {
+      // 18,002 characters. Measured against this very glob: ~8 s of
+      // uninterruptible backtracking on the proxy thread (1.8 KB = 10 ms,
+      // 3.6 KB = 77 ms, 7.2 KB = 614 ms, 9.1 KB = 1.2 s, 18 KB = 7.9 s), and
+      // it is cubic, so a bigger name is a longer freeze.
+      const bomb = 'readwrite'.repeat(2000) + 'xx';
+      expect(bomb.length).toBe(18_002);
+      const s = startProxy(GLOB_BOMB, { command: reportingServer() });
+      await handshake(s);
+
+      const t0 = Date.now();
+      s.send(toolsCall(2, bomb, {}));
+      s.send(toolsCall(3, 'innocent', { hi: 1 }));
+      await waitFor(() => s.responded(2)() && s.responded(3)(), 'both answers', 30_000);
+      const elapsed = Date.now() - t0;
+
+      // Answered promptly: the engine never ran a glob over those bytes.
+      // Without the cap this pair takes ~8 s (and the whole event loop with it).
+      expect(elapsed).toBeLessThan(3000);
+
+      // Refused, fail-closed, WITHOUT a rule: the policy was never consulted.
+      const refusal = s.response(2).result as { isError: boolean; content: { text: string }[] };
+      expect(refusal.isError).toBe(true);
+      expect(refusal.content[0]!.text).toBe(
+        `mcp-recorder gateway: tools/call "${sha256Ref(bomb)}" denied by policy: ` +
+          'tools/call params.name is 18002 characters; the gateway evaluates at most 128' +
+          ' (the name is refused, never truncated)\n' +
+          FAIL_CLOSED_REFUSAL_GUIDANCE,
+      );
+      // The name does not travel back verbatim either.
+      expect(refusal.content[0]!.text).not.toContain('readwritereadwrite');
+      // The innocent call really ran, unaffected.
+      expect((s.response(3).result as { content: { text: string }[] }).content[0]!.text).toBe('{"hi":1}');
+
+      const { seen } = await askServer(s, 4);
+      expect(seen).toEqual(['innocent']); // never forwarded
+      s.stdin.end();
+      expect(await s.done).toBe(0);
+
+      const events = s.events();
+      const decision = decisions(events)[0]!;
+      expect(decision).toMatchObject({ decision: 'deny', tool: sha256Ref(bomb), request_id: 2 });
+      expect(decision.rule_id).toBeUndefined();
+      const refused = toolCalls(events).find((c) => c.request_id === 2)!;
+      expect(refused.error?.type).toBe('policy_denied');
+      expect(refused.gateway).toMatchObject({ decision: 'deny' });
+      // Nothing readable, anywhere.
+      expect(JSON.stringify(events)).not.toContain('readwritereadwrite');
+      expect(s.err.raw()).not.toContain('readwritereadwrite');
+      assertChainIntact(s.store);
+    },
+    30_000,
+  );
+
+  it('the cap is exact: 128 characters is evaluated by the policy, 129 is refused without it', async () => {
+    const s = startProxy(standardPolicy(), { command: reportingServer() });
+    await handshake(s);
+    const atCap = 'delete_' + 'x'.repeat(121); // 128
+    const overCap = 'delete_' + 'x'.repeat(122); // 129
+    expect(atCap).toHaveLength(128);
+    expect(overCap).toHaveLength(129);
+
+    s.send(toolsCall(2, atCap, {}));
+    s.send(toolsCall(3, overCap, {}));
+    await waitFor(() => s.responded(2)() && s.responded(3)(), 'both refusals');
+    // At the cap: the `delete_*` RULE decided it, so the engine saw the name.
+    expect((s.response(2).result as { content: { text: string }[] }).content[0]!.text).toContain(
+      `denied by policy rule "no-delete"`,
+    );
+    // One character over: the gateway refused rather than look at it.
+    expect((s.response(3).result as { content: { text: string }[] }).content[0]!.text).toContain(
+      'tools/call params.name is 129 characters; the gateway evaluates at most 128',
+    );
+
+    const { seen } = await askServer(s, 4);
+    expect(seen).toEqual([]);
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+    expect(decisions(s.events()).map((d) => [d.request_id, d.rule_id])).toEqual([
+      [2, 'no-delete'],
+      [3, undefined],
+    ]);
+  });
+});
+
+describe('F5: a JSON-RPC batch is not a way past the request-id checks', () => {
+  it('a batch element reusing an IN-FLIGHT id is refused; the surviving call keeps its own arguments AND its own result', async () => {
+    const s = startProxy(ALLOW_ALL, { command: reportingServer() });
+    await handshake(s);
+    const argsA = { tag: 'A' };
+    const argsB = { tag: 'B' };
+    // ONE write: the proxy drains a chunk line by line, so call A is in
+    // `pending` before the batch line is looked at — no timing window.
+    s.sendRaw(
+      JSON.stringify(toolsCall(7, 'call_a', argsA)) + '\n' + JSON.stringify([toolsCall(7, 'call_b', argsB)]) + '\n',
+    );
+    await waitFor(() => repliesFor(s, 7).length >= 1, 'call A answered');
+    // `debug/seen` is itself the barrier: the server reads lines in order, so
+    // anything the gateway forwarded before it has already been executed.
+    const { seen } = await askServer(s, 8);
+    expect(seen).toEqual(['call_a']); // call B was refused, not forwarded
+    expect(repliesFor(s, 7)).toHaveLength(1);
+    expect(batchReplies(s)).toHaveLength(1);
+
+    // The client got call A's own result, once, plus B's refusal in the batch.
+    expect((repliesFor(s, 7)[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe(
+      JSON.stringify(argsA),
+    );
+    const batch = batchReplies(s)[0] as Record<string, unknown>[];
+    expect(batch).toHaveLength(1);
+    expect(batch[0]!.id).toBe(7);
+    expect((batch[0]!.result as { isError: boolean; content: { text: string }[] }).content[0]!.text).toBe(
+      duplicateIdText('call_b', 7, 'pending'),
+    );
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    const calls = toolCalls(events).filter((c) => c.request_id === 7);
+    expect(calls).toHaveLength(2);
+    const [refused, executed] = calls as [ToolCallEvent, ToolCallEvent];
+    expect(refused).toMatchObject({ tool: 'call_b', is_error: true, error: { type: 'duplicate_id' } });
+    // THE regression: the record of the call that ran carries that call's
+    // arguments together with that call's result — not B's arguments with
+    // A's result, which is what the unguarded batch produced.
+    expect(executed.tool).toBe('call_a');
+    expect(executed.args).toEqual(fakeRedactor.scrub(argsA));
+    expect(executed.result_hash).toBe(sha256Ref(canonicalJson(echoResult(argsA))));
+    expect(executed.is_error).toBe(false);
+    // No orphan: call B never executed, so no response of its own arrived.
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    assertChainIntact(s.store);
+  });
+
+  it('a batch element reusing a HELD id is refused; the hold keeps its slot and records its OWN result', async () => {
+    const s = startProxy(standardPolicy((p) => (p.mcp!.hold.timeout_ms = 30_000)), {
+      command: reportingServer(),
+    });
+    await handshake(s);
+    const heldArgs = { to: 'ops@example.com' };
+    s.send(toolsCall(9, 'send_mail', heldArgs));
+    await waitFor(() => s.holdStore.list().length === 1, 'hold file');
+    const [parked] = s.holdStore.list();
+
+    s.send([toolsCall(9, 'call_b', { tag: 'B' })]);
+    // Not forwarded, and the hold is untouched (`debug/seen` is the barrier).
+    expect((await askServer(s, 10)).seen).toEqual([]);
+    expect(batchReplies(s)).toHaveLength(1);
+    const batch = batchReplies(s)[0] as Record<string, unknown>[];
+    expect((batch[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe(
+      duplicateIdText('call_b', 9, 'held'),
+    );
+    expect(s.holdStore.read(parked!.approval_id)?.status).toBe('pending');
+
+    s.holdStore.decide(parked!.approval_id, 'approved', 'alice');
+    await waitFor(() => repliesFor(s, 9).length === 1, 'the approved call, answered');
+    expect((repliesFor(s, 9)[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe(
+      JSON.stringify(heldArgs),
+    );
+    expect((await askServer(s, 11)).seen).toEqual(['send_mail']);
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    const events = s.events();
+    const calls = toolCalls(events).filter((c) => c.request_id === 9);
+    expect(calls.map((c) => c.tool)).toEqual(['call_b', 'send_mail']);
+    // `call_b` is a REFUSAL record for a call that never ran — not the false
+    // "duplicate_id / result: null" seal the unguarded batch wrote for a call
+    // that ran and returned data.
+    expect(calls[0]).toMatchObject({ is_error: true, error: { type: 'duplicate_id' } });
+    expect(calls[0]!.result).not.toBeNull();
+    // The hold's own tool_call carries the hold's own result.
+    expect(calls[1]!.result_hash).toBe(sha256Ref(canonicalJson(echoResult(heldArgs))));
+    expect(calls[1]!.gateway).toMatchObject({ decision: 'hold', outcome: 'approved' });
+    expect(events.filter((e) => e.kind === 'protocol_error')).toHaveLength(0);
+    expect(s.err.raw()).not.toContain('sealed as duplicate_id');
+    assertChainIntact(s.store);
+  });
+
+  it('a tools/call with a null id inside a batch is refused with -32600 and never forwarded (mixed batch, and a batch of nothing else)', async () => {
+    const s = startProxy(standardPolicy(), { command: reportingServer() });
+    await handshake(s);
+    const nullIdCall = (name: string): Record<string, unknown> => ({
+      jsonrpc: '2.0',
+      id: null,
+      method: 'tools/call',
+      params: { name, arguments: {} },
+    });
+    const nullIdError = {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: NULL_ID_TOOLS_CALL_MESSAGE },
+    };
+
+    // (1) mixed with a real request.
+    s.send([nullIdCall('delete_all'), toolsCall(20, 'report', {})]);
+    await waitFor(s.responded(20), 'the report');
+    // (2) a batch whose ONLY element is the null-id call: it used to miss the
+    // `batch.some(isToolsCallRequest)` guard entirely and cross unevaluated.
+    s.send([nullIdCall('delete_everything')]);
+    // The policy denies `delete_*`; neither one ever reached the server
+    // (`debug/seen` is the barrier: it is read after both batch lines).
+    expect((await askServer(s, 21)).seen).toEqual(['report']);
+    expect(batchReplies(s)).toEqual([[nullIdError], [nullIdError]]);
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    expect(s.err.raw()).toContain(
+      'gateway: refused a tools/call with a null id inside a JSON-RPC batch (not a valid request); not forwarded',
+    );
+    const events = s.events();
+    // Recorded the only way the frozen schema can describe an id-less
+    // message: one notification each.
+    const notes = events.filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
+    expect(notes).toHaveLength(2);
+    expect(toolCalls(events).map((c) => c.request_id)).toEqual([20]);
+    assertChainIntact(s.store);
+  });
+
+  it('two elements of the SAME batch cannot share a request id', async () => {
+    const s = startProxy(ALLOW_ALL, { command: reportingServer() });
+    await handshake(s);
+    s.send([toolsCall(30, 'first', { n: 1 }), toolsCall(30, 'second', { n: 2 })]);
+    await waitFor(() => repliesFor(s, 30).length >= 1, 'the first element answered');
+    expect((await askServer(s, 31)).seen).toEqual(['first']);
+    expect(repliesFor(s, 30)).toHaveLength(1);
+    expect(batchReplies(s)).toHaveLength(1);
+    const batch = batchReplies(s)[0] as Record<string, unknown>[];
+    expect((batch[0]!.result as { content: { text: string }[] }).content[0]!.text).toBe(
+      duplicateIdText('second', 30, 'pending'),
+    );
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+    expect(toolCalls(s.events()).map((c) => [c.tool, c.error?.type])).toEqual([
+      ['second', 'duplicate_id'],
+      ['first', undefined],
+    ]);
+  });
+});
+
+describe('F7: a boundary rewrite edits only what it redacted', () => {
+  /**
+   * JSON numbers do not survive `JSON.parse` -> `JSON.stringify`: a 20-digit
+   * integer loses its tail, `1e400` becomes `null`, 2^53+1 loses a bit. A
+   * filter that re-serialized the whole message to redact one string
+   * therefore silently rewrote unrelated data in the same result.
+   */
+  const NUMBERS =
+    '"structuredContent":{"balance":12345678901234567890,"huge":1e400},' +
+    '"_meta":{"progressToken":9007199254740993}';
+  const resultLine = (text: string, id = '{ID}'): string =>
+    `{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":${JSON.stringify(text)}}],${NUMBERS}}}`;
+
+  it('numbers elsewhere in a REDACTED result cross exactly as the server wrote them', async () => {
+    const s = startProxy(ALLOW_SCAN, { command: reportingServer() });
+    await handshake(s);
+    // Identical payloads; only the text differs, and only one has a secret.
+    s.send(toolsCall(2, 'echo', { raw: resultLine('nothing interesting here') }));
+    s.send(toolsCall(3, 'echo', { raw: resultLine(`token ${AWS_KEY} here`) }));
+    await waitFor(() => s.responded(2)() && s.responded(3)(), 'both results');
+
+    const control = s.out.lines().find((l) => parseLine(l)?.id === 2)!;
+    const redacted = s.out.lines().find((l) => parseLine(l)?.id === 3)!;
+
+    // The control crosses byte-for-byte: that is what makes the filter the
+    // only possible cause of any difference below.
+    expect(control).toBe(resultLine('nothing interesting here', '2'));
+    // The redaction happened...
+    expect(redacted).toContain(AWS_MARKER);
+    expect(redacted).not.toContain(AWS_KEY);
+    // ...and nothing else moved.
+    expect(redacted).toContain('"balance":12345678901234567890');
+    expect(redacted).toContain('"huge":1e400');
+    expect(redacted).toContain('"progressToken":9007199254740993');
+    expect(redacted).not.toContain('12345678901234567000');
+    expect(redacted).not.toContain('"huge":null');
+    expect(redacted).not.toContain('9007199254740992');
+    // The whole line is the original with ONE span replaced.
+    expect(redacted).toBe(resultLine(`token ${AWS_KEY} here`, '3').replace(AWS_KEY, AWS_MARKER));
+
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+    const call = toolCalls(s.events()).find((c) => c.request_id === 3)!;
+    const boundary = call.gateway!.boundary!;
+    expect(boundary.action).toBe('redact');
+    // The hash still describes what the client actually received.
+    expect(boundary.delivered_result_hash).toBe(
+      sha256Ref(canonicalJson((JSON.parse(redacted) as { result: unknown }).result)),
+    );
+    assertNoLeak(s, AWS_KEY);
+    assertChainIntact(s.store);
+  });
+
+  it('a batched server answer only re-serializes the element that changed', async () => {
+    const s = startProxy(ALLOW_SCAN, { command: reportingServer() });
+    await handshake(s);
+    // One server line answering two ids as a JSON-RPC array: the element
+    // with the secret is rewritten, the clean one must not be touched.
+    const clean = resultLine('all clear', '90');
+    const dirty = resultLine(`token ${AWS_KEY} here`, '91');
+    s.send(toolsCall(4, 'echo', { raw: `[${clean},${dirty}]` }));
+    await waitFor(() => batchReplies(s).length === 1, 'the batched answer');
+
+    const line = s.out.lines().find((l) => l.startsWith('['))!;
+    expect(batchReplies(s)[0]).toHaveLength(2);
+    expect(line).toContain(AWS_MARKER);
+    expect(line).not.toContain(AWS_KEY);
+    // The clean element is byte-identical and the rewritten one differs ONLY
+    // in the redacted span — numbers survive in both.
+    expect(line).toBe(`[${clean},${dirty.replace(AWS_KEY, AWS_MARKER)}]`);
+    expect(line.match(/"balance":12345678901234567890/g)).toHaveLength(2);
+    expect(line.match(/"huge":1e400/g)).toHaveLength(2);
+    expect(line.match(/"progressToken":9007199254740993/g)).toHaveLength(2);
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+    assertNoLeak(s, AWS_KEY);
+  });
+
+  it('a client->server batch forwards the kept elements as the CLIENT wrote them', async () => {
+    const s = startProxy(standardPolicy(), { command: reportingServer() });
+    await handshake(s);
+    // One denied element and one allowed element carrying a number that no
+    // JSON round-trip survives.
+    const line =
+      '[{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"delete_it","arguments":{}}},' +
+      ' {"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"keep","arguments":{"big":12345678901234567890,"huge":1e400}}}]\n';
+    s.sendRaw(line);
+    await waitFor(s.responded(41), 'the allowed element');
+    const { seen, raw } = await askServer(s, 42);
+    expect(seen).toEqual(['keep']);
+    expect(raw).toHaveLength(1);
+    expect(raw[0]).toContain('"big":12345678901234567890');
+    expect(raw[0]).toContain('"huge":1e400');
+    expect(raw[0]).not.toContain('delete_it');
+    expect(raw[0]).not.toContain('12345678901234567000');
+
+    // Nothing refused: the line crosses byte-for-byte, odd spacing included.
+    const untouched = '[ {"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"keep","arguments":{"big":98765432109876543210}}} ]\n';
+    s.sendRaw(untouched);
+    await waitFor(s.responded(43), 'the untouched batch');
+    const after = await askServer(s, 44);
+    expect(after.raw[1]).toBe(untouched.trimEnd());
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+  });
+});
+
+describe('gateway: hashing what was delivered is recording, and recording fails open', () => {
+  it('a result tree too deep to hash still reaches the client redacted, and the rest of its chunk with it', async () => {
+    const s = startProxy(ALLOW_SCAN, { command: reportingServer() });
+    await handshake(s);
+    // 100,000 levels of nesting (a 200 KB line, well under the 1 MiB default
+    // `max_scan_bytes`): `JSON.parse` is iterative and takes it, `canonicalJson`
+    // recurses and cannot, so hashing what the client received overflows the
+    // stack. That hash is RECORDING; unguarded, the throw escaped into the s2c
+    // Transform's catch and the client lost the line — and every later line of
+    // the same chunk — for it.
+    const deep = '['.repeat(100_000) + '1' + ']'.repeat(100_000);
+    const line =
+      `{"jsonrpc":"2.0","id":{ID},"result":{"content":[{"type":"text","text":"key ${AWS_KEY} here"}],` +
+      `"deep":${deep}}}`;
+    s.send(toolsCall(2, 'echo', { raw: line }));
+    await waitFor(s.responded(2), 'the deep result');
+    // The client got it, redacted, with the deep sibling untouched.
+    const delivered = s.out.lines().find((l) => parseLine(l)?.id === 2)!;
+    expect(delivered).toContain(AWS_MARKER);
+    expect(delivered).not.toContain(AWS_KEY);
+    expect(delivered).toBe(line.replace('{ID}', '2').replace(AWS_KEY, AWS_MARKER));
+
+    // Traffic keeps flowing.
+    s.send(toolsCall(3, 'echo', {}));
+    await waitFor(s.responded(3), 'the next call');
+    s.stdin.end();
+    expect(await s.done).toBe(0);
+
+    // RECORDING is what degraded: building the event for a tree this deep
+    // throws too, so the guarded tap drops it and says so on stderr. The
+    // call that followed is recorded normally and the chain still verifies.
+    expect(s.err.raw()).toContain('tap error (recording degraded, traffic unaffected)');
+    expect(toolCalls(s.events()).map((c) => c.request_id)).toEqual([3]);
+    assertNoLeak(s, AWS_KEY);
     assertChainIntact(s.store);
   });
 });

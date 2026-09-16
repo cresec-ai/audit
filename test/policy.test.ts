@@ -13,12 +13,15 @@ import {
   PolicyLoadError,
   PolicyValidationError,
   REGEX_DEADLINE_MS,
+  REGEX_RETRY_MS,
   REGEX_STARTUP_MS,
   REGEX_VALUE_CAP,
+  VALUE_TOO_LONG,
   SUPPORTED_KEYWORDS,
   autoRuleId,
   checkCatastrophicShape,
   checkGlob,
+  checkProvablyLinear,
   checkRe2Subset,
   clearGlobCache,
   configureRegexGuard,
@@ -41,6 +44,7 @@ import {
   regexGuardState,
   resetRegexGuard,
   ruleLabel,
+  toUnicodeSource,
   warmRegexGuard,
   validateAgainstSchema,
   validatePolicyObject,
@@ -674,6 +678,134 @@ describe('validatePolicyObject: error paths', () => {
     expect(checkRe2Subset('(a+)+(')).toMatch(/invalid regular expression/);
   });
 
+  it('args regexes: a redundant wrapper group cannot hide an exponential shape', () => {
+    // `checkCatastrophicShape` used to inspect only the repeated group's
+    // TOP-LEVEL atoms, so one extra pair of parentheses hid every shape it
+    // knows: all of these validated with exit 0, and `^((a+))+$` against 30
+    // non-matching characters takes 38 s in V8 (measured) where RE2 answers
+    // instantly. The analysis now re-enters a trailing group.
+    const wrapped: Array<[string, RegExp]> = [
+      ['^((a+))+$', /ends with the quantified atom "a\+"/],
+      ['^((?:a+))+$', /ends with the quantified atom "a\+"/],
+      ['^((a|aa))+$', /body contains an alternation/],
+      ['^((a{1,2}))+$', /ends with the quantified atom "a\{1,2\}"/],
+      ['^(([a-z]+))+$', /ends with the quantified atom "\[a-z\]\+"/],
+      ['^(((a+)))+$', /ends with the quantified atom "a\+"/], // two wrappers deep
+      ['(b(.*a))*', /can also be matched by "\.\*"/], // a trailing group is spliced into the body
+    ];
+    for (const [pattern, why] of wrapped) {
+      expect(checkCatastrophicShape(pattern), pattern).toMatch(why);
+      // The message names the group as written, wrapper and all.
+      expect(checkCatastrophicShape(pattern), pattern).toContain(JSON.stringify(pattern.replace(/^\^|\$$/g, '')));
+      expect(checkRe2Subset(pattern), pattern).toBe(checkCatastrophicShape(pattern));
+      expectError(errorsFor((d) => (rule0(d).match.args = { url: pattern })), '/mcp/rules/0/match/args/url', 'regex', why);
+    }
+    // A group whose body has an alternation BEHIND an anchor is not a wrapper:
+    // each iteration starts with "a", so the branches are not ambiguous.
+    expect(checkCatastrophicShape('(?:a(?:b|c))+')).toBeUndefined();
+  });
+
+  it('args regexes: adjacent quantifiers over the same characters are rejected', () => {
+    // The second blind spot, with no nesting at all: every way of splitting
+    // the input between the two quantifiers is tried. `^[a-z]*[a-z]*[a-z]*x$`
+    // validated with exit 0 and takes 8.6 s on a 4096-character value (the
+    // most one argument can carry), where RE2 stays linear.
+    const adjacent = ['^[a-z]*[a-z]*[a-z]*x$', '\\w+\\w+', '.*.*', '[a-z]+[a-z]*', 'a+a{2,}', '[a-z]+x?[a-z]+', '(?:x[0-9]*\\d+)'];
+    for (const pattern of adjacent) {
+      const why = checkCatastrophicShape(pattern);
+      expect(why, pattern).toMatch(/repeats two adjacent atoms that can match the same characters/);
+      expect(why, pattern).toMatch(/make the character sets disjoint or drop one of the quantifiers/);
+      expect(checkRe2Subset(pattern), pattern).toBe(why);
+      expectError(
+        errorsFor((d) => (rule0(d).match.args = { url: pattern })),
+        '/mcp/rules/0/match/args/url',
+        'regex',
+        /two adjacent atoms/,
+      );
+    }
+    // Disjoint sets, a literal that has to be consumed in between, or a
+    // quantifier that cannot repeat: all still fine.
+    for (const pattern of ['[a-z]+[0-9]*', '^.*secret.*$', '^rm -rf .+$', '\\d+\\.\\d+', '(a+b?c)*', '^https?://', '[a-z]+ ?[0-9]+']) {
+      expect(checkCatastrophicShape(pattern), pattern).toBeUndefined();
+      expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+    }
+  });
+
+  it('checkProvablyLinear is the fail-closed twin: it PROVES a bound instead of spotting bad shapes', () => {
+    // What the runtime guard consults when it has no worker thread. Absence of
+    // a known-bad shape is not enough there: a repeated group, too many
+    // repeated atoms or too many alternation paths are all refused, even
+    // though a policy carrying them still validates.
+    for (const pattern of ['^https://', '^https?://', '^.*secret.*$', '^rm -rf .+$', '^(title|body)$', '\\d+\\.\\d+', '^[0-9]{1,2}$', '(^|/)(\\.env|id_rsa)$']) {
+      expect(checkProvablyLinear(pattern), pattern).toBeUndefined();
+    }
+    expect(checkProvablyLinear('([a-z0-9-]+\\.)*')).toMatch(/repeated group .* cannot be proved linear/);
+    expect(checkProvablyLinear('^.*a.*b.*$')).toMatch(/3 repeated quantifiers \(more than 2\)/);
+    expect(checkProvablyLinear('(unclosed')).toMatch(/could not be parsed/);
+    expect(checkProvablyLinear('^((a+))+$')).toMatch(/ends with the quantified atom/);
+    expect(checkProvablyLinear('(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)')).toMatch(/more than 64 alternation paths/);
+    // Everything the validator refuses is refused here too.
+    for (const pattern of ['^(a+)+$', '(a|aa)+', '^[a-z]*[a-z]*x$']) {
+      expect(checkProvablyLinear(pattern), pattern).toBe(checkCatastrophicShape(pattern));
+    }
+    // ... and these two are independent: a pattern the validator accepts can
+    // still be unprovable, which is a deny only when there is no worker.
+    expect(checkCatastrophicShape('([a-z0-9-]+\\.)*')).toBeUndefined();
+  });
+
+  it('args regexes: patterns are matched in Unicode mode, and unportable spellings are translated not rejected', () => {
+    // The local engine matches with the `u` flag so that it counts runes like
+    // RE2 does. `u` also tightens SPELLING, which carries no meaning, so
+    // `toUnicodeSource` rewrites those spellings instead of rejecting them:
+    // everything the escape whitelist accepts keeps validating.
+    const translated: Array<[string, string]> = [
+      ['\\-', '\\x2d'],
+      ['a\\ b', 'a\\x20b'],
+      ['\\#\\_\\@\\:', '\\x23\\x5f\\x40\\x3a'],
+      ['a]b', 'a\\]b'],
+      ['a{b', 'a\\{b'],
+      ['a}b', 'a\\}b'],
+      ['[a\\-z]', '[a\\-z]'], // legal under `u` inside a class: left alone
+      ['^https?://', '^https?://'],
+      ['a{2,3}', 'a{2,3}'],
+      ['\\x41\\t\\n\\.\\\\', '\\x41\\t\\n\\.\\\\'],
+      ['[\\]a]', '[\\]a]'],
+    ];
+    for (const [pattern, expected] of translated) {
+      expect(toUnicodeSource(pattern), pattern).toBe(expected);
+      // The rewrite never changes which strings match.
+      const plain = new RegExp(pattern);
+      const unicode = new RegExp(toUnicodeSource(pattern), 'u');
+      for (const sample of ['', '-', ' ', 'a b', 'a]b', 'a{b', 'a}b', 'az', 'a-z', 'https://x', 'aa', 'aaa', 'A\t\n.\\', ']a', '#_@:']) {
+        expect(unicode.test(sample), `${pattern} vs ${JSON.stringify(sample)}`).toBe(plain.test(sample));
+      }
+    }
+    // The whole pinned escape set still validates, and so does the shipped example.
+    for (const pattern of ['\\.\\\\\\+\\*\\?\\(\\)\\[\\]\\{\\}\\|\\^\\$\\-\\/\\_\\#\\ ', '[\\d\\w\\n\\t\\x41\\-\\]]', '(^|/)(\\.env|secrets\\.env|id_rsa|\\.npmrc)$']) {
+      expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+    }
+    // A class range `u` (and RE2) refuse cannot be translated, so it is rejected.
+    for (const pattern of ['[a-\\d]', '[\\d-z]']) {
+      expect(checkRe2Subset(pattern), pattern).toMatch(/cannot be matched in Unicode mode/);
+      expectError(errorsFor((d) => (rule0(d).match.args = { url: pattern })), '/mcp/rules/0/match/args/url', 'regex', /Unicode mode/);
+    }
+  });
+
+  it('policy strings with an unpaired surrogate are rejected: Go cannot carry one', () => {
+    // OPA reads "\ud800" back as U+FFFD, so the compiled Rego would match on
+    // different text than the local engine. Unlike U+FEFF (which the emitter
+    // escapes) there is no spelling that survives, so it is refused here.
+    expectError(errorsFor((d) => (rule0(d).reason = 'oops \uD800')), '/mcp/rules/0/reason', 'text', /unpaired surrogate \\ud800/);
+    expectError(errorsFor((d) => (rule0(d).match.args = { url: '^\uDFFF' })), '/mcp/rules/0/match/args/url', 'regex', /unpaired surrogate/);
+    expectError(errorsFor((d) => (rule0(d).match.tool = 'a\uD800b')), '/mcp/rules/0/match/tool', 'glob', /unpaired surrogate/);
+    expectError(errorsFor((d) => (erule0(d).reason = '\uDC00')), '/egress/rules/0/reason', 'text', /unpaired surrogate/);
+    // A real astral character (a well-formed pair) is fine everywhere.
+    const ok = designExample();
+    ok.mcp!.rules![0]!.reason = 'no \u{1F600} exfiltration';
+    ok.mcp!.rules![0]!.match.args = { url: '^\u{1F600}' };
+    expect(validatePolicyObject(ok).ok, formatPolicyErrors(validatePolicyObject(ok).ok ? [] : (validatePolicyObject(ok) as { errors: PolicyError[] }).errors)).toBe(true);
+  });
+
   it('max_args_bytes / max_body_bytes: integer >= 0', () => {
     expectError(errorsFor((d) => (rule0(d).match.max_args_bytes = -1)), '/mcp/rules/0/match/max_args_bytes', 'minimum');
     expectError(errorsFor((d) => (rule0(d).match.max_args_bytes = 1.5)), '/mcp/rules/0/match/max_args_bytes', 'type');
@@ -989,6 +1121,40 @@ describe('glob', () => {
     expect(globToRegExp('$^|[]{}\\', '/').test('$^|[]{}\\')).toBe(true);
   });
 
+  it('collapses a RUN of wildcards: the same language, without the adjacent-quantifier blowup', () => {
+    // Translated atom for atom, `"*".repeat(30)` is fifteen adjacent
+    // `[\s\S]*` quantifiers: against a 60-character subject (a tool name off
+    // the wire, matched on the proxy thread) that took 88 s here. A run
+    // accepts exactly what its most permissive member accepts, so it is
+    // emitted once.
+    expect(globToRegExp('**', '/').source).toBe('^[\\s\\S]*$');
+    expect(globToRegExp('***', '/').source).toBe('^[\\s\\S]*$');
+    expect(globToRegExp('*'.repeat(30) + 'x', '/').source).toBe('^[\\s\\S]*x$');
+    expect(globToRegExp('*', '/').source).toBe('^[^\\/]*$');
+    expect(globToRegExp('a*/**b', '/').source).toBe('^a[^\\/]*\\/[\\s\\S]*b$');
+    const t0 = Date.now();
+    expect(globMatch('*'.repeat(30) + 'x', '/', 'a'.repeat(60))).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(500);
+    // Collapsing never changes what a glob accepts, with either delimiter.
+    const subjects = ['', 'a', 'x', 'ax', 'a/b', 'a/b/c', 'abc/x', 'a.b', 'aaa', 'a/x', 'ab'];
+    const pairs: Array<[string, string]> = [
+      ['***', '**'],
+      ['****', '**'],
+      ['a***b', 'a**b'],
+      ['a**b', 'a**b'],
+      ['*a*', '*a*'],
+    ];
+    for (const [runGlob, single] of pairs) {
+      for (const delim of ['/', '.'] as const) {
+        for (const subject of subjects) {
+          expect(globMatch(runGlob, delim, subject), `${runGlob} vs ${JSON.stringify(subject)} (${delim})`).toBe(
+            globMatch(single, delim, subject),
+          );
+        }
+      }
+    }
+  });
+
   it('caches compiled globs with a bounded LRU', () => {
     clearGlobCache();
     const first = compileGlob('first', '/');
@@ -1106,15 +1272,53 @@ describe('evaluateMcp', () => {
     expect(coerceScalar(undefined)).toBeUndefined();
   });
 
-  it('args: string values are truncated to 4 KiB before matching', () => {
-    // The cap is also the bound on how much work one argument can ask of V8's
-    // backtracking engine; RE2 (the Rego side) is linear and does not truncate.
+  it('args: a string longer than 4 KiB is UNEVALUABLE and denies — it is never truncated and matched', () => {
+    // Truncating to the cap silently turned a deny into an allow: the tail was
+    // cut off before matching, so a padded value did not match the rule that
+    // names it and the call was forwarded. RE2 (the Rego side) does not
+    // truncate and would have matched, so the local engine must refuse to
+    // answer rather than answer differently — enforcement fails closed.
     expect(REGEX_VALUE_CAP).toBe(4_096);
     const p = mcp([{ id: 'tail', match: { tool: 't', args: { s: 'END$' } }, action: 'deny' }]);
     const run = (s: string) => evaluateMcp(p, { server: 's', tool: 't', args: { s }, argsBytes: 1 });
     expect(run('x'.repeat(REGEX_VALUE_CAP - 3) + 'END')).toMatchObject({ ruleId: 'tail' });
-    expect(run('x'.repeat(REGEX_VALUE_CAP - 2) + 'END')).toEqual({ action: 'allow', matched: false });
-    expect(coerceScalar('a'.repeat(REGEX_VALUE_CAP + 10))).toHaveLength(REGEX_VALUE_CAP);
+    expect(run('x'.repeat(REGEX_VALUE_CAP - 2) + 'END')).toEqual({
+      action: 'deny',
+      matched: false,
+      reason:
+        'policy evaluation error: args value at "s" is longer than the 4096-character regex cap and cannot be matched safely (tail)',
+      failClosed: true,
+    });
+    expect(coerceScalar('a'.repeat(REGEX_VALUE_CAP))).toHaveLength(REGEX_VALUE_CAP);
+    expect(coerceScalar('a'.repeat(REGEX_VALUE_CAP + 1))).toBe(VALUE_TOO_LONG);
+
+    // The reviewer's reproduction: 5000 characters of padding in front of the
+    // payload used to sail straight through the rule that forbids it.
+    const shell = mcp([{ id: 'no-rm', match: { tool: 'run_shell', args: { cmd: 'rm -rf /' } }, action: 'deny' }], { default: 'allow' });
+    const call = (cmd: string) => evaluateMcp(shell, { server: 's', tool: 'run_shell', args: { cmd }, argsBytes: cmd.length + 10 });
+    expect(call('rm -rf /')).toMatchObject({ action: 'deny', ruleId: 'no-rm', matched: true });
+    expect(call('x'.repeat(5_000) + 'rm -rf /')).toMatchObject({ action: 'deny', matched: false, failClosed: true });
+    // Everything up to the cap still decides normally, padding or not.
+    expect(call('x'.repeat(REGEX_VALUE_CAP - 8) + 'rm -rf /')).toMatchObject({ action: 'deny', ruleId: 'no-rm', matched: true });
+  });
+
+  it('args: regexes count runes and read "." the way RE2 does (the Rego twin is pinned in policy-rego.test.ts)', () => {
+    // Without the `u` flag V8 counts UTF-16 units where RE2 counts runes, so
+    // `^.{1,8}$` against five U+1F600 was an ALLOW here and a DENY in OPA
+    // (verified against OPA 1.20.2), and `^..$` against one U+1F600 was the
+    // reverse. The local engine now matches in Unicode mode.
+    const len = mcp([{ id: 'len', match: { tool: 't', args: { s: '^.{1,8}$' } }, action: 'deny' }], { default: 'allow' });
+    const two = mcp([{ id: 'two', match: { tool: 't', args: { s: '^..$' } }, action: 'deny' }], { default: 'allow' });
+    const dot = mcp([{ id: 'dot', match: { tool: 't', args: { s: '^.*secret.*$' } }, action: 'deny' }], { default: 'allow' });
+    const run = (p: Policy, s: string) => evaluateMcp(p, { server: 's', tool: 't', args: { s }, argsBytes: 8 });
+    const grin = '\u{1F600}';
+    expect(run(len, grin.repeat(5))).toMatchObject({ ruleId: 'len', action: 'deny' }); // 5 runes, not 10 units
+    expect(run(len, grin.repeat(9))).toEqual({ action: 'allow', matched: false });
+    expect(run(two, grin)).toEqual({ action: 'allow', matched: false }); // one rune, not two units
+    expect(run(two, 'ab')).toMatchObject({ ruleId: 'two' });
+    // JavaScript's "." excludes \r; the emitted Rego is compiled to agree.
+    expect(run(dot, 'my secret')).toMatchObject({ ruleId: 'dot' });
+    expect(run(dot, 'my\rsecret')).toEqual({ action: 'allow', matched: false });
   });
 
   it('getPath / dotPathSegments', () => {
@@ -1305,6 +1509,88 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
     );
     expect(warmRegexGuard()).toBe(false);
   });
+
+  it('with no worker, a pattern that cannot be PROVED linear denies at once: never allow, never a stall', () => {
+    // The reviewer's reproduction, with worker_threads out of reach (Node's
+    // own --experimental-permission without --allow-worker produces exactly
+    // this): `^((a+))+$` slipped past the old blacklist gate, ran in-thread
+    // for 40 s with every other request stuck behind it, and was then
+    // ALLOWED. Enforcement may not be turned fail-open by the absence of a
+    // worker thread, so an unprovable pattern is refused instead.
+    const seen: string[] = [];
+    configureRegexGuard({ startupMs: 0, onDiag: (m) => seen.push(m) });
+    const wrapped = handBuilt('^((a+))+$', 'exfil-guard');
+    const t0 = Date.now();
+    const decision = run(wrapped, 'a'.repeat(32) + '!');
+    const elapsed = Date.now() - t0;
+    expect(decision).toEqual({
+      action: 'deny',
+      matched: false,
+      reason: 'policy evaluation error: regex could not be evaluated safely (guard worker unavailable) (exfil-guard)',
+      failClosed: true,
+    });
+    expect(elapsed).toBeLessThan(1_000); // 40 s before the fix, at 30 characters
+    expect(regexGuardState()).toMatchObject({ worker: false, degraded: true });
+    expect(seen.filter((m) => m.includes('cannot be proved bounded'))).toHaveLength(1);
+
+    // A shape the VALIDATOR accepts is still refused here when it cannot be
+    // proved bounded: no worker means no way to abandon a runaway match.
+    expect(checkCatastrophicShape('([a-z0-9-]+\\.)*')).toBeUndefined();
+    expect(run(handBuilt('([a-z0-9-]+\\.)*', 'hostname'), 'a-b-c.'.repeat(40) + '!')).toMatchObject({
+      action: 'deny',
+      failClosed: true,
+      reason: 'policy evaluation error: regex could not be evaluated safely (guard worker unavailable) (hostname)',
+    });
+    // ... while a provably linear one is still evaluated, both ways.
+    const fine = handBuilt('^https://', 'url');
+    expect(run(fine, 'https://x')).toMatchObject({ action: 'deny', ruleId: 'url', matched: true });
+    expect(run(fine, 'http://x')).toEqual({ action: 'allow', matched: false });
+  });
+
+  it('with no worker, an in-thread match that still overruns the deadline poisons its pattern', () => {
+    // The in-thread path cannot be interrupted, so the guarantee is that it
+    // can cost the proxy one over-budget match and never two: the answer is
+    // thrown away (a fail-closed deny, never an allow) and the pattern is off
+    // for the rest of the process.
+    configureRegexGuard({ startupMs: 0, deadlineMs: 1 });
+    const slow = handBuilt('^.*x.*y$', 'slow'); // provably linear (quadratic), but 1 ms is not enough for 4 KiB
+    const first = run(slow, 'x'.repeat(4_000));
+    expect(first).toMatchObject({ action: 'deny', failClosed: true, reason: 'policy evaluation error: regex timed out (slow)' });
+    expect(regexGuardState().poisoned).toBe(1);
+    const t0 = Date.now();
+    expect(run(slow, 'x'.repeat(4_000)).reason).toBe('policy evaluation error: regex timed out (slow)');
+    expect(Date.now() - t0).toBeLessThan(50); // poisoned: no second over-budget match
+  });
+
+  it('the degradation is NOT permanent: one slow handshake does not disable the bounded path for the process', () => {
+    // `degrade()` used to latch for the lifetime of the process, so a single
+    // slow startup left every args rule on the in-thread path (and every
+    // unprovable pattern denied) for good. It is retried now, and a retry
+    // never blocks a call: the worker is adopted by a later evaluation.
+    expect(REGEX_RETRY_MS).toBe(30_000);
+    const sleep = (ms: number): void => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    };
+    configureRegexGuard({ startupMs: 0 }); // nothing can hand-shake in 0 ms
+    const fine = handBuilt('^https://', 'url');
+    expect(run(fine, 'https://x').action).toBe('deny');
+    expect(regexGuardState()).toMatchObject({ worker: false, degraded: true });
+    const unprovable = handBuilt('^([a-z0-9-]+\\.)*$', 'hostname'); // fine for the validator, unprovable without a worker
+    expect(run(unprovable, 'x.').failClosed).toBe(true);
+
+    configureRegexGuard({ startupMs: 5_000, retryMs: 0 }); // retry on the next call
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !regexGuardState().worker) {
+      const t0 = Date.now();
+      run(fine, 'https://x');
+      expect(Date.now() - t0).toBeLessThan(1_000); // a retry never blocks the caller
+      sleep(5);
+    }
+    expect(regexGuardState()).toMatchObject({ worker: true, degraded: false, retrying: false });
+    // With the worker back, the pattern that was denied is evaluated again.
+    expect(run(unprovable, 'x.')).toMatchObject({ action: 'deny', ruleId: 'hostname', matched: true });
+    expect(run(unprovable, '!')).toEqual({ action: 'allow', matched: false });
+  }, 30_000);
 
   it('never keeps the host process alive: a script that evaluates an args rule exits on its own', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-guard-'));

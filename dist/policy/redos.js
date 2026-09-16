@@ -12,15 +12,21 @@
  * (a hard deadline off the main thread); this module is the VALIDATION-TIME
  * one, rejecting the shapes that are clearly exponential before a policy is
  * ever loaded. It is deliberately a structural check, not a proof: it names
- * the shape it saw so the author can rewrite the pattern, and it is also what
- * the runtime guard consults when it has to fall back to in-thread matching.
+ * the shape it saw so the author can rewrite the pattern.
  *
- * A group repeated by `*`, `+`, `{n,}`, `{n,m}` (m > 1) or `{n}` (n > 1) — a
- * trailing `?` is not a repetition — is rejected when its body:
+ * Two families are refused. First, a group repeated by `*`, `+`, `{n,}`,
+ * `{n,m}` (m > 1) or `{n}` (n > 1) — a trailing `?` is not a repetition —
+ * whose body:
  *
  *   1. contains a top-level alternation:  `(a|aa)+`, `(?:x|y)*`
  *   2. ends with a quantified atom:       `(a+)+`, `(\w+[ ]?)*`, `(ab?)*`
  *   3. ends with characters the repeated part can also match: `(.*a)*`
+ *
+ * A body whose last atom is itself a GROUP is re-analysed as if the outer
+ * quantifier were written on the inner group: `((a+))+` is `(a+)+` wearing a
+ * redundant wrapper, and `((a|aa))+`, `((?:a+))+`, `((a{1,2}))+` and
+ * `(([a-z]+))+` are the same trick. Without that recursion the wrapper hides
+ * the shape from the check and `^((a+))+$` takes 38 s at 30 characters.
  *
  * Shape 3 is what separates `(.*a)*` (the `.*` swallows the trailing `a`, so
  * every iteration boundary is ambiguous) from `([a-z0-9-]+\.)*`, which stays
@@ -29,13 +35,34 @@
  * `x{0,3}`) never anchors, and a group never does either — the analysis
  * cannot see inside it, and a nested repeated group is the shape this module
  * exists to catch.
+ *
+ * Second, ADJACENT repeated atoms that can match the same characters, at any
+ * nesting level and with no group involved at all: `[a-z]*[a-z]*[a-z]*x`,
+ * `\w+\w+`, `a+a*`. Every way of splitting the input between them is tried,
+ * which is polynomial in the number of such atoms — `^[a-z]*[a-z]*[a-z]*x$`
+ * against a 4096-character value (the `REGEX_VALUE_CAP` a single argument can
+ * reach) takes 8.6 s here, where RE2 answers instantly.
+ *
+ * {@link checkProvablyLinear} is the stricter, POSITIVE form of the same
+ * analysis: it is what the runtime guard consults when it has no worker
+ * thread and has to decide whether a pattern may be run on the proxy thread
+ * at all. Absence of a known-bad shape is not enough there, so that check
+ * additionally refuses every repeated group, more than
+ * {@link MAX_LINEAR_REPEATS} repeated atoms and more than
+ * {@link MAX_LINEAR_BRANCHES} alternation branches.
  */
+/** How deep {@link shapeProblem} re-enters trailing groups before giving up and refusing. */
+const MAX_WRAPPER_DEPTH = 32;
+/** Max repeated (`*`, `+`, `{n,m}`) atoms a pattern may have to stay in-thread runnable. */
+export const MAX_LINEAR_REPEATS = 2;
+/** Max product of alternation branch counts a pattern may have to stay in-thread runnable. */
+export const MAX_LINEAR_BRANCHES = 64;
 /** Characters the overlap test probes: all of ASCII plus a few representative non-ASCII ones. */
 const PROBE_CHARS = (() => {
     const chars = [];
     for (let c = 0; c < 128; c++)
         chars.push(String.fromCharCode(c));
-    return [...chars, ' ', 'é', 'а', ' ', '中'];
+    return [...chars, ' ', 'é', 'а', ' ', '中'];
 })();
 /** `{2}`, `{2,}`, `{2,5}` starting at `at` (a `{`), or undefined when it is a literal brace. */
 function braceQuantifier(pattern, at) {
@@ -67,6 +94,10 @@ function optional(quant) {
         return false;
     const parsed = braceQuantifier(quant, 0);
     return parsed !== undefined && parsed.min === 0;
+}
+/** True when this atom is run more than once by its own quantifier. */
+function isRepeated(atom) {
+    return atom.quant !== undefined && repeats(atom.quant);
 }
 /** Length of the escape sequence starting at `at` (a backslash). */
 function escapeLength(pattern, at) {
@@ -148,26 +179,62 @@ function anchors(repeated, anchor) {
     }
     return anchorMatchedSomething;
 }
+/** True when the two atoms can match the same character (assumed when either cannot be compiled). */
+function overlap(a, b) {
+    const am = matcher(a.text);
+    const bm = matcher(b.text);
+    if (am === undefined || bm === undefined)
+        return true; // cannot tell: assume the worst
+    return PROBE_CHARS.some((ch) => am(ch) && bm(ch));
+}
 const ADVICE = 'JavaScript backtracks exponentially on a non-matching input, where RE2 (the compiled Rego) stays linear;' +
     ' end each repetition with something the repeated part cannot match, e.g. "([a-z0-9-]+\\.)*"';
-/** Why the group closed at `frame` and repeated by `quant` is exponential, or undefined. */
-function shapeProblem(frame, pattern, closeAt, quant) {
-    const group = `${pattern.slice(frame.openedAt, closeAt + 1)}${quant}`;
-    if (frame.alternation) {
-        return `regex shape ${JSON.stringify(group)} repeats a group whose body contains an alternation (like "(a|aa)+"): ${ADVICE}`;
+const ADJACENT_ADVICE = 'JavaScript tries every way of splitting the input between them, where RE2 (the compiled Rego) stays linear;' +
+    ' make the character sets disjoint or drop one of the quantifiers, e.g. "[a-z]+[0-9]*"';
+/** Source text of one atom including its quantifier. */
+function atomText(a) {
+    return `${a.text}${a.quant ?? ''}`;
+}
+/**
+ * Why the group whose body is `frame`, repeated by the quantifier that makes
+ * `label` (the group source plus that quantifier), is exponential — or
+ * undefined. `depth` counts the redundant wrappers already seen through.
+ */
+function shapeProblem(frame, label, depth) {
+    const group = JSON.stringify(label);
+    if (depth > MAX_WRAPPER_DEPTH) {
+        return `regex shape ${group} nests repeated groups too deeply to analyse: ${ADVICE}`;
     }
-    const atoms = frame.atoms.filter((a) => !a.zeroWidth);
+    if (frame.branches.length > 1) {
+        return `regex shape ${group} repeats a group whose body contains an alternation (like "(a|aa)+"): ${ADVICE}`;
+    }
+    const atoms = frame.branches[0].filter((a) => !a.zeroWidth);
     if (atoms.length === 0)
         return undefined;
     const last = atoms[atoms.length - 1];
     if (last.quant !== undefined) {
-        return (`regex shape ${JSON.stringify(group)} repeats a group whose body ends with the quantified atom ` +
-            `${JSON.stringify(`${last.text}${last.quant}`)} (like "(a+)+"): ${ADVICE}`);
+        return (`regex shape ${group} repeats a group whose body ends with the quantified atom ` +
+            `${JSON.stringify(atomText(last))} (like "(a+)+"): ${ADVICE}`);
+    }
+    if (last.group && last.frame !== undefined) {
+        // A group that IS the body is a redundant wrapper around the real
+        // repetition: `((a+))+` is `(a+)+` and `((a|aa))+` is `(a|aa)+`.
+        // Re-analyse it as if the outer quantifier had been written on it.
+        if (atoms.length === 1)
+            return shapeProblem(last.frame, label, depth + 1);
+        // A trailing group with no alternation of its own is plain concatenation,
+        // so splice its atoms into the body: `(b(.*a))*` is `(b.*a)*`. With an
+        // alternation inside it (`(?:a(?:b|c))+`) that is not true — the branches
+        // are anchored by what precedes them — and the group stays opaque.
+        const inner = last.frame.branches[0];
+        if (last.frame.branches.length === 1) {
+            const spliced = { branches: [[...atoms.slice(0, -1), ...inner]], openedAt: frame.openedAt };
+            return shapeProblem(spliced, label, depth + 1);
+        }
     }
     let repeatedAt = -1;
     for (let i = atoms.length - 1; i >= 0; i--) {
-        const q = atoms[i].quant;
-        if (q !== undefined && repeats(q)) {
+        if (isRepeated(atoms[i])) {
             repeatedAt = i;
             break;
         }
@@ -179,25 +246,52 @@ function shapeProblem(frame, pattern, closeAt, quant) {
         if (anchors(repeated, atoms[i]))
             return undefined;
     }
-    const tail = atoms
-        .slice(repeatedAt + 1)
-        .map((a) => `${a.text}${a.quant ?? ''}`)
-        .join('');
-    return (`regex shape ${JSON.stringify(group)} repeats a group whose trailing ${JSON.stringify(tail)} can also be matched by ` +
-        `${JSON.stringify(`${repeated.text}${repeated.quant ?? ''}`)} in front of it (like "(.*a)*"): ${ADVICE}`);
+    const tail = atoms.slice(repeatedAt + 1).map(atomText).join('');
+    return (`regex shape ${group} repeats a group whose trailing ${JSON.stringify(tail)} can also be matched by ` +
+        `${JSON.stringify(atomText(repeated))} in front of it (like "(.*a)*"): ${ADVICE}`);
 }
 /**
- * Why `pattern` has a clearly exponential shape under a backtracking engine,
- * or undefined when it does not. Never throws: an unparseable pattern (a
- * dangling `(`, a stray `)`) is somebody else's error and simply yields
- * undefined here.
+ * Why one alternation branch has two repeated atoms that can match the same
+ * characters, with nothing in between that has to be consumed — or undefined.
+ * `[a-z]*[a-z]*x` is the shape; `[a-z]+\.` and `.*secret.*` are not (the
+ * second atom of each pair is anchored by text the first cannot swallow, or
+ * separated by a literal that must be consumed).
  */
-export function checkCatastrophicShape(pattern) {
-    const root = { atoms: [], alternation: false, openedAt: 0 };
+function adjacentProblem(branch) {
+    for (let i = 0; i < branch.length; i++) {
+        const first = branch[i];
+        if (first.zeroWidth || first.group || !isRepeated(first))
+            continue;
+        for (let j = i + 1; j < branch.length; j++) {
+            const next = branch[j];
+            if (next.zeroWidth)
+                continue;
+            if (next.group)
+                break; // opaque: `shapeProblem` is what looks inside groups
+            if (isRepeated(next) && overlap(first, next)) {
+                return (`regex shape ${JSON.stringify(atomText(first) + atomText(next))} repeats two adjacent atoms that can match ` +
+                    `the same characters (like "\\w+\\w+"): ${ADJACENT_ADVICE}`);
+            }
+            if (next.quant !== undefined && optional(next.quant))
+                continue; // can be skipped entirely
+            break;
+        }
+    }
+    return undefined;
+}
+/**
+ * Parse `pattern` into frames. `balanced` is false when the parentheses do
+ * not match (a stray `)`, an unclosed `(`): somebody else's error to report,
+ * and never a reason to claim a pattern is safe.
+ */
+function parsePattern(pattern) {
+    const root = { branches: [[]], openedAt: 0 };
     const stack = [root];
+    let problem;
     let i = 0;
     while (i < pattern.length) {
         const frame = stack[stack.length - 1];
+        const branch = frame.branches[frame.branches.length - 1];
         const ch = pattern[i];
         let atom;
         let next = i + 1;
@@ -213,38 +307,37 @@ export function checkCatastrophicShape(pattern) {
             next = end;
         }
         else if (ch === '(') {
-            stack.push({ atoms: [], alternation: false, openedAt: i });
+            stack.push({ branches: [[]], openedAt: i });
             i += groupPrefixLength(pattern, i);
             continue;
         }
         else if (ch === ')') {
             if (stack.length === 1)
-                return undefined; // unbalanced: not our error to report
+                return { root, balanced: false, ...(problem === undefined ? {} : { problem }) }; // stray ")"
             const closed = stack.pop();
             const parent = stack[stack.length - 1];
+            const parentBranch = parent.branches[parent.branches.length - 1];
             const quant = readQuantifier(pattern, i + 1);
-            atom = { text: pattern.slice(closed.openedAt, i + 1), group: true, zeroWidth: false };
+            atom = { text: pattern.slice(closed.openedAt, i + 1), group: true, zeroWidth: false, frame: closed };
             if (quant !== undefined) {
                 atom.quant = quant;
-                if (repeats(quant)) {
-                    const why = shapeProblem(closed, pattern, i, quant);
-                    if (why !== undefined)
-                        return why;
+                if (repeats(quant) && problem === undefined) {
+                    problem = shapeProblem(closed, `${atom.text}${quant}`, 0);
                 }
             }
-            parent.atoms.push(atom);
+            parentBranch.push(atom);
             i = i + 1 + (quant?.length ?? 0);
             continue;
         }
         else if (ch === '|') {
-            frame.alternation = true;
+            frame.branches.push([]);
             i++;
             continue;
         }
         else if (ch === '*' || ch === '+' || ch === '?' || ch === '{') {
             // A quantifier with nothing to quantify (or a literal `{`): treat it as a plain character.
             const quant = readQuantifier(pattern, i);
-            const target = frame.atoms[frame.atoms.length - 1];
+            const target = branch[branch.length - 1];
             if (quant !== undefined && target !== undefined && target.quant === undefined) {
                 target.quant = quant;
                 i += quant.length;
@@ -257,8 +350,93 @@ export function checkCatastrophicShape(pattern) {
             atom = { text: ch, group: false, zeroWidth: ch === '^' || ch === '$' };
             next = i + 1;
         }
-        frame.atoms.push(atom);
+        branch.push(atom);
         i = next;
+    }
+    const balanced = stack.length === 1;
+    return { root, balanced, ...(problem === undefined ? {} : { problem }) };
+}
+/** Every frame of a parse, outermost first. */
+function allFrames(root) {
+    const out = [];
+    const walk = (frame) => {
+        out.push(frame);
+        for (const branch of frame.branches) {
+            for (const atom of branch)
+                if (atom.frame !== undefined)
+                    walk(atom.frame);
+        }
+    };
+    walk(root);
+    return out;
+}
+/**
+ * Why `pattern` has a clearly exponential (or badly polynomial) shape under a
+ * backtracking engine, or undefined when it does not. Never throws: an
+ * unparseable pattern (a dangling `(`, a stray `)`) is somebody else's error
+ * and simply yields undefined here.
+ */
+export function checkCatastrophicShape(pattern) {
+    const parsed = parsePattern(pattern);
+    if (parsed.problem !== undefined)
+        return parsed.problem;
+    if (!parsed.balanced)
+        return undefined;
+    for (const frame of allFrames(parsed.root)) {
+        for (const branch of frame.branches) {
+            const why = adjacentProblem(branch);
+            if (why !== undefined)
+                return why;
+        }
+    }
+    return undefined;
+}
+/**
+ * Why `pattern` may NOT be matched on the proxy thread, or undefined when it
+ * provably runs in (at worst low-degree polynomial) bounded time.
+ *
+ * This is the fail-closed twin of {@link checkCatastrophicShape}: there,
+ * absence of a known-bad shape is enough to load a policy, because at run
+ * time the worker's hard deadline is what actually bounds the match. With no
+ * worker there is nothing to abandon a runaway match, so a pattern gets to
+ * run in-thread only if it is positively cleared here:
+ *
+ * - it parses, and has none of the catastrophic shapes;
+ * - no group carries a repeating quantifier at all (`(...)+` is the whole
+ *   exponential family; a wrapper cannot hide one from this rule);
+ * - at most {@link MAX_LINEAR_REPEATS} repeated atoms in the entire pattern,
+ *   so the worst case stays quadratic in the value length (~8 ms at the
+ *   4096-character `REGEX_VALUE_CAP`, measured);
+ * - at most {@link MAX_LINEAR_BRANCHES} alternation paths, so a pattern
+ *   cannot multiply its way to an exponential number of them.
+ */
+export function checkProvablyLinear(pattern) {
+    const parsed = parsePattern(pattern);
+    const shape = checkCatastrophicShape(pattern);
+    if (shape !== undefined)
+        return shape;
+    if (!parsed.balanced)
+        return 'the pattern could not be parsed for a linearity proof';
+    let repeatedAtoms = 0;
+    let branches = 1;
+    for (const frame of allFrames(parsed.root)) {
+        branches *= frame.branches.length;
+        if (branches > MAX_LINEAR_BRANCHES) {
+            return `the pattern has more than ${MAX_LINEAR_BRANCHES} alternation paths, which cannot be proved linear`;
+        }
+        for (const branch of frame.branches) {
+            for (const atom of branch) {
+                if (!isRepeated(atom))
+                    continue;
+                if (atom.group) {
+                    return `the repeated group ${JSON.stringify(atomText(atom))} cannot be proved linear`;
+                }
+                repeatedAtoms++;
+            }
+        }
+    }
+    if (repeatedAtoms > MAX_LINEAR_REPEATS) {
+        return `the pattern has ${repeatedAtoms} repeated quantifiers (more than ${MAX_LINEAR_REPEATS}), which cannot be proved linear`;
     }
     return undefined;
 }

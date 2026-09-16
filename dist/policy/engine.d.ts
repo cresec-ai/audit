@@ -13,10 +13,11 @@
  *   other segments address OBJECT KEYS only; a missing path, a null, or a
  *   non-scalar value means the rule does not match. Scalars are coerced with
  *   `String()` (Rego: `scalar_text`, i.e. `json.marshal` for non-strings,
- *   whose number formatting is the ES6 one `String()` also uses), truncated
- *   to `REGEX_VALUE_CAP` UTF-16 units before matching (Rego does not
- *   truncate: RE2 is linear-time, so only values beyond the cap can ever
- *   differ, and that is documented).
+ *   whose number formatting is the ES6 one `String()` also uses). A string
+ *   longer than `REGEX_VALUE_CAP` UTF-16 units is NOT matched at all: it used
+ *   to be truncated, which let `"x".repeat(5000) + "rm -rf /"` sail through a
+ *   `cmd: "rm -rf /"` deny rule, so an over-long value is now unevaluable and
+ *   denies (see {@link VALUE_TOO_LONG}).
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
  * Every `args` regex runs through `regex-guard.ts`, which matches it off the
@@ -86,8 +87,24 @@ export declare function dotPathSegments(dotPath: string): Array<string | number>
  * now agree that those never match.
  */
 export declare function getPath(root: unknown, dotPath: string): unknown;
-/** String form used for regex matching, or undefined when the value is not a scalar. */
-export declare function coerceScalar(value: unknown): string | undefined;
+/**
+ * A string argument too long to match against a backtracking regex.
+ *
+ * The cap bounds how much work one hostile argument can ask of V8, but
+ * TRUNCATING to it silently changed the answer: `"x".repeat(5000) + "rm -rf
+ * /"` did not match a `cmd: "rm -rf /"` deny rule, because the tail was cut
+ * off before matching, and the call was forwarded. RE2 (the Rego side) does
+ * not truncate and would have matched. Enforcement fails closed, so the local
+ * engine now refuses to answer instead of answering differently: `argsMatch`
+ * turns this into the same fail-closed deny a timed-out regex produces.
+ */
+export declare const VALUE_TOO_LONG: unique symbol;
+/**
+ * String form used for regex matching, {@link VALUE_TOO_LONG} when the value
+ * is a string longer than `REGEX_VALUE_CAP`, or undefined when the value is
+ * not a scalar at all.
+ */
+export declare function coerceScalar(value: unknown): string | typeof VALUE_TOO_LONG | undefined;
 /**
  * Decide a `tools/call`. A policy without an `mcp` section yields the
  * documented default (`allow`, unmatched). Never throws.

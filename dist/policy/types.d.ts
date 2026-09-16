@@ -168,14 +168,19 @@ export declare const LIMITS: {
 /** Identifier pattern shared by `name` and rule `id`. */
 export declare const ID_PATTERN = "^[A-Za-z0-9_.:/-]{1,64}$";
 /**
- * Values longer than this (UTF-16 units) are truncated before regex matching.
+ * The longest `args` value (UTF-16 units) the local engine will match a regex
+ * against. A longer one is UNEVALUABLE: the rule neither matches nor is
+ * skipped, and the call is denied (`engine.ts`, `VALUE_TOO_LONG`).
  *
  * 4 KiB, not the 64 KiB of earlier drafts: the local engine matches with V8's
  * BACKTRACKING RegExp, whose worst case grows with the subject length, so the
  * cap is also the bound on how much work one hostile argument can ask for.
- * The Rego side matches with RE2 (linear time) and does not truncate at all,
- * so only values longer than the cap can ever make the two engines disagree —
- * documented in `docs/policy.md`.
+ * The value used to be TRUNCATED to the cap, which silently turned a deny into
+ * an allow — `"x".repeat(5000) + "rm -rf /"` did not match a `cmd: "rm -rf /"`
+ * rule — so the engine now refuses to answer instead. The Rego side matches
+ * with RE2 (linear time) and keeps answering for values of any length; within
+ * the cap the two engines agree exactly, and beyond it the local one is never
+ * more permissive. Documented in `docs/policy.md`.
  */
 export declare const REGEX_VALUE_CAP = 4096;
 /** Auto-assigned id for a rule without one; brackets keep it outside ID_PATTERN so it can never collide. */

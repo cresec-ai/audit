@@ -143,6 +143,11 @@ const ALWAYS_PATTERNS: RegExp[] = [
   /\bsk-[A-Za-z0-9_-]{10,}\b/,
   // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  // GitHub fine-grained PATs (github_pat_<22>_<59>). NOT reachable by the
+  // `gh[pousr]_` shape above ("github_" has no matching second letter), and
+  // not by the generic base64 run either (the embedded `_` kills the \b), so
+  // before this entry a fine-grained PAT crossed the recorder unhashed.
+  /\bgithub_pat_[A-Za-z0-9_]{22,}\b/,
   // Slack tokens
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
   // Bearer auth headers
@@ -151,8 +156,22 @@ const ALWAYS_PATTERNS: RegExp[] = [
   /\b[0-9a-fA-F]{32,}\b/,
   // Long base64 blobs (>= 40 chars)
   /\b[A-Za-z0-9+/]{40,}={0,2}\b/,
-  // password-ish assignments ("password=...", "api_key: ...")
-  /\b(password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+/i,
+  // Credentials carried in a URL's userinfo ("postgres://user:pass@host/db").
+  // Only the `user:pass` is matched, so a redaction keeps the scheme, host
+  // and path readable, and the ref is sha256("user:pass") — the same value
+  // `scrubArgv` already fingerprints for a DSN on a server's command line.
+  /(?<=:\/\/)[^\s:/?#@]{1,128}:[^\s/?#@]{1,128}(?=@)/,
+  // password-ish assignments ("password=...", "api_key: ...", and the
+  // env-var-shaped names that carry them: "AWS_SECRET_ACCESS_KEY=...",
+  // "DB_PASSWORD=...", "X-Api-Key: ...").
+  //
+  // The leading/trailing `\b` this used to carry made the pattern blind to
+  // exactly those: `_` is a word character, so there is no boundary before
+  // the `SECRET` in `AWS_SECRET_ACCESS_KEY` nor after it. An affix is
+  // allowed instead, and it must be separated from the keyword by `_`/`-`,
+  // which keeps "secretary_id=5", "tokenizer_count=3" and
+  // "passwordless=true" out. Both affixes are bounded and unnested.
+  /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?\s*[:=]\s*\S+/i,
 ];
 
 export const DEFAULT_POLICY: RedactionPolicy = {
@@ -616,14 +635,23 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
       // throws on a `--flag=...` string, so the value half must be checked
       // on its own, and the `--flag=` prefix re-joined onto the scrubbed
       // result.
-      if (looksSecret(value)) {
-        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
-        continue;
-      }
+      //
+      // The URL check runs FIRST. `alwaysPatterns` now carries a
+      // url-userinfo shape, so `looksSecret` is true of a DSN too, and
+      // whichever branch runs first decides the outcome. Stripping wins on
+      // both counts: it fingerprints `user:pass`, the password and the
+      // username SEPARATELY (three refs a blast-radius query can hit) where
+      // hashing the element whole yields one ref for the entire DSN, and it
+      // keeps the scheme/host/path — which carry no credential — legible in
+      // `ServerContext.command`.
       const eqUrlHit = stripUrlUserinfo(value);
       if (eqUrlHit !== undefined) {
         fingerprintUrlHit(label, eqUrlHit);
         out.push(el.slice(0, eq + 1) + eqUrlHit.stripped);
+        continue;
+      }
+      if (looksSecret(value)) {
+        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
         continue;
       }
     }
@@ -635,15 +663,17 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
       continue;
     }
 
-    if (looksSecret(el)) {
-      out.push(fingerprint(`argv[${i}]`, el));
-      continue;
-    }
-
+    // Same ordering as the `=` branch above, for the same reason: a URL with
+    // userinfo is now `looksSecret`, and the strip is the stronger outcome.
     const urlHit = stripUrlUserinfo(el);
     if (urlHit !== undefined) {
       fingerprintUrlHit(`argv[${i}]`, urlHit);
       out.push(urlHit.stripped);
+      continue;
+    }
+
+    if (looksSecret(el)) {
+      out.push(fingerprint(`argv[${i}]`, el));
       continue;
     }
 

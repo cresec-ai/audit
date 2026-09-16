@@ -15,6 +15,14 @@
  *   whitelisted escapes, no leading `]` in a character class) so the local
  *   engine and OPA agree on every input, whatever the running Node version's
  *   V8 happens to accept;
+ * - regexes also compile in JavaScript's UNICODE mode after
+ *   {@link toUnicodeSource} rewrites the spellings `u` refuses: the local
+ *   engine matches with the `u` flag so that it counts runes the way RE2
+ *   does (`^.{1,8}$` against five U+1F600 must not mean one thing here and
+ *   another in OPA), and a pattern that cannot be expressed that way is
+ *   rejected rather than silently split between the engines;
+ * - no policy string carries an unpaired surrogate, which Go (and therefore
+ *   OPA) cannot represent and reads back as U+FFFD;
  * - regexes avoid the repeated-group shapes that are linear under RE2 but
  *   EXPONENTIAL under V8's backtracking engine (`redos.ts`): the compiled
  *   Rego would shrug them off, the local engine on the proxy thread would
@@ -41,6 +49,26 @@ export type ValidationResult = { ok: true; policy: Policy } | { ok: false; error
 const GLOB_RESERVED = /[[\]{}\\]/;
 
 /**
+ * An unpaired surrogate: legal in a JavaScript string, impossible in a Go
+ * one. OPA reads `"\ud800"` back as U+FFFD, so a glob, regex or reason
+ * containing one means a different thing in the compiled Rego than it does
+ * here — and, unlike U+FEFF (which `rego.ts` escapes), no spelling of it
+ * survives the trip. Rejected at validation time instead.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** Why `text` cannot be carried through to OPA unchanged, or undefined. */
+export function checkPortableText(text: string): string | undefined {
+  const m = LONE_SURROGATE.exec(text);
+  if (m === null) return undefined;
+  const code = (m[0] as string).charCodeAt(0).toString(16).padStart(4, '0');
+  return (
+    `the unpaired surrogate \\u${code} cannot be represented in a Rego string ` +
+    '(OPA reads it back as U+FFFD), so the two engines would not see the same text'
+  );
+}
+
+/**
  * Why `glob` is not acceptable, or undefined when it is. Blank globs can
  * never match anything useful and the reserved characters would make the TS
  * engine and the emitted Rego disagree.
@@ -53,6 +81,8 @@ const GLOB_RESERVED = /[[\]{}\\]/;
  */
 export function checkGlob(glob: string): string | undefined {
   if (glob.trim().length === 0) return 'glob must not be empty or blank';
+  const unportable = checkPortableText(glob);
+  if (unportable !== undefined) return unportable;
   const m = GLOB_RESERVED.exec(glob);
   if (m !== null) {
     return `glob must not contain ${JSON.stringify(m[0])} (reserved: [ ] { } \\ have no meaning in policy v1)`;
@@ -121,6 +151,99 @@ function checkEscape(pattern: string, i: number, inClass: boolean): string | und
   return undefined; // escaped ASCII punctuation: a literal in both engines
 }
 
+/** Punctuation JavaScript still allows after a backslash in Unicode (`u`) mode. */
+const U_MODE_ESCAPABLE: ReadonlySet<string> = new Set(['^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '/']);
+
+/** A `{n}` / `{n,}` / `{n,m}` quantifier starting at `at`, or undefined for a literal brace. */
+function braceQuantifierAt(pattern: string, at: number): string | undefined {
+  const m = /^\{[0-9]+(,[0-9]*)?\}/.exec(pattern.slice(at));
+  return m === null ? undefined : m[0];
+}
+
+/** Two-digit hex escape for an ASCII character. */
+function hexEscape(ch: string): string {
+  return `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
+}
+
+/**
+ * The same regex, spelled so JavaScript accepts it with the `u` flag.
+ *
+ * The local engine matches with `u` on purpose: without it V8 counts UTF-16
+ * units where RE2 counts runes, so `^.{1,8}$` matches five U+1F600 in OPA and
+ * not here, and `^..$` matches one U+1F600 here and not in OPA. Turning `u`
+ * on also tightens the SPELLING rules, and those tightenings carry no meaning
+ * — they are rewritten here rather than rejected, so policies that already
+ * pass validation keep working:
+ *
+ * - `\-`, `\ `, `\@`, `\:` ... — escaped punctuation `u` does not recognise —
+ *   become `\x2d`, `\x20`, `\x40`, `\x3a`: the same literal in V8 and in RE2
+ *   (inside a character class `\-` is already legal under `u` and is left
+ *   alone, because `\x2d` there would be a range endpoint spelled differently
+ *   but the same character);
+ * - a lone `]`, `{` or `}` outside a character class becomes `\]`, `\{`,
+ *   `\}`: a literal in RE2 either way, and `u` refuses the bare form;
+ * - an escaped non-ASCII character (`\é`) loses the backslash, which is what
+ *   V8 without `u` reads it as anyway (the subset check rejects it before
+ *   this, so only hand-built patterns get here).
+ *
+ * Nothing else changes: the rewrite never alters which strings match, only
+ * how the pattern is written.
+ */
+export function toUnicodeSource(pattern: string): string {
+  let out = '';
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i] as string;
+    if (ch === '\\') {
+      const next = pattern[i + 1];
+      if (next === undefined) {
+        out += ch; // dangling backslash: let `new RegExp` report it
+        continue;
+      }
+      if (next === 'x' && HEX_DIGIT.test(pattern[i + 2] ?? '') && HEX_DIGIT.test(pattern[i + 3] ?? '')) {
+        out += pattern.slice(i, i + 4);
+        i += 3;
+        continue;
+      }
+      if (ALPHANUMERIC.test(next) || U_MODE_ESCAPABLE.has(next) || (inClass && next === '-')) {
+        out += ch + next;
+      } else if (next.charCodeAt(0) > 0x7f) {
+        out += next; // `\é` is the literal "é" without the `u` flag
+      } else {
+        out += hexEscape(next);
+      }
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false;
+      out += ch;
+      continue;
+    }
+    if (ch === '[') {
+      inClass = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ']' || ch === '}') {
+      out += '\\' + ch; // a literal in RE2; `u` mode refuses the bare form
+      continue;
+    }
+    if (ch === '{') {
+      const quant = braceQuantifierAt(pattern, i);
+      if (quant === undefined) {
+        out += '\\{';
+        continue;
+      }
+      out += quant;
+      i += quant.length - 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 /**
  * Why `pattern` is outside the RE2-portable subset (or fails to compile), or
  * undefined when it is acceptable. Rejected: lookaround `(?=` `(?!` `(?<=`
@@ -180,6 +303,20 @@ export function checkRe2Subset(pattern: string): string | undefined {
   } catch (err) {
     return `invalid regular expression: ${err instanceof Error ? err.message : String(err)}`;
   }
+  // The local engine matches with the `u` flag (so it counts runes, like
+  // RE2). `toUnicodeSource` rewrites the spellings `u` refuses without
+  // changing what matches; anything still rejected means something different
+  // in the two engines and cannot be translated, so it is refused here.
+  try {
+    new RegExp(toUnicodeSource(pattern), 'u');
+  } catch (err) {
+    return (
+      'pattern cannot be matched in Unicode mode, which the local engine needs so that it counts characters' +
+      ` the way RE2 does: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const unportable = checkPortableText(pattern);
+  if (unportable !== undefined) return unportable;
   return checkCatastrophicShape(pattern);
 }
 
@@ -232,8 +369,15 @@ function checkDuplicateIds(rules: ReadonlyArray<{ id?: string }>, section: strin
   });
 }
 
+function checkReason(reason: unknown, path: string, errors: PolicyError[]): void {
+  if (typeof reason !== 'string') return; // the schema already reported the type
+  const why = checkPortableText(reason);
+  if (why !== undefined) errors.push({ path, message: why, keyword: 'text' });
+}
+
 function checkMcpRule(rule: McpRuleInput, i: number, errors: PolicyError[]): void {
   const base = `/mcp/rules/${i}/match`;
+  checkReason(rule.reason, `/mcp/rules/${i}/reason`, errors);
   if (rule.match.server !== undefined) checkGlobField(rule.match.server, `${base}/server`, errors);
   checkGlobField(rule.match.tool, `${base}/tool`, errors);
   if (rule.match.args === undefined) return;
@@ -253,6 +397,7 @@ function checkMcpRule(rule: McpRuleInput, i: number, errors: PolicyError[]): voi
 
 function checkEgressRule(rule: EgressRuleInput, i: number, errors: PolicyError[]): void {
   const base = `/egress/rules/${i}/match`;
+  checkReason(rule.reason, `/egress/rules/${i}/reason`, errors);
   checkGlobField(rule.match.host, `${base}/host`, errors);
   if (rule.match.path !== undefined) checkGlobField(rule.match.path, `${base}/path`, errors);
 }

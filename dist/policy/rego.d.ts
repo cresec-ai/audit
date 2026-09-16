@@ -65,6 +65,8 @@ export declare const BUNDLE_FILE_ORDER: readonly string[];
 export declare function bundleFileOrder(files: Record<string, string>): string[];
 /** Strip an optional `sha256:` prefix and require 64 lowercase hex. */
 export declare function policyRevision(policyHash: string): string;
+/** The same regex, spelled so RE2 reads `.` exactly as the local engine does. */
+export declare function toRe2Source(pattern: string): string;
 /** The documented decision shape (comment in every module header). */
 export declare const DECISION_SHAPE = "{\"allow\": bool, \"action\": \"allow\"|\"hold\"|\"deny\", \"rule_id\": \"...\", \"reason\": \"...\", \"matched\": bool, \"deny_reason\": \"...\"}";
 /** Render `cresec/mcp/tool.rego`. A policy without `mcp` compiles to the documented default (allow, no rules). */

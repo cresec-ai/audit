@@ -21,6 +21,15 @@
  *
  * Compiled patterns are kept in a small LRU cache keyed by delimiter+glob so
  * the hot path of the gateway never recompiles.
+ *
+ * A RUN of wildcards collapses into one: `***` and `****` are the same
+ * language as `**`, but translated atom for atom they become
+ * `[\s\S]*[^/]*[\s\S]*...`, which is the classic adjacent-quantifier
+ * blowup — `"*".repeat(30) + "x"` against a 60-character subject takes 88 s
+ * here (measured), and the subject is a tool name off the wire. Collapsing
+ * removes every adjacent pair, so no glob can be written that way; it changes
+ * no policy's meaning, because a run always accepts exactly what its most
+ * permissive member accepts.
  */
 export type GlobDelimiter = '/' | '.';
 /** Max compiled globs retained; beyond this the least recently used is evicted. */

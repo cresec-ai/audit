@@ -22,17 +22,32 @@
  *    tools/call the gateway saw — element by element when the server
  *    answers a batch with a JSON-RPC array, and over an uncorrelated
  *    ("orphan") result that still looks like a tool result; forward the
- *    original bytes when nothing changed, else the re-serialized message.
+ *    original bytes when nothing changed, else the original line with ONLY
+ *    the rewritten subtrees spliced back into it (see
+ *    `spliceRewrittenLine`: re-serializing a whole message to redact one
+ *    string would silently rewrite unrelated numbers in it).
  * Enforcement fails CLOSED (an evaluation throw or an unwritable hold is a
  * deny); recording stays fail-open exactly as in record mode. Every
  * `tools/call` REQUEST (one carrying an id) is evaluated, including one
  * whose `params.name` is missing or not a string: it is evaluated as the
  * tool name '' so the section default — and any glob matching the empty
- * string — applies. Known v1 limits, on purpose: a `hold` inside a
- * JSON-RPC batch is treated as deny, a `tools/call` with no `id` property
- * at all (a notification) is forwarded unevaluated, and a line over the
- * 32 MiB tap cap cannot be parsed so it is forwarded unchanged and
- * recorded as `protocol_error` — as in record mode.
+ * string — applies, and one whose `params.name` is longer than
+ * `MAX_EVALUATED_TOOL_NAME_LEN`, which is a fail-closed deny WITHOUT
+ * consulting the policy (the engine's tool globs are backtracking regexes
+ * on this thread; an uncapped name off the wire is a remote freeze). Known
+ * v1 limits, on purpose: a `hold` inside a JSON-RPC batch is treated as
+ * deny, a `tools/call` with no `id` property at all (a notification) is
+ * forwarded unevaluated, and a line over the 32 MiB tap cap cannot be
+ * parsed so it is forwarded unchanged and recorded as `protocol_error` —
+ * as in record mode.
+ *
+ * A JSON-RPC BATCH IS NOT A WAY IN. Every `tools/call` element of a batch
+ * goes through the same gate a standalone one does, in the same order: the
+ * duplicate-id refusal, the null-id refusal, then the policy. A refused
+ * element is never forwarded and its refusal comes back as an element of
+ * the batch response; the elements that ARE forwarded travel as the client
+ * wrote them. Ids taken by earlier elements of the same batch count as in
+ * flight, because the batch is forwarded (and registered) as a unit.
  *
  * DUPLICATE REQUEST IDS. `pending` and `holds` are both keyed by the
  * request id, and a held call sits on its key for as long as a human takes
@@ -45,11 +60,17 @@
  * pending, is refused immediately with a synthesized isError result and
  * recorded as a `policy_decision` (deny) plus a synthetic `tool_call` with
  * `error.type: 'duplicate_id'` — it is never forwarded, so the in-flight
- * call keeps its slot. Belt and braces, an approved hold that still finds a
- * pending entry on its key (one that slipped in through a path with no such
- * check) seals that entry as `duplicate_id` before taking the slot back, so
- * nothing is ever silently overwritten. Record mode is untouched: without a
- * policy the tap keeps its last-writer-wins `pending` map.
+ * call keeps its slot. This runs for a batch element too (`refuseReusedId`
+ * is the one gate): a batch used to skip it, which put the clobber straight
+ * back and wrote a FALSE record on top of it — a `tool_call` carrying one
+ * call's arguments with another call's result. Belt and braces, an approved
+ * hold that still finds a pending entry on its key (one that slipped in
+ * through a path with no such check) seals that entry as `duplicate_id`
+ * before taking the slot back, so nothing is ever silently overwritten;
+ * that seal is a last resort, not the mitigation — it writes a record for a
+ * call whose real result was lost, so the refusal above must happen first.
+ * Record mode is untouched: without a policy the tap keeps its
+ * last-writer-wins `pending` map.
  *
  * NULL REQUEST IDS. `{"id": null}` is not a valid MCP request (the official
  * SDK rejects it) and is not a notification either, so a `tools/call`
@@ -60,8 +81,10 @@
  * permits a null id on an error response). It is recorded exactly as the
  * tap has always recorded an id-less message — one `notification` event —
  * because the frozen schema's `request_id` is `string | number` and cannot
- * describe it; the refusal itself is visible on stderr. Without `--policy`
- * it is forwarded unevaluated, as before.
+ * describe it; the refusal itself is visible on stderr. This holds inside a
+ * JSON-RPC batch as well, both for a batch that mixes one in and for a
+ * batch that contains nothing else. Without `--policy` it is forwarded
+ * unevaluated, as before.
  */
 import { type Readable, type Writable } from 'node:stream';
 import type { GatewayOptions } from '../gateway/options.js';

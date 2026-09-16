@@ -27,10 +27,30 @@
  *
  * Fallback: if the worker cannot be started at all (no `worker_threads`, a
  * sandbox that refuses threads, a startup handshake that misses its budget),
- * the guard degrades to IN-THREAD matching, but ONLY for patterns that pass
- * `checkCatastrophicShape`; anything else is refused as unevaluable, which is
- * again a fail-closed deny. The degradation is reported once through the diag
- * callback.
+ * the guard degrades to IN-THREAD matching — but the absence of
+ * `worker_threads` must never turn enforcement fail-OPEN, so in that state:
+ *
+ * - a pattern runs on this thread ONLY if `checkProvablyLinear` clears it
+ *   (no repeated groups, at most two repeated atoms, a bounded number of
+ *   alternation paths). That is a proof of boundedness, not the mere absence
+ *   of a known-bad shape: `^((a+))+$` used to slip through the blacklist and
+ *   took 40 s in one call, blocking every other request behind it, and then
+ *   ALLOWED. Anything not cleared is refused as unevaluable — a fail-closed
+ *   deny, never an allow, and never a wait;
+ * - a cleared match that still overruns the deadline (a machine under load, a
+ *   shape the analysis was too generous about) cannot be interrupted, so its
+ *   answer is thrown away and the pattern is POISONED: it can happen at most
+ *   once per pattern, and every later call denies immediately;
+ * - the degradation is NOT permanent. A single slow startup handshake used to
+ *   disable the bounded path for the lifetime of the process; now the guard
+ *   retries after `REGEX_RETRY_MS` (doubling up to `REGEX_RETRY_MAX_MS`), and
+ *   a retry never blocks the caller — the worker is adopted by a later call
+ *   once its handshake lands.
+ *
+ * Every `match.args` regex is matched with the `u` flag (through
+ * `toUnicodeSource`, which rewrites the spellings `u` refuses without
+ * changing what matches), because without it V8 counts UTF-16 units where
+ * RE2 counts runes and the two engines disagree about `^.{1,8}$`.
  */
 /** Max wall-clock time one `match.args` regex may take before it is abandoned. */
 export declare const REGEX_DEADLINE_MS = 25;
@@ -38,6 +58,10 @@ export declare const REGEX_DEADLINE_MS = 25;
 export declare const REGEX_STARTUP_MS = 1000;
 /** Max compiled arg regexes retained (LRU). */
 export declare const REGEX_CACHE_SIZE = 512;
+/** How long the guard waits after a failed worker start before trying again. */
+export declare const REGEX_RETRY_MS = 30000;
+/** Ceiling for the doubling retry backoff. */
+export declare const REGEX_RETRY_MAX_MS = 300000;
 /** Why a bounded match could not produce an answer. Always fail-closed for the caller. */
 export type RegexGuardFailure = 'timeout' | 'unavailable';
 /**
@@ -53,6 +77,8 @@ export interface RegexGuardOptions {
     deadlineMs?: number;
     /** Worker startup budget in ms (default {@link REGEX_STARTUP_MS}). */
     startupMs?: number;
+    /** Delay before the first retry after a failed start (default {@link REGEX_RETRY_MS}); it doubles from there. */
+    retryMs?: number;
     /** One line of diagnostics; called at most once per poisoned pattern / degradation. */
     onDiag?: (msg: string) => void;
 }
@@ -68,11 +94,16 @@ export declare function setRegexGuardDiag(fn: ((msg: string) => void) | undefine
 export declare function configureRegexGuard(opts: RegexGuardOptions): void;
 /** Terminate the worker and forget every knob, poisoned pattern and cached regex (tests). */
 export declare function resetRegexGuard(): void;
-/** Current guard state, for tests and diagnostics. */
+/**
+ * Current guard state, for tests and diagnostics. `degraded` means the
+ * bounded path is not available right now — either waiting out the retry
+ * backoff or waiting for a retried worker's handshake.
+ */
 export declare function regexGuardState(): {
     worker: boolean;
     degraded: boolean;
     poisoned: number;
+    retrying: boolean;
 };
 /**
  * Start the worker now (paying the handshake off the hot path) and report

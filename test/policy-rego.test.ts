@@ -23,6 +23,7 @@ import {
   policyRevision,
   renderEgressModule,
   renderMcpModule,
+  REGEX_VALUE_CAP,
   ruleLabel,
   validatePolicyObject,
 } from '../src/policy/index.js';
@@ -611,6 +612,150 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     expect(ts.ruleId ?? null, `TypeScript engine picked ${ruleLabel(ts)}`).toBe(c.ruleId);
     const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };
     expect(opaEval(opa, parityDir, 'data.cresec.mcp.decision', opaInput)).toEqual(asOpa(ts));
+  });
+
+  /*
+   * `.` and character counting. JavaScript's `.` (no `s` flag) excludes
+   * \n \r U+2028 U+2029 and counts UTF-16 units; RE2's excludes \n only and
+   * counts runes. Every case below was measured as a DISAGREEMENT against
+   * OPA 1.20.2 before the compiler started spelling `.` out for RE2 and the
+   * local engine started matching with the `u` flag.
+   */
+  const dotsResult = validatePolicyObject({
+    version: 1,
+    name: 'dots',
+    mcp: {
+      default: 'allow',
+      rules: [
+        { id: 'dot-star', match: { tool: 'a', args: { s: '^.*secret.*$' } }, action: 'deny', reason: 'secrets' },
+        { id: 'rm-rf', match: { tool: 'b', args: { s: '^rm -rf .+$' } }, action: 'deny', reason: 'destructive' },
+        { id: 'etc', match: { tool: 'c', args: { s: '^/etc/.+$' } }, action: 'deny', reason: 'system files' },
+        { id: 'count8', match: { tool: 'd', args: { s: '^.{1,8}$' } }, action: 'deny', reason: 'short values' },
+        { id: 'count2', match: { tool: 'e', args: { s: '^..$' } }, action: 'deny', reason: 'exactly two' },
+        { id: 'dot-class', match: { tool: 'f', args: { s: '^[.]$' } }, action: 'deny', reason: 'a literal dot' },
+        { id: 'dot-escaped', match: { tool: 'g', args: { s: '^a\\.b$' } }, action: 'deny', reason: 'an escaped dot' },
+      ],
+    },
+  });
+  if (!dotsResult.ok) throw new Error('dots fixture invalid');
+  const dotsPolicy = dotsResult.policy;
+  const dotsDir = join(tmp, 'dots');
+  writeBundle(dotsDir, compileToRego(dotsPolicy, { policyHash: goldenHash('dots'), toolVersion: TOOL_VERSION, policyName: 'dots' }));
+  const GRIN = '\u{1F600}';
+  const DOT_CASES: Array<{ note: string; input: McpRequestInput; ruleId: string | null }> = [
+    { note: 'F9 "." does not match \\r in either engine', input: mcpIn('s', 'a', { s: 'my\rsecret' }, 20), ruleId: null },
+    { note: 'F9 "." does not match \\n in either engine', input: mcpIn('s', 'a', { s: 'my\nsecret' }, 20), ruleId: null },
+    { note: 'F9 "." does not match U+2028 in either engine', input: mcpIn('s', 'a', { s: `my\u2028secret` }, 20), ruleId: null },
+    { note: 'F9 ".*secret.*" still matches ordinary text', input: mcpIn('s', 'a', { s: 'my secret' }, 20), ruleId: 'dot-star' },
+    { note: 'F9 "rm -rf .+" does not match a \\r argument', input: mcpIn('s', 'b', { s: 'rm -rf \r/' }, 20), ruleId: null },
+    { note: 'F9 "rm -rf .+" still matches a real path', input: mcpIn('s', 'b', { s: 'rm -rf /tmp' }, 20), ruleId: 'rm-rf' },
+    { note: 'F9 "/etc/.+" does not match a \\r argument', input: mcpIn('s', 'c', { s: '/etc/\rpasswd' }, 20), ruleId: null },
+    { note: 'F9 "/etc/.+" still matches /etc/passwd', input: mcpIn('s', 'c', { s: '/etc/passwd' }, 20), ruleId: 'etc' },
+    { note: 'F9 ".{1,8}" counts five astral runes, not ten UTF-16 units', input: mcpIn('s', 'd', { s: GRIN.repeat(5) }, 30), ruleId: 'count8' },
+    { note: 'F9 ".{1,8}" rejects nine astral runes', input: mcpIn('s', 'd', { s: GRIN.repeat(9) }, 50), ruleId: null },
+    { note: 'F9 ".." is two runes, so one astral character does not match', input: mcpIn('s', 'e', { s: GRIN }, 12), ruleId: null },
+    { note: 'F9 ".." still matches two ASCII characters', input: mcpIn('s', 'e', { s: 'ab' }, 12), ruleId: 'count2' },
+    { note: 'F9 "." inside a character class stays a literal dot', input: mcpIn('s', 'f', { s: '.' }, 10), ruleId: 'dot-class' },
+    { note: 'F9 "[.]" does not match another character', input: mcpIn('s', 'f', { s: 'x' }, 10), ruleId: null },
+    { note: 'F9 an escaped "\\." is untouched by the rewrite', input: mcpIn('s', 'g', { s: 'a.b' }, 12), ruleId: 'dot-escaped' },
+    { note: 'F9 "a\\.b" does not match "axb"', input: mcpIn('s', 'g', { s: 'axb' }, 12), ruleId: null },
+  ];
+
+  it('dots policy: "." is emitted as the explicit class, and opa check --strict / opa fmt stay green', () => {
+    const module = readFileSync(join(dotsDir, MCP_REGO_PATH), 'utf8');
+    expect(module).toContain('regex.match("^[^\\\\n\\\\r\\\\x{2028}\\\\x{2029}]*secret[^\\\\n\\\\r\\\\x{2028}\\\\x{2029}]*$", scalar_text(v0))');
+    expect(module).toContain('regex.match("^[.]$", scalar_text(v0))'); // inside a class: untouched
+    expect(module).toContain('regex.match("^a\\\\.b$", scalar_text(v0))'); // escaped: untouched
+    const check = spawnSync(opa, ['check', '--strict', '-b', dotsDir], { encoding: 'utf8' });
+    expect(check.status, check.stderr + check.stdout).toBe(0);
+    const fmt = spawnSync(opa, ['fmt', '--fail', '--list', join(dotsDir, 'cresec')], { encoding: 'utf8' });
+    expect(fmt.status, `opa fmt would reformat:\n${fmt.stdout}${fmt.stderr}`).toBe(0);
+  });
+
+  it.each(DOT_CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {
+    const ts = evaluateMcp(dotsPolicy, c.input);
+    expect(ts.ruleId ?? null, `TypeScript engine picked ${ruleLabel(ts)}`).toBe(c.ruleId);
+    const opaInput = { server: c.input.server, tool: c.input.tool, args: c.input.args, args_bytes: c.input.argsBytes };
+    expect(opaEval(opa, dotsDir, 'data.cresec.mcp.decision', opaInput)).toEqual(asOpa(ts));
+  });
+
+  it('a byte-order mark (and the rest of its class) is escaped, so the bundle loads and reads back unchanged', () => {
+    // A U+FEFF pasted in from a document used to compile with exit 0 and then
+    // fail to load: `opa check --strict` reported `rego_parse_error:
+    // non-terminated object` and `opa eval` exited 2.
+    const reason = 'pasted\ufefffrom \u007f\u0085a \u2028document\u2029';
+    const r = validatePolicyObject({
+      version: 1,
+      name: 'bom',
+      mcp: { default: 'allow', rules: [{ id: 'bom', match: { tool: 'echo', args: { s: 'a\ufeffb' } }, action: 'deny', reason }] },
+    });
+    if (!r.ok) throw new Error('bom fixture invalid');
+    const dir = join(tmp, 'bom');
+    writeBundle(dir, compileToRego(r.policy, { policyHash: goldenHash('bom'), toolVersion: TOOL_VERSION, policyName: 'bom' }));
+    const module = readFileSync(join(dir, MCP_REGO_PATH), 'utf8');
+    // Nothing of the class survives raw, in a reason OR in a regex literal.
+    expect(module).not.toMatch(/[\u007f-\u009f\u2028\u2029\ufeff]/);
+    expect(module).toContain('\\ufeff');
+    const check = spawnSync(opa, ['check', '--strict', '-b', dir], { encoding: 'utf8' });
+    expect(check.status, check.stderr + check.stdout).toBe(0);
+    const fmt = spawnSync(opa, ['fmt', '--fail', '--list', join(dir, 'cresec')], { encoding: 'utf8' });
+    expect(fmt.status, `opa fmt would reformat:\n${fmt.stdout}${fmt.stderr}`).toBe(0);
+    // OPA reads every escaped character back as itself: same reason, and the
+    // regex still matches exactly the value that carries the mark.
+    const ts = evaluateMcp(r.policy, { server: 's', tool: 'echo', args: { s: 'a\ufeffb' }, argsBytes: 12 });
+    expect(ts).toMatchObject({ action: 'deny', ruleId: 'bom', reason });
+    const got = opaEval(opa, dir, 'data.cresec.mcp.decision', { server: 's', tool: 'echo', args: { s: 'a\ufeffb' }, args_bytes: 12 });
+    expect(got).toEqual(asOpa(ts));
+    expect(got.reason).toBe(reason);
+    expect(opaEval(opa, dir, 'data.cresec.mcp.decision', { server: 's', tool: 'echo', args: { s: 'ab' }, args_bytes: 10 })).toEqual(
+      asOpa(evaluateMcp(r.policy, { server: 's', tool: 'echo', args: { s: 'ab' }, argsBytes: 10 })),
+    );
+  });
+
+  it('past REGEX_VALUE_CAP the local engine REFUSES rather than answering differently from RE2', () => {
+    // RE2 does not truncate and is linear, so it keeps answering for values of
+    // any length; the local engine cannot match a 4 KiB+ value against a
+    // backtracking regex safely, and truncating it (what it used to do) turned
+    // a deny into an allow. So beyond the cap the two engines are not compared
+    // decision for decision: the local one stops deciding and fails closed,
+    // which is never more permissive than the Rego. Every value up to the cap
+    // is compared exactly, here and in every other case of this suite.
+    const r = validatePolicyObject({
+      version: 1,
+      name: 'cap',
+      mcp: {
+        default: 'allow',
+        rules: [
+          { id: 'no-rm', match: { tool: 'sh', args: { cmd: 'rm -rf /' } }, action: 'deny', reason: 'destructive' },
+          { id: 'allow-x', match: { tool: 'x', args: { s: '^x+$' } }, action: 'allow', reason: 'harmless' },
+        ],
+      },
+    });
+    if (!r.ok) throw new Error('cap fixture invalid');
+    const dir = join(tmp, 'cap');
+    writeBundle(dir, compileToRego(r.policy, { policyHash: goldenHash('cap'), toolVersion: TOOL_VERSION, policyName: 'cap' }));
+    const at = (n: number) => 'x'.repeat(n) + 'rm -rf /';
+    // At the cap the engines agree exactly, padding and all.
+    for (const value of ['rm -rf /', at(REGEX_VALUE_CAP - 8)]) {
+      const ts = evaluateMcp(r.policy, { server: 's', tool: 'sh', args: { cmd: value }, argsBytes: value.length + 10 });
+      expect(ts).toMatchObject({ action: 'deny', ruleId: 'no-rm', matched: true });
+      expect(opaEval(opa, dir, 'data.cresec.mcp.decision', { server: 's', tool: 'sh', args: { cmd: value }, args_bytes: value.length + 10 })).toEqual(asOpa(ts));
+    }
+    // Past it: OPA still matches the deny rule, the local engine refuses to
+    // evaluate — both refuse the call, by different routes.
+    const long = at(5_000);
+    const tsLong = evaluateMcp(r.policy, { server: 's', tool: 'sh', args: { cmd: long }, argsBytes: long.length + 10 });
+    const opaLong = opaEval(opa, dir, 'data.cresec.mcp.decision', { server: 's', tool: 'sh', args: { cmd: long }, args_bytes: long.length + 10 });
+    expect(tsLong).toMatchObject({ action: 'deny', matched: false, failClosed: true });
+    expect(opaLong).toMatchObject({ action: 'deny', rule_id: 'no-rm', allow: false });
+    // And where the Rego would ALLOW, the refusal is stricter, never looser:
+    // an unevaluable condition denies, it is not skipped.
+    const big = 'x'.repeat(5_000);
+    const tsAllow = evaluateMcp(r.policy, { server: 's', tool: 'x', args: { s: big }, argsBytes: big.length + 8 });
+    const opaAllow = opaEval(opa, dir, 'data.cresec.mcp.decision', { server: 's', tool: 'x', args: { s: big }, args_bytes: big.length + 8 });
+    expect(opaAllow).toMatchObject({ allow: true, rule_id: 'allow-x' });
+    expect(tsAllow).toMatchObject({ action: 'deny', failClosed: true });
+    expect(tsAllow.action === 'allow').toBe(false);
   });
 
   it.each(CASES.map((c) => [c.note, c] as const))('%s', (_note, c) => {

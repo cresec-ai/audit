@@ -22,17 +22,32 @@
  *    tools/call the gateway saw — element by element when the server
  *    answers a batch with a JSON-RPC array, and over an uncorrelated
  *    ("orphan") result that still looks like a tool result; forward the
- *    original bytes when nothing changed, else the re-serialized message.
+ *    original bytes when nothing changed, else the original line with ONLY
+ *    the rewritten subtrees spliced back into it (see
+ *    `spliceRewrittenLine`: re-serializing a whole message to redact one
+ *    string would silently rewrite unrelated numbers in it).
  * Enforcement fails CLOSED (an evaluation throw or an unwritable hold is a
  * deny); recording stays fail-open exactly as in record mode. Every
  * `tools/call` REQUEST (one carrying an id) is evaluated, including one
  * whose `params.name` is missing or not a string: it is evaluated as the
  * tool name '' so the section default — and any glob matching the empty
- * string — applies. Known v1 limits, on purpose: a `hold` inside a
- * JSON-RPC batch is treated as deny, a `tools/call` with no `id` property
- * at all (a notification) is forwarded unevaluated, and a line over the
- * 32 MiB tap cap cannot be parsed so it is forwarded unchanged and
- * recorded as `protocol_error` — as in record mode.
+ * string — applies, and one whose `params.name` is longer than
+ * `MAX_EVALUATED_TOOL_NAME_LEN`, which is a fail-closed deny WITHOUT
+ * consulting the policy (the engine's tool globs are backtracking regexes
+ * on this thread; an uncapped name off the wire is a remote freeze). Known
+ * v1 limits, on purpose: a `hold` inside a JSON-RPC batch is treated as
+ * deny, a `tools/call` with no `id` property at all (a notification) is
+ * forwarded unevaluated, and a line over the 32 MiB tap cap cannot be
+ * parsed so it is forwarded unchanged and recorded as `protocol_error` —
+ * as in record mode.
+ *
+ * A JSON-RPC BATCH IS NOT A WAY IN. Every `tools/call` element of a batch
+ * goes through the same gate a standalone one does, in the same order: the
+ * duplicate-id refusal, the null-id refusal, then the policy. A refused
+ * element is never forwarded and its refusal comes back as an element of
+ * the batch response; the elements that ARE forwarded travel as the client
+ * wrote them. Ids taken by earlier elements of the same batch count as in
+ * flight, because the batch is forwarded (and registered) as a unit.
  *
  * DUPLICATE REQUEST IDS. `pending` and `holds` are both keyed by the
  * request id, and a held call sits on its key for as long as a human takes
@@ -45,11 +60,17 @@
  * pending, is refused immediately with a synthesized isError result and
  * recorded as a `policy_decision` (deny) plus a synthetic `tool_call` with
  * `error.type: 'duplicate_id'` — it is never forwarded, so the in-flight
- * call keeps its slot. Belt and braces, an approved hold that still finds a
- * pending entry on its key (one that slipped in through a path with no such
- * check) seals that entry as `duplicate_id` before taking the slot back, so
- * nothing is ever silently overwritten. Record mode is untouched: without a
- * policy the tap keeps its last-writer-wins `pending` map.
+ * call keeps its slot. This runs for a batch element too (`refuseReusedId`
+ * is the one gate): a batch used to skip it, which put the clobber straight
+ * back and wrote a FALSE record on top of it — a `tool_call` carrying one
+ * call's arguments with another call's result. Belt and braces, an approved
+ * hold that still finds a pending entry on its key (one that slipped in
+ * through a path with no such check) seals that entry as `duplicate_id`
+ * before taking the slot back, so nothing is ever silently overwritten;
+ * that seal is a last resort, not the mitigation — it writes a record for a
+ * call whose real result was lost, so the refusal above must happen first.
+ * Record mode is untouched: without a policy the tap keeps its
+ * last-writer-wins `pending` map.
  *
  * NULL REQUEST IDS. `{"id": null}` is not a valid MCP request (the official
  * SDK rejects it) and is not a notification either, so a `tools/call`
@@ -60,8 +81,10 @@
  * permits a null id on an error response). It is recorded exactly as the
  * tap has always recorded an id-less message — one `notification` event —
  * because the frozen schema's `request_id` is `string | number` and cannot
- * describe it; the refusal itself is visible on stderr. Without `--policy`
- * it is forwarded unevaluated, as before.
+ * describe it; the refusal itself is visible on stderr. This holds inside a
+ * JSON-RPC batch as well, both for a batch that mixes one in and for a
+ * batch that contains nothing else. Without `--policy` it is forwarded
+ * unevaluated, as before.
  */
 import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
@@ -75,7 +98,7 @@ import { setRegexGuardDiag, warmRegexGuard } from '../policy/regex-guard.js';
 import { normalizePolicy } from '../policy/types.js';
 import { planSpawn, spawnWrapped, terminateChild, withNodeDirOnPath } from './spawn.js';
 import { SCHEMA } from '../schema/events.js';
-import { scrubArgv, scrubToolArguments, structuralString } from '../redact/redactor.js';
+import { STRUCTURAL_STRING_MAX_LEN, scrubArgv, scrubToolArguments, structuralString, } from '../redact/redactor.js';
 import { LineScanner } from './framing.js';
 const NL = 0x0a;
 /** Explicit rule ids (`ID_PATTERN`) and the auto-assigned `rule[<i>]` survive as-is. */
@@ -194,6 +217,384 @@ function toolsCallParts(msg) {
 function asBuffer(chunk) {
     return Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
 }
+/** Beyond this many separate edits on one line, re-serialize the whole message. */
+const MAX_LINE_EDITS = 32;
+/** Thrown internally by the span scanner; never escapes `jsonValueSpan`. */
+class JsonScanError extends Error {
+}
+/**
+ * Locates the exact character span of a value inside a JSON document that
+ * has ALREADY been parsed successfully, so it can assume well-formed input
+ * and only has to be accurate. Skipping a value is iterative — a deeply
+ * nested message costs a counter, never stack frames.
+ */
+class JsonSpanScanner {
+    s;
+    i = 0;
+    constructor(s) {
+        this.s = s;
+    }
+    fail() {
+        throw new JsonScanError('json span scan failed');
+    }
+    ws() {
+        for (;;) {
+            const c = this.s.charCodeAt(this.i);
+            // space, \t, \n, \r — the only JSON whitespace
+            if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d)
+                this.i++;
+            else
+                return;
+        }
+    }
+    /**
+     * Advance past a string token starting at `i`. Nothing is copied: a big
+     * message is mostly strings, and only the KEYS of the object actually
+     * being searched are ever materialized (`keyToken`).
+     */
+    skipString() {
+        if (this.s.charCodeAt(this.i) !== 0x22)
+            this.fail(); // '"'
+        this.i++;
+        for (;;) {
+            const c = this.s.charCodeAt(this.i);
+            if (Number.isNaN(c))
+                this.fail();
+            this.i++;
+            if (c === 0x22)
+                return; // '"'
+            if (c === 0x5c) {
+                // backslash: the next character is part of the escape
+                if (this.i >= this.s.length)
+                    this.fail();
+                this.i++;
+            }
+        }
+    }
+    /** Like `skipString`, but returns the token's RAW text (quotes included). */
+    keyToken() {
+        const start = this.i;
+        this.skipString();
+        return this.s.slice(start, this.i);
+    }
+    /** Advance past a number / true / false / null literal. */
+    primitive() {
+        const start = this.i;
+        for (;;) {
+            const c = this.s.charCodeAt(this.i);
+            // end of input, ',' '}' ']', or whitespace ends the literal
+            if (Number.isNaN(c) || c === 0x2c || c === 0x7d || c === 0x5d)
+                break;
+            if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d)
+                break;
+            this.i++;
+        }
+        if (this.i === start)
+            this.fail();
+    }
+    /** Advance past exactly one complete JSON value (containers included). */
+    skipValue() {
+        let depth = 0;
+        for (;;) {
+            this.ws();
+            const c = this.s[this.i];
+            if (c === undefined)
+                this.fail();
+            if (c === '{' || c === '[') {
+                this.i++;
+                depth++;
+                continue; // read this container's first key/element (or its close)
+            }
+            if (c === '}' || c === ']') {
+                if (depth === 0)
+                    this.fail(); // an empty container is closed here
+                this.i++;
+                depth--;
+            }
+            else if (c === '"') {
+                this.skipString();
+            }
+            else {
+                this.primitive();
+            }
+            // A value (or a whole container) just ended: close every container
+            // that ends here, and stop as soon as the outermost one is done.
+            for (;;) {
+                if (depth === 0)
+                    return;
+                this.ws();
+                const d = this.s[this.i];
+                if (d === ',' || d === ':') {
+                    this.i++;
+                    break; // more to read at this level
+                }
+                if (d === '}' || d === ']') {
+                    this.i++;
+                    depth--;
+                    continue;
+                }
+                this.fail();
+            }
+        }
+    }
+    /**
+     * Span of `key`'s value in the object starting at `i`. The LAST member
+     * with that key wins, exactly as `JSON.parse` resolves duplicate keys.
+     */
+    member(key) {
+        const wanted = JSON.stringify(key);
+        this.ws();
+        if (this.s[this.i] !== '{')
+            this.fail();
+        this.i++;
+        let found;
+        this.ws();
+        if (this.s[this.i] === '}')
+            return found;
+        for (;;) {
+            this.ws();
+            const raw = this.keyToken();
+            this.ws();
+            if (this.s[this.i] !== ':')
+                this.fail();
+            this.i++;
+            this.ws();
+            const start = this.i;
+            this.skipValue();
+            // `raw === wanted` covers every unescaped key; only an escaped one
+            // (`"result"`) needs decoding to be compared.
+            if (raw === wanted || (raw.includes('\\') && JSON.parse(raw) === key)) {
+                found = [start, this.i];
+            }
+            this.ws();
+            const c = this.s[this.i];
+            if (c === ',') {
+                this.i++;
+                continue;
+            }
+            if (c === '}') {
+                this.i++;
+                return found;
+            }
+            this.fail();
+        }
+    }
+    /** Span of element `index` in the array starting at `i`. */
+    element(index) {
+        this.ws();
+        if (this.s[this.i] !== '[')
+            this.fail();
+        this.i++;
+        let found;
+        let at = 0;
+        this.ws();
+        if (this.s[this.i] === ']')
+            return found;
+        for (;;) {
+            this.ws();
+            const start = this.i;
+            this.skipValue();
+            if (at === index)
+                found = [start, this.i];
+            at++;
+            this.ws();
+            const c = this.s[this.i];
+            if (c === ',') {
+                this.i++;
+                continue;
+            }
+            if (c === ']') {
+                this.i++;
+                return found;
+            }
+            this.fail();
+        }
+    }
+    /** Spans of EVERY element of the array starting at `i`, in order. */
+    elements() {
+        const out = [];
+        this.ws();
+        if (this.s[this.i] !== '[')
+            this.fail();
+        this.i++;
+        this.ws();
+        if (this.s[this.i] === ']')
+            return out;
+        for (;;) {
+            this.ws();
+            const start = this.i;
+            this.skipValue();
+            out.push([start, this.i]);
+            this.ws();
+            const c = this.s[this.i];
+            if (c === ',') {
+                this.i++;
+                continue;
+            }
+            if (c === ']')
+                return out;
+            this.fail();
+        }
+    }
+}
+/** Character span `[start, end)` of the value at `path`, or undefined when it cannot be located exactly. */
+function jsonValueSpan(text, path) {
+    try {
+        const sc = new JsonSpanScanner(text);
+        let span = [0, text.length];
+        for (const seg of path) {
+            sc.i = span[0];
+            const found = typeof seg === 'number' ? sc.element(seg) : sc.member(seg);
+            if (found === undefined)
+                return undefined;
+            span = found;
+        }
+        return span;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Character spans of every top-level array element, or undefined. */
+function jsonElementSpans(text) {
+    try {
+        return new JsonSpanScanner(text).elements();
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The SHORTEST disjoint set of paths at which `next` differs from `prev`.
+ *
+ * `applyBoundary` promises a changed message is a fresh tree sharing every
+ * untouched subtree BY REFERENCE, so `===` is an exact "unchanged" test and
+ * the walk only ever descends the spine the filter actually rewrote.
+ * Returns false when there are too many edits to splice (the caller then
+ * re-serializes the whole message).
+ */
+function collectDivergences(prev, next, path, out) {
+    if (prev === next)
+        return true;
+    if (out.length >= MAX_LINE_EDITS)
+        return false;
+    if (Array.isArray(prev) && Array.isArray(next) && prev.length === next.length) {
+        for (let i = 0; i < prev.length; i++) {
+            if (!collectDivergences(prev[i], next[i], [...path, i], out))
+                return false;
+        }
+        return true;
+    }
+    if (isPlainObject(prev) && isPlainObject(next)) {
+        const keys = Object.keys(prev);
+        const nextKeys = Object.keys(next);
+        if (keys.length === nextKeys.length && keys.every((k, i) => nextKeys[i] === k)) {
+            for (const k of keys) {
+                if (!collectDivergences(prev[k], next[k], [...path, k], out))
+                    return false;
+            }
+            return true;
+        }
+    }
+    out.push(path);
+    return true;
+}
+/** The value at `path`, or undefined when the path does not resolve. */
+function valueAtPath(root, path) {
+    let cur = root;
+    for (const seg of path) {
+        if (typeof seg === 'number') {
+            if (!Array.isArray(cur))
+                return undefined;
+            cur = cur[seg];
+        }
+        else {
+            if (!isPlainObject(cur))
+                return undefined;
+            cur = cur[seg];
+        }
+    }
+    return cur;
+}
+/** `JSON.stringify` that reports failure instead of throwing. */
+function tryStringify(value) {
+    try {
+        const s = JSON.stringify(value);
+        return typeof s === 'string' ? s : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** The line terminator the line arrived with: '\r\n', '\n', or '' for an unterminated trailing line. */
+function lineTerminator(line) {
+    const raw = line.raw;
+    if (raw === undefined)
+        return '\n';
+    const cr = line.bytesLen > 0 && raw[line.bytesLen - 1] === 0x0d ? '\r' : '';
+    return cr + (raw.length > line.bytesLen ? '\n' : '');
+}
+/**
+ * The bytes to forward for a line whose parsed message the gateway
+ * rewrote: the ORIGINAL line with only the rewritten subtrees spliced in.
+ * Falls back to re-serializing the whole message when the edits cannot be
+ * located exactly — correctness of the FILTER never depends on this, only
+ * the fidelity of everything around it.
+ */
+function spliceRewrittenLine(line, before, after) {
+    const terminator = lineTerminator(line);
+    const text = line.text;
+    const paths = [];
+    if (text !== null && collectDivergences(before, after, [], paths) && paths.length > 0) {
+        const edits = [];
+        let ok = true;
+        for (const path of paths) {
+            const span = path.length === 0 ? undefined : jsonValueSpan(text, path);
+            const json = span === undefined ? undefined : tryStringify(valueAtPath(after, path));
+            if (span === undefined || json === undefined) {
+                ok = false;
+                break;
+            }
+            edits.push({ start: span[0], end: span[1], json });
+        }
+        if (ok) {
+            edits.sort((a, b) => a.start - b.start);
+            let out = '';
+            let cursor = 0;
+            for (const e of edits) {
+                if (e.start < cursor) {
+                    ok = false; // overlapping spans: not the disjoint set we expect
+                    break;
+                }
+                out += text.slice(cursor, e.start) + e.json;
+                cursor = e.end;
+            }
+            if (ok)
+                return Buffer.from(out + text.slice(cursor) + terminator, 'utf8');
+        }
+    }
+    return Buffer.from(JSON.stringify(after) + terminator, 'utf8');
+}
+/**
+ * The bytes of a client->server JSON-RPC batch with the refused elements
+ * dropped. Same rule as above: the kept elements travel as the CLIENT wrote
+ * them, so a refusal elsewhere in the batch cannot silently rewrite the
+ * arguments of a call that IS forwarded. When nothing was refused the
+ * original line crosses byte-for-byte.
+ */
+function keptBatchBytes(line, raw, batch, keptIndexes) {
+    if (keptIndexes.length === batch.length)
+        return raw;
+    const text = line.text;
+    if (text !== null) {
+        const spans = jsonElementSpans(text);
+        if (spans !== undefined && spans.length === batch.length) {
+            const parts = keptIndexes.map((i) => text.slice(spans[i][0], spans[i][1]));
+            return Buffer.from('[' + parts.join(',') + ']' + lineTerminator(line), 'utf8');
+        }
+    }
+    return Buffer.from(JSON.stringify(keptIndexes.map((i) => batch[i])) + lineTerminator(line), 'utf8');
+}
 const CREDENTIAL_NAME_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
 const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
 // Runner flags with no value (skipped outright) vs. flags that consume the
@@ -219,6 +620,47 @@ const DUPLICATE_ID_REASON = {
 };
 /** `error.type` of both events recorded for a refused duplicate id (free-form string, v1). */
 const DUPLICATE_ID_ERROR_TYPE = 'duplicate_id';
+/**
+ * Cap on the `params.name` a `tools/call` may carry INTO the policy engine.
+ *
+ * `mcpRuleMatches` runs every `match.tool` glob against this string with
+ * `globMatch`, which compiles the glob to a V8 RegExp — a BACKTRACKING
+ * engine — and matches it ON THE PROXY THREAD. A policy that validates
+ * clean (`tool: "*read*write*exec*"` is three legal wildcards) is cubic in
+ * the length of the subject when it fails to match, so an uncapped
+ * `params.name` straight off the wire is a remote freeze of the whole
+ * gateway: forwarding, holds, the boundary filter and every concurrent
+ * call stop until the regex returns. `match.args` values are already capped
+ * (`REGEX_VALUE_CAP`) and matched off-thread under a deadline
+ * (`../policy/regex-guard.ts`), and the server name reaching the engine is
+ * `structuralString`-capped where it is learned, so the tool name was the
+ * one uncapped wire value left on an in-thread matcher.
+ *
+ * The cap is `STRUCTURAL_STRING_MAX_LEN` — the same 128 characters above
+ * which `structuralString` already refuses to keep a tool name verbatim in
+ * an event — so the engine never sees a name the evidence store would not
+ * have kept either.
+ *
+ * An over-long name is REFUSED, never truncated: truncating would hand the
+ * engine a DIFFERENT tool name from the one the server would execute, which
+ * is a policy bypass (a 200-character name whose first 128 characters read
+ * `safe_read...` is not the tool that runs). The refusal is a fail-closed
+ * deny — the gateway declining to guess, not an operator decision.
+ */
+const MAX_EVALUATED_TOOL_NAME_LEN = STRUCTURAL_STRING_MAX_LEN;
+/** True for a `params.name` the policy engine must not be handed (see above). */
+function toolNameTooLong(name) {
+    return name.length > MAX_EVALUATED_TOOL_NAME_LEN;
+}
+/**
+ * Reason of the fail-closed deny an over-long tool name gets. It carries the
+ * LENGTH, never the name: the text travels back to the client and, scrubbed,
+ * into the evidence store.
+ */
+function toolNameTooLongReason(length) {
+    return (`tools/call params.name is ${length} characters; the gateway evaluates at most` +
+        ` ${MAX_EVALUATED_TOOL_NAME_LEN} (the name is refused, never truncated)`);
+}
 /**
  * The text the model sees for a `tools/call` refused because its id is
  * still in use. Like every other synthesized text it names the tool as the
@@ -1055,6 +1497,21 @@ export async function runStdioProxy(opts) {
             const { canonical, argsHash, err } = argsCanonical(args);
             if (canonical === null)
                 return { decision: evaluationFailed(err), argsHash };
+            if (toolNameTooLong(rawTool)) {
+                // Fail closed WITHOUT consulting the policy: the engine's tool globs
+                // are backtracking regexes on this thread, so an uncapped name is a
+                // denial of service on the whole gateway. See
+                // MAX_EVALUATED_TOOL_NAME_LEN — refused, never truncated.
+                return {
+                    decision: {
+                        action: 'deny',
+                        matched: false,
+                        reason: toolNameTooLongReason(rawTool.length),
+                        failClosed: true,
+                    },
+                    argsHash,
+                };
+            }
             try {
                 const decision = evaluateMcp(loaded.policy, {
                     server: currentServer().name,
@@ -1071,16 +1528,24 @@ export async function runStdioProxy(opts) {
             }
         };
         /** The policy-independent half of a GatewayCall. */
-        const newCall = (id, params, name, args, argsHash) => ({
-            id,
-            params,
-            rawTool: name,
+        const newCall = (id, params, name, args, argsHash) => {
             // '' stays '': structuralString would hash the empty string, and ''
             // is what a nameless call's tool_call event has always carried.
-            tool: name === '' ? '' : structuralString(name, 'identifier'),
-            args,
-            argsHash,
-        });
+            const tool = name === '' ? '' : structuralString(name, 'identifier');
+            return {
+                id,
+                params,
+                // `rawTool` is the name as the CLIENT wrote it, quoted back in the
+                // synthesized text. A name past MAX_EVALUATED_TOOL_NAME_LEN is one
+                // the gateway refused to even look at, so it does not travel
+                // verbatim either — the capped form stands in, and the refusal
+                // reason says how long the real one was.
+                rawTool: toolNameTooLong(name) ? tool : name,
+                tool,
+                args,
+                argsHash,
+            };
+        };
         /**
          * A call refused on PROTOCOL grounds (a duplicate request id): the
          * policy is not consulted at all — no rule could allow an id that is
@@ -1228,6 +1693,10 @@ export async function runStdioProxy(opts) {
          * synthetic `tool_call` carrying `error.type: 'duplicate_id'`. The
          * reason travels in the text the model sees and in the diagnostic line;
          * the events carry hashes only, never arguments.
+         *
+         * Returns the response the client must get; the caller decides HOW it
+         * travels — on its own line for a standalone request, or as one element
+         * of the batch response array when the refused call came from a batch.
          */
         const refuseDuplicateId = (msg, state) => {
             const call = unevaluatedCall(msg);
@@ -1236,11 +1705,33 @@ export async function runStdioProxy(opts) {
                 recordPolicyDecision(call);
                 recordSyntheticToolCall(call, response.result, undefined, DUPLICATE_ID_ERROR_TYPE);
             });
-            writeToClient(Buffer.from(JSON.stringify(response) + '\n'));
             // The id is client-supplied, so it is capped like any other protocol
             // string before it reaches a diagnostic line.
             diag(`gateway: refused tools/call "${call.tool}" — ${DUPLICATE_ID_REASON[state]}` +
                 ` (id ${structuralString(String(call.id), 'identifier')})`);
+            return response;
+        };
+        /**
+         * THE protocol gate every `tools/call` REQUEST passes before the policy
+         * is consulted, whether it arrived on its own line or as an element of
+         * a JSON-RPC batch. `pendingKey` folds the id's TYPE in, so the number
+         * 7 and the string "7" are different ids here too.
+         *
+         * `claimed` carries the ids taken by EARLIER elements of the same batch:
+         * those calls are forwarded together at the end of the loop, so
+         * `pending` does not know about them yet, and without this a batch could
+         * clobber its own slots.
+         *
+         * Returns the refusal response when the id is not usable, `undefined`
+         * when the call may proceed to the policy.
+         */
+        const refuseReusedId = (msg, claimed) => {
+            const key = pendingKey('c2s:', msg.id);
+            if (holds.has(key))
+                return refuseDuplicateId(msg, 'held');
+            if (pending.has(key) || claimed?.has(key) === true)
+                return refuseDuplicateId(msg, 'pending');
+            return undefined;
         };
         /**
          * A `tools/call` carrying `id: null` (see the module header): refused
@@ -1249,11 +1740,16 @@ export async function runStdioProxy(opts) {
          * `tool_call` against, so it is recorded exactly as the tap records any
          * id-less message — one `notification` event — and the refusal itself
          * is visible on stderr.
+         *
+         * Returns the error response, which the caller delivers on its own line
+         * or inside the batch response array (a batch element gets exactly the
+         * same treatment as a standalone one).
          */
-        const refuseNullIdToolsCall = (msg, line) => {
-            writeToClient(Buffer.from(JSON.stringify(NULL_ID_ERROR_RESPONSE) + '\n'));
-            diag('gateway: refused a tools/call with a null id (not a valid request); not forwarded');
+        const refuseNullIdToolsCall = (msg, line, inBatch = false) => {
+            diag(`gateway: refused a tools/call with a null id${inBatch ? ' inside a JSON-RPC batch' : ''}` +
+                ' (not a valid request); not forwarded');
             guarded(() => handleMessage(msg, 'client_to_server', line));
+            return NULL_ID_ERROR_RESPONSE;
         };
         /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
         const registerCall = (call, gatewayOutcome) => {
@@ -1485,15 +1981,10 @@ export async function runStdioProxy(opts) {
             // that belongs to a request the server has not answered yet, is
             // refused instead of forwarded — otherwise it would take over the
             // other call's `pending`/`holds` slot and that call's real response
-            // would be recorded as an orphan. `pendingKey` folds the id's TYPE in,
-            // so the number 7 and the string "7" are different ids here too.
-            const key = pendingKey('c2s:', msg.id);
-            if (holds.has(key)) {
-                refuseDuplicateId(msg, 'held');
-                return;
-            }
-            if (pending.has(key)) {
-                refuseDuplicateId(msg, 'pending');
+            // would be recorded as an orphan.
+            const reused = refuseReusedId(msg);
+            if (reused !== undefined) {
+                writeToClient(Buffer.from(JSON.stringify(reused) + '\n'));
                 return;
             }
             const { call, action } = buildCall(msg);
@@ -1518,30 +2009,67 @@ export async function runStdioProxy(opts) {
             startHold(call, raw);
         };
         /**
-         * JSON-RPC batch: each tools/call element is evaluated; allowed ones and
-         * every non-tools/call element are re-serialized and forwarded as a
-         * batch; refused ones (deny, and hold — not supported inside a batch)
-         * get their isError results back as a batch response.
+         * JSON-RPC batch: each tools/call element goes through the SAME gate a
+         * standalone one does — the protocol checks first (a reused request id,
+         * a null id), then the policy. Allowed elements and every non-tools/call
+         * element are forwarded as a batch; refused ones (a duplicate id, a null
+         * id, a deny, and a hold — not supported inside a batch) get their
+         * refusal back as elements of the batch response and are never
+         * forwarded.
+         *
+         * A batch is NOT a way in: a `tools/call` inside one used to skip the
+         * duplicate-id refusal and the null-id refusal entirely, which put the
+         * original id clobber back on the table (both calls execute, one
+         * `tool_call` ends up carrying one call's arguments with the other's
+         * result) and let a policy-denied tool run unevaluated as long as it
+         * carried `"id": null`.
          */
         const c2sBatch = (batch, raw, line) => {
-            if (!batch.some(isToolsCallRequest)) {
+            // Null-id elements count too: a batch whose ONLY tools/call carries
+            // `"id": null` must not be waved through on the fast path.
+            if (!batch.some((el) => isToolsCallRequest(el) || isNullIdToolsCall(el))) {
                 forwardC2s(raw);
                 guarded(() => handleMessage(batch, 'client_to_server', line));
                 return;
             }
             const kept = [];
+            const keptIndexes = [];
             const forwardedCalls = [];
             const responses = [];
-            for (const el of batch) {
+            /**
+             * Request ids already taken by earlier elements of THIS batch.
+             * `registerCall`/`handleMessage` only run once the whole batch has
+             * been forwarded, so `pending` cannot answer for them yet.
+             */
+            const claimed = new Set();
+            const claim = (el) => {
+                if (isPlainObject(el) && typeof el.method === 'string' && isRpcId(el.id)) {
+                    claimed.add(pendingKey('c2s:', el.id));
+                }
+            };
+            batch.forEach((el, index) => {
+                if (isNullIdToolsCall(el)) {
+                    responses.push(refuseNullIdToolsCall(el, line, true));
+                    return;
+                }
                 if (!isToolsCallRequest(el)) {
                     kept.push(el);
-                    continue;
+                    keptIndexes.push(index);
+                    claim(el);
+                    return;
+                }
+                const reused = refuseReusedId(el, claimed);
+                if (reused !== undefined) {
+                    responses.push(reused);
+                    return;
                 }
                 const { call, action } = buildCall(el);
                 if (action === 'allow') {
                     kept.push(el);
+                    keptIndexes.push(index);
+                    claim(el);
                     forwardedCalls.push(call);
-                    continue;
+                    return;
                 }
                 // A `hold` inside a batch is a deny because a batch element has
                 // nowhere to park — so no operator is ever asked about it, and the
@@ -1554,9 +2082,9 @@ export async function runStdioProxy(opts) {
                 }
                 responses.push(synthesizeDeny(refused));
                 diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
-            }
+            });
             if (kept.length > 0)
-                forwardC2s(Buffer.from(JSON.stringify(kept) + '\n'));
+                forwardC2s(keptBatchBytes(line, raw, batch, keptIndexes));
             guarded(() => {
                 for (const call of forwardedCalls)
                     registerCall(call, gatewayOutcomeFor(call));
@@ -1595,7 +2123,7 @@ export async function runStdioProxy(opts) {
                 return;
             }
             if (isNullIdToolsCall(msg)) {
-                refuseNullIdToolsCall(msg, line);
+                writeToClient(Buffer.from(JSON.stringify(refuseNullIdToolsCall(msg, line)) + '\n'));
                 return;
             }
             forwardC2s(raw);
@@ -1645,8 +2173,32 @@ export async function runStdioProxy(opts) {
             const outcome = applyBoundary(msg, mcp.boundary, boundaryDeps, { rawBytes });
             const report = { ...outcome.report };
             if (outcome.changed) {
-                const delivered = isPlainObject(outcome.message) ? outcome.message['result'] : null;
-                report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+                // The hash of what the client actually receives. `spliceRewrittenLine`
+                // puts the ORIGINAL source text of every untouched value back on the
+                // wire, but those bytes parse to exactly the values in
+                // `outcome.message` — they are the very values this line parsed to —
+                // so the canonical JSON of the delivered result, and therefore this
+                // hash, is the same either way.
+                //
+                // This is RECORDING, and it runs on the forwarding path, so it is
+                // guarded: `canonicalJson` recurses, and a pathological result tree
+                // overflows the stack. Unguarded, that throw escaped `s2cLine` into
+                // the Transform's catch and the client lost the line — and the rest
+                // of the chunk it arrived in — for a hash. AGENTS.md: nothing about
+                // recording may block, delay, corrupt or kill forwarded traffic.
+                // Enforcement (applyBoundary, self-guarded) has already decided.
+                try {
+                    const delivered = isPlainObject(outcome.message) ? outcome.message['result'] : null;
+                    report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+                }
+                catch (err) {
+                    // Fail open, the way every other recording failure here does: the
+                    // report simply carries no `delivered_result_hash` (its absence on
+                    // a changed result IS the signal, and `scanned`/`action` still say
+                    // what the client got), and `tapError` puts it on stderr and in
+                    // the recorder's error accounting.
+                    tapError(err);
+                }
                 diag(`gateway: ${report.action === 'block' ? 'blocked' : 'redacted'} tool result of tools/call "${tool}"` +
                     ` (${report.secrets_found} secret-shaped, ${report.injection_found} injection marker(s))`);
             }
@@ -1680,7 +2232,7 @@ export async function runStdioProxy(opts) {
                     orphans++;
                 reports.set(index, filtered.report);
             });
-            forwardS2c(changed ? Buffer.from(JSON.stringify(out) + '\n') : raw);
+            forwardS2c(changed ? spliceRewrittenLine(line, batch, out) : raw);
             if (orphans > 0) {
                 diag(`gateway: boundary-filtered ${orphans} batched tool result(s) with no pending request`);
             }
@@ -1721,7 +2273,7 @@ export async function runStdioProxy(opts) {
                 const target = boundaryTarget(msg);
                 if (target !== undefined) {
                     const filtered = filterResult(msg, line.bytesLen, target.tool);
-                    forwardS2c(filtered.changed ? Buffer.from(JSON.stringify(filtered.message) + '\n') : raw);
+                    forwardS2c(filtered.changed ? spliceRewrittenLine(line, msg, filtered.message) : raw);
                     if (target.kind === 'orphan') {
                         // The id is the server's, so it is capped like any other
                         // protocol string before it reaches a diagnostic line.

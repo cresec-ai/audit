@@ -21,6 +21,15 @@
  *
  * Compiled patterns are kept in a small LRU cache keyed by delimiter+glob so
  * the hot path of the gateway never recompiles.
+ *
+ * A RUN of wildcards collapses into one: `***` and `****` are the same
+ * language as `**`, but translated atom for atom they become
+ * `[\s\S]*[^/]*[\s\S]*...`, which is the classic adjacent-quantifier
+ * blowup — `"*".repeat(30) + "x"` against a 60-character subject takes 88 s
+ * here (measured), and the subject is a tool name off the wire. Collapsing
+ * removes every adjacent pair, so no glob can be written that way; it changes
+ * no policy's meaning, because a run always accepts exactly what its most
+ * permissive member accepts.
  */
 /** Max compiled globs retained; beyond this the least recently used is evicted. */
 export const GLOB_CACHE_SIZE = 512;
@@ -31,26 +40,38 @@ function escapeRegExp(ch) {
 /** Translate a glob into an anchored, flag-less RegExp (uncached). */
 export function globToRegExp(glob, delimiter) {
     const d = escapeRegExp(delimiter);
-    let out = '^';
+    const crossing = '[\\s\\S]*'; // `**`: any run, delimiters included
+    const segment = `[^${d}]*`; // `*`: any run of non-delimiters
+    const parts = [];
+    /** True when the last part is one of the two wildcard translations. */
+    let openRun = false;
+    const pushWildcard = (crosses) => {
+        if (openRun) {
+            // Already inside a run: keep the most permissive translation of it, and
+            // never emit a second quantifier next to the first.
+            if (crosses)
+                parts[parts.length - 1] = crossing;
+            return;
+        }
+        parts.push(crosses ? crossing : segment);
+        openRun = true;
+    };
     for (let i = 0; i < glob.length; i++) {
         const ch = glob[i];
         if (ch === '*') {
             if (glob[i + 1] === '*') {
-                out += '[\\s\\S]*';
+                pushWildcard(true);
                 i++;
             }
             else {
-                out += `[^${d}]*`;
+                pushWildcard(false);
             }
+            continue;
         }
-        else if (ch === '?') {
-            out += `[^${d}]`;
-        }
-        else {
-            out += escapeRegExp(ch);
-        }
+        parts.push(ch === '?' ? `[^${d}]` : escapeRegExp(ch));
+        openRun = false;
     }
-    return new RegExp(out + '$');
+    return new RegExp(`^${parts.join('')}$`);
 }
 /** Cached variant of `globToRegExp`. */
 export function compileGlob(glob, delimiter) {

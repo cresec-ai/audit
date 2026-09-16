@@ -70,8 +70,62 @@ export function policyRevision(policyHash) {
     }
     return hex;
 }
-const q = (s) => JSON.stringify(s);
+/**
+ * Characters `JSON.stringify` leaves raw that a Rego module cannot carry as
+ * themselves. U+FEFF is the one that bites: a byte-order mark pasted in from
+ * a document ends the string token for OPA's lexer, so the bundle compiles
+ * with exit 0 and then fails to load with `rego_parse_error: non-terminated
+ * object`. The rest of the class is the invisible company it keeps — DEL, the
+ * C1 controls and the two Unicode line separators. All of them round-trip
+ * through OPA as `\uXXXX` (pinned by the parity suite), so they are escaped
+ * rather than rejected and existing policies keep working.
+ *
+ * An unpaired surrogate is NOT in this class: Go cannot represent one at all
+ * (OPA reads `"\ud800"` back as U+FFFD), so `validate.ts` rejects it instead.
+ */
+const REGO_UNSAFE_TEXT = /[\u007f-\u009f\u2028\u2029\ufeff]/g;
+const q = (s) => JSON.stringify(s).replace(REGO_UNSAFE_TEXT, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
 const qList = (xs) => `[${xs.map(q).join(', ')}]`;
+/**
+ * What RE2 must be given so that `.` means what the local engine means by it.
+ *
+ * JavaScript's `.` (no `s` flag) excludes \n \r U+2028 U+2029; RE2's excludes
+ * \n only. Unaligned, `^.*secret.*$` against "my\rsecret" is an ALLOW here
+ * and a DENY in OPA — verified against OPA 1.20.2 — and the same split shows
+ * up for `^rm -rf .+$` and `^/etc/.+$`. Rewriting each unescaped `.` outside
+ * a character class into the explicit negated class closes it, and leaves
+ * every other part of the pattern exactly as the author wrote it. (The other
+ * half of the divergence, counting UTF-16 units instead of runes, is closed
+ * on the JavaScript side by matching with the `u` flag: see
+ * `toUnicodeSource`.)
+ */
+const RE2_DOT = '[^\\n\\r\\x{2028}\\x{2029}]';
+/** The same regex, spelled so RE2 reads `.` exactly as the local engine does. */
+export function toRe2Source(pattern) {
+    let out = '';
+    let inClass = false;
+    for (let i = 0; i < pattern.length; i++) {
+        const ch = pattern[i];
+        if (ch === '\\') {
+            out += pattern.slice(i, i + 2); // an escape is a literal in both engines
+            i++;
+            continue;
+        }
+        if (inClass) {
+            if (ch === ']')
+                inClass = false;
+            out += ch; // `.` inside a class is already a literal dot
+            continue;
+        }
+        if (ch === '[') {
+            inClass = true;
+            out += ch;
+            continue;
+        }
+        out += ch === '.' ? RE2_DOT : ch;
+    }
+    return out;
+}
 function segmentsLiteral(dotPath) {
     return `[${dotPathSegments(dotPath)
         .map((s) => (typeof s === 'number' ? String(s) : q(s)))
@@ -95,7 +149,7 @@ function mcpRuleBody(rule) {
             lines.push(`${v} := object.get(input.args, ${segmentsLiteral(dotPath)}, null)`);
             lines.push(`${v} != null`);
             lines.push(`type_name(${v}) in {"string", "number", "boolean"}`);
-            lines.push(`regex.match(${q(pattern)}, scalar_text(${v}))`);
+            lines.push(`regex.match(${q(toRe2Source(pattern))}, scalar_text(${v}))`);
         });
     }
     if (m.max_args_bytes !== undefined)

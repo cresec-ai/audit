@@ -13,10 +13,11 @@
  *   other segments address OBJECT KEYS only; a missing path, a null, or a
  *   non-scalar value means the rule does not match. Scalars are coerced with
  *   `String()` (Rego: `scalar_text`, i.e. `json.marshal` for non-strings,
- *   whose number formatting is the ES6 one `String()` also uses), truncated
- *   to `REGEX_VALUE_CAP` UTF-16 units before matching (Rego does not
- *   truncate: RE2 is linear-time, so only values beyond the cap can ever
- *   differ, and that is documented).
+ *   whose number formatting is the ES6 one `String()` also uses). A string
+ *   longer than `REGEX_VALUE_CAP` UTF-16 units is NOT matched at all: it used
+ *   to be truncated, which let `"x".repeat(5000) + "rm -rf /"` sail through a
+ *   `cmd: "rm -rf /"` deny rule, so an over-long value is now unevaluable and
+ *   denies (see {@link VALUE_TOO_LONG}).
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
  * Every `args` regex runs through `regex-guard.ts`, which matches it off the
@@ -115,11 +116,28 @@ export function getPath(root: unknown, dotPath: string): unknown {
   return cur;
 }
 
-/** String form used for regex matching, or undefined when the value is not a scalar. */
-export function coerceScalar(value: unknown): string | undefined {
+/**
+ * A string argument too long to match against a backtracking regex.
+ *
+ * The cap bounds how much work one hostile argument can ask of V8, but
+ * TRUNCATING to it silently changed the answer: `"x".repeat(5000) + "rm -rf
+ * /"` did not match a `cmd: "rm -rf /"` deny rule, because the tail was cut
+ * off before matching, and the call was forwarded. RE2 (the Rego side) does
+ * not truncate and would have matched. Enforcement fails closed, so the local
+ * engine now refuses to answer instead of answering differently: `argsMatch`
+ * turns this into the same fail-closed deny a timed-out regex produces.
+ */
+export const VALUE_TOO_LONG: unique symbol = Symbol('policy: args value exceeds REGEX_VALUE_CAP');
+
+/**
+ * String form used for regex matching, {@link VALUE_TOO_LONG} when the value
+ * is a string longer than `REGEX_VALUE_CAP`, or undefined when the value is
+ * not a scalar at all.
+ */
+export function coerceScalar(value: unknown): string | typeof VALUE_TOO_LONG | undefined {
   switch (typeof value) {
     case 'string':
-      return value.length > REGEX_VALUE_CAP ? value.slice(0, REGEX_VALUE_CAP) : value;
+      return value.length > REGEX_VALUE_CAP ? VALUE_TOO_LONG : value;
     case 'number':
     case 'boolean':
       return String(value);
@@ -129,15 +147,22 @@ export function coerceScalar(value: unknown): string | undefined {
 }
 
 /**
- * All `args` conditions of one rule. Throws when a pattern is unevaluable
- * (deadline overrun, poisoned, or no guard worker for a pattern that is not
- * provably linear): the rule is then neither a match nor a miss, and the
- * caller's fail-closed path turns it into a deny naming `ruleId`.
+ * All `args` conditions of one rule. Throws when a condition is unevaluable
+ * (deadline overrun, poisoned pattern, no guard worker for a pattern that is
+ * not provably linear, or a value past `REGEX_VALUE_CAP`): the rule is then
+ * neither a match nor a miss, and the caller's fail-closed path turns it into
+ * a deny naming `ruleId`.
  */
 function argsMatch(args: Record<string, string>, input: unknown, ruleId: string): boolean {
   for (const [dotPath, pattern] of Object.entries(args)) {
     const s = coerceScalar(getPath(input, dotPath));
     if (s === undefined) return false;
+    if (s === VALUE_TOO_LONG) {
+      throw new Error(
+        `args value at ${JSON.stringify(dotPath)} is longer than the ${REGEX_VALUE_CAP}-character regex cap` +
+          ` and cannot be matched safely (${ruleId})`,
+      );
+    }
     let matched: boolean;
     try {
       matched = matchBounded(pattern, s);

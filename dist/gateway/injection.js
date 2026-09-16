@@ -8,8 +8,9 @@
  * injection" and a pure `findInjectionSpans()` that locates them.
  *
  * Scanning happens on a NORMALIZED COPY of the text (`normalizeForScan()`):
- * zero-width and bidi control characters are dropped, NFKC folds homoglyph
- * look-alikes (fullwidth, mathematical, compatibility forms) onto their
+ * invisible characters are dropped (every `Default_Ignorable_Code_Point` and
+ * every `\p{Cf}` format character — which is all of Bidi_Control — plus
+ * U+034F), NFKC folds homoglyph look-alikes (fullwidth, mathematical, compatibility forms) onto their
  * ASCII equivalents, and whitespace runs collapse to one space. Every span
  * is mapped back onto the ORIGINAL text before it is returned, so callers
  * report and redact exactly the original bytes and nothing else.
@@ -162,24 +163,61 @@ export function mergeSpans(spans) {
     return out;
 }
 /**
- * Characters removed outright: zero-width space/non-joiner/joiner and the
- * LTR/RTL marks (U+200B–U+200F), word joiner and the invisible operators
- * (U+2060–U+2064), the bidi embedding/override controls (U+202A–U+202E) and
- * the BOM (U+FEFF). They render as nothing, so a marker can hide behind them.
+ * Characters removed outright, as ONE code point each (not one UTF-16 unit:
+ * the plane-14 tag characters U+E0000–U+E0FFF are astral).
+ *
+ * The set is Unicode's own answer to "renders as nothing", not a hand-kept
+ * list of ranges: `Default_Ignorable_Code_Point` (zero-width space/joiners,
+ * the LTR/RTL marks, SOFT HYPHEN U+00AD, the variation selectors U+FE00–
+ * U+FE0F, the Hangul fillers, the tag characters, the BOM) united with every
+ * format character `\p{Cf}` (the bidi embedding/override controls U+202A–
+ * U+202E, the bidi ISOLATES U+2066–U+2069, the ARABIC LETTER MARK U+061C,
+ * the Arabic number signs, the interlinear-annotation anchors). Both
+ * properties are available in V8 on Node 20+, this repo's floor.
+ *
+ * U+034F COMBINING GRAPHEME JOINER is named explicitly. It is `Mn`, so
+ * `\p{Cf}` does not reach it, and while it is default-ignorable today that
+ * is a DERIVED property this security check should not silently depend on.
+ *
+ * Hand-kept ranges covered five of these families and missed the rest, so an
+ * identical marker carrying U+061C, U+2066, U+00AD, U+FE0F, U+E0061 or
+ * U+034F walked past the scanner that stopped U+200B and U+202E.
+ *
+ * Every Bidi_Control code point (U+061C, U+200E–U+200F, U+202A–U+202E,
+ * U+2066–U+2069) is `Cf`, so "bidi control characters are stripped" is now
+ * true of the whole class, which is what docs/policy.md claims.
  */
-function isInvisible(code) {
-    return ((code >= 0x200b && code <= 0x200f) ||
-        (code >= 0x2060 && code <= 0x2064) ||
-        (code >= 0x202a && code <= 0x202e) ||
-        code === 0xfeff);
+const INVISIBLE_RE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u034F]/u;
+/** Lowest invisible code point (U+00AD); everything below it is visible. */
+const INVISIBLE_MIN = 0x00ad;
+/**
+ * Memo over the BMP (0 = unknown, 1 = visible, 2 = invisible), allocated on
+ * first use. 64 KiB buys a table lookup per character instead of a regex
+ * test, which keeps the 1 MiB obfuscated-input scan well inside its budget.
+ */
+let invisibleMemo;
+/** True when the CODE POINT `cp` renders as nothing and must be dropped. */
+function isInvisible(cp) {
+    if (cp < INVISIBLE_MIN)
+        return false;
+    if (cp > 0xffff)
+        return INVISIBLE_RE.test(String.fromCodePoint(cp));
+    const memo = (invisibleMemo ??= new Uint8Array(0x10000));
+    const cached = memo[cp];
+    if (cached !== 0)
+        return cached === 2;
+    const invisible = INVISIBLE_RE.test(String.fromCharCode(cp));
+    memo[cp] = invisible ? 2 : 1;
+    return invisible;
 }
 const WS_RE = /\s/;
-function isWhitespace(code) {
-    if (code === 0x20 || (code >= 0x09 && code <= 0x0d))
+/** True when the CODE POINT `cp` is whitespace (all of it is in the BMP). */
+function isWhitespace(cp) {
+    if (cp === 0x20 || (cp >= 0x09 && cp <= 0x0d))
         return true;
-    if (code < 0x80)
+    if (cp < 0x80 || cp > 0xffff)
         return false;
-    return WS_RE.test(String.fromCharCode(code));
+    return WS_RE.test(String.fromCharCode(cp));
 }
 /**
  * Cheap pre-check: anything outside printable ASCII, or a repeated space,
@@ -232,27 +270,29 @@ export function normalizeForScan(original) {
             emit(original.slice(start, i), start, i, true);
             continue;
         }
-        const code = original.charCodeAt(i);
-        if (isInvisible(code)) {
-            i += 1;
+        // Decode a full code point: an invisible may be astral (a tag character),
+        // in which case its UTF-16 units are two surrogates and neither is.
+        const cp = original.codePointAt(i) ?? original.charCodeAt(i);
+        const width = cp > 0xffff ? 2 : 1;
+        if (isInvisible(cp)) {
+            i += width;
             changed = true;
             continue;
         }
-        if (isWhitespace(code)) {
+        if (isWhitespace(cp)) {
             let j = i;
             while (j < len) {
-                const c = original.charCodeAt(j);
+                const c = original.codePointAt(j) ?? original.charCodeAt(j);
+                const w = c > 0xffff ? 2 : 1;
                 if (isWhitespace(c) || isInvisible(c))
-                    j += 1;
+                    j += w;
                 else
                     break;
             }
-            emit(' ', i, j, j - i === 1 && code === 0x20);
+            emit(' ', i, j, j - i === 1 && cp === 0x20);
             i = j;
             continue;
         }
-        const cp = original.codePointAt(i) ?? code;
-        const width = cp > 0xffff ? 2 : 1;
         const ch = original.slice(i, i + width);
         const folded = ch.normalize('NFKC');
         emit(folded, i, i + width, folded === ch);

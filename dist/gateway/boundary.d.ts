@@ -17,6 +17,15 @@
  * images, and are excluded here. `secret_refs` in the evidence store keep
  * their full, wider meaning.
  *
+ * What the narrowing must NOT do is drop a shape that is a credential and
+ * nothing else. Three did: an env-var-shaped assignment
+ * (`AWS_SECRET_ACCESS_KEY=...`), a `github_pat_` fine-grained token, and a
+ * URL carrying userinfo (`postgres://user:pass@host/db`). All three are back
+ * — and since the boundary may only name patterns storage already hashes,
+ * all three had to be fixed in `ALWAYS_PATTERNS` first, where the same three
+ * shapes were missing (or, for the assignment, blinded by a `\b` that `_`
+ * defeats).
+ *
  * Invariants:
  *  - `applyBoundary()` NEVER throws and NEVER mutates its input; a changed
  *    message is a fresh tree that shares only untouched subtrees.

@@ -17,6 +17,15 @@
  * images, and are excluded here. `secret_refs` in the evidence store keep
  * their full, wider meaning.
  *
+ * What the narrowing must NOT do is drop a shape that is a credential and
+ * nothing else. Three did: an env-var-shaped assignment
+ * (`AWS_SECRET_ACCESS_KEY=...`), a `github_pat_` fine-grained token, and a
+ * URL carrying userinfo (`postgres://user:pass@host/db`). All three are back
+ * — and since the boundary may only name patterns storage already hashes,
+ * all three had to be fixed in `ALWAYS_PATTERNS` first, where the same three
+ * shapes were missing (or, for the assignment, blinded by a `\b` that `_`
+ * defeats).
+ *
  * Invariants:
  *  - `applyBoundary()` NEVER throws and NEVER mutates its input; a changed
  *    message is a fresh tree that shares only untouched subtrees.
@@ -122,6 +131,11 @@ export const BOUNDARY_SECRET_FAMILIES = [
         note: 'GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` tokens.',
     },
     {
+        id: 'github-fine-grained-pat',
+        re: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/,
+        note: 'A `github_pat_` prefix plus 22+ token characters is a fine-grained PAT and nothing else.',
+    },
+    {
         id: 'slack-token',
         re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
         note: 'Slack `xoxb-`/`xoxp-`/`xoxa-`/`xoxr-`/`xoxs-` tokens.',
@@ -132,9 +146,18 @@ export const BOUNDARY_SECRET_FAMILIES = [
         note: 'An Authorization bearer value: the keyword makes it a credential by construction.',
     },
     {
+        id: 'url-userinfo',
+        re: /(?<=:\/\/)[^\s:/?#@]{1,128}:[^\s/?#@]{1,128}(?=@)/,
+        note: 'The `user:pass` of a URL that carries userinfo (`postgres://user:pass@host/db`). ' +
+            'Only the userinfo is the span, so the scheme, host and path the model needs stay readable.',
+    },
+    {
         id: 'secret-assignment',
-        re: /\b(password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+/i,
-        note: '`password=`, `passwd:`, `secret=`, `token:`, `api_key=` with a value.',
+        re: /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?\s*[:=]\s*\S+/i,
+        note: '`password=`, `passwd:`, `secret=`, `token:`, `api_key=` with a value, including the ' +
+            'env-var-shaped names that carry them (`AWS_SECRET_ACCESS_KEY=`, `DB_PASSWORD=`, ' +
+            '`X-Api-Key:`). The affixes must be separated from the keyword by `_`/`-`, so ' +
+            '`secretary_id=5` and `tokenizer_count=3` are not credentials.',
     },
 ];
 const BOUNDARY_SOURCES = new Set(BOUNDARY_SECRET_FAMILIES.map((f) => f.re.source));

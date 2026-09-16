@@ -15,6 +15,14 @@
  *   whitelisted escapes, no leading `]` in a character class) so the local
  *   engine and OPA agree on every input, whatever the running Node version's
  *   V8 happens to accept;
+ * - regexes also compile in JavaScript's UNICODE mode after
+ *   {@link toUnicodeSource} rewrites the spellings `u` refuses: the local
+ *   engine matches with the `u` flag so that it counts runes the way RE2
+ *   does (`^.{1,8}$` against five U+1F600 must not mean one thing here and
+ *   another in OPA), and a pattern that cannot be expressed that way is
+ *   rejected rather than silently split between the engines;
+ * - no policy string carries an unpaired surrogate, which Go (and therefore
+ *   OPA) cannot represent and reads back as U+FFFD;
  * - regexes avoid the repeated-group shapes that are linear under RE2 but
  *   EXPONENTIAL under V8's backtracking engine (`redos.ts`): the compiled
  *   Rego would shrug them off, the local engine on the proxy thread would
@@ -35,6 +43,8 @@ export type ValidationResult = {
     ok: false;
     errors: PolicyError[];
 };
+/** Why `text` cannot be carried through to OPA unchanged, or undefined. */
+export declare function checkPortableText(text: string): string | undefined;
 /**
  * Why `glob` is not acceptable, or undefined when it is. Blank globs can
  * never match anything useful and the reserved characters would make the TS
@@ -47,6 +57,31 @@ export type ValidationResult = {
  * `?` rather than with two meanings for it.
  */
 export declare function checkGlob(glob: string): string | undefined;
+/**
+ * The same regex, spelled so JavaScript accepts it with the `u` flag.
+ *
+ * The local engine matches with `u` on purpose: without it V8 counts UTF-16
+ * units where RE2 counts runes, so `^.{1,8}$` matches five U+1F600 in OPA and
+ * not here, and `^..$` matches one U+1F600 here and not in OPA. Turning `u`
+ * on also tightens the SPELLING rules, and those tightenings carry no meaning
+ * — they are rewritten here rather than rejected, so policies that already
+ * pass validation keep working:
+ *
+ * - `\-`, `\ `, `\@`, `\:` ... — escaped punctuation `u` does not recognise —
+ *   become `\x2d`, `\x20`, `\x40`, `\x3a`: the same literal in V8 and in RE2
+ *   (inside a character class `\-` is already legal under `u` and is left
+ *   alone, because `\x2d` there would be a range endpoint spelled differently
+ *   but the same character);
+ * - a lone `]`, `{` or `}` outside a character class becomes `\]`, `\{`,
+ *   `\}`: a literal in RE2 either way, and `u` refuses the bare form;
+ * - an escaped non-ASCII character (`\é`) loses the backslash, which is what
+ *   V8 without `u` reads it as anyway (the subset check rejects it before
+ *   this, so only hand-built patterns get here).
+ *
+ * Nothing else changes: the rewrite never alters which strings match, only
+ * how the pattern is written.
+ */
+export declare function toUnicodeSource(pattern: string): string;
 /**
  * Why `pattern` is outside the RE2-portable subset (or fails to compile), or
  * undefined when it is acceptable. Rejected: lookaround `(?=` `(?!` `(?<=`

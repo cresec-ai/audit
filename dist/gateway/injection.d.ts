@@ -8,8 +8,9 @@
  * injection" and a pure `findInjectionSpans()` that locates them.
  *
  * Scanning happens on a NORMALIZED COPY of the text (`normalizeForScan()`):
- * zero-width and bidi control characters are dropped, NFKC folds homoglyph
- * look-alikes (fullwidth, mathematical, compatibility forms) onto their
+ * invisible characters are dropped (every `Default_Ignorable_Code_Point` and
+ * every `\p{Cf}` format character — which is all of Bidi_Control — plus
+ * U+034F), NFKC folds homoglyph look-alikes (fullwidth, mathematical, compatibility forms) onto their
  * ASCII equivalents, and whitespace runs collapse to one space. Every span
  * is mapped back onto the ORIGINAL text before it is returned, so callers
  * report and redact exactly the original bytes and nothing else.
