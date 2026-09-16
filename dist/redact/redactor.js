@@ -110,7 +110,7 @@ const ALWAYS_PATTERNS = [
     // JWTs (three dot-separated base64url segments starting "eyJ")
     /\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b/,
     // PEM private key blocks
-    /-----BEGIN [A-Z ]+PRIVATE KEY-----/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
     // OpenAI-style keys
     /\bsk-[A-Za-z0-9_-]{10,}\b/,
     // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
@@ -214,7 +214,7 @@ const ALWAYS_PATTERNS = [
     // and `tokens` are not credentials. The value gate is the affixed arm's,
     // so `{"accessTokenExpiresIn": 3600}`, `{"SecretName": "prod/db"}` and
     // `PasswordPolicy: minimum length 12` stay untouched.
-    /(?:Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
+    /(?:(?<![\w-])(?:password|passwd|secret|token|credential)|Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
     // A credential passed as a command-line FLAG whose value is the NEXT
     // argument ("--password hunter2", "--api-key 0123456789abcdef"): the
     // separator is whitespace, so neither assignment shape above can see it.

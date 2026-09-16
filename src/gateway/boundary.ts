@@ -198,8 +198,11 @@ export const BOUNDARY_SECRET_FAMILIES: readonly BoundarySecretFamily[] = [
   },
   {
     id: 'pem-private-key',
-    re: /-----BEGIN [A-Z ]+PRIVATE KEY-----/,
-    note: 'A PEM private-key armour line is never ordinary tool output.',
+    re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+    note:
+      'A PEM private-key armour line is never ordinary tool output. The algorithm prefix is ' +
+      'OPTIONAL: PKCS#8, which is what `openssl genpkey` and most modern tooling emit, is ' +
+      'plain `-----BEGIN PRIVATE KEY-----`, and requiring a prefix let exactly that one cross.',
   },
   {
     id: 'sk-prefixed-api-key',
@@ -267,14 +270,17 @@ export const BOUNDARY_SECRET_FAMILIES: readonly BoundarySecretFamily[] = [
   },
   {
     id: 'secret-assignment-camel',
-    re: /(?:Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
+    re: /(?:(?<![\w-])(?:password|passwd|secret|token|credential)|Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
     note:
       'The same assignment shape in camelCase or PascalCase — the dominant style in real tool ' +
       'output, and invisible to both arms above, which require the affix to be separated by `_` ' +
       'or `-`. `SecretAccessKey`, `SessionToken`, `accessToken`, `refreshToken` and ' +
-      '`clientSecret` all reached the model in clear. CASE-SENSITIVE on purpose: the capital ' +
-      'letter is the word boundary, and a suffix must start upper-case or with a digit, so ' +
-      '`Secretary` and `tokens` are not credentials.',
+      '`clientSecret` all reached the model in clear. A capital letter is ONE of the two word ' +
+      'boundaries: the keyword may also be lower-case when it STARTS the identifier ' +
+      '(`secretAccessKey`, `secretKey`, `passwordHash`, `tokenValue`), which requiring a ' +
+      'capital missed entirely. Either way the suffix must start upper-case or with a digit, ' +
+      'so `secretary`, `tokens` and `tokenize` are not credentials. `apiKey` needs no ' +
+      'lower-case arm here: `api[_-]?key` above already makes its separator optional.',
   },
   {
     id: 'credential-flag-value',
@@ -522,17 +528,25 @@ export function isCodeShapedValue(matched: string): boolean {
  * Measured over this repository's own sources before the fix: 21 files, 188
  * lines rewritten.
  *
- * The two extra rules are the ones that need the missing value gate to be
- * safe, and both are applied HERE ONLY:
+ * The ONE extra rule here is the one that needs the missing value gate to be
+ * safe: an unterminated one-word value is an identifier or a type
+ * (`password = None`, `token: string`), where for a gated arm it is a
+ * passphrase (`CLIENT_SECRET=supersecretpassphrase`). A one-word value that
+ * IS terminated by punctuation is code for every arm — see
+ * {@link TYPE_ANNOTATION_VALUE}.
  *
- * - `preceding === '.'` reads the name as a member access. In code that is
- *   `clean.password = ''`; in a config dump the same dot is part of the key
- *   (`spring.datasource.password=`, `aws.SecretAccessKey`, `env.DB_PASSWORD=`),
- *   which is why the gated arms must not consult it — one dot would
- *   otherwise veto the whole family.
- * - A one-word value is an identifier or a type (`password = None`,
- *   `token: string`). For a gated arm a one-word value is a 16-character
- *   passphrase (`CLIENT_SECRET=supersecretpassphrase`).
+ * A member-access rule used to sit beside it, reading a `.` before the
+ * keyword as `clean.password = ''`. It is gone, and its removal was
+ * measured: over 1,081,257 lines of installed third-party source it
+ * prevented exactly ONE rewrite (a doc comment reading
+ * `* myURL.password = '123';`), because the value rules already catch real
+ * member assignments — `self.password = get_password()` is an expression,
+ * `this.password = undefined` and `obj.token = t` are bare words,
+ * `clean.password = ''` is punctuation only. Against that one line it cost a
+ * whole leak class, because a `.` before the keyword is a KEY SEPARATOR in
+ * every config format there is: `env.password=hunter2` and
+ * `config.token=abc123`, both too short for the gated arms to see, were
+ * delivered in clear.
  *
  * This runs at the BOUNDARY only. The storage pattern keeps the permissive
  * `\S+`, because the two directions fail differently: hashing a type
@@ -542,8 +556,7 @@ export function isCodeShapedValue(matched: string): boolean {
  * matches rather than the pattern being changed, and `boundary ⊆ storage`
  * still holds — now strictly.
  */
-export function isCodeShapedAssignment(matched: string, preceding: string): boolean {
-  if (preceding === '.') return true; // `clean.password = ''` — a member assignment
+export function isCodeShapedAssignment(matched: string): boolean {
   if (isCodeShapedValue(matched)) return true;
   const value = assignmentValue(matched);
   if (value === undefined) return false;
@@ -557,13 +570,12 @@ function rawSecretSpans(text: string, patterns: readonly RegExp[]): Span[] {
     const assignment = ASSIGNMENT_SOURCES.has(re.source);
     const bare = re.source === BARE_ASSIGNMENT_SOURCE;
     for (const s of matchSpans(re, text, secretId(i))) {
-      const before = s.start === 0 ? '' : text.slice(s.start - 1, s.start);
       if (!assignment) {
         out.push(s);
         continue;
       }
       const matched = text.slice(s.start, s.end);
-      if (bare ? isCodeShapedAssignment(matched, before) : isCodeShapedValue(matched)) continue;
+      if (bare ? isCodeShapedAssignment(matched) : isCodeShapedValue(matched)) continue;
       out.push(s);
     }
   });

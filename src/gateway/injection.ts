@@ -259,6 +259,13 @@ export interface NormalizedScan {
    * with no escape sequence in it never pays for that pass.
    */
   sawEscapeText?: true;
+  /**
+   * Present (and `true`) when a string family carried a lone alphanumeric
+   * header byte, which is the one byte the other two copies necessarily
+   * disagree about. The trigger for the THIRD copy; nothing else pays for
+   * it.
+   */
+  sawHeaderText?: true;
 }
 
 /** Options for {@link normalizeForScan}. */
@@ -287,6 +294,18 @@ export interface NormalizeOptions {
    * all CSI, never pays for a second pass.
    */
   keepEscapeText?: boolean;
+  /**
+   * Read a string family's lone alphanumeric header byte (`ESC P` + `q`) as
+   * TEXT rather than as a header. Implies {@link keepEscapeText}.
+   *
+   * That byte is genuinely ambiguous and the two readings are both needed:
+   * `ESC P q <marker> ST` hides a marker in the DATA, which wants the byte
+   * dropped as a header, and `inst<ESC>P` + `ructions ST` hides one by
+   * having the marker's own `r` eaten AS that header, which wants it kept.
+   * Same bytes, opposite requirements, so this is its own copy — built only
+   * when such a sequence is actually present.
+   */
+  keepStringHeader?: boolean;
 }
 
 /**
@@ -437,6 +456,16 @@ interface AnsiSequence {
   /** True for OSC / DCS / APC / PM / SOS: the families with a payload. */
   isString: boolean;
   /**
+   * Where a string family's header begins, when that header is a single
+   * ALPHANUMERIC final byte and nothing else — `ESC P q`. Such a byte is
+   * indistinguishable from a letter of the text: `ESC P` in front of
+   * `ructions` parses `r` as the final byte of a Sixel header, and dropping
+   * it as a header is how `inst` + `ructions` scanned as `instuctions`.
+   * A copy that keeps it resolves the ambiguity the only way it can be
+   * resolved — by looking at it both ways.
+   */
+  headerTextStart?: number;
+  /**
    * True when consuming the sequence would delete a character a reader of
    * the raw bytes still sees as TEXT: the final byte of a bare
    * two-character escape (`ESC` + one final byte, no intermediates), or a
@@ -467,6 +496,11 @@ interface AnsiSequence {
  *
  * Every character is examined at most twice, so the scan stays linear.
  */
+/** A byte a reader of the text would take for part of a word: a letter, a digit or the space between two. */
+function isTextShapedByte(c: number): boolean {
+  return c === 0x20 || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+}
+
 function ansiSequenceAt(s: string, i: number): AnsiSequence | undefined {
   const c0 = s.charCodeAt(i);
   let body: number;
@@ -578,7 +612,16 @@ function ansiSequenceAt(s: string, i: number): AnsiSequence | undefined {
     }
     if (lastSemi >= 0) dataStart = lastSemi + 1;
   }
+  let headerTextStart: number | undefined;
   if (dcs) {
+    // A header that BEGINS with a letter, a digit or a space is
+    // indistinguishable from the start of the text — `ESC P` in front of
+    // `ructions` parses `r` as a Sixel final byte, and in front of ` all
+    // previous instructions` parses the space as an intermediate and `a` as
+    // the final byte. Either way the header skip eats a character of the
+    // marker, which is how 30 of 31 split points got past `injection:
+    // block`. Record where it starts so the third copy can read it as text.
+    if (isTextShapedByte(s.charCodeAt(body))) headerTextStart = body;
     let j = body;
     while (j < s.length) {
       const c = s.charCodeAt(j);
@@ -593,9 +636,11 @@ function ansiSequenceAt(s: string, i: number): AnsiSequence | undefined {
   }
   for (let j = dataStart; j < s.length; j++) {
     const c = s.charCodeAt(j);
-    if (c === BEL || c === C1_ST) return { end: j + 1, dataStart, isString: true, hidesText: false };
+    if (c === BEL || c === C1_ST) {
+      return { end: j + 1, dataStart, isString: true, hidesText: false, ...(headerTextStart === undefined ? {} : { headerTextStart }) };
+    }
     if (c === ESC && s.charCodeAt(j + 1) === 0x5c) {
-      return { end: j + 2, dataStart, isString: true, hidesText: false };
+      return { end: j + 2, dataStart, isString: true, hidesText: false, ...(headerTextStart === undefined ? {} : { headerTextStart }) };
     }
   }
   return undefined; // unterminated: nothing is consumed, so nothing is hidden
@@ -627,12 +672,14 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
     return { text: typeof original === 'string' ? original : '', changed: false };
   }
   const dropMarks = opts.dropMarks === true;
-  const keepEscapeText = opts.keepEscapeText === true;
+  const keepStringHeader = opts.keepStringHeader === true;
+  const keepEscapeText = opts.keepEscapeText === true || keepStringHeader;
   const runs: Run[] = [];
   let out = '';
   let changed = false;
   let sawMark = false;
   let sawEscapeText = false;
+  let sawHeaderText = false;
 
   const emit = (chunk: string, oStart: number, oEnd: number, identity: boolean): void => {
     if (!identity) changed = true;
@@ -674,14 +721,17 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
         // A sequence whose removal takes TEXT with it needs the second copy;
         // a CSI does not, so coloured output never pays for one.
         if (!sawEscapeText && (seq.isString || seq.hidesText)) sawEscapeText = true;
+        if (!sawHeaderText && seq.headerTextStart !== undefined) sawHeaderText = true;
         if (keepEscapeText && seq.hidesText) {
           // Fall through: the ESC drops as a control and its final byte,
           // which may be a letter of a marker, stays.
         } else if (keepEscapeText && seq.isString) {
           // Keep the data string a reader of the bytes sees; drop only the
           // introducer and header, which cannot carry a marker but can glue
-          // onto one (`ESC P q` in front of `ignore all previous ...`).
-          i = seq.dataStart;
+          // onto one (`ESC P q` in front of `ignore all previous ...`) —
+          // except a lone alphanumeric header byte, which CAN be a marker
+          // letter and is kept in the copy built for exactly that.
+          i = keepStringHeader && seq.headerTextStart !== undefined ? seq.headerTextStart : seq.dataStart;
           changed = true;
           continue;
         } else {
@@ -714,6 +764,7 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
           const seq = ansiSequenceAt(original, j);
           if (seq !== undefined) {
             if (!sawEscapeText && (seq.isString || seq.hidesText)) sawEscapeText = true;
+            if (!sawHeaderText && seq.headerTextStart !== undefined) sawHeaderText = true;
             if (!(keepEscapeText && (seq.isString || seq.hidesText))) {
               j = seq.end;
               continue;
@@ -725,7 +776,7 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
               // header standing: one space in front of the introducer was
               // enough to put `Pq` between the two halves of a marker, and
               // the copy that exists to recover exactly that missed it.
-              j = seq.dataStart;
+              j = keepStringHeader && seq.headerTextStart !== undefined ? seq.headerTextStart : seq.dataStart;
               break;
             }
           }
@@ -748,6 +799,7 @@ export function normalizeForScan(original: string, opts: NormalizeOptions = {}):
   const scan: NormalizedScan = changed ? { text: out, changed, runs } : { text: out, changed: false };
   if (sawMark) scan.sawMark = true;
   if (sawEscapeText) scan.sawEscapeText = true;
+  if (sawHeaderText) scan.sawHeaderText = true;
   return scan;
 }
 
@@ -838,10 +890,17 @@ export function findInjectionSpans(text: string, limit: number = MAX_SCAN_CHARS)
   const found = scanCopy(normalized);
   const marks = normalized.sawMark === true;
   const escapes = normalized.sawEscapeText === true;
+  // A string family's lone alphanumeric header byte is the one byte the
+  // other copies must disagree about: dropped as a header it hides a marker
+  // split across it, kept as text it hides one inside the data. Rare enough
+  // that nothing else pays for the extra pass.
+  const headerText = normalized.sawHeaderText === true;
   const extras: NormalizeOptions[] = [];
   if (marks) extras.push({ dropMarks: true });
   if (escapes) extras.push({ keepEscapeText: true });
   if (marks && escapes) extras.push({ dropMarks: true, keepEscapeText: true });
+  if (headerText) extras.push({ keepStringHeader: true });
+  if (marks && headerText) extras.push({ dropMarks: true, keepStringHeader: true });
   for (const opts of extras) {
     for (const s of scanCopy(normalizeForScan(scanned, opts))) found.push(s);
   }

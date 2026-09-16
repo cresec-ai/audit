@@ -191,17 +191,25 @@ export declare function isCodeShapedValue(matched: string): boolean;
  * Measured over this repository's own sources before the fix: 21 files, 188
  * lines rewritten.
  *
- * The two extra rules are the ones that need the missing value gate to be
- * safe, and both are applied HERE ONLY:
+ * The ONE extra rule here is the one that needs the missing value gate to be
+ * safe: an unterminated one-word value is an identifier or a type
+ * (`password = None`, `token: string`), where for a gated arm it is a
+ * passphrase (`CLIENT_SECRET=supersecretpassphrase`). A one-word value that
+ * IS terminated by punctuation is code for every arm — see
+ * {@link TYPE_ANNOTATION_VALUE}.
  *
- * - `preceding === '.'` reads the name as a member access. In code that is
- *   `clean.password = ''`; in a config dump the same dot is part of the key
- *   (`spring.datasource.password=`, `aws.SecretAccessKey`, `env.DB_PASSWORD=`),
- *   which is why the gated arms must not consult it — one dot would
- *   otherwise veto the whole family.
- * - A one-word value is an identifier or a type (`password = None`,
- *   `token: string`). For a gated arm a one-word value is a 16-character
- *   passphrase (`CLIENT_SECRET=supersecretpassphrase`).
+ * A member-access rule used to sit beside it, reading a `.` before the
+ * keyword as `clean.password = ''`. It is gone, and its removal was
+ * measured: over 1,081,257 lines of installed third-party source it
+ * prevented exactly ONE rewrite (a doc comment reading
+ * `* myURL.password = '123';`), because the value rules already catch real
+ * member assignments — `self.password = get_password()` is an expression,
+ * `this.password = undefined` and `obj.token = t` are bare words,
+ * `clean.password = ''` is punctuation only. Against that one line it cost a
+ * whole leak class, because a `.` before the keyword is a KEY SEPARATOR in
+ * every config format there is: `env.password=hunter2` and
+ * `config.token=abc123`, both too short for the gated arms to see, were
+ * delivered in clear.
  *
  * This runs at the BOUNDARY only. The storage pattern keeps the permissive
  * `\S+`, because the two directions fail differently: hashing a type
@@ -211,7 +219,7 @@ export declare function isCodeShapedValue(matched: string): boolean;
  * matches rather than the pattern being changed, and `boundary ⊆ storage`
  * still holds — now strictly.
  */
-export declare function isCodeShapedAssignment(matched: string, preceding: string): boolean;
+export declare function isCodeShapedAssignment(matched: string): boolean;
 /**
  * Locate secret-shaped tokens in `text`. Returns merged, sorted,
  * non-overlapping spans whose `id` is `secret:<pattern index>` of the

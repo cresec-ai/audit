@@ -122,6 +122,13 @@ export interface NormalizedScan {
      * with no escape sequence in it never pays for that pass.
      */
     sawEscapeText?: true;
+    /**
+     * Present (and `true`) when a string family carried a lone alphanumeric
+     * header byte, which is the one byte the other two copies necessarily
+     * disagree about. The trigger for the THIRD copy; nothing else pays for
+     * it.
+     */
+    sawHeaderText?: true;
 }
 /** Options for {@link normalizeForScan}. */
 export interface NormalizeOptions {
@@ -149,6 +156,18 @@ export interface NormalizeOptions {
      * all CSI, never pays for a second pass.
      */
     keepEscapeText?: boolean;
+    /**
+     * Read a string family's lone alphanumeric header byte (`ESC P` + `q`) as
+     * TEXT rather than as a header. Implies {@link keepEscapeText}.
+     *
+     * That byte is genuinely ambiguous and the two readings are both needed:
+     * `ESC P q <marker> ST` hides a marker in the DATA, which wants the byte
+     * dropped as a header, and `inst<ESC>P` + `ructions ST` hides one by
+     * having the marker's own `r` eaten AS that header, which wants it kept.
+     * Same bytes, opposite requirements, so this is its own copy — built only
+     * when such a sequence is actually present.
+     */
+    keepStringHeader?: boolean;
 }
 /**
  * Characters removed outright, as ONE code point each (not one UTF-16 unit:
