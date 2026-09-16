@@ -383,8 +383,25 @@ function cappedRuleId(id: string): string {
  * `true`, `{}`, `[]` and a bare `null` are not ids, and a message carrying
  * one is treated as id-less rather than smuggled into an event.
  */
+/**
+ * A usable JSON-RPC id, and therefore a legal `request_id` under the frozen
+ * schema.
+ *
+ * Numbers must be FINITE: `1e999` parses to `Infinity`, which
+ * `JSON.stringify` writes back as `null` — outside `string | number` — and
+ * every such id collapses onto one pending key. A `tools/call` carrying one
+ * falls into the invalid-id refusal; anything else is recorded id-less.
+ *
+ * Finite is the whole test. Requiring a SAFE INTEGER was tried and reverted:
+ * it would also reject `1.5`, which JSON-RPC discourages but permits, which
+ * this proxy has always evaluated, and which is schema-legal as a
+ * `request_id`. Ids beyond 2^53 do lose precision, but that happens in
+ * `JSON.parse` before any of this runs — two such ids are already the same
+ * double by the time the proxy sees them, so there is nothing here to fix.
+ */
 function isRpcId(v: unknown): v is string | number {
-  return typeof v === 'string' || typeof v === 'number';
+  if (typeof v === 'string') return true;
+  return typeof v === 'number' && Number.isFinite(v);
 }
 
 /** A `tools/call` REQUEST (has a usable id) — the only thing the policy answers on. */
@@ -963,6 +980,13 @@ const DUPLICATE_ID_REASON: Record<DuplicateIdState, string> = {
 };
 /** `error.type` of both events recorded for a refused duplicate id (free-form string, v1). */
 const DUPLICATE_ID_ERROR_TYPE = 'duplicate_id';
+/**
+ * `error.type` for an in-flight request dropped because `pending` hit
+ * MAX_PENDING. Additive and free-form under the frozen schema, like
+ * `duplicate_id` and `unanswered`: the point is that the chain says the
+ * request was dropped rather than losing it silently.
+ */
+const EVICTED_ERROR_TYPE = 'evicted';
 
 /**
  * `error.type` on an event whose `result_hash` could not be computed (free-
@@ -1071,6 +1095,16 @@ function invalidIdErrorResponse(id: unknown): Record<string, unknown> {
 export const OVERSIZED_LINE_MESSAGE =
   'mcp-recorder gateway: this line is larger than the gateway can buffer, so it could not be' +
   ' evaluated against the policy and was refused (enforcement fails closed); send a smaller request';
+
+/**
+ * The sibling case: a line that IS small enough to buffer but is not JSON, so
+ * the policy cannot be shown it either. Refused for the same reason and in
+ * the same way — a line that skips the parser also skips every id gate below
+ * it, so forwarding one reopens the duplicate-id holes as well.
+ */
+export const UNPARSEABLE_LINE_MESSAGE =
+  'mcp-recorder gateway: this line is not valid JSON, so it could not be evaluated against the ' +
+  'policy and was refused (enforcement fails closed); send a valid JSON-RPC message';
 
 /**
  * A non-`tools/call` request refused for reusing a JSON-RPC id that is still
@@ -1440,7 +1474,21 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       }
     }
     if (victim === undefined) victim = pending.keys().next().value as string | undefined;
-    if (victim !== undefined) pending.delete(victim);
+    if (victim !== undefined) {
+      // Seal before dropping. This is the same failure `registerPending`
+      // guards against — an in-flight request vanishing from the chain while
+      // its real response lands as an orphan — on the one path that guard
+      // does not cover.
+      const entry = pending.get(victim);
+      pending.delete(victim);
+      if (entry !== undefined) {
+        try {
+          sealPending(entry, EVICTED_ERROR_TYPE, round2(performance.now() - entry.t0));
+        } catch (err) {
+          tapError(err);
+        }
+      }
+    }
     if (!pendingEvictWarned) {
       pendingEvictWarned = true;
       diag(`pending request map exceeded ${MAX_PENDING} entries; evicting oldest`);
@@ -2718,12 +2766,37 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
      * so a batch ('[') is answered with a batch, as a client that sent one
      * expects.
      */
-    const refuseOversizedC2sLine = (line: ScannedLine): void => {
-      const response = invalidRequestResponse(null, OVERSIZED_LINE_MESSAGE);
+    /**
+     * Refuse a client line the policy could not be shown, and say why.
+     *
+     * TWO things stop the policy seeing a line: it is larger than the gateway
+     * can buffer, or it is not JSON. Both fail closed, and for the same two
+     * reasons. A line the policy never saw could carry anything, including
+     * the tool a rule denies. And a line that skips the parser also skips
+     * every id gate below it, so forwarding one reopens the duplicate-id
+     * holes as well: the server's answer to it correlates onto whatever call
+     * owns that id, and one `tool_call` ends up carrying one call's arguments
+     * with another call's result.
+     *
+     * Only the oversized branch was fixed first, and the unparseable branch
+     * five lines below it went on forwarding — which is why this is one
+     * helper both call rather than two similar blocks.
+     *
+     * Record mode forwards both, unchanged: it promises byte-for-byte and
+     * enforces nothing.
+     */
+    const refuseUnevaluatableC2sLine = (line: ScannedLine, why: 'oversized' | 'unparseable'): void => {
+      const message = why === 'oversized' ? OVERSIZED_LINE_MESSAGE : UNPARSEABLE_LINE_MESSAGE;
+      const response = invalidRequestResponse(null, message);
+      // The line was never parsed, so its first non-whitespace byte is all we
+      // know of its shape: a batch gets a batch-shaped refusal.
       const body = line.firstByte === 0x5b ? [response] : response;
+      // Name the cause, not just the class: an operator reading stderr needs
+      // to know whether to send less or to send valid JSON.
+      const cause = why === 'oversized' ? 'too large to buffer' : 'not valid JSON';
       diag(
-        `gateway: refused a ${line.bytesLen}-byte client line: too large to buffer, so the policy` +
-          ' could not see it; not forwarded',
+        `gateway: refused a ${line.bytesLen}-byte client line: ${cause}, so the policy could not` +
+          ' see it; not forwarded',
       );
       writeToClient(Buffer.from(JSON.stringify(body) + '\n'));
     };
@@ -2734,7 +2807,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // them to the server, so nothing crossed unevaluated. Record the
         // line exactly as record mode does, then answer the client.
         guarded(() => protocolError('client_to_server', 'oversized', line.bytesLen, line.lineHashHex));
-        refuseOversizedC2sLine(line);
+        refuseUnevaluatableC2sLine(line, 'oversized');
         return;
       }
       const raw = line.raw;
@@ -2743,8 +2816,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       try {
         msg = JSON.parse(line.text);
       } catch {
-        forwardC2s(raw);
+        // Not JSON, so the policy cannot be shown it — refused, not forwarded.
         guarded(() => protocolError('client_to_server', 'unparseable', line.bytesLen, line.lineHashHex));
+        refuseUnevaluatableC2sLine(line, 'unparseable');
         return;
       }
       if (Array.isArray(msg)) {

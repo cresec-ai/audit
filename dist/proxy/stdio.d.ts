@@ -180,6 +180,13 @@ export declare const INVALID_ID_TOOLS_CALL_MESSAGE = "mcp-recorder gateway: tool
  */
 export declare const OVERSIZED_LINE_MESSAGE: string;
 /**
+ * The sibling case: a line that IS small enough to buffer but is not JSON, so
+ * the policy cannot be shown it either. Refused for the same reason and in
+ * the same way — a line that skips the parser also skips every id gate below
+ * it, so forwarding one reopens the duplicate-id holes as well.
+ */
+export declare const UNPARSEABLE_LINE_MESSAGE: string;
+/**
  * A non-`tools/call` request refused for reusing a JSON-RPC id that is still
  * in flight. A tool call gets an isError tool RESULT (the model reads it);
  * every other method gets a plain JSON-RPC error, which is what its caller

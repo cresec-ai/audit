@@ -142,9 +142,16 @@ export const BOUNDARY_SECRET_FAMILIES = [
     {
         id: 'github-fine-grained-pat',
         re: /\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b/,
-        note: 'The real fine-grained PAT shape: `github_pat_` + a 22-character base62 id + `_` + a ' +
-            '59-character base62 secret. Spelling it out keeps ordinary snake_case identifiers that ' +
-            'merely start with the prefix (`github_pat_token_refresh_helper_result`) out.',
+        note: 'The documented fine-grained PAT shape: `github_pat_` + a 22-character base62 id + `_` + ' +
+            'a 59-character base62 secret.',
+    },
+    {
+        id: 'github-fine-grained-pat-defensive',
+        re: /\bgithub_pat_(?=[A-Za-z0-9_]{40,}\b)(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[a-z])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]+\b/,
+        note: 'A token that does NOT match the documented lengths exactly — a format change, a variant, ' +
+            'a paste that lost a character — must not reach the model in clear on a length ' +
+            'technicality. Keyed on what a token has and a snake_case identifier does not: 40+ ' +
+            'characters, a digit, and both letter cases.',
     },
     {
         id: 'slack-token',

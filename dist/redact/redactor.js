@@ -128,7 +128,26 @@ const ALWAYS_PATTERNS = [
     // `github_pat_validation_middleware_options` — was hashed as a credential
     // in the store and rewritten at the boundary. The two halves are fixed
     // length, so nothing here can backtrack.
+    //
+    // But spelling ONLY that shape made a credential hinge on two exact
+    // lengths: a token from a format change, a variant, or a paste that lost a
+    // character then matches nothing at all and reaches the store in clear —
+    // which is strictly worse than the false positives the narrowing fixed. So
+    // a second, defensive arm follows it, keyed on what a token has and an
+    // identifier does not: 40+ characters, a digit, AND both letter cases.
+    // `github_pat_token_refresh_helper_result` is lower-case with no digit;
+    // `GITHUB_PAT_SOMETHING_LONG` has no lower case. A real base62 secret of
+    // 81 characters has all three with overwhelming probability. Each lookahead
+    // scans the same bounded run once, so this cannot backtrack either.
+    //
+    // The floor is 40 because a real token carries 82 characters of payload,
+    // so no genuine credential is near it. A floor of 24 was tried and
+    // reverted: it starts matching `github_pat_Handler2_Options_Result_Cache`,
+    // and all it buys is a heavily truncated paste, which is not a working
+    // credential. The case and digit tests, not the floor, keep identifiers
+    // out.
     /\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b/,
+    /\bgithub_pat_(?=[A-Za-z0-9_]{40,}\b)(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[a-z])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]+\b/,
     // Slack tokens
     /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
     // Bearer auth headers

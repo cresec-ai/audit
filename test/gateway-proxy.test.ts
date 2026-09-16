@@ -40,6 +40,7 @@ import {
   NESTED_BATCH_MESSAGE,
   NULL_ID_TOOLS_CALL_MESSAGE,
   OVERSIZED_LINE_MESSAGE,
+  UNPARSEABLE_LINE_MESSAGE,
   duplicateIdText,
   runStdioProxy,
 } from '../src/proxy/stdio.js';
@@ -446,8 +447,29 @@ describe('gateway: allow', () => {
     s.stdin.end();
     expect(await s.done).toBe(0);
 
+    // Gateway mode is byte-for-byte with the unwrapped server for every line
+    // the policy could actually be shown — CRLF framing, ids of both types,
+    // a redaction-bait payload, all identical.
+    //
+    // The ONE deliberate difference is the non-JSON line. Record mode
+    // forwards it (asserted below, and in the record-mode fidelity test);
+    // gateway mode refuses it, because a line the policy cannot be shown is
+    // exactly how a denied tool gets executed — the parser is upstream of
+    // every id gate too, so forwarding one reopens those holes as well. An
+    // allow-all policy would not have denied anything, but the gateway
+    // cannot know that without parsing, so it fails closed either way.
     const direct = await runDirect();
-    expect([...s.out.lines()].sort()).toEqual([...direct].sort());
+    const refusals = s.out.lines().filter((l) => l.includes(UNPARSEABLE_LINE_MESSAGE));
+    expect(refusals).toHaveLength(1);
+    expect(JSON.parse(refusals[0]!)).toEqual({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: UNPARSEABLE_LINE_MESSAGE },
+    });
+    const proxied = s.out.lines().filter((l) => !l.includes(UNPARSEABLE_LINE_MESSAGE));
+    expect([...proxied].sort()).toEqual([...direct].sort());
+    // And the server never saw it: nothing it echoed can contain the text.
+    expect(direct.some((l) => l.includes('not json at all'))).toBe(false);
 
     const events = s.events();
     const start = events[0] as SessionStartEvent;

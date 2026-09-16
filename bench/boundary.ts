@@ -151,21 +151,35 @@ const BATCHES = 4;
  *    run it does not care how fast or how loaded the machine is: a slow
  *    runner makes every size slower together and the ratio holds.
  *
- *    Two rules, because noise and superlinearity look different. A large
- *    falloff is conclusive on its own — real catastrophic backtracking on a
- *    1 MiB input costs seconds, not milliseconds. A SMALL falloff only
- *    counts when throughput also declines MONOTONICALLY with size, which is
- *    what a growing per-byte cost does and what scatter does not: measured
- *    clean, throughput wanders (45-41-45-42 locally, 35-30-34-37 on a GitHub
- *    runner, neither ordered), while a deliberately quadratic scanner fell
- *    41-37-34-29, strictly decreasing, for a 1.4x falloff the flat threshold
- *    alone would have missed.
+ *    ONE rule: a large falloff, measured from the second-smallest size so
+ *    the cache cliff is mostly spent before the comparison starts.
+ *
+ *    A monotonic-decline rule was tried here and removed, because it flaked
+ *    on a clean CI run that read 43 MiB/s at 16 KiB and 34 at the cap. That
+ *    decline is NOT noise to be tuned out: a linear scanner's per-byte
+ *    throughput genuinely falls as the input leaves cache, so mild monotonic
+ *    decline is the expected shape of a healthy run and cannot be separated
+ *    from mild superlinearity at this span. What this gate is for — real
+ *    catastrophic backtracking — is not mild: `(a+)+` against 30 characters
+ *    costs 38 SECONDS where a linear scan costs microseconds, so it clears
+ *    both thresholds by orders of magnitude. A 1.5x polynomial regression is
+ *    reported by the linearity line above and is deliberately NOT gated.
  * 2. A p50 CEILING, which catches what (1) cannot: a scanner that got
  *    uniformly slower at every size stays perfectly linear. p50 is used
  *    rather than a tail because it is robust, and it travels between
  *    machines — the worst cap-sized cell measures 27-32ms locally and
  *    25-36ms on a GitHub runner, while the same cells' maxima differ by 3x.
- *    The ceiling leaves about 4x of headroom over that.
+ *    Those figures are for an idle machine; the same cells measured 48ms on
+ *    this one while three other agents were running, so the ceiling is set
+ *    for margin against LOAD rather than for sensitivity — roughly 5x over
+ *    the worst observed. It is a "something is badly wrong" alarm, not a
+ *    performance target: it will not notice a 2x regression, and is not
+ *    meant to. Catastrophic backtracking clears it by an order of magnitude.
+ *
+ *    The first version of this gate was a fixed 120ms on the p99 and it
+ *    flaked in CI on its first run; the second added a monotonic-decline
+ *    rule and flaked on its first run too. Both times the fix was to widen
+ *    what the number has to survive, not to re-tune it slightly.
  * 3. A p99 CEILING, applied ONLY when the p99 is a real percentile. In
  *    --smoke a cell has ~24 samples, so its "p99" is the cell MAXIMUM (the
  *    table marks it `*`), and one scheduling hiccup out of 24 on a shared
@@ -177,9 +191,7 @@ const BATCHES = 4;
  */
 /** A falloff this large is superlinear whatever its shape. */
 const SUPERLINEAR_GATE = 2;
-/** With a monotonic decline across every size, this much falloff is enough. */
-const MONOTONIC_FALLOFF_GATE = 1.25;
-const P50_GATE_MS = 150;
+const P50_GATE_MS = 250;
 const P99_GATE_MS = 120;
 
 const CONFIG: BoundaryConfig = { ...DEFAULTS.boundary };
@@ -847,19 +859,20 @@ function main(): void {
   const worstP50 = cells.reduce((a, b) => (b.total.p50 > a.total.p50 ? b : a));
   // Superlinearity, measured where it shows: smallest size against largest.
   // A scanner whose per-byte cost grows with input reads slower at the cap.
-  const smallRate = rates[0] ?? 0;
+  // From the SECOND size, not the first: the 16 KiB cell still fits in cache,
+  // so including it folds the memory-hierarchy cliff into a number that is
+  // supposed to mean "the per-byte cost grows with input size".
+  const baseIndex = Math.min(1, rates.length - 1);
+  const baseRate = rates[baseIndex] ?? 0;
   const capRate = rates[rates.length - 1] ?? 0;
-  const falloff = capRate > 0 ? smallRate / capRate : Infinity;
-  const monotonic = rates.every((r, i) => i === 0 || r <= (rates[i - 1] ?? Infinity));
+  const falloff = capRate > 0 ? baseRate / capRate : Infinity;
 
   const failures: string[] = [];
-  const superlinear = falloff > SUPERLINEAR_GATE || (monotonic && falloff > MONOTONIC_FALLOFF_GATE);
-  if (superlinear) {
+  if (falloff > SUPERLINEAR_GATE) {
     failures.push(
-      `superlinear in input size: ${smallRate.toFixed(0)} MiB/s at ${sizeLabel(SIZES[0]!)} but ` +
-        `${capRate.toFixed(0)} MiB/s at ${sizeLabel(SIZES[SIZES.length - 1]!)} (${falloff.toFixed(1)}x falloff` +
-        `${monotonic ? ', declining at every size' : ''}; gate: < ${SUPERLINEAR_GATE}x, ` +
-        `or < ${MONOTONIC_FALLOFF_GATE}x when it declines at every size)`,
+      `superlinear in input size: ${baseRate.toFixed(0)} MiB/s at ${sizeLabel(SIZES[baseIndex]!)} but ` +
+        `${capRate.toFixed(0)} MiB/s at ${sizeLabel(SIZES[SIZES.length - 1]!)} ` +
+        `(${falloff.toFixed(1)}x falloff; gate: < ${SUPERLINEAR_GATE}x)`,
     );
   }
   if (worstP50.total.p50 > P50_GATE_MS) {
@@ -877,8 +890,7 @@ function main(): void {
   }
   const worstScan = cells.reduce((a, b) => (b.scan.p99 > a.scan.p99 ? b : a));
   const gateMsg =
-    `${falloff.toFixed(1)}x size falloff${monotonic ? ' (declining at every size)' : ''}, ` +
-    `worst p50 ${fmt(worstP50.total.p50)}, ` +
+    `${falloff.toFixed(1)}x size falloff, worst p50 ${fmt(worstP50.total.p50)}, ` +
     `worst ${p99Weak ? 'cell max' : 'p99'} ${fmt(worst.total.p99)} ` +
     `(${sizeLabel(worst.size)} ${worst.shape} ${worst.content}; worst scan ${fmt(worstScan.scan.p99)})` +
     (p99Weak ? ` — too few samples to gate a tail, so linearity and p50 decide` : '');
