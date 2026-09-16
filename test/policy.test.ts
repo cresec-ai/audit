@@ -855,10 +855,29 @@ describe('validatePolicyObject: error paths', () => {
     for (const pattern of ['\\.\\\\\\+\\*\\?\\(\\)\\[\\]\\{\\}\\|\\^\\$\\-\\/\\_\\#\\ ', '[\\d\\w\\n\\t\\x41\\-\\]]', '(^|/)(\\.env|secrets\\.env|id_rsa|\\.npmrc)$']) {
       expect(checkRe2Subset(pattern), pattern).toBeUndefined();
     }
-    // A class range `u` (and RE2) refuse cannot be translated, so it is rejected.
-    for (const pattern of ['[a-\\d]', '[\\d-z]']) {
+    // A class range RE2 itself refuses ("invalid character class range:
+    // `a-\\`", verified against OPA 1.20.2) cannot be translated: rejected.
+    for (const pattern of ['[a-\\d]']) {
       expect(checkRe2Subset(pattern), pattern).toMatch(/cannot be matched in Unicode mode/);
       expectError(errorsFor((d) => (rule0(d).match.args = { url: pattern })), '/mcp/rules/0/match/args/url', 'regex', /Unicode mode/);
+    }
+    // A dash BESIDE a class escape is a different matter: `u` mode calls it
+    // an invalid range, and both RE2 and non-`u` JavaScript read it as a
+    // literal dash. Verified against OPA 1.20.2: `[\\d-z]` matches "-", "5"
+    // and "z" and nothing else. These validated before the engine moved to
+    // `u` and validate again, translated rather than refused.
+    for (const [pattern, expected] of [
+      ['[\\d-z]', '[\\d\\-z]'],
+      ['[\\w-x]', '[\\w\\-x]'],
+      ['[\\w-.]', '[\\w\\-.]'],
+    ] as const) {
+      expect(checkRe2Subset(pattern), pattern).toBeUndefined();
+      expect(toUnicodeSource(pattern), pattern).toBe(expected);
+      const plain = new RegExp(pattern);
+      const unicode = new RegExp(toUnicodeSource(pattern), 'u');
+      for (const sample of ['-', '5', 'z', 'x', 'm', '.', 'a', '_']) {
+        expect(unicode.test(sample), `${pattern} vs ${JSON.stringify(sample)}`).toBe(plain.test(sample));
+      }
     }
   });
 
@@ -1562,6 +1581,40 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
     expect(regexGuardState()).toMatchObject({ worker: true, degraded: false, poisoned: 0 });
   });
 
+  it('arms the backoff when the worker dies on its own, instead of building one per evaluation', async () => {
+    // The `error`/`exit` handlers cleared the slot without calling
+    // `degrade()`, so `retryAt` stayed in the past and every later
+    // evaluation constructed another OS thread — 50 in 25 s, where a healthy
+    // backoff expects two. The real worker never dies on its own, which is
+    // why this went untested; one that signals ready and then exits
+    // reproduces it in a second.
+    const seen: string[] = [];
+    const dying = [
+      "'use strict';",
+      "const { workerData } = require('node:worker_threads');",
+      'const ctrl = new Int32Array(workerData.sab);',
+      'Atomics.store(ctrl, 0, 1);',
+      'Atomics.notify(ctrl, 0);',
+      'setTimeout(() => process.exit(0), 10);',
+    ].join('\n');
+    configureRegexGuard({ workerSource: dying, retryMs: 60_000, onDiag: (m) => seen.push(m) });
+
+    expect(warmRegexGuard()).toBe(true); // it hand-shakes fine
+    await new Promise((r) => setTimeout(r, 150)); // and then it is gone
+
+    expect(regexGuardState()).toMatchObject({ worker: false, degraded: true, retrying: false });
+    expect(seen.filter((m) => m.includes('exited without being asked to'))).toHaveLength(1);
+
+    // Every later evaluation takes the in-thread path for the length of the
+    // backoff. No new worker, no new thread, and one diagnostic in total.
+    const policy = handBuilt('^https://', 'url');
+    for (let i = 0; i < 20; i++) {
+      expect(run(policy, `https://example.com/${i}`)).toMatchObject({ action: 'deny', ruleId: 'url' });
+    }
+    expect(regexGuardState()).toMatchObject({ worker: false, degraded: true, retrying: false });
+    expect(seen.filter((m) => m.includes('worker unavailable'))).toHaveLength(1);
+  });
+
   it('falls back to in-thread matching when the worker cannot start, but only for provably linear patterns', () => {
     const seen: string[] = [];
     configureRegexGuard({ startupMs: 0, onDiag: (m) => seen.push(m) }); // no worker can hand-shake in 0 ms
@@ -1762,5 +1815,77 @@ describe('checkRe2Subset: shapes that would break RE2 at evaluation time', () =>
     expect(checkRe2Subset('^(?<café>secret)$')).toMatch(/not valid in RE2/);
     expect(checkRe2Subset('^(?<$x>secret)$')).toMatch(/not valid in RE2/);
     expect(checkRe2Subset('^(?<x>a)|(?<x>b)$')).toMatch(/used twice/);
+  });
+});
+
+/* ------------- the shapes the ReDoS checks still let through --------------
+ * `policy validate` is the only thing standing between an author's typo and
+ * a rule that one client message can brick: a pattern that times out at run
+ * time is poisoned for the life of the process, so every later call on that
+ * rule denies. These three shapes validated clean and were exponential.
+ */
+describe('checkCatastrophicShape: a repeated group ending in an ambiguous alternation', () => {
+  it.each([
+    ['identical branches', '^(?:a(?:b|b))+$'],
+    ['a class and the literal it contains', '^(?:a(?:[b]|b))+$'],
+    ['one branch a prefix of the other', '^(?:a(?:bc|b))+$'],
+    ['wrapped one level deeper', '^(?:x(?:a(?:b|b)))+$'],
+  ])('%s is rejected', (_label, pattern) => {
+    expect(checkCatastrophicShape(pattern)).toMatch(/alternation whose branches can match the same text/);
+    expect(checkRe2Subset(pattern)).toBeDefined();
+  });
+
+  it.each([
+    ['disjoint branches stay allowed', '^(?:a(?:b|c))+$'],
+    ['the documented good example', '^([a-z0-9-]+\\.)*$'],
+    ['a dotted-quad', '^(\\d{1,3}\\.){3}\\d{1,3}$'],
+  ])('%s', (_label, pattern) => {
+    expect(checkCatastrophicShape(pattern)).toBeUndefined();
+    expect(checkRe2Subset(pattern)).toBeUndefined();
+  });
+
+  it('measures the difference: the rejected shape backtracks, the allowed one does not', () => {
+    const bad = /^(?:a(?:b|b))+$/;
+    const started = performance.now();
+    bad.test('ab'.repeat(24) + 'x');
+    const badMs = performance.now() - started;
+    const good = /^(?:a(?:b|c))+$/;
+    const t2 = performance.now();
+    good.test('ab'.repeat(24) + 'x');
+    const goodMs = performance.now() - t2;
+    expect(badMs).toBeGreaterThan(goodMs * 10);
+  });
+});
+
+describe('overlap: an absence of probes is not proof of disjointness', () => {
+  it('rejects adjacent repeats over a band no probe used to reach', () => {
+    // Two of the five non-ASCII probes were plain ASCII spaces, so the
+    // Latin-1 band had none: `[\xa0-\xa5]*[\xa0-\xa5]*` read as disjoint.
+    expect(checkCatastrophicShape('^[\\xa0-\\xa5]*[\\xa0-\\xa5]*[\\xa0-\\xa5]*x$')).toMatch(/adjacent atoms/);
+    expect(checkCatastrophicShape('^[\\u4e00-\\u4e10]*[\\u4e00-\\u4e10]*x$')).toMatch(/adjacent atoms/);
+    // And the ASCII case it always caught.
+    expect(checkCatastrophicShape('^[a-z]*[a-z]*[a-z]*x$')).toMatch(/adjacent atoms/);
+  });
+
+  it('still lets genuinely disjoint adjacent repeats through', () => {
+    expect(checkCatastrophicShape('^[a-z]+[0-9]*$')).toBeUndefined();
+    expect(checkCatastrophicShape('^\\d+[a-z]*$')).toBeUndefined();
+  });
+});
+
+describe('checkProvablyLinear: an optional group has one more path than it has branches', () => {
+  it('counts the skip path, so chained optional alternations are not certified', () => {
+    // `(?:a|a)?` is three ways to read the same input, not two. Six chained
+    // are 729 paths where the product counted 64 and certified them for the
+    // in-thread path, which has no deadline to stop them.
+    const six = '^' + '(?:a|a)?'.repeat(6) + '$';
+    expect(checkRe2Subset(six)).toBeUndefined(); // it still VALIDATES
+    expect(checkProvablyLinear(six)).toMatch(/alternation paths/);
+  });
+
+  it('leaves ordinary patterns on the in-thread path', () => {
+    expect(checkProvablyLinear('^https?://')).toBeUndefined();
+    expect(checkProvablyLinear('^rm -rf .+$')).toBeUndefined();
+    expect(checkProvablyLinear('^(?:GET|POST|HEAD)$')).toBeUndefined();
   });
 });

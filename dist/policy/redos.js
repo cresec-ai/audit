@@ -69,12 +69,29 @@ const MAX_WRAPPER_DEPTH = 32;
 export const MAX_LINEAR_REPEATS = 2;
 /** Max product of alternation branch counts a pattern may have to stay in-thread runnable. */
 export const MAX_LINEAR_BRANCHES = 64;
-/** Characters the overlap test probes: all of ASCII plus a few representative non-ASCII ones. */
+/**
+ * Characters the overlap test probes: all of ASCII plus representative
+ * non-ASCII ones. Two of the five non-ASCII probes used to be plain ASCII
+ * spaces — a non-breaking and an ideographic space that had been normalized
+ * away at some point — so the Latin-1 band had no probe at all and
+ * `[\xa0-\xa5]` overlapped with nothing.
+ */
 const PROBE_CHARS = (() => {
     const chars = [];
     for (let c = 0; c < 128; c++)
         chars.push(String.fromCharCode(c));
-    return [...chars, ' ', 'é', 'а', ' ', '中'];
+    const nonAscii = [
+        '\u00a0', // NO-BREAK SPACE: the start of the Latin-1 supplement
+        '\u00a3', // POUND SIGN: Latin-1 punctuation
+        '\u00e9', // é: a Latin-1 letter
+        '\u0301', // COMBINING ACUTE ACCENT: a mark
+        '\u0430', // а: Cyrillic
+        '\u2028', // LINE SEPARATOR: a line terminator the two engines argue about
+        '\u3000', // IDEOGRAPHIC SPACE
+        '\u4e2d', // 中: CJK
+        '\ud83d\ude00', // an astral code point, as its surrogate pair
+    ];
+    return [...chars, ...nonAscii];
 })();
 /** `{2}`, `{2,}`, `{2,5}` starting at `at` (a `{`), or undefined when it is a literal brace. */
 function braceQuantifier(pattern, at) {
@@ -197,7 +214,48 @@ function overlap(a, b) {
     const bm = matcher(b.text);
     if (am === undefined || bm === undefined)
         return true; // cannot tell: assume the worst
-    return PROBE_CHARS.some((ch) => am(ch) && bm(ch));
+    let sawA = false;
+    let sawB = false;
+    for (const ch of PROBE_CHARS) {
+        const inA = am(ch);
+        const inB = bm(ch);
+        if (inA && inB)
+            return true;
+        sawA ||= inA;
+        sawB ||= inB;
+    }
+    // No probe landed in one of the sets, so the probes say nothing about it.
+    // Reading that as "disjoint" is what let `[\xa0-\xa5]*[\xa0-\xa5]*` past
+    // the adjacent-atom rule; it is an absence of evidence, so assume overlap.
+    return !sawA || !sawB;
+}
+/**
+ * True when two branches of an alternation can match the same input, which
+ * makes a repetition around it ambiguous: the engine has more than one way
+ * to consume the same characters, and on a non-matching tail it tries all of
+ * them. `(?:b|b)`, `(?:[b]|b)` and `(?:ab|a)` are all ambiguous; `(?:b|c)`
+ * is not, which is why a trailing alternation is not rejected outright.
+ */
+function ambiguousAlternation(frame) {
+    const branches = frame.branches.map((b) => b.filter((a) => !a.zeroWidth));
+    const key = (branch) => branch.map(atomText).join('\u0000');
+    for (let i = 0; i < branches.length; i++) {
+        for (let j = i + 1; j < branches.length; j++) {
+            const a = branches[i];
+            const b = branches[j];
+            if (a.length === 0 || b.length === 0)
+                continue; // an empty branch is `?`, not ambiguity
+            if (key(a) === key(b))
+                return true;
+            if (a.length === 1 && b.length === 1 && overlap(a[0], b[0]))
+                return true;
+            const short = a.length <= b.length ? a : b;
+            const long = a.length <= b.length ? b : a;
+            if (short.every((atom, k) => atomText(atom) === atomText(long[k])))
+                return true;
+        }
+    }
+    return false;
 }
 const ADVICE = 'JavaScript backtracks exponentially on a non-matching input, where RE2 (the compiled Rego) stays linear;' +
     ' end each repetition with something the repeated part cannot match, e.g. "([a-z0-9-]+\\.)*"';
@@ -240,12 +298,20 @@ function shapeProblem(frame, label, depth) {
             return shapeProblem(last.frame, label, depth + 1);
         // A trailing group with no alternation of its own is plain concatenation,
         // so splice its atoms into the body: `(b(.*a))*` is `(b.*a)*`. With an
-        // alternation inside it (`(?:a(?:b|c))+`) that is not true — the branches
-        // are anchored by what precedes them — and the group stays opaque.
+        // alternation inside it that is not true in general — the branches are
+        // anchored by what precedes them — so `(?:a(?:b|c))+` stays allowed and
+        // the group stays opaque. UNLESS the branches can match the same text:
+        // `(?:a(?:b|b))+` then has two ways to consume every iteration and
+        // backtracks exponentially on a non-matching tail, which is the same
+        // defect as `(a|aa)+` one level down.
         const inner = last.frame.branches[0];
         if (last.frame.branches.length === 1) {
             const spliced = { branches: [[...atoms.slice(0, -1), ...inner]], openedAt: frame.openedAt };
             return shapeProblem(spliced, label, depth + 1);
+        }
+        if (ambiguousAlternation(last.frame)) {
+            return (`regex shape ${group} repeats a group ending in an alternation whose branches can match the same ` +
+                `text (like "(?:a(?:b|b))+"): ${ADVICE}`);
         }
     }
     let repeatedAt = -1;
@@ -414,13 +480,17 @@ function parsePattern(pattern) {
 }
 /** Every frame of a parse, outermost first. */
 function allFrames(root) {
+    return framesWithOwners(root).map((f) => f.frame);
+}
+/** Every frame of a parse with the atom that owns it (undefined for the root). */
+function framesWithOwners(root) {
     const out = [];
-    const walk = (frame) => {
-        out.push(frame);
+    const walk = (frame, owner) => {
+        out.push(owner === undefined ? { frame } : { frame, owner });
         for (const branch of frame.branches) {
             for (const atom of branch)
                 if (atom.frame !== undefined)
-                    walk(atom.frame);
+                    walk(atom.frame, atom);
         }
     };
     walk(root);
@@ -475,8 +545,12 @@ export function checkProvablyLinear(pattern) {
         return 'the pattern could not be parsed for a linearity proof';
     let repeatedAtoms = 0;
     let branches = 1;
-    for (const frame of allFrames(parsed.root)) {
-        branches *= frame.branches.length;
+    for (const { frame, owner } of framesWithOwners(parsed.root)) {
+        // An OPTIONAL group has one more path than it has branches: skipping it
+        // entirely. `(?:a|a)?` is three ways to read the same input, not two,
+        // and six of them chained are 729 paths where this counted 64.
+        const skippable = owner?.quant !== undefined && optional(owner.quant);
+        branches *= frame.branches.length + (skippable ? 1 : 0);
         if (branches > MAX_LINEAR_BRANCHES) {
             return `the pattern has more than ${MAX_LINEAR_BRANCHES} alternation paths, which cannot be proved linear`;
         }

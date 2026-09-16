@@ -81,6 +81,14 @@ export interface RegexGuardOptions {
     retryMs?: number;
     /** One line of diagnostics; called at most once per poisoned pattern / degradation. */
     onDiag?: (msg: string) => void;
+    /**
+     * Replace the worker's source (TESTS ONLY). The real worker never dies on
+     * its own, which is exactly why the handling of one that does went
+     * untested: the handlers cleared the slot without arming the backoff, so
+     * the guard built one OS thread per evaluation forever. A test worker that
+     * signals ready and then exits reproduces it in a second.
+     */
+    workerSource?: string;
 }
 /** Compile with an LRU cache. Throws `SyntaxError` for a pattern V8 rejects. */
 export declare function compiledRegex(pattern: string): RegExp;

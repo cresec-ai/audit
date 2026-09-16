@@ -100,6 +100,14 @@ export interface RegexGuardOptions {
   retryMs?: number;
   /** One line of diagnostics; called at most once per poisoned pattern / degradation. */
   onDiag?: (msg: string) => void;
+  /**
+   * Replace the worker's source (TESTS ONLY). The real worker never dies on
+   * its own, which is exactly why the handling of one that does went
+   * untested: the handlers cleared the slot without arming the backoff, so
+   * the guard built one OS thread per evaluation forever. A test worker that
+   * signals ready and then exits reproduces it in a second.
+   */
+  workerSource?: string;
 }
 
 /* ------------------------------ worker side ------------------------------ */
@@ -234,9 +242,22 @@ export function configureRegexGuard(opts: RegexGuardOptions): void {
     if (retryAt !== 0) retryAt = Date.now() + retryBaseMs;
   }
   if ('onDiag' in opts) onDiag = opts.onDiag;
+  if ('workerSource' in opts) workerSource = opts.workerSource;
 }
 
+/** Test-only override of the worker source; see `RegexGuardOptions`. */
+let workerSource: string | undefined;
+
+/**
+ * Workers this module killed on purpose. Their `exit` is expected and must
+ * not arm the backoff; a worker that dies on its own must, or the guard
+ * builds one OS thread per evaluation forever — measured at 50 threads in
+ * 25 s, where a healthy backoff expects two.
+ */
+const terminated = new WeakSet<Worker>();
+
 function terminate(worker: Worker): void {
+  terminated.add(worker);
   try {
     void worker.terminate();
   } catch {
@@ -261,6 +282,7 @@ export function resetRegexGuard(): void {
   if (pending !== undefined) terminate(pending.worker);
   pending = undefined;
   retryAt = 0;
+  workerSource = undefined;
   retryBaseMs = REGEX_RETRY_MS;
   retryDelayMs = REGEX_RETRY_MS;
   deadlineMs = REGEX_DEADLINE_MS;
@@ -299,7 +321,7 @@ function startWorker(): GuardWorker | undefined {
   try {
     const sab = new SharedArrayBuffer(16);
     const ctrl = new Int32Array(sab);
-    const worker = new Worker(WORKER_SOURCE, {
+    const worker = new Worker(workerSource ?? WORKER_SOURCE, {
       eval: true,
       workerData: { sab },
       // Keep the worker's stdio to itself: the parent's stdout carries MCP frames.
@@ -308,13 +330,19 @@ function startWorker(): GuardWorker | undefined {
     });
     worker.unref();
     worker.on('error', (err: Error) => {
-      diag(`policy: regex worker error (${err.message}); a fresh one starts on the next evaluation`);
+      const expected = terminated.has(worker);
       if (active?.worker === worker) active = undefined;
       if (pending?.worker === worker) pending = undefined;
+      if (!expected) degrade(`worker error (${err.message})`);
     });
     worker.on('exit', () => {
+      const expected = terminated.has(worker);
       if (active?.worker === worker) active = undefined;
       if (pending?.worker === worker) pending = undefined;
+      // An exit nobody asked for is the environment saying no. Clearing the
+      // slot without arming the backoff left `retryAt` in the past, so the
+      // next evaluation built another worker, and the next, and the next.
+      if (!expected) degrade('worker exited without being asked to');
     });
     return { worker, ctrl };
   } catch (err) {

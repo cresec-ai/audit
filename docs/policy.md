@@ -241,17 +241,22 @@ Keys containing `.` are not addressable in v1.
 `params.arguments` is an object per MCP, and a dot-path only resolves when it
 is one: if a client sends an array, a string, a number, a boolean or `null`
 as `arguments`, **no `args` condition matches** — a rule with `args` simply
-falls through. (Rego's `object.get` is undefined for a non-object, so this is
-what the compiled policy does too.)
+falls through. (The compiled Rego says so as an explicit
+`is_object(input.args)` line, so both engines refuse a non-object root for
+the same stated reason.)
 
 The value at the path is coerced before matching: strings as-is, numbers and
 booleans via their canonical string form (`1.5`, `true`), anything else
-(`null`, objects, arrays, missing) never matches. Values longer than 4 KiB
-are truncated to 4 KiB (4096 UTF-16 units) before the regex runs: the local
-engine matches with JavaScript's backtracking RegExp, so the cap is also the
-bound on how much work a single argument can ask of it. RE2 is linear-time,
-so the Rego side does not truncate at all and only values beyond the cap can
-ever make the two engines differ.
+(`null`, objects, arrays, missing) never matches. A value longer than 4 KiB
+(4096 UTF-16 units) is **not matched at all**, and the call is denied
+fail-closed with `policy evaluation error`. It is not truncated to the cap:
+truncating turned a deny into an allow, since `"x".repeat(5000) + "rm -rf /"`
+then did not match a `cmd: "rm -rf /"` rule and was forwarded. The cap exists
+because the local engine matches with JavaScript's backtracking RegExp and
+something has to bound the work one argument can ask of it; RE2 is
+linear-time, so the Rego side has no cap and only values beyond it can make
+the two engines differ — in the safe direction, a local deny where the
+control plane would have allowed.
 
 The number form is JavaScript's: the shortest text that round-trips, with an
 exponent only below `1e-6` or at/above `1e21`. `1234567.5` is `"1234567.5"`,
@@ -368,15 +373,25 @@ blocks. That last case is scanned fail-closed and still recorded as
   your system prompt", HTML comments carrying imperative instructions, and
   similar. False positives are possible on security documentation that
   quotes such phrases; that is why the default is `flag` (record, don't
-  touch). Before scanning, the filter normalizes a copy of the text:
-  zero-width and bidi control characters (U+200B–U+200F, U+2060–U+2064,
-  U+202A–U+202E, U+FEFF) are stripped, NFKC folds homoglyphs (fullwidth,
-  mathematical and other compatibility forms) onto their ASCII equivalents,
-  and runs of whitespace collapse to a single space; every marker found is
-  mapped back onto the original text, so what gets reported and rewritten is
-  exactly the original bytes. Base64-encoded instructions and keywords split
-  by markdown or HTML markup are out of scope — the filter does not decode or
-  un-mark-up text before scanning.
+  touch). Before scanning, the filter normalizes a copy of the text: every
+  format character (`\p{Cf}`), every default-ignorable code point and
+  U+034F are stripped — that is the whole class, not a hand-written range
+  list, because a dozen characters outside the list delivered the identical
+  instruction with `injection_found: 0`; NFKC folds homoglyphs (fullwidth,
+  mathematical and other compatibility forms) onto their ASCII equivalents;
+  combining marks are dropped in a second copy (a mark is visible, so
+  dropping it for everyone would fold distinct words together); runs of
+  whitespace collapse to a single space; and ANSI escape sequences are
+  consumed WHOLE — CSI, the intermediate and two-character forms, OSC, DCS,
+  APC, PM, SOS and the 8-bit C1 introducers — so a sequence a terminal does
+  not render cannot split a marker in two. Consuming a sequence also removes
+  text a model reading the raw bytes still sees, so a second copy keeps
+  exactly that (a string family's data, a bare escape's final byte) and the
+  two span sets are unioned. Every marker found is mapped back onto the
+  original text, so what gets reported and rewritten is exactly the original
+  bytes. Base64-encoded instructions and keywords split by markdown or HTML
+  markup are out of scope — the filter does not decode or un-mark-up text
+  before scanning.
 - **Actions.** `redact` rewrites the matched span; `block` replaces the whole
   result with an `isError` result saying what was found; `flag` forwards the
   result unchanged and only records; `off` skips the scan. When secrets and

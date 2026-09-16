@@ -437,6 +437,24 @@ describe('gateway: allow', () => {
     return out.split('\n').filter((l) => l.trim().length > 0);
   }
 
+  it('a blank or whitespace-only client line crosses unchanged rather than being refused', async () => {
+    // It carries no request and cannot carry a tool call, so there is
+    // nothing for the policy to see and nothing to refuse. Clients send
+    // these as separators and keepalives, and answering one with -32600 is
+    // the gateway inventing an error for a question nobody asked.
+    const s = startProxy(ALLOW_ALL, { command: witnessServer() });
+    await handshake(s);
+    s.sendRaw('\n');
+    s.sendRaw('   \t  \n');
+    s.sendRaw(JSON.stringify(toolsCall(9, 'echo_it', { last: true })) + '\n');
+    await waitFor(s.responded(9), 'the call after the blank lines');
+    s.stdin.end();
+    await s.done;
+
+    expect(s.out.lines().filter((l) => l.includes(UNPARSEABLE_LINE_MESSAGE))).toEqual([]);
+    expect(executed(s)).toEqual(['echo_it']);
+  });
+
   it('an allow-all policy forwards bytes unchanged in both directions (direct-vs-proxied), records gateway fields, and stamps the policy on session_start', async () => {
     const s = startProxy(ALLOW_ALL);
     for (const msg of CLIENT_SCRIPT) {
@@ -2992,7 +3010,7 @@ describe('G7: a result too deep to hash costs one field, never the whole event',
 });
 
 describe('G8: one request id gets at most one gateway answer inside a batch', () => {
-  it('a later element reusing an id the gateway already denied gets the duplicate-id refusal, not execution', async () => {
+  it('a later element reusing an id the gateway already denied is refused and recorded, but not answered twice', async () => {
     const s = startProxy(standardPolicy(), { command: witnessServer() });
     await handshake(s);
     s.sendRaw(JSON.stringify([toolsCall(5, 'delete_it', {}), toolsCall(5, 'echo_it', {})]) + '\n');
@@ -3002,11 +3020,17 @@ describe('G8: one request id gets at most one gateway answer inside a batch', ()
 
     // The second element never ran: the id was already answered on.
     expect(executed(s)).toEqual([]);
+    // And it is not answered a second time. Claiming the id stopped the
+    // element being forwarded; it did not stop the refusal being WRITTEN,
+    // and a refusal is a response — so the client used to get the deny and a
+    // duplicate-id error, two responses for one request id, which is the
+    // thing the claim set exists to prevent.
     const answers = clientMessages(s).filter((m) => m['id'] === 5);
-    expect(answers).toHaveLength(2);
-    const texts = answers.map((m) => ((m['result'] as { content: { text: string }[] }).content[0]!.text));
-    expect(texts[0]).toBe(deniedText({ tool: 'delete_it', ruleId: 'no-delete', reason: 'destructive' }));
-    expect(texts[1]).toBe(duplicateIdText('echo_it', 5, 'pending'));
+    expect(answers).toHaveLength(1);
+    const text = (answers[0]!['result'] as { content: { text: string }[] }).content[0]!.text;
+    expect(text).toBe(deniedText({ tool: 'delete_it', ruleId: 'no-delete', reason: 'destructive' }));
+    // The refusal is still recorded, so nothing the client sent goes missing
+    // from the chain.
     const calls = toolCalls(s.events()).filter((c) => c.request_id === 5);
     expect(calls.map((c) => c.error?.type)).toEqual(['policy_denied', 'duplicate_id']);
     assertChainIntact(s.store);

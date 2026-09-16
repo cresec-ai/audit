@@ -2458,6 +2458,20 @@ export async function runStdioProxy(opts) {
              * client two responses for one request id.
              */
             const claimed = new Set();
+            /**
+             * Ids the gateway has already ANSWERED on in this batch. Claiming an
+             * id stops a later element being forwarded; it does not stop the
+             * refusal itself being written, and a refusal IS a response — so a
+             * batch that denied id 5 and then reused it sent the client the deny
+             * AND a duplicate-id error, two responses for one request id, which is
+             * the thing the claim set exists to prevent. The second refusal is
+             * still recorded and still logged; it just is not answered twice.
+             */
+            const answered = new Set();
+            const answer = (id, response) => {
+                answered.add(pendingKey('c2s:', id));
+                responses.push(response);
+            };
             const claim = (el) => {
                 if (isRpcRequest(el))
                     claimed.add(pendingKey('c2s:', el.id));
@@ -2491,7 +2505,8 @@ export async function runStdioProxy(opts) {
                         const reused = refuseReusedRequestId(el, claimed);
                         if (reused !== undefined) {
                             claimed.add(pendingKey('c2s:', el.id));
-                            responses.push(reused);
+                            if (!answered.has(pendingKey('c2s:', el.id)))
+                                answer(el.id, reused);
                             return;
                         }
                     }
@@ -2500,7 +2515,8 @@ export async function runStdioProxy(opts) {
                 }
                 const reused = refuseReusedId(el, claimed);
                 if (reused !== undefined) {
-                    responses.push(reused);
+                    if (!answered.has(pendingKey('c2s:', el.id)))
+                        answer(el.id, reused);
                     return;
                 }
                 const { call, action } = buildCall(el);
@@ -2519,9 +2535,9 @@ export async function runStdioProxy(opts) {
                     diag(`gateway: hold inside a JSON-RPC batch is treated as deny (tools/call "${call.tool}")`);
                 }
                 // The gateway has now answered on this id: a later element reusing
-                // it gets the duplicate-id refusal instead of a second response.
+                // it is refused and recorded, but not answered a second time.
                 claimed.add(pendingKey('c2s:', call.id));
-                responses.push(synthesizeDeny(refused));
+                answer(call.id, synthesizeDeny(refused));
                 diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
             });
             if (kept.length > 0)
@@ -2606,6 +2622,18 @@ export async function runStdioProxy(opts) {
             const raw = line.raw;
             if (raw === undefined || line.text === null)
                 return; // unreachable: non-oversized lines carry raw
+            if (line.text.trim() === '') {
+                // A blank or whitespace-only line carries no request and cannot
+                // carry a tool call, so there is nothing for the policy to see and
+                // nothing to refuse. Clients send them as separators and keepalives;
+                // answering one with -32600 would be the gateway inventing an error
+                // for a question nobody asked. It crosses as written, and is
+                // recorded exactly as record mode records it, so the two modes'
+                // chains still say the same thing about the same bytes.
+                guarded(() => protocolError('client_to_server', 'unparseable', line.bytesLen, line.lineHashHex));
+                forwardC2s(raw);
+                return;
+            }
             let msg;
             try {
                 msg = JSON.parse(line.text);

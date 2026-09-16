@@ -97,6 +97,8 @@ const PORTABLE_LETTER_ESCAPES = new Set(['d', 'D', 'w', 'W', 'b', 'B', 'n', 'r',
 const ALLOWED_ESCAPES = '\\d \\D \\w \\W \\b \\B \\n \\r \\t \\f \\v \\xhh and any escaped punctuation';
 const HEX_DIGIT = /^[0-9A-Fa-f]$/;
 const ALPHANUMERIC = /^[0-9A-Za-z]$/;
+/** The escapes that stand for a SET of characters rather than one character. */
+const CLASS_ESCAPE = /^[dDsSwWpP]$/;
 /**
  * Why the escape starting at `pattern[i]` (a backslash) is not acceptable, or
  * undefined when it is. `inClass` is true inside a `[...]` character class,
@@ -173,6 +175,15 @@ function hexEscape(ch) {
 export function toUnicodeSource(pattern) {
     let out = '';
     let inClass = false;
+    /**
+     * Inside a class, whether the item just emitted was a class ESCAPE
+     * (`\w`, `\d`, `\p{L}`, ...). A `-` next to one is a literal dash in
+     * RE2 and in non-`u` JavaScript, and an "invalid character class" in `u`
+     * mode — so `[\w-x]`, which RE2 accepts and matches, stopped validating
+     * when the local engine moved to `u`. Escaping the dash means the same
+     * thing in all three.
+     */
+    let afterClassEscape = false;
     for (let i = 0; i < pattern.length; i++) {
         const ch = pattern[i];
         if (ch === '\\') {
@@ -195,17 +206,26 @@ export function toUnicodeSource(pattern) {
             else {
                 out += hexEscape(next);
             }
+            afterClassEscape = inClass && CLASS_ESCAPE.test(next);
             i++;
             continue;
         }
         if (inClass) {
             if (ch === ']')
                 inClass = false;
-            out += ch;
+            // A dash AFTER a class escape is a literal in RE2 and in non-`u`
+            // JavaScript, so it is escaped rather than refused. A dash BEFORE one
+            // (`[a-\d]`, a range ending in a class) is an error in RE2 too
+            // ("invalid character class range"), so it stays rejected: translating
+            // it would make the local engine accept what the control plane cannot
+            // even load.
+            out += ch === '-' && afterClassEscape ? '\\-' : ch;
+            afterClassEscape = false;
             continue;
         }
         if (ch === '[') {
             inClass = true;
+            afterClassEscape = false;
             out += ch;
             continue;
         }

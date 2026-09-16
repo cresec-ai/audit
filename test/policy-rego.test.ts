@@ -648,6 +648,9 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
         { id: 'count2', match: { tool: 'e', args: { s: '^..$' } }, action: 'deny', reason: 'exactly two' },
         { id: 'dot-class', match: { tool: 'f', args: { s: '^[.]$' } }, action: 'deny', reason: 'a literal dot' },
         { id: 'dot-escaped', match: { tool: 'g', args: { s: '^a\\.b$' } }, action: 'deny', reason: 'an escaped dot' },
+        // A dash beside a class escape: `u` mode calls it an invalid range,
+        // RE2 and non-`u` JavaScript both read it as a literal dash.
+        { id: 'class-dash', match: { tool: 'h', args: { s: '^[\\d-z]$' } }, action: 'deny', reason: 'a dash after a class escape' },
       ],
     },
   });
@@ -673,6 +676,10 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     { note: 'F9 "[.]" does not match another character', input: mcpIn('s', 'f', { s: 'x' }, 10), ruleId: null },
     { note: 'F9 an escaped "\\." is untouched by the rewrite', input: mcpIn('s', 'g', { s: 'a.b' }, 12), ruleId: 'dot-escaped' },
     { note: 'F9 "a\\.b" does not match "axb"', input: mcpIn('s', 'g', { s: 'axb' }, 12), ruleId: null },
+    { note: 'F10 "[\\d-z]" matches a literal dash in both engines', input: mcpIn('s', 'h', { s: '-' }, 10), ruleId: 'class-dash' },
+    { note: 'F10 "[\\d-z]" matches a digit', input: mcpIn('s', 'h', { s: '5' }, 10), ruleId: 'class-dash' },
+    { note: 'F10 "[\\d-z]" matches "z"', input: mcpIn('s', 'h', { s: 'z' }, 10), ruleId: 'class-dash' },
+    { note: 'F10 "[\\d-z]" is not a range: "x" does not match', input: mcpIn('s', 'h', { s: 'x' }, 10), ruleId: null },
   ];
 
   it('dots policy: "." is emitted as the explicit class, and opa check --strict / opa fmt stay green', () => {
