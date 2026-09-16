@@ -56,3 +56,29 @@ lands in `.mcp-recorder/` (gitignored); inspect it with
 and Cursor cloud agents take their MCP configuration from the platform
 dashboard instead; the exact JSON is in `docs/install.md`. Never commit
 `.mcp-recorder/`.
+
+## Dogfood runs in spawned sessions
+
+A dogfood run proves what the test suite cannot: real clients, real hosted
+connectors, real failures. Past runs are on `evidence/cloud-dogfood-*`
+branches, each with a `REPORT.md` and a signed bundle. Two practical notes
+for anyone setting up the next one.
+
+**Hooks are captured at session start.** Claude Code snapshots its hooks when
+the session begins, so installing a policy part-way through does not take
+effect. A run that needs a policy live must START from a checkout that already
+has it — commit the policy and the `--policy` flag to a throwaway branch and
+launch the session from that branch. Installing mid-session produces a false
+negative that looks like the product failing.
+
+**A spawned session will refuse an instruction it cannot verify, and it is
+right to.** Two Sonnet sessions spawned for dogfood 4 both declined before
+touching the repository; the second recorded its reason as "prompt injection
+suspected; cannot verify task legitimacy". Adding provenance to the prompt
+made it worse, not better: an assertion of authority inside the message body
+is exactly the shape of an injection, and trust cannot be bootstrapped from
+inside the message that claims it. There is no out-of-band channel to a cloud
+child session, so the fix is not a better prompt. Either the human starts the
+session themselves, which carries their authority by construction, or they
+confirm the blocked session in the web UI. Budget for this when planning a run
+that pushes a branch or touches a connector.
