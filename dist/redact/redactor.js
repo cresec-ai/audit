@@ -23,6 +23,7 @@
  * deliberately absolute rule, not merely "whatever the vocabulary allows".
  */
 import { sha256Ref } from '../chain/hash.js';
+import { ENV_PREFIX } from '../types.js';
 /** Literal stored (hashed) for function/symbol leaves. */
 const UNSERIALIZABLE = '[unserializable]';
 /** Literal stored (hashed) when JSON.stringify of a subtree throws. */
@@ -511,11 +512,11 @@ export function scrubToolArguments(redactor, value) {
 /* argv scrubbing (P1) — ServerContext.command                           */
 /* -------------------------------------------------------------------- */
 /**
- * Kept in sync with (but intentionally separate from) stdio.ts's own
- * CREDENTIAL_NAME_RE, which fingerprints env var names — argv flag names
- * use the identical shape.
+ * One shape for both the argv flag names scrubbed below and the environment
+ * variable names fingerprinted by `collectEnvCredentialFingerprints`. These
+ * used to be two identical literals in two files, "kept in sync" by comment.
  */
-const CREDENTIAL_FLAG_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
+const CREDENTIAL_NAME_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
 /** '--token' / '-t' -> 'token' / 't'; anything else -> undefined. */
 function flagName(arg) {
     const m = /^--?([A-Za-z][\w-]*)$/.exec(arg);
@@ -624,8 +625,15 @@ export function scrubArgv(argv, redactor) {
             const fname = isFlagAssign ? flagName(el.slice(0, eq)) : el.slice(0, eq);
             const value = el.slice(eq + 1);
             const label = fname ?? `argv[${i}]`;
-            if (fname !== undefined && CREDENTIAL_FLAG_RE.test(fname)) {
-                out.push(el.slice(0, eq + 1) + fingerprint(label, value));
+            if (fname !== undefined && CREDENTIAL_NAME_RE.test(fname)) {
+                // `env MCP_RECORDER_SINK_TOKEN=... server` — the recorder's OWN
+                // transport credential written into the wrapped command. It is still
+                // hashed out of `command` (nothing readable ever lands), but it is
+                // NOT fingerprinted: see `isRecorderOwnEnvVar`.
+                const ref = isRecorderOwnEnvVar(fname)
+                    ? redactor.hashString(value)
+                    : fingerprint(label, value);
+                out.push(el.slice(0, eq + 1) + ref);
                 continue;
             }
             // P1 fix: the flag name alone isn't credential-shaped (`--dsn`,
@@ -660,7 +668,7 @@ export function scrubArgv(argv, redactor) {
         }
         // A standalone value following a credential-ish flag (previous element).
         const prevName = i > 0 ? flagName(argv[i - 1]) : undefined;
-        if (prevName !== undefined && CREDENTIAL_FLAG_RE.test(prevName) && !el.startsWith('-')) {
+        if (prevName !== undefined && CREDENTIAL_NAME_RE.test(prevName) && !el.startsWith('-')) {
             out.push(fingerprint(prevName, el));
             continue;
         }
@@ -679,5 +687,66 @@ export function scrubArgv(argv, redactor) {
         out.push(el);
     }
     return { command: out.join(' '), fingerprints };
+}
+/* -------------------------------------------------------------------- */
+/* env credential fingerprints — and the one family never fingerprinted  */
+/* -------------------------------------------------------------------- */
+/**
+ * Cap on fingerprints derived from the ENVIRONMENT alone. Deliberately
+ * separate from (and lower than) the caller's overall cap, so a wrapped
+ * server with dozens of credential-shaped env vars cannot crowd out an
+ * argv/URL-derived fingerprint (P2 fix; see `MAX_CREDENTIAL_FINGERPRINTS` in
+ * src/proxy/stdio.ts).
+ */
+export const ENV_CREDENTIAL_FINGERPRINT_CAP = 32;
+/** Below this length a value is noise, not a credential. */
+const MIN_CREDENTIAL_VALUE_LEN = 8;
+/**
+ * Is this environment variable part of the RECORDER's own configuration?
+ *
+ * Such a variable is never fingerprinted. `identity.credential_fingerprints`
+ * exists to answer "which sessions saw this secret" for secrets the AGENT and
+ * the wrapped server were exposed to; the recorder's own configuration is not
+ * that. `MCP_RECORDER_SINK_TOKEN` is the clearest case and the reason this
+ * function exists: it is the transport credential the shipper authenticates
+ * to the evidence sink with, the agent never sees it, a blast-radius query
+ * for it answers nothing anyone needs — and, before this exclusion, its ref
+ * was stamped on EVERY recorded event and then shipped to the receiver that
+ * accepts that very token. Refs are unsalted by design (see
+ * `Redactor.hashString` / `sha256Ref`), so for a low-entropy token that ref
+ * is recoverable by brute force: the sink was being handed a reversible copy
+ * of its own bearer token, on every event. `MCP_RECORDER_SINK_TOKEN_FILE` is
+ * the same family (its value is where the token lives), and so is anything
+ * else added to `ENV` later — which is why this matches the whole namespace
+ * rather than a list of names that a future variable would silently escape.
+ */
+export function isRecorderOwnEnvVar(name) {
+    return name.toUpperCase().startsWith(ENV_PREFIX);
+}
+/**
+ * THE one place environment variables become `CredentialFingerprint`s.
+ *
+ * Every recording surface that wants env-derived fingerprints calls this
+ * rather than walking `env` itself, so the exclusion above cannot be lost by
+ * a new call site: a later filter over the assembled list would be, since
+ * nothing forces a new caller through it.
+ *
+ * Never throws — it is on a fail-open path; a hashing failure degrades to
+ * "fewer fingerprints", never to a broken session.
+ */
+export function collectEnvCredentialFingerprints(env, redactor, cap = ENV_CREDENTIAL_FINGERPRINT_CAP) {
+    const fingerprints = [];
+    for (const [name, value] of Object.entries(env)) {
+        if (fingerprints.length >= cap)
+            break;
+        if (typeof value !== 'string' || value.length < MIN_CREDENTIAL_VALUE_LEN)
+            continue;
+        if (!CREDENTIAL_NAME_RE.test(name))
+            continue;
+        if (isRecorderOwnEnvVar(name))
+            continue;
+        fingerprints.push({ name, ref: redactor.hashString(value) });
+    }
+    return fingerprints;
 }
 //# sourceMappingURL=redactor.js.map

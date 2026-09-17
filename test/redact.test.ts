@@ -3,13 +3,17 @@ import { canonicalJson, sha256Ref } from '../src/chain/hash.js';
 import type { RedactedRef, Scrubbed } from '../src/schema/events.js';
 import {
   DEFAULT_POLICY,
+  ENV_CREDENTIAL_FINGERPRINT_CAP,
   Redactor,
   STRUCTURAL_STRING_MAX_LEN,
+  collectEnvCredentialFingerprints,
+  isRecorderOwnEnvVar,
   looksSecret,
   scrubArgv,
   scrubToolArguments,
   structuralString,
 } from '../src/redact/redactor.js';
+import { ENV } from '../src/types.js';
 
 /* ------------------------------ fixtures ------------------------------ */
 
@@ -924,5 +928,83 @@ describe('alwaysPatterns: shapes that are the credential and nothing else', () =
   ])('the container/tag reference %s is not userinfo', (ref) => {
     const urlRe = DEFAULT_POLICY.alwaysPatterns.find((r) => r.source.startsWith('(?<=:\\/\\/)'))!;
     expect(new RegExp(urlRe.source).test(ref)).toBe(false);
+  });
+});
+
+/* --- Finding 12 (local dogfood 6): the recorder's OWN configuration
+ * credentials must never be fingerprinted. With a sink configured, every
+ * recorded event carried a fingerprint of MCP_RECORDER_SINK_TOKEN — the
+ * shipper's own bearer token, which the agent never sees — and the shipper
+ * then delivered those events TO THE RECEIVER THAT ACCEPTS THAT TOKEN. Refs
+ * are unsalted by design, so for a low-entropy token that is a reversible
+ * copy of the credential. The exclusion lives INSIDE the collector, not at a
+ * call site and not in a later filter, so a new caller cannot lose it. */
+describe('env credential fingerprints exclude the recorder own configuration (finding 12)', () => {
+  const redactor = new Redactor({ mode: 'allowlist' });
+
+  it('never fingerprints the sink token, its file path, or any other MCP_RECORDER_* variable', () => {
+    const token = 'local-ingest';
+    const fps = collectEnvCredentialFingerprints(
+      {
+        [ENV.SINK]: 'https://sink.example.com',
+        [ENV.SINK_TOKEN]: token,
+        [ENV.SINK_TOKEN_FILE]: '/etc/mcp-recorder/sink-token',
+        // A shape no name list anticipates: the exclusion is the namespace,
+        // not an enumeration of today's variables.
+        MCP_RECORDER_FUTURE_API_KEY: 'whatever-comes-next',
+      },
+      redactor,
+    );
+    expect(fps).toEqual([]);
+    // ...and specifically not by value either: the report verified that the
+    // stored ref equalled sha256('local-ingest').
+    expect(fps.map((f) => f.ref)).not.toContain(redactor.hashString(token));
+  });
+
+  it('still fingerprints a genuine credential-shaped variable (no over-correction)', () => {
+    const fps = collectEnvCredentialFingerprints(
+      {
+        GITHUB_TOKEN: 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456',
+        [ENV.SINK_TOKEN]: 'local-ingest',
+        PATH: '/usr/bin:/bin',
+        SHORT_TOKEN: 'abc', // below the value-length floor
+      },
+      redactor,
+    );
+    expect(fps).toEqual([
+      { name: 'GITHUB_TOKEN', ref: redactor.hashString('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456') },
+    ]);
+  });
+
+  it('caps env-derived fingerprints on their own, leaving room for argv-derived ones', () => {
+    const env: NodeJS.ProcessEnv = {};
+    for (let i = 0; i < ENV_CREDENTIAL_FINGERPRINT_CAP + 8; i++) {
+      env[`SERVICE_TOKEN_${String(i)}`] = `env-credential-value-${String(i)}`;
+    }
+    expect(collectEnvCredentialFingerprints(env, redactor).length).toBe(
+      ENV_CREDENTIAL_FINGERPRINT_CAP,
+    );
+  });
+
+  it('matches the recorder namespace case-insensitively, and nothing outside it', () => {
+    expect(isRecorderOwnEnvVar(ENV.SINK_TOKEN)).toBe(true);
+    expect(isRecorderOwnEnvVar('mcp_recorder_sink_token')).toBe(true);
+    expect(isRecorderOwnEnvVar('GITHUB_TOKEN')).toBe(false);
+    expect(isRecorderOwnEnvVar('MY_MCP_RECORDER_TOKEN')).toBe(false);
+    // Every variable the recorder reads for itself is inside the namespace.
+    for (const name of Object.values(ENV)) expect(isRecorderOwnEnvVar(name)).toBe(true);
+  });
+
+  it('keeps the sink token out of a wrapped `env NAME=value ...` command, unfingerprinted', () => {
+    const token = 'local-ingest';
+    const { command, fingerprints } = scrubArgv(
+      ['env', `${ENV.SINK_TOKEN}=${token}`, 'node', 'server.js'],
+      redactor,
+    );
+    // Still not readable in ServerContext.command...
+    expect(command).not.toContain(token);
+    expect(command).toBe(`env ${ENV.SINK_TOKEN}=${redactor.hashString(token)} node server.js`);
+    // ...and still not fingerprinted onto identity either.
+    expect(fingerprints).toEqual([]);
   });
 });

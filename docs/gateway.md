@@ -192,6 +192,11 @@ mcp-recorder query 'sk-demo-EXFILTRATION-c4n4ry-9f3a7b2e'   # a redacted value i
 mcp-recorder export --out evidence.zip
 ```
 
+`query` matches the **exact** value: the needle is hashed whole, so
+`query attacker.example` finds nothing where
+`query https://attacker.example/collect` finds the call — measured in local
+dogfood 6, on a store recorded by this same demo policy.
+
 Three things are recorded ([docs/event-schema.md](event-schema.md)):
 
 - `session_start.policy` — the hash and name of the policy that was in force;

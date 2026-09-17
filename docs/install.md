@@ -548,6 +548,15 @@ mcp-recorder query "<a value your call touched>"   # blast-radius: which session
 
 If `sessions` comes back empty, see Troubleshooting below.
 
+**`query` matches exact values, not substrings.** The needle is hashed whole
+and compared against stored refs, so pass the value exactly as the agent
+passed it. `query attacker.example` finds nothing while
+`query https://attacker.example/collect` finds the call, and
+`query mcp__claude_ai_ClickUp__clickup_filter_tasks` — the name Claude Code
+shows you — finds nothing while the bare `clickup_filter_tasks` finds both
+calls, because the server and the tool are stored as separate fields. Both
+misses are from local dogfood 6, where they cost an investigation.
+
 ## Where the data lives and what's in it
 
 Default data directory: `~/.mcp-recorder` (override with `--data-dir` or

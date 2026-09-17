@@ -310,6 +310,23 @@ export interface RecorderConfig {
     /** MCP_RECORDER_DISABLE=1 → pure passthrough, no recording. */
     disabled: boolean;
 }
+/**
+ * The namespace of every environment variable the recorder reads for its OWN
+ * configuration — every key in `ENV` below starts with it, and so must any
+ * future one.
+ *
+ * It exists because that namespace has to be excluded from credential
+ * fingerprinting. `identity.credential_fingerprints` answers "which sessions
+ * saw this secret", which is only meaningful for secrets the AGENT and the
+ * wrapped server were exposed to. Ours are not those: `MCP_RECORDER_SINK_TOKEN`
+ * is the recorder's own transport credential, the agent never sees it, and its
+ * ref would be shipped by the sink TO THE RECEIVER THAT ACCEPTS THAT VERY
+ * TOKEN — the worst possible destination for it, given refs are unsalted by
+ * design (see `sha256Ref`) and a low-entropy token is therefore recoverable
+ * from one. See `collectEnvCredentialFingerprints` in src/redact/redactor.ts,
+ * which is the one place this exclusion is applied.
+ */
+export declare const ENV_PREFIX = "MCP_RECORDER_";
 export declare const ENV: {
     readonly DATA_DIR: "MCP_RECORDER_DATA_DIR";
     readonly STORE: "MCP_RECORDER_STORE";
@@ -321,6 +338,19 @@ export declare const ENV: {
      *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
      *  See src/hook/mcp-config.ts. */
     readonly MCP_CONFIG: "MCP_RECORDER_MCP_CONFIG";
+    /**
+     * Additive (evidence sink): base URL of a receiver to replicate sealed
+     * records to. SETTING IT IS THE ENTIRE OPT-IN — absent, there is no sink,
+     * no shipper and byte-identical behaviour to a build without the feature.
+     * There is deliberately no second `..._ENABLED` switch. See src/sink.
+     */
+    readonly SINK: "MCP_RECORDER_SINK";
+    /** Additive: the sink's bearer token (channel authorisation only — it
+     *  answers "may this connection write to tenant T at all", nothing more). */
+    readonly SINK_TOKEN: "MCP_RECORDER_SINK_TOKEN";
+    /** Additive: a file holding the bearer token, for platforms where a
+     *  root-owned file is easier to protect than an environment variable. */
+    readonly SINK_TOKEN_FILE: "MCP_RECORDER_SINK_TOKEN_FILE";
 };
 /** File names inside the data dir. */
 export declare const FILES: {
@@ -329,4 +359,11 @@ export declare const FILES: {
     readonly JSONL_SIGS: "signatures.jsonl";
     readonly PRIVATE_KEY: "identity.key";
     readonly PUBLIC_KEY: "identity.pub";
+    /** Evidence sink: cached copy of the receiver's cursor. A CACHE ONLY —
+     *  the receiver is always the authority on what it holds. */
+    readonly SINK_CURSOR: "sink-cursor.json";
+    /** Evidence sink: single-instance mutex DIRECTORY for `ship`. */
+    readonly SHIP_LOCK: "ship.lock";
+    /** Evidence sink: what `ship --status` prints. */
+    readonly SHIP_STATUS: "ship-status.json";
 };

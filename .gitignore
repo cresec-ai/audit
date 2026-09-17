@@ -10,6 +10,9 @@ coverage.*
 # Local evidence stores / demo output (never commit recorded data)
 .mcp-recorder/
 demo-data/
+# Default data dir of the reference receiver (receiver/): received evidence,
+# ingest tokens and the operator token. Never commit it.
+receiver-data/
 *.evidence.db
 *.evidence.jsonl
 bundle*.zip

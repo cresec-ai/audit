@@ -34,9 +34,29 @@
  * (`mcp__ClickUp__clickup_filter_tasks`) — route 1 missed, so no
  * `server.url` was recorded for any hosted connector, no host alias existed,
  * and both of that run's live deny rules failed to fire while the calls went
- * through to the real workspace. A local session is keyed by friendly name
- * with friendly tool names (route 1 again). Resolution therefore may not
- * assume the key equals the segment.
+ * through to the real workspace. Resolution therefore may not assume the key
+ * equals the segment.
+ *
+ * LOCALLY, NEITHER ROUTE RESOLVES ANYTHING — measured, not assumed. Local
+ * dogfood 6 (`evidence/local-dogfood-6/REPORT.md`, Part 1) ran on one machine
+ * with two local Claude Code surfaces, a WSL2 CLI and a Windows Desktop Code
+ * tab, on one claude.ai account, and found:
+ *   - NO `/tmp/mcp-config-*.json` at all — checked before a CLI session,
+ *     polled every 0.25 s while one ran, and after it exited; nothing under
+ *     the Windows host's `%TEMP%`, `%LOCALAPPDATA%\Temp` or `C:\tmp` either,
+ *     and neither surface's `claude` process is launched with `--mcp-config`.
+ *   - NO claude.ai connector in any `mcpServers` map on that machine. Hosted
+ *     connectors live in `remoteMcpServersConfig` inside a Desktop
+ *     session-metadata file, which has no `mcpServers` key at all; the Desktop
+ *     chat config's entry is a keyed stdio command with no `url`; project
+ *     `.mcp.json` entries are stdio and this resolver never reads that file.
+ * So in a local session, unless `MCP_RECORDER_MCP_CONFIG` is pointed at a file
+ * by hand, there is no candidate file: route 1 and route 2 both resolve
+ * nothing for EVERY server, `server.url` is never recorded, no host alias ever
+ * exists, and a host-alias deny rule can never fire — only tool-anchored rules
+ * (`^mcp__.*__<tool>$`) work there. (An earlier version of this comment
+ * claimed a local session was "keyed by friendly name with friendly tool
+ * names (route 1 again)". That was written from assumption and is disproved.)
  *
  * WHAT IS TAKEN from the chosen entry, and nothing else: the vendor endpoint
  * carried (URL-encoded) in the relay URL's `mcp_url` query parameter when

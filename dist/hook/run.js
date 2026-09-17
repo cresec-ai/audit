@@ -161,7 +161,7 @@ export async function runHook(stdinText, opts) {
         /* -------------------------- recording setup -------------------------- */
         let setup;
         try {
-            setup = await setupProxyRecording(opts.config, diagStderr);
+            setup = await setupProxyRecording(opts.config, diagStderr, { surface: 'hook' });
         }
         catch {
             return ALLOW; // recording could not initialize: still allow, fail-open

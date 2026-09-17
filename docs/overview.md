@@ -436,10 +436,20 @@ Nothing on stdout and exit 0 is how the hook says "allow". The control's
 recorded event carries `"error": null` and no `server.url` at all.
 
 **State it precisely.** The declared-tool fallback is proven against the real
-binary in the exact shape that defeated dogfood 4. It has not yet been
-exercised by a live session that naturally presents that mismatch. If a deny
-rule against a hosted connector has to hold, write it to match the raw tool
-name as well as the host alias — route B above needs no resolution at all —
+binary in the exact shape that defeated dogfood 4, and **cloud dogfood 6 then
+ran it inside a live session**: that run rewrote its own MCP config at session
+start so no key could match any segment, and the host-alias-only rule fired and
+blocked both live ClickUp calls, with
+`server.url: "https://mcp.clickup.com/mcp"` on the denied events. The mismatch
+was forced deliberately; no run has yet been handed one by the platform.
+
+**And none of it happens on a laptop.** Local dogfood 6 found no
+`/tmp/mcp-config-*.json` on a local machine — not before, during or after a
+session — and no claude.ai connector in any `mcpServers` map there, so
+`server.url` is never recorded locally and a host-alias rule can never fire.
+If a deny rule against a hosted connector has to hold, write it to match the
+raw tool name as well as the host alias — route B above needs no resolution at
+all, and locally it is the only thing that works —
 and [docs/hooks.md](hooks.md#write-deny-rules-against-the-tool-not-the-server-segment)
 gives the shape.
 
@@ -828,6 +838,9 @@ It does not fit if:
 
 - [docs/install.md](install.md) — installation, per-client config, Windows and
   WSL, uninstall, troubleshooting.
+- [docs/deployment.md](deployment.md) — what deploying this in a customer looks
+  like, per agent platform: what the install is, how it reaches a fleet, what
+  breaks it, and a rollout order.
 - [docs/connector-coverage.md](connector-coverage.md) — the authority on what
   each surface exposes, and what needs Anthropic.
 - [docs/hooks.md](hooks.md) — the Claude Code tap in detail, including the

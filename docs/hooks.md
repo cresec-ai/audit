@@ -17,7 +17,10 @@ connectors** such as `mcp__ClickUp__*`, `mcp__Gmail__*`, `mcp__github__*`,
 Anthropic's infrastructure. No local proxy — this one included — can sit in
 front of them. (In a Claude Code *cloud* session most of them are not even
 named that readably: they arrive as opaque UUIDs — see
-[Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl).)
+[Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl). Locally
+they are named differently again, and differently per surface: the Desktop
+"Code" tab uses the connector's UUID, the CLI uses `claude_ai_<Name>` — see
+[Local sessions](#local-sessions-no-config-file-so-no-serverurl).)
 
 Every tool call Claude Code makes, hosted connectors included, passes
 through its **PreToolUse** hook first, and then exactly one of
@@ -282,9 +285,10 @@ two sides can disagree.** Cloud dogfood 3 saw UUID-keyed config *and*
 UUID-prefixed tool names. Cloud dogfood 4, on the same repository a day
 later, saw a **UUID-keyed config file and friendly tool names**
 (`mcp__ClickUp__clickup_filter_tasks`, `mcp__Gmail__*`,
-`mcp__Google_Calendar__*`, `mcp__Google_Drive__*`). Other sessions key the
-config by friendly name (`ClickUp`, `Gmail`, `github`) with friendly tool
-names. So the `<server>` segment of a tool name is **not** guaranteed to be
+`mcp__Google_Calendar__*`, `mcp__Google_Drive__*`). **On a local machine
+there is no such file at all, and no key of any kind** — see [Local
+sessions](#local-sessions-no-config-file-so-no-serverurl). So the
+`<server>` segment of a tool name is **not** guaranteed to be
 a key of `mcpServers`, and resolution must not assume it is — the first
 shipped version did, which is exactly how dogfood 4's deny policy failed
 (see [Write deny rules against the tool](#write-deny-rules-against-the-tool-not-the-server-segment)).
@@ -307,7 +311,12 @@ goes varies:
 | --- | --- | --- |
 | cloud dogfood 3 | UUID | `mcp__47d587b8-…__clickup_get_list` |
 | cloud dogfood 4 | UUID | `mcp__ClickUp__clickup_filter_tasks` |
-| a local session | `ClickUp` | `mcp__ClickUp__clickup_filter_tasks` |
+| local dogfood 6, WSL CLI | **no config file, so no key** | `mcp__claude_ai_ClickUp__clickup_filter_tasks` |
+| local dogfood 6, Desktop "Code" tab | **no config file, so no key** | `mcp__47d587b8-…__clickup_filter_tasks` |
+
+(The two local rows are one machine, one account, one connector. They are
+measured; an earlier version of this table claimed a local session was keyed
+`ClickUp` with friendly tool names, which was an assumption and is wrong.)
 
 So the entry is looked for two ways, in this order:
 
@@ -331,7 +340,11 @@ The sources, in order:
 
 1. **`MCP_RECORDER_MCP_CONFIG`** — one path, or comma-separated paths tried
    in order. Set it in the environment the hook runs in to pin a specific
-   file (or to point a local Claude Code's hook at its own `.mcp.json`).
+   file. It has to be a file shaped like the one above — an `mcpServers` map
+   whose entries carry a `url`. Pointing it at a project `.mcp.json` resolves
+   nothing, because those entries are stdio commands with no `url`, and local
+   dogfood 6 found nothing else on a local machine that has the shape either
+   (see [Local sessions](#local-sessions-no-config-file-so-no-serverurl)).
 2. Otherwise **the files matching `/tmp/mcp-config-*.json`** — what a cloud
    session has, so cloud sessions need no configuration at all.
 
@@ -380,6 +393,79 @@ inherits that unchanged — it only decides which entry of the same untrusted
 file is read — and its uniqueness requirement is there so a forged or sloppy
 file cannot attribute a tool to the wrong vendor and produce a wrong deny.
 
+## Local sessions: no config file, so no `server.url`
+
+Everything above is about a **cloud** session, where `/tmp/mcp-config-*.json`
+exists. On a local machine it does not. **Local dogfood 6**
+(`evidence/local-dogfood-6/REPORT.md`, Part 1 — 2026-09-17, one Windows 11
+machine with two Claude Code surfaces on one claude.ai account: a WSL2 CLI and
+the Desktop "Code" tab) looked for it and found nothing:
+
+- **No `/tmp/mcp-config-*.json`, ever.** Checked before a `claude -p` session,
+  polled every 0.25 s *while* one ran, and after it exited: zero files each
+  time. A scan of the Windows host's `%TEMP%`, `%LOCALAPPDATA%\Temp` and
+  `C:\tmp` for `mcp-config*` printed nothing, and neither surface's `claude`
+  process is launched with `--mcp-config`.
+- **No claude.ai connector in any `mcpServers` map on that machine.** Windows
+  and WSL `~/.claude.json` have empty `mcpServers`; the project `.mcp.json`
+  holds only the two stdio servers this repository wraps; the Desktop *chat*
+  config's `clickup` entry is a stdio `command`/`args` pair with no `url` and
+  no `tools[]`. The connectors actually live in `remoteMcpServersConfig`
+  inside a Desktop session-metadata file (`…\claude-code-sessions\…json`),
+  which has **no `mcpServers` key at all**, and in nothing the CLI exposes.
+- **Pointing `MCP_RECORDER_MCP_CONFIG` at those two files resolves nothing**,
+  which the run tested directly: with the Desktop session file the event came
+  out with `server.name` = the UUID and no `url`; with the Desktop chat config
+  it came out `server.name: "clickup"` and no `url`.
+
+**So on a local session neither route resolves.** Route 1 has no candidate
+file to key into and route 2 has no `tools[]` to match, for hosted connectors
+and `.mcp.json` servers alike. `server.url` is never recorded, no host alias
+is ever derived, and PR #16's declared-tool fallback cannot run at all. That
+holds unless you point `MCP_RECORDER_MCP_CONFIG` by hand at a file that
+really is an `mcpServers` map with `url`s — and nothing on that machine was.
+
+**The operator consequence, plainly: on a local session, only tool-anchored
+deny rules work.** A rule spelled as a host alias cannot fire, because the
+alias cannot be derived. Write this:
+
+```json
+{ "tool": "^mcp__.*__clickup_filter_tasks$", "reason": "bulk task reads are blocked" }
+```
+
+That is the rule local dogfood 6 ran, and it blocked both live
+`clickup_filter_tasks` attempts in a fresh WSL CLI session — the calls came
+back to the model as `mcp-recorder policy: df6-local: tool-anchored deny`, no
+workspace data was returned, and Claude Code listed both under
+`permission_denials`. The recorded deny carries
+`server.name: "claude_ai_ClickUp"`, `error.type: "policy_denied"` and **no
+`server.url`**: the block came from the tool segment of the name, which needs
+no resolution. A rule written `^mcp__mcp\.clickup\.com__clickup_filter_tasks$`
+would have matched nothing in that session.
+
+**And do not anchor on the server segment either.** One ClickUp connector,
+one account: **two different segments on one machine at the same time, and a
+third in the cloud**.
+
+| Where | Segment the hook sees |
+| --- | --- |
+| Desktop "Code" tab (Windows host) | `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_filter_tasks` |
+| WSL CLI (`claude -p`) | `mcp__claude_ai_ClickUp__clickup_filter_tasks` |
+| Cloud session (cloud dogfood 4) | `mcp__ClickUp__clickup_filter_tasks` |
+
+The same connector, the same person, the same day for the first two. A rule,
+a permission entry or an allowlist anchored to any one of those spellings is
+surface-specific and silently stops matching on the others — see [Write deny
+rules against the
+tool](#write-deny-rules-against-the-tool-not-the-server-segment).
+
+**Recording itself is unaffected.** The local run recorded every call, hashed
+the arguments, chained and signed them, and `verify` passed; what is missing
+is only the connector's origin and everything derived from it. Local dogfood 6
+covered two surfaces on one machine, so read it as "this is what a local
+machine did", not as a guarantee about every local machine — but do not plan a
+local deployment on a host alias that has never been observed locally.
+
 ## Policy: allow / deny
 
 An optional JSON file passed as `--policy FILE` (to `hook` directly, or
@@ -410,7 +496,9 @@ Claude Code then never runs the tool at all.
   tool](#write-deny-rules-against-the-tool-not-the-server-segment), which is
   the part of this page to read before writing a policy you intend to rely
   on. A **`deny` rule is also tested**, when the server's origin was resolved
-  (see [Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl)),
+  (see [Cloud sessions](#cloud-sessions-uuid-server-names-and-serverurl); in
+  a local session it never is, see [Local
+  sessions](#local-sessions-no-config-file-so-no-serverurl)),
   **against the alias `mcp__<host>__<tool>`**: a cloud session's
   `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_delete_task` is
   also tested as `mcp__mcp.clickup.com__clickup_delete_task`, and the rule
@@ -467,6 +555,15 @@ not by you and not by this tool. It has been observed as a UUID
 friendly name (`mcp__ClickUp__clickup_filter_tasks`) in another on the same
 repository a day later, and the MCP config file's own keying is a separate
 choice that can disagree with the segment. **Treat it as unstable.**
+
+It is not only a cloud phenomenon, and not only a per-session one. Local
+dogfood 6 found **one ClickUp connector, one account, one machine, carrying
+two different segments at the same time** — `mcp__47d587b8-…__clickup_*` in
+the Desktop "Code" tab and `mcp__claude_ai_ClickUp__clickup_*` in the WSL
+CLI — with cloud dogfood 4's `mcp__ClickUp__…` as a third form of the same
+connector. Anchoring on the segment therefore also makes a rule
+*surface-specific*: it can hold in the terminal and miss in the Desktop tab on
+the same laptop.
 
 This is not hypothetical. Cloud dogfood 4 ran a live Claude Code session
 with the hook installed on
@@ -528,10 +625,14 @@ Worked through the namings dogfood 3 and dogfood 4 each saw:
 | `mcp__47d587b8-…__clickup_filter_tasks` | `mcp__mcp.clickup.com__…` | deny | **deny** |
 | `mcp__47d587b8-…__clickup_get_workspace_members` | `mcp__mcp.clickup.com__…` | deny | **deny** |
 | `mcp__ClickUp__clickup_filter_tasks` | `mcp__mcp.clickup.com__…` | deny | **deny** |
+| `mcp__claude_ai_ClickUp__clickup_filter_tasks` (local dogfood 6, WSL CLI) | none, and none is possible locally | allow | **deny — what happened live** |
 
-The last row is the friendly name once the connector-resolution fix lets the
-alias resolve: it repairs one of dogfood 4's two routes. The open rule
-already held in every row, including the two that happened live, with no
+The fifth row is the friendly name once the connector-resolution fix lets the
+alias resolve: it repairs one of dogfood 4's two routes. The sixth is a local
+session, where no alias can resolve at all ([Local
+sessions](#local-sessions-no-config-file-so-no-serverurl)) and the open rule
+is the only one that can fire — it did, blocking both live attempts. The open
+rule held in every row, including the three that happened live, with no
 resolution at all.
 
 Three things follow.
@@ -546,7 +647,9 @@ Three things follow.
   best-effort, and exists only when the server resolved against the MCP
   config — so it can vanish for exactly the reason a segment-anchored rule
   stops matching, which is what made dogfood 4's two "independent" routes
-  fail together. Use it to make a policy readable, never to make it hold.
+  fail together. **On a local session it is not a line of defence at all:
+  there is no config file, so the alias never exists.** Use it to make a
+  policy readable, never to make it hold.
 - **`allow` rules are segment-anchored by necessity** (they are never tested
   against the alias). `^mcp__github__.*$` stops matching if that server is
   ever renamed: under `default: "allow"` nothing changes, under

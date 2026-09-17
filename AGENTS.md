@@ -59,6 +59,18 @@ setup hook calls the same script:
 - No readable payload strings ever reach the store, the replay page, or a
   bundle; tool arguments are hashed unconditionally.
 - Never skip or weaken a test to get green.
+- The evidence sink (`MCP_RECORDER_SINK`, `mcp-recorder ship`, `src/sink/`)
+  is a read-only REPLICA and never runs on the forwarding path. It ships in
+  its own detached process, one per data dir; `record`/`http`/`hook` do one
+  `statSync` and at most a spawn-and-forget between them. It never calls
+  `record()`, never appends to the chain, and has no second queue — the spool
+  IS the chain, read with `store.iterate`. A sink that is down, slow, 500ing,
+  401ing or hostile must never block a tool call, deny one, change a byte of
+  stdout, change an exit code, or cost a local event. It cannot widen
+  redaction either: records go on the wire verbatim, so a rewritten `event`
+  stops reproducing `record.hash`. Never couple it to gateway enforcement —
+  that is fail-CLOSED and decided entirely in-process. See docs/sink.md.
+
 - Gateway mode (`record --policy`) is the ONLY place the proxy may block,
   delay or rewrite traffic, and only for `tools/call` requests and their
   results. Without `--policy` the byte-for-byte, fail-open behaviour above is
