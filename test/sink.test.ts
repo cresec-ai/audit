@@ -14,7 +14,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -954,8 +954,26 @@ describe('sink self-check', () => {
 
 describe('shipper process', () => {
   it('resolves its own CLI entry point in both the tsx and the dist world', () => {
-    expect(cliEntryPoint('file:///pkg/dist/sink/spawn.js')).toBe(join('/pkg', 'dist', 'cli.js'));
-    expect(cliEntryPoint('file:///pkg/src/sink/spawn.ts')).toBe(join('/pkg', 'src', 'cli.ts'));
+    // Build the URLs the way Node itself would, rather than writing a POSIX
+    // file URL literal: on Windows `file:///pkg/...` carries no drive letter,
+    // so fileURLToPath rejects it (ERR_INVALID_FILE_URL_PATH) and this test
+    // failed there while passing everywhere else. The root is anchored to
+    // this test file rather than to `resolve('/pkg')`, because that depends
+    // on the cwd's drive being set — anchoring guarantees a real absolute
+    // path, drive letter included, on every platform.
+    const root = resolve(fileURLToPath(import.meta.url), '..', 'pkg-fixture');
+    const url = (...parts: string[]): string => pathToFileURL(join(root, ...parts)).href;
+    expect(cliEntryPoint(url('dist', 'sink', 'spawn.js'))).toBe(join(root, 'dist', 'cli.js'));
+    expect(cliEntryPoint(url('src', 'sink', 'spawn.ts'))).toBe(join(root, 'src', 'cli.ts'));
+  });
+
+  it('defaults to its own module URL, which is what the recording surfaces rely on', () => {
+    // The production call passes no argument: the entry point is derived from
+    // import.meta.url of the real spawn module. Under the test runner that is
+    // the tsx world, so it must resolve to src/cli.ts next to it.
+    const entry = cliEntryPoint();
+    expect(entry).toBe(join(resolve(fileURLToPath(import.meta.url), '..', '..', 'src'), 'cli.ts'));
+    expect(existsSync(entry)).toBe(true);
   });
 
   it('spawns at most one shipper per data dir, detached and unref-ed', () => {
