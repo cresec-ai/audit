@@ -69,6 +69,7 @@ import type {
   BundleManifest,
   EvidenceStore,
   RecorderConfig,
+  SessionSummary,
   VerifyProblem,
   VerifyResult,
 } from './types.js';
@@ -1106,6 +1107,25 @@ async function cmdQuery(flags: Flags, positionals: string[]): Promise<void> {
   }
 }
 
+/**
+ * The ENDED cell. A `session_end` is NOT necessarily a session's last event:
+ * a Claude Code session resumed under the same session_id keeps recording
+ * after it (cloud dogfood 4: session_end at 07:59:20, tool calls until
+ * 12:41:08), and every count in the row is a live aggregate over all of it.
+ * Printing that superseded timestamp under "ENDED" invites the reading the
+ * dogfood report actually made — "it ended at 07:59:20, so the later counts
+ * must be stale". So an end time is printed only when the session_end is
+ * genuinely the last event; a session that was ended and then reopened
+ * reads `(reopened)` (its session_end stays in `--json` as `ended_at`), and
+ * one that never ended reads `(open)` as it always has. LAST_EVENT carries
+ * the instant the counts run through in every case.
+ */
+function endedCell(s: SessionSummary): string {
+  if (s.ended_at === undefined) return '(open)';
+  if (s.last_event_at !== undefined && s.last_event_at > s.ended_at) return '(reopened)';
+  return s.ended_at;
+}
+
 async function cmdSessions(flags: Flags): Promise<void> {
   guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
@@ -1135,11 +1155,12 @@ async function cmdSessions(flags: Flags): Promise<void> {
           'ERRORS',
           'SERVERS',
           'DECISIONS',
+          'LAST_EVENT',
         ],
         sessions.map((s) => [
           id8(s.session_id),
           s.started_at,
-          s.ended_at ?? '(open)',
+          endedCell(s),
           s.server_name,
           String(s.event_count),
           String(s.tool_call_count),
@@ -1153,6 +1174,10 @@ async function cmdSessions(flags: Flags): Promise<void> {
           // policy. A denied call also shows up under TOOL_CALLS and
           // ERRORS — the refusal the client was handed is a call too.
           s.policy_decision_count === undefined ? '' : String(s.policy_decision_count),
+          // The instant every count in this row runs through — the same for
+          // a session that ended and stayed ended, later for a reopened or
+          // still-open one.
+          s.last_event_at ?? '',
         ]),
       ),
     );

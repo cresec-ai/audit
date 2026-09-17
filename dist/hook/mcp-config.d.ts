@@ -19,23 +19,45 @@
  *               "type":"http","tools":[{"name":"clickup_get_list","permission_policy":"always_allow"},…]},
  *     …}}
  *
- * WHAT IS TAKEN from it — for the ONE entry named exactly like the segment,
- * and nothing else: the vendor endpoint carried (URL-encoded) in the relay
- * URL's `mcp_url` query parameter when present (`https://mcp.clickup.com/mcp`),
- * else the entry's own `url` (the Anthropic relay); scrubbed by
- * `scrubOriginUrl` below; plus that URL's hostname, which `run.ts` turns
- * into the policy alias `mcp__<host>__<tool>`. No headers (they carry the
- * session id and server ids), no session ids (the relay PATH embeds one —
- * it is hashed in place, see `scrubOriginUrl`), no tool lists, no
- * permission policies, no other entries.
+ * WHICH ENTRY, in this order, and never by guesswork:
+ *   1. KEY — the entry whose `mcpServers` key is exactly the segment. The
+ *      precise route; tried in every candidate file before route 2 is.
+ *   2. DECLARED TOOL — the entry whose `tools[]` declares exactly the tool
+ *      being called, used ONLY when EXACTLY ONE entry of a file declares it
+ *      and that file has no entry keyed by the segment at all. Zero matches,
+ *      or two or more, resolve to nothing.
+ *
+ * WHY ROUTE 2 EXISTS. The config key and the tool-name segment disagree in
+ * real sessions, and which way varies per session. Cloud dogfood 3: config
+ * UUID-keyed, tool names UUID-prefixed — route 1 worked. Cloud dogfood 4:
+ * config UUID-keyed, tool names FRIENDLY
+ * (`mcp__ClickUp__clickup_filter_tasks`) — route 1 missed, so no
+ * `server.url` was recorded for any hosted connector, no host alias existed,
+ * and both of that run's live deny rules failed to fire while the calls went
+ * through to the real workspace. A local session is keyed by friendly name
+ * with friendly tool names (route 1 again). Resolution therefore may not
+ * assume the key equals the segment.
+ *
+ * WHAT IS TAKEN from the chosen entry, and nothing else: the vendor endpoint
+ * carried (URL-encoded) in the relay URL's `mcp_url` query parameter when
+ * present (`https://mcp.clickup.com/mcp`), else the entry's own `url` (the
+ * Anthropic relay); scrubbed by `scrubOriginUrl` below; plus that URL's
+ * hostname, which `run.ts` turns into the policy alias `mcp__<host>__<tool>`.
+ * No headers (they carry the session id and server ids), no session ids (the
+ * relay PATH embeds one — it is hashed in place, see `scrubOriginUrl`), no
+ * permission policies, no other entries; a `tools[].name` is READ by route 2
+ * (compared against the tool being called) but never recorded.
  *
  * SOURCES, in order: `MCP_RECORDER_MCP_CONFIG` (one path, or comma-separated
  * paths, tried in order) when set; else the files matching
- * `/tmp/mcp-config-*.json` (what a cloud session has). The first file whose
- * `mcpServers` has the segment wins. Resolution is attempted for every MCP
- * tool event — a UUID segment is the case this exists for, and a readable
- * name (`github`) still gets its relay URL — but it is cheap: a file that
- * does not even contain the quoted segment is skipped before parsing.
+ * `/tmp/mcp-config-*.json` (what a cloud session has — one file per live
+ * session, so several can match). The first file whose `mcpServers` has the
+ * segment as a KEY wins; only when NO file does is route 2 tried, again in
+ * file order, so the precise route beats the fallback even across files.
+ * Resolution is attempted for every MCP tool event — a UUID segment is the
+ * case this exists for, and a readable name (`github`) still gets its relay
+ * URL — but it is cheap: a file containing neither the quoted segment nor
+ * the quoted tool name is skipped before parsing.
  *
  * FAIL-OPEN, ALWAYS: `resolveServerOrigin` never throws and never blocks.
  * A missing, unreadable, oversized (> `MCP_CONFIG_MAX_BYTES`), malformed or
@@ -52,7 +74,11 @@
  * same environment and changes nothing about that. Consumers therefore
  * treat `url` as the config file's claim about the server, and the policy
  * alias built from `host` is DENY-ONLY (src/hook/policy.ts): a forged file
- * can add a deny or make one miss, never turn a deny into an allow.
+ * can add a deny or make one miss, never turn a deny into an allow. Route 2
+ * changes nothing about that — it only decides WHICH entry of the same
+ * (already untrusted) file is read, and the uniqueness requirement keeps a
+ * forged or sloppy file from attributing a tool to the wrong vendor and so
+ * producing a WRONG deny.
  */
 /** Where a cloud session's Claude Code MCP config lives (one per session). */
 export declare const CLOUD_MCP_CONFIG_GLOB = "/tmp/mcp-config-*.json";
@@ -89,6 +115,11 @@ export interface ResolveServerOriginOpts {
     /** Expand one glob pattern into matching paths, sorted. Default:
      *  `simpleGlob` (a single `*` in the basename). May throw — swallowed. */
     glob?: (pattern: string) => string[];
+    /** The bare MCP tool name of the call being resolved — the `<tool>` of
+     *  `mcp__<server>__<tool>` (`parseToolName`, src/hook/names.ts). Enables
+     *  route 2, the declared-tool fallback, for a config file that does not
+     *  key any entry by the segment. Omitted (or empty): route 1 only. */
+    tool?: string;
 }
 /** The config files to consult, in order — see the file-level comment. */
 export declare function candidateConfigPaths(env: Record<string, string | undefined>, glob: (pattern: string) => string[]): string[];
@@ -130,13 +161,26 @@ export declare function scrubOriginUrl(u: URL): ServerOrigin | undefined;
  *  usable http(s) URL, else the entry URL itself. Undefined when neither
  *  parses. Exported for tests; `resolveServerOrigin` is the entry point. */
 export declare function originFromEntryUrl(entryUrl: string): ServerOrigin | undefined;
-/** Look `segment` up in one config file's text. Undefined when the file
- *  does not contain it, is not JSON, is not shaped `{mcpServers:{…}}`, or
- *  the entry has no usable `url` (a stdio server, for instance). */
+/** ROUTE 1. Look `segment` up as an `mcpServers` KEY in one config file's
+ *  text. Undefined when the file does not contain it, is not JSON, is not
+ *  shaped `{mcpServers:{…}}`, or the entry has no usable `url` (a stdio
+ *  server, for instance). */
 export declare function originFromConfigText(text: string, segment: string): ServerOrigin | undefined;
+/** ROUTE 2, the fallback for a file whose keys are not the tool-name segments
+ *  (cloud dogfood 4 — see WHICH ENTRY at the top): the entry that DECLARES
+ *  this exact tool name in its `tools[]`, used only when EXACTLY ONE entry
+ *  does. Undefined otherwise — zero declarations, two or more (two vendors
+ *  claiming one tool name is ambiguous, and a wrong attribution would produce
+ *  a WRONG deny), or an entry with no usable `url`.
+ *
+ *  A file that keys an entry by `segment` is left to route 1 entirely: that
+ *  entry IS the server Claude Code routes to, whether or not it yielded a
+ *  usable URL, so there is nothing to fall back to within that file. */
+export declare function originFromDeclaredTool(text: string, segment: string, tool: string): ServerOrigin | undefined;
 /**
  * Resolve the origin of the MCP server Claude Code calls `segment` (the
- * `<server>` in `mcp__<server>__<tool>`). `{}` whenever nothing usable is
- * found. Never throws.
+ * `<server>` in `mcp__<server>__<tool>`), optionally using `opts.tool` (the
+ * `<tool>` of the same name) for the declared-tool fallback. `{}` whenever
+ * nothing usable is found. Never throws.
  */
 export declare function resolveServerOrigin(segment: string, opts?: ResolveServerOriginOpts): ServerOrigin;

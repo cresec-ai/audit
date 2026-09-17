@@ -17,6 +17,7 @@ import type {
   IdentityContext,
   PolicyDecisionEvent,
   ServerContext,
+  SessionEndEvent,
   SessionStartEvent,
   ToolCallEvent,
 } from '../src/schema/events.js';
@@ -464,6 +465,68 @@ function seedGatewaySession(dataDir: string, sessionId: string): void {
   }
 }
 
+/**
+ * Seed a jsonl store with one session that recorded its session_end and then
+ * KEPT RECORDING — the shape a Claude Code session resumed under the same
+ * session_id leaves behind (cloud dogfood 4: session_end at 07:59:20, tool
+ * calls until 12:41:08). `sessions` must not present this as simply ENDED.
+ */
+function seedReopenedSession(dataDir: string, sessionId: string): void {
+  const at = (h: number, m: number, sec: number): string =>
+    new Date(Date.UTC(2026, 0, 1, h, m, sec)).toISOString();
+  const call = (timestamp: string, tool: string, requestId: number): ToolCallEvent => ({
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp,
+    kind: 'tool_call',
+    identity: FIXTURE_IDENTITY,
+    server: FIXTURE_SERVER,
+    attributes: {},
+    tool,
+    request_id: requestId,
+    args: {},
+    result_hash: sha256Ref('{}'),
+    result: {},
+    is_error: false,
+    duration_ms: 1,
+  });
+  const end: SessionEndEvent = {
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp: at(7, 59, 20),
+    kind: 'session_end',
+    identity: FIXTURE_IDENTITY,
+    server: FIXTURE_SERVER,
+    attributes: {},
+    reason: 'child_exit',
+    child_exit_code: 0,
+    events_recorded: 3,
+    events_dropped: 0,
+  };
+  const events: AnyEvent[] = [
+    fixtureSessionStart(sessionId, at(7, 0, 0)),
+    call(at(7, 30, 0), 'list_issues', 1),
+    end,
+    // ... resumed here, same session_id, no second session_start.
+    call(at(12, 40, 0), 'create_issue', 2),
+    call(at(12, 41, 8), 'get_file_contents', 3),
+  ];
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records = events.map((event) => {
+      const record = makeRecord(head, event);
+      head = { seq: record.seq, hash: record.hash };
+      return record;
+    });
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
 function waitMs(ms: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
@@ -626,8 +689,8 @@ describe('mcp-recorder CLI', () => {
     expect(human.code).toBe(0);
     const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
     const headers = headerLine!.trim().split(/\s+/);
-    // SERVERS and DECISIONS were appended, in that order: every column that
-    // existed before them keeps its position.
+    // SERVERS, DECISIONS and LAST_EVENT were appended, in that order: every
+    // column that existed before them keeps its position.
     expect(headers).toEqual([
       'SESSION',
       'STARTED',
@@ -638,6 +701,7 @@ describe('mcp-recorder CLI', () => {
       'ERRORS',
       'SERVERS',
       'DECISIONS',
+      'LAST_EVENT',
     ]);
     expect(rowLines).toHaveLength(1);
     const cells = rowLines[0]!.trim().split(/\s+/);
@@ -704,6 +768,51 @@ describe('mcp-recorder CLI', () => {
       policy_decision_count: 2,
       tool_call_count: 3,
       error_count: 1,
+    });
+  }, 60_000);
+
+  it('sessions: a session whose events continue past its session_end reads (reopened), not ENDED', async () => {
+    const dataDir = tmpDir('mcp-rec-sessions-reopened-');
+    const sessionId = 'dddddddd-0000-4000-8000-000000000000';
+    seedReopenedSession(dataDir, sessionId);
+
+    const human = await runCli(['sessions', '--data-dir', dataDir]);
+    expect(human.code).toBe(0);
+    const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
+    const headers = headerLine!.trim().split(/\s+/);
+    expect(rowLines).toHaveLength(1);
+    const cells = rowLines[0]!.trim().split(/\s+/);
+    const cell = (name: string): string => cells[headers.indexOf(name)]!;
+    // The session_end at 07:59:20 was superseded by later events, so it is
+    // NOT printed as an end time — printing it invites "ended at 07:59:20,
+    // so the 5 events must be stale", which is exactly the misreading cloud
+    // dogfood 4's report made of a real row.
+    expect(cell('ENDED')).toBe('(reopened)');
+    expect(human.stdout).not.toContain('07:59:20');
+    // LAST_EVENT is the instant the counts run through.
+    expect(cell('LAST_EVENT')).toBe('2026-01-01T12:41:08.000Z');
+    expect(cell('STARTED')).toBe('2026-01-01T07:00:00.000Z');
+    expect(cell('EVENTS')).toBe('5'); // session_start + 3 calls + the session_end
+    expect(cell('TOOL_CALLS')).toBe('3'); // 1 before the session_end, 2 after
+
+    // --json keeps the session_end itself: nothing recorded is hidden, the
+    // human table just refuses to call a superseded one an end.
+    const json = await runCli(['sessions', '--data-dir', dataDir, '--json']);
+    expect(json.code).toBe(0);
+    const list = JSON.parse(json.stdout) as Array<{
+      session_id: string;
+      started_at: string;
+      ended_at?: string;
+      last_event_at?: string;
+      event_count: number;
+    }>;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      session_id: sessionId,
+      started_at: '2026-01-01T07:00:00.000Z',
+      ended_at: '2026-01-01T07:59:20.000Z',
+      last_event_at: '2026-01-01T12:41:08.000Z',
+      event_count: 5,
     });
   }, 60_000);
 

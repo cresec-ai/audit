@@ -34,7 +34,29 @@ export interface ChainHead {
 export interface SessionSummary {
     session_id: string;
     started_at: string;
+    /**
+     * The session's LATEST `session_end` timestamp, when it has one. A
+     * `session_end` is not necessarily the session's last event: a Claude Code
+     * session resumed under the same `session_id` records more events after
+     * it (cloud dogfood 4: a `session_end` at 07:59:20 followed by tool calls
+     * until 12:41:08). So `ended_at` is only the session's end when it equals
+     * `last_event_at`; when `last_event_at` is later the session was REOPENED,
+     * and the counts below — all live aggregates over every event — cover the
+     * activity after it too. `mcp-recorder sessions` renders that case as
+     * `(reopened)` rather than printing a superseded end time.
+     */
     ended_at?: string;
+    /**
+     * Additive, optional: the timestamp of the session's LAST event, whatever
+     * its kind — the instant through which `event_count`, `tool_call_count`,
+     * `error_count` and `server_count` run. Equal to `ended_at` for a session
+     * that ended and stayed ended, later than it for a reopened one, and the
+     * last activity of a session with no `session_end` at all. Both store
+     * backends always set it (every session has at least one event); it is
+     * optional only so a summary produced by an older reader of this contract
+     * still type-checks.
+     */
+    last_event_at?: string;
     /**
      * `server.name` of the session's first event. For a proxy session that is
      * the one wrapped server; for a hook-captured session it is the client
