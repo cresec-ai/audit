@@ -20,7 +20,13 @@ setup hook calls the same script:
 
 ## Commands
 
-- `npm run typecheck` — TypeScript, strict.
+- `npm run typecheck` — TypeScript, strict, over `src` AND `test`/`bench`/
+  `demo`. Two configs, because `tsconfig.json` emits the committed `dist/`
+  and must not compile the tests: `tsconfig.test.json` extends it with
+  `noEmit` and the wider `include`. Add a new top-level TypeScript directory
+  to that `include` or nothing will check it — vitest and tsx strip types
+  rather than check them, so an unchecked test can call a one-argument
+  function with two and stay green forever.
 - `npm test` — vitest; spawns real child processes, takes about a minute.
 - `npm run demo` — scripted prompt-injection incident, recorded and verified.
 - `npm run bench` — latency gate (p50 added latency must stay under 5 ms).
