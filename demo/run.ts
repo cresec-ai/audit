@@ -3,6 +3,9 @@
  *
  *   npm run demo            # run the 5-step incident-response story
  *   npm run demo -- --ui    # ...and then launch the HTML replay UI
+ *   npm run demo -- --policy docs/examples/policy.demo.yaml
+ *                           # same story behind the gateway: http_post denied,
+ *                           # the canary redacted before the agent sees it
  *
  * The story (all deterministic, no LLM, no network):
  *   [1/5] run the poisoned agent session through the recorder
@@ -34,6 +37,9 @@ const DATA_DIR = resolve(ROOT, 'demo-data');
 const BUNDLE_DIR = resolve(DATA_DIR, 'bundle');
 
 const WANT_UI = process.argv.includes('--ui');
+/** `--policy FILE`: run the recorder in gateway mode (forwarded to demo/agent.ts via DEMO_POLICY). */
+const POLICY_IDX = process.argv.indexOf('--policy');
+const POLICY = POLICY_IDX >= 0 ? resolve(process.argv[POLICY_IDX + 1] ?? '') : undefined;
 
 function out(msg: string): void {
   process.stderr.write(msg + '\n');
@@ -90,6 +96,7 @@ function fail(t0: number, msg: string): never {
 
 async function main(): Promise<void> {
   const t0 = performance.now();
+  if (POLICY_IDX >= 0 && (process.argv[POLICY_IDX + 1] ?? '') === '') fail(t0, '--policy needs a file argument');
 
   out('=== @edut/mcp-recorder — prompt-injection exfiltration demo ===');
   out('(deterministic · no LLM · no network · the planted secret and leak are fake)\n');
@@ -98,12 +105,16 @@ async function main(): Promise<void> {
   if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true, force: true });
 
   /* ---------------------- [1/5] run the poisoned agent --------------------- */
-  out(`[1/5] running poisoned agent session… (${elapsed(t0)})`);
-  const agentEnv = { ...process.env, DEMO_DATA_DIR: DATA_DIR };
+  out(`[1/5] running poisoned agent session${POLICY !== undefined ? ` behind the gateway (policy ${POLICY})` : ''}… (${elapsed(t0)})`);
+  const agentEnv = { ...process.env, DEMO_DATA_DIR: DATA_DIR, ...(POLICY !== undefined ? { DEMO_POLICY: POLICY } : {}) };
   const agent = await run('npx', ['tsx', 'demo/agent.ts'], { env: agentEnv });
   if (agent.stderr.trim()) out(quote(agent.stderr));
   if (agent.code !== 0) fail(t0, `agent exited ${agent.code}`);
-  out('  ↳ recorder captured the session into demo-data/\n');
+  out(
+    POLICY !== undefined
+      ? '  ↳ gateway enforced: http_post denied, canary redacted before the agent saw it — all recorded into demo-data/\n'
+      : '  ↳ recorder captured the session into demo-data/\n',
+  );
 
   /* --------------------------- [2/5] verify chain -------------------------- */
   out(`[2/5] verifying the hash chain… (${elapsed(t0)})`);
@@ -125,7 +136,11 @@ async function main(): Promise<void> {
   if (/\b0\b\s+match|no\s+match|matches?:\s*0|0\s+result/i.test(queryText) || !/match/i.test(queryText)) {
     fail(t0, 'blast-radius query found ZERO matches — the exfiltration was not captured');
   }
-  out('  ↳ the hash of the leaked secret matches the http_post exfil call\n');
+  out(
+    POLICY !== undefined
+      ? '  ↳ the hash of the canary matches the redacted read_file result — the http_post exfil never left the box\n'
+      : '  ↳ the hash of the leaked secret matches the http_post exfil call\n',
+  );
 
   /* ------------------- [4/5] export + standalone verification -------------- */
   out(`[4/5] exporting signed evidence bundle… (${elapsed(t0)})`);

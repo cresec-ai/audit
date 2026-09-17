@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://cresec.ai/schemas/agent-policy.v1.json
+#
+# Policy for the scripted incident:  npm run demo -- --policy docs/examples/policy.demo.yaml
+#
+# The demo's "compromised agent" reads a poisoned note, obeys the injected
+# instructions, reads secrets.env and POSTs the credential out through
+# http_post. Behind this policy the exfiltration is denied outright, the
+# canary credential is redacted out of the read_file result before the agent
+# sees it, and the injection marker in the note is flagged in the evidence.
+version: 1
+name: demo
+
+mcp:
+  default: allow
+  rules:
+    - id: no-exfil
+      match:
+        tool: [http_post, "send_*"]
+      action: deny
+      reason: outbound HTTP from agents is not allowed
+  boundary:
+    secrets: redact     # the canary in secrets.env never reaches the model
+    injection: flag     # the "SYSTEM OVERRIDE" comment is recorded, not rewritten

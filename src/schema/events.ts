@@ -110,7 +110,9 @@ export type EventKind =
   | 'rpc'
   | 'notification'
   | 'protocol_error'
-  | 'session_end';
+  | 'session_end'
+  /** Additive (v1): an enforcement action taken by gateway mode. */
+  | 'policy_decision';
 
 /**
  * OTel-style flat attribute bag. Use semconv names where they exist:
@@ -147,6 +149,68 @@ export interface SessionStartEvent extends EventBase {
   proxy_version: string;
   cwd: string;
   redaction_mode: 'allowlist' | 'off';
+  /**
+   * Optional and additive (v1). Present only in gateway mode: the SHA-256 of
+   * the exact bytes of the `policy.yaml` in force and, when it has one, its
+   * `name` (capped via structuralString, kind `identifier`).
+   */
+  policy?: { hash: Sha256Ref; name?: string };
+}
+
+/* ------------------------------------------------------------------ */
+/* Gateway mode (additive, v1) — see docs/event-schema.md.             */
+/* ------------------------------------------------------------------ */
+
+/** What the policy decided for a tools/call request. */
+export type GatewayDecision = 'allow' | 'hold' | 'deny';
+
+/** How a held call was resolved. */
+export type HoldOutcome = 'approved' | 'denied' | 'timeout' | 'cancelled' | 'session_end';
+
+/**
+ * What the tool-result boundary filter found and did. Never carries the
+ * matched text — only counts, an action enum, and sha256 refs.
+ */
+export interface BoundaryReport {
+  /** false when the result exceeded boundary.max_scan_bytes or the filter hit an internal error. */
+  scanned: boolean;
+  /** What was applied to the result the client received. */
+  action: 'none' | 'redact' | 'block' | 'flag';
+  secrets_found: number;
+  injection_found: number;
+  /** Hashes of the secret-shaped tokens found (de-duplicated, capped at 8). */
+  secret_refs?: Sha256Ref[];
+  /**
+   * Present only when the filter modified the result: sha256:<hex> of the
+   * canonical JSON of the result the CLIENT actually received.
+   * `result_hash`/`result` keep describing the raw server result.
+   */
+  delivered_result_hash?: Sha256Ref;
+  /** Internal-error class when `scanned` is false for a reason other than size. */
+  error?: string;
+}
+
+/** Additive (v1) `gateway` field on a tool_call recorded in gateway mode. */
+export interface GatewayOutcome {
+  decision: GatewayDecision;
+  /** Matching rule id (capped identifier); absent when the section default applied. */
+  rule_id?: string;
+  /**
+   * Set when the gateway refused the MESSAGE rather than evaluating it, so a
+   * `deny` with no `rule_id` is not misread as the section default having
+   * applied. An identifier naming the refusal, the way
+   * {@link RpcEvent.error}`.type` names an error; `invalid_request_id` is
+   * the only value the proxy writes today.
+   */
+  refusal?: string;
+  /** Holds only. `session_end` = the proxy shut down while the call was still held. */
+  outcome?: HoldOutcome;
+  /** Holds only: the approval id the operator saw in `mcp-recorder holds`. */
+  approval_id?: string;
+  /** Holds only: how long the call was parked before it was resolved. */
+  waited_ms?: number;
+  /** Present when the result went through the boundary filter. */
+  boundary?: BoundaryReport;
 }
 
 /** The MCP initialize handshake (request + response correlated). */
@@ -186,12 +250,54 @@ export interface ToolCallEvent extends EventBase {
   /** Wall-clock ms between request and response crossing the proxy. */
   duration_ms: number;
   /**
+   * Optional and additive (v1). Present only when the result was nested
+   * deeper than the hash depth cap (256), in which case `result_hash` is NOT
+   * `sha256Ref(canonicalJson(result))`: every subtree below that depth
+   * hashed as one fixed marker, so two results differing only below it share
+   * a hash. The cap is what keeps a hostile payload from overflowing the
+   * stack; this field is what stops it being silent, so a reader who
+   * recomputes the documented hash and gets a different answer knows why.
+   */
+  result_hash_depth_capped?: true;
+  /**
+   * Optional and additive (v1). Present on every tool_call recorded in
+   * gateway mode: the policy decision, hold outcome and boundary-filter
+   * report for this call. See docs/event-schema.md.
+   */
+  gateway?: GatewayOutcome;
+  /**
    * Additive optional field (schema stays v1). `mcp-recorder hook` records a
    * tool call as two separate correlated events sharing `request_id` — this
    * says which half. Undefined for proxy-captured tool_call events, which
    * are already request+response correlated into a single event.
    */
   phase?: 'pre' | 'post';
+}
+
+/**
+ * Additive (v1). An enforcement action taken by gateway mode: one per deny
+ * and one per hold outcome. Allowed calls do not produce this event (their
+ * tool_call carries `gateway.decision: 'allow'`). Never carries arguments —
+ * only their canonical-JSON hash.
+ */
+export interface PolicyDecisionEvent extends EventBase {
+  kind: 'policy_decision';
+  decision: 'deny' | 'hold';
+  /** Holds only. `session_end` = the proxy shut down while the call was still held. */
+  outcome?: HoldOutcome;
+  /** gen_ai.tool.name — capped exactly like ToolCallEvent.tool. */
+  tool: string;
+  request_id: string | number;
+  /** Matching rule id (capped identifier); absent when mcp.default applied. */
+  rule_id?: string;
+  /** sha256:<hex> of the exact bytes of the policy file in force. */
+  policy_hash: Sha256Ref;
+  /** sha256:<hex> of the canonical JSON of the raw params.arguments. */
+  args_hash: Sha256Ref;
+  approval_id?: string;
+  waited_ms?: number;
+  /** OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one. */
+  approver?: string;
 }
 
 /** Any other correlated JSON-RPC request/response (tools/list, resources/read, ...). */
@@ -202,6 +308,8 @@ export interface RpcEvent extends EventBase {
   request_id: string | number;
   params: Scrubbed;
   result_hash: Sha256Ref;
+  /** Same meaning as {@link ToolCallEvent.result_hash_depth_capped}. */
+  result_hash_depth_capped?: true;
   is_error: boolean;
   error?: { code?: number; type?: string; message_ref?: Sha256Ref };
   duration_ms: number;
@@ -213,6 +321,21 @@ export interface NotificationEvent extends EventBase {
   method: string;
   direction: 'client_to_server' | 'server_to_client';
   params: Scrubbed;
+  /**
+   * Gateway mode only, and only on a `tools/call` NOTIFICATION the policy
+   * refused. Additive and optional, like `ToolCallEvent.gateway`, which it
+   * shares a shape with.
+   *
+   * A notification has no request id, and the frozen schema's `request_id`
+   * is `string | number`, so no `policy_decision` event can be written for
+   * one. Without this field the only record of the refusal was a line on
+   * stderr: the chain held one ordinary `notification` event,
+   * indistinguishable from a forwarded one, so `sessions` reported no
+   * decisions and an auditor could not tell a blocked exfiltration attempt
+   * from a notification that went through. Enforcement without evidence is
+   * the failure this tool exists to prevent.
+   */
+  gateway?: GatewayOutcome;
 }
 
 /** Traffic the tap could not interpret. Forwarding is unaffected (fail-open). */
@@ -245,7 +368,8 @@ export type AnyEvent =
   | RpcEvent
   | NotificationEvent
   | ProtocolErrorEvent
-  | SessionEndEvent;
+  | SessionEndEvent
+  | PolicyDecisionEvent;
 
 /* ------------------------------------------------------------------ */
 /* Chain layer — how events are wrapped in the tamper-evident store.   */

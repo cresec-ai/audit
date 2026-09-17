@@ -10,6 +10,12 @@ jobs:
   test:
     name: test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    # MCP_RECORDER_REQUIRE_OPA=1 turns the OPA suites' "no opa binary, skip
+    # myself" path into a hard failure, so a broken setup-opa step below can
+    # never quietly switch the policy-to-Rego parity gate off. Linux only:
+    # the Windows job installs no OPA and is expected to skip those suites.
+    env:
+      MCP_RECORDER_REQUIRE_OPA: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +32,19 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Install OPA (policy-to-Rego parity tests)
+        # The Rego emitted by `mcp-recorder policy compile` is evaluated with
+        # a real OPA and compared against the TypeScript engine; without an
+        # `opa` binary those tests would skip themselves, so this step plus
+        # MCP_RECORDER_REQUIRE_OPA above is what makes them run for real.
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          # Pinned, NOT `latest`: the parity suite asserts `opa fmt` would not
+          # reformat the emitted Rego, so a formatter change in a new OPA
+          # release would break main with no code change. This is the version
+          # the checked-in goldens were generated and verified with — bump it
+          # deliberately, in the same commit as a golden refresh.
+          version: 1.20.2
       - name: Typecheck
         run: npm run typecheck
       - name: Lint
@@ -63,6 +82,11 @@ jobs:
     name: bench smoke (node 20)
     runs-on: ubuntu-latest
     # Latency numbers are jittery on shared runners; this job is informational.
+    # `continue-on-error` therefore also covers the boundary bench's p99 gate
+    # here. That gate is NOT only informational: test/latency.smoke.test.ts
+    # runs the same bench with the gate ENABLED inside `npm test`, in the
+    # `test` job above, which does fail the build. This job exists to print
+    # the numbers and to run the boundary matrix on a second machine shape.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -72,5 +96,11 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Bench smoke
+      - name: Bench smoke (latency, p50 added-latency gate)
         run: npm run bench -- --smoke
+      # The boundary bench's P99_GATE_MS is a ReDoS alarm: a pattern that went
+      # superlinear costs orders of magnitude, so a gate ~3x over the worst
+      # measured cell catches it without tripping on a loaded runner. Run it
+      # WITHOUT --no-gate so the alarm is actually armed.
+      - name: Bench smoke (boundary, p99 ReDoS gate)
+        run: npm run bench:boundary -- --smoke

@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { GENESIS_HASH, canonicalJson, computeHash, makeRecord } from '../chain/hash.js';
 import { FILES } from '../types.js';
+import { sleepSync } from '../util/sleep-sync.js';
 let cachedCtor;
 let loadFailed = false;
 function loadSqlite() {
@@ -91,14 +92,27 @@ BEGIN SELECT RAISE(ABORT, 'mcp-recorder: append-only'); END;
  * --name (server.name is the argv-derived basename until the initialize
  * handshake and the learned serverInfo.name after it — review of the
  * integrated change), and would count the client's own session-level
- * events (`claude-code`) as a server in a hook session. 1 for a proxy
- * session with or without --name, 0 for a session that never called a
- * tool, and the number of MCP servers called for a hook session.
+ * events (`claude-code`) as a server in a hook session. Usually 1 for a
+ * proxy session with or without --name, 0 for a session that never called a
+ * tool, and the number of MCP servers called for a hook session — but a
+ * proxy session reads 2 when a tool call was sealed before the initialize
+ * response was seen, which gateway mode makes ordinary because a deny is
+ * answered by the proxy itself without waiting for the server. See
+ * SessionSummary.server_count for the full account.
+ * policy_decision_count is gateway mode's enforcement: one per deny and one
+ * per resolved hold, an approved hold included. It comes off the kind, plus
+ * the one decision that CANNOT be a `policy_decision` event — a refused
+ * `tools/call` NOTIFICATION, which has no request id to write one with and
+ * carries its outcome on the `notification` event instead. The synthetic
+ * tool_call that carries a refusal back to the client is a tool_call,
+ * counted there and in error_count, never here.
  *
  * Non-conforming records are read the same way jsonl.ts reads them: an
  * explicit `phase: null` counts as a call like an absent phase, a
- * server.name that is not a JSON string is not a server, and is_error only
- * counts on tool_call/rpc events.
+ * server.name that is not a JSON string is not a server, is_error only
+ * counts on tool_call/rpc events, and a policy_decision whose own
+ * decision/outcome fields are missing or off-shape still counts — nothing
+ * below the kind is read for it, exactly as for event_count.
  */
 const SESSIONS_SQL = `
 SELECT
@@ -116,6 +130,10 @@ SELECT
   COUNT(DISTINCT CASE WHEN r.kind = 'tool_call'
                        AND json_type(r.event, '$.server.name') = 'text'
                       THEN json_extract(r.event, '$.server.name') END) AS server_count,
+  SUM(CASE WHEN r.kind = 'policy_decision'
+            OR (r.kind = 'notification'
+                AND json_type(r.event, '$.gateway.decision') = 'text')
+           THEN 1 ELSE 0 END)                           AS policy_decision_count,
   (SELECT json_extract(f.event, '$.server.name')
      FROM records f WHERE f.session_id = r.session_id ORDER BY f.seq LIMIT 1) AS server_name,
   (SELECT json_extract(f.event, '$.identity.fingerprint')
@@ -130,11 +148,6 @@ export const OPEN_BUSY_TIMEOUT_MS = 10_000;
 function isBusyError(err) {
     const code = err?.code;
     return typeof code === 'string' && (code.startsWith('SQLITE_BUSY') || code === 'SQLITE_LOCKED');
-}
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
-/** Block the thread for `ms` (open-time only — never on the forwarding path). */
-function sleepSync(ms) {
-    Atomics.wait(sleepCell, 0, 0, ms);
 }
 /**
  * Run `fn`, retrying on SQLITE_BUSY/SQLITE_LOCKED with a short, jittered
@@ -324,6 +337,7 @@ export class SqliteStore {
                 tool_call_count: row.tool_call_count,
                 error_count: row.error_count,
                 server_count: row.server_count,
+                policy_decision_count: row.policy_decision_count,
             };
             if (row.ended_at !== null)
                 summary.ended_at = row.ended_at;

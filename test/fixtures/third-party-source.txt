@@ -1,0 +1,161 @@
+# Real third-party source lines that reach a GATED assignment arm.
+#
+# The boundary filter's job is reading OTHER PEOPLE'S code through a
+# filesystem server, and this repository's own sources are not a
+# representative corpus for that. A round of changes that corrupted 119 lines
+# of installed TypeScript showed zero regressions when swept over this repo's
+# own 142 tracked files, and the suite stayed green, because 11 of its 12
+# "source code delivered intact" cases have values too short to reach a gated
+# arm at all.
+#
+# Every line below is verbatim from a package in node_modules, is matched by
+# the affixed or camelCase arm's NAME shape with a value long enough to clear
+# its gate — so its fate depends entirely on the shape rules — and crosses the
+# boundary unchanged today. Any rule change that rewrites one fails CI.
+#
+# Sampled from: @eslint-community/eslint-utils, @eslint/plugin-kit,
+# @modelcontextprotocol/sdk, @noble/hashes, @types/node,
+# @typescript-eslint/*, @vitest/*, acorn, bl, content-disposition,
+# content-type, es-module-lexer, eslint, espree, expect-type, hono, jose,
+# path-to-regexp, postcss, type-is, typescript, vite, vitest, yaml, zod.
+# Their licences are their own; these are short declaration lines quoted as
+# test data. Regenerate by sampling node_modules the same way.
+#
+declare function isArrowToken(token: CommentOrToken): token is ArrowToken$1;
+declare function isCommaToken(token: CommentOrToken): token is CommaToken$1;
+declare function isSemicolonToken(token: CommentOrToken): token is SemicolonToken$1;
+declare function isColonToken(token: CommentOrToken): token is ColonToken$1;
+declare function isOpeningParenToken(token: CommentOrToken): token is OpeningParenToken$1;
+declare function isClosingParenToken(token: CommentOrToken): token is ClosingParenToken$1;
+declare function isOpeningBracketToken(token: CommentOrToken): token is OpeningBracketToken$1;
+declare function isClosingBracketToken(token: CommentOrToken): token is ClosingBracketToken$1;
+declare function isOpeningBraceToken(token: CommentOrToken): token is OpeningBraceToken$1;
+declare function isClosingBraceToken(token: CommentOrToken): token is ClosingBraceToken$1;
+declare function isCommentToken(token: CommentOrToken): token is estree.Comment;
+const isNotArrowToken = negate(isArrowToken);
+const isNotCommaToken = negate(isCommaToken);
+const isNotSemicolonToken = negate(isSemicolonToken);
+getLoc(nodeOrToken: Options["SyntaxElementWithLoc"]): SourceLocation;
+getRange(nodeOrToken: Options["SyntaxElementWithLoc"]): SourceRange;
+console.log(`Using resumption token: ${notificationsToolLastEventId || 'none'}`);
+resumptionToken: notificationsToolLastEventId,
+exports.UnsupportedTokenTypeError = UnsupportedTokenTypeError;
+exports.InvalidTokenError = InvalidTokenError;
+client_secret: z.string().optional()
+const token_js_1 = require("./handlers/token.js");
+token_endpoint_auth_methods_supported: z.array(z.string()).optional(),
+token_endpoint_auth_signing_alg_values_supported: z.array(z.string()).optional(),
+id_token_signing_alg_values_supported: z.array(z.string()),
+id_token_encryption_alg_values_supported: z.array(z.string()).optional(),
+id_token_encryption_enc_values_supported: z.array(z.string()).optional(),
+id_token: z.string().optional(), // Optional for OAuth 2.1, but necessary in OpenID Connect
+refresh_token: z.string().optional()
+token_endpoint_auth_method: z.string().optional(),
+password = kdfInputToBytes(password);
+const password = kdfInputToBytes(_password);
+* const aliceSecret = alice.computeSecret(bobKey);
+* const bobSecret = bob.computeSecret(aliceKey);
+* const aliceSecret = alice.computeSecret(bob.getPublicKey(), null, 'hex');
+* const bobSecret = bob.computeSecret(alice.getPublicKey(), null, 'hex');
+const firstToken = context.sourceCode.getTokenBefore(node.id);
+const openingBraceToken = context.sourceCode.getFirstTokenBetween(importToken, node.source, util_1.isOpeningBraceToken);
+const lastToken = context.sourceCode.getLastToken(node);
+const nextToken = context.sourceCode.getTokenAfter(lastToken);
+const lastToken = sourceCode.getLastToken(node);
+firstToken = sourceCode.getTokenAfter(firstToken);
+const leftHandFinalToken = context.sourceCode.getLastToken(node.left);
+const beforeUnionOrIntersectionToken = getUnionOrIntersectionToken('Before', -1);
+const leftToken = assertToken(isCommaToken, context.sourceCode.getTokenBefore(leftCurly));
+const rightToken = assertToken(isRightCurlyToken, context.sourceCode.getFirstToken(importDecl, isRightCurlyToken.predicate));
+const token = sourceCode.getTokenBefore(leftMost);
+const token = sourceCode.getTokenAfter(rightMost);
+const awaitToken = context.sourceCode.getFirstToken(node, util_1.isAwaitKeyword);
+const nextToken = context.sourceCode.getTokenAfter(awaitToken, {
+exports.getTextForTokenKind = getTextForTokenKind;
+export declare const isArrowToken: IsPunctuatorTokenWithValueFunction<'=>'>;
+export declare const isNotArrowToken: IsNotPunctuatorTokenWithValueFunction<'=>'>;
+export declare const isClosingBraceToken: IsPunctuatorTokenWithValueFunction<'}'>;
+export declare const isNotClosingBraceToken: IsNotPunctuatorTokenWithValueFunction<'}'>;
+export declare const isClosingBracketToken: IsPunctuatorTokenWithValueFunction<']'>;
+export declare const isNotClosingBracketToken: IsNotPunctuatorTokenWithValueFunction<']'>;
+export declare const isClosingParenToken: IsPunctuatorTokenWithValueFunction<')'>;
+export declare const isNotClosingParenToken: IsNotPunctuatorTokenWithValueFunction<')'>;
+export declare const isColonToken: IsPunctuatorTokenWithValueFunction<':'>;
+export declare const isNotColonToken: IsNotPunctuatorTokenWithValueFunction<':'>;
+export declare const isCommaToken: IsPunctuatorTokenWithValueFunction<','>;
+export declare const isNotCommaToken: IsNotPunctuatorTokenWithValueFunction<','>;
+export declare const isOpeningBraceToken: IsPunctuatorTokenWithValueFunction<'{'>;
+export declare const isNotOpeningBraceToken: IsNotPunctuatorTokenWithValueFunction<'{'>;
+const token = s.substring(start, i).trim();
+const lastToken = s.substring(start).trim();
+lastSignificantToken = match[0];
+lastSignificantToken = nextLastSignificantToken;
+nextLastSignificantToken = match[0];
+var token = this$1$1.getToken();
+pp.invalidStringToken = function(position, message) {
+token = tokenizer.getToken();
+const secret = crypto.randomBytes(256)
+var TOKEN_REGEXP = /^[!#$%&'*+.0-9A-Z^_`a-z|~-]+$/
+var TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+openTokenPosStack = Array(1024);
+const lastToken = source.charCodeAt(lastTokenPos);
+TokenStore = require("./token-store"),
+const nextToken = sourceCode.getTokenAfter(currentToken, {
+const BackwardTokenCommentCursor = require("./backward-token-comment-cursor");
+const BackwardTokenCursor = require("./backward-token-cursor");
+const ForwardTokenCommentCursor = require("./forward-token-comment-cursor");
+const ForwardTokenCursor = require("./forward-token-cursor");
+this.TokenCommentCursor = TokenCommentCursor;
+const PaddedTokenCursor = require("./padded-token-cursor");
+let currentToken = cursor.getOneToken();
+currentToken = cursor.getOneToken();
+const nextToken = sourceCode.getTokenAfter(token, {
+const previousToken = sourceCode.getTokenBefore(token, {
+const nextToken = sourceCode.getTokenAfter(token);
+const previousToken = sourceCode.getTokenBefore(token);
+const firstToken = tokens[0],
+lastTemplateToken = tokens.at(-1);
+const secret = Symbol('secret');
+const ALLOWED_TOKEN_PATTERN = /^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/;
+const headerToken = c.req.header(options.headerName || HEADER);
+return { username: userPass[1], password: userPass[2] };
+const partialToken = `${encodedHeader}.${encodedPayload}`;
+var ALLOWED_TOKEN_PATTERN = /^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/;
+const max = typeof maxTokenAge === 'number' ? maxTokenAge : secs(maxTokenAge);
+const token = tokens[index++];
+token = this.tokenizer.nextToken()
+token = params[params.length - 1]
+token = tokens[tokens.length - 1][0]
+lastTokenType = tokens[tokens.length - 1][0]
+let token = processor.nextToken()
+const TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const cancellationToken = createCancellationToken(sys4.args);
+cancellationToken: HostCancellationToken;
+readonly cancellationToken: HostCancellationToken;
+const nullCancellationToken: ServerCancellationToken;
+cancellationToken: ServerCancellationToken;
+readonly operatorToken: BinaryOperatorToken;
+readonly equalsGreaterThanToken: EqualsGreaterThanToken;
+runWithCancellationToken<T>(token: CancellationToken, cb: (checker: TypeChecker) => T): T;
+createMetaProperty(keywordToken: MetaProperty["keywordToken"], name: Identifier): MetaProperty;
+createHeritageClause(token: HeritageClause["token"], types: readonly ExpressionWithTypeArguments[]): HeritageClause;
+cancellationToken: CancellationToken;
+createScalarToken: createScalarToken,
+// scenario: PASSWORD_EXPAND_NESTED=${PASSWORD_EXPAND}
+const wsTokenReplacement = escapeReplacement(config.webSocketToken);
+const token = header.slice(start, end);
+const token = url.searchParams.get("token");
+const isValidToken = crypto$2.timingSafeEqual(
+var firstToken = this.tokens[startPosition];
+var lastToken = this.tokens[this.position - 1];
+var nextSigTokenPos = this.locateNextMeaningfulToken(this.position);
+token = value.slice(pos, next);
+resolved.api = { ...api, token: crypto.randomUUID() };
+exports.createScalarToken = createScalarToken;
+export type TokenType = SourceToken['type'] | DocumentEnd['type'] | FlowScalar['type'];
+password: z.string().min(6),
+//       password: z.string().min(6),
+password: z.string().min(1),
+password: z.string().optional(),
+confirmPassword: z.string().optional(),
+password: z.string().min(8),

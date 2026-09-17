@@ -85,17 +85,53 @@ export interface SessionSummary {
     error_count: number;
     /**
      * Additive, optional: the number of distinct `server.name` values over
-     * the session's `tool_call` events — the servers actually called. 1 for
-     * a proxy session with or without `--name` (its session_start may carry
-     * the argv-derived name and its later events the initialize-learned one,
-     * but every tool call carries one name), 0 for a session that never
-     * called a tool, and for a hook session the number of MCP servers its
-     * calls went to (ClickUp + GitHub + a local server = 3; the client's own
-     * `claude-code` session-level events are not a server). Both store
-     * backends always set it; it is optional only so a summary produced by an
-     * older reader of this contract still type-checks.
+     * the session's `tool_call` events — the servers actually called. Usually
+     * 1 for a proxy session with or without `--name`, 0 for a session that
+     * never called a tool, and for a hook session the number of MCP servers
+     * its calls went to (ClickUp + GitHub + a local server = 3; the client's
+     * own `claude-code` session-level events are not a server).
+     *
+     * A proxy session reads 2 when a tool call was sealed BEFORE the server's
+     * `initialize` response was seen. Without `--name`, `server.name` is the
+     * argv-derived basename until that response and the initialize-learned
+     * `serverInfo.name` after it, so a call recorded on the early side of
+     * that line carries a different name from the rest. Gateway mode makes
+     * this ordinary rather than rare: a denied call is answered by the proxy
+     * itself without waiting for the server, so a deny early in a session is
+     * routinely sealed with the pre-handshake name while the calls that were
+     * actually forwarded carry the learned one. `--name` pins a single name
+     * for the whole session and avoids it. Both store backends always set
+     * this; it is optional only so a summary produced by an older reader of
+     * this contract still type-checks.
      */
     server_count?: number;
+    /**
+     * Additive, optional: the number of `policy_decision` events in the
+     * session — every enforcement action gateway mode took (docs/gateway.md).
+     * One per deny, and one per RESOLVED hold whatever its outcome, so a hold
+     * the operator APPROVED counts too: this is what the gateway ruled on,
+     * not what it refused. It does NOT count calls. An allowed call produces
+     * no `policy_decision` event at all, so a session recorded without
+     * `--policy`, and a gateway session that allowed everything, both read 0.
+     * Nor does it count the synthetic `tool_call` carrying a refusal back to
+     * the client — that one is counted in `tool_call_count` and `error_count`
+     * like any other failed call, so a denied call adds 1 to each of the
+     * three, and so does a call refused on protocol grounds rather than by
+     * rule (a duplicate JSON-RPC id, recorded as a deny with no `rule_id`).
+     * ONE decision is not a `policy_decision` event and still counts: a
+     * refused `tools/call` NOTIFICATION. A notification has no request id,
+     * and the frozen schema's `request_id` is `string | number`, so the
+     * decision rides its `notification` event's additive `gateway` field
+     * instead. Leaving it out reported `0` for a session where enforcement
+     * had happened.
+     *
+     * When the number is surprising, read the session's `policy_decision`
+     * events themselves — the POLICY rows in `mcp-recorder ui` — each of
+     * which names its tool, matching rule (or none), decision and hold
+     * outcome. Both store backends always set it; it is optional only so a
+     * summary produced by an older reader of this contract still type-checks.
+     */
+    policy_decision_count?: number;
 }
 export interface IterateOpts {
     fromSeq?: number;
@@ -220,8 +256,13 @@ export interface QueryMatch {
     kind: AnyEvent['kind'];
     /** tool or method name when applicable. */
     name?: string;
-    /** Where the needle matched: 'ref' | 'result_hash' | 'plain' | 'credential' | 'name'. */
-    matched_on: 'ref' | 'result_hash' | 'plain' | 'credential' | 'name';
+    /**
+     * Where the needle matched:
+     * 'ref' | 'result_hash' | 'args_hash' | 'credential' | 'name' | 'plain'.
+     * `args_hash` is additive (gateway mode): the canonical-JSON hash of the
+     * arguments of a call the gateway denied or held.
+     */
+    matched_on: 'ref' | 'result_hash' | 'args_hash' | 'plain' | 'credential' | 'name';
     /** JSON-path-ish location of the match inside the event. */
     path: string;
 }
@@ -274,6 +315,8 @@ export declare const ENV: {
     readonly STORE: "MCP_RECORDER_STORE";
     readonly REDACT: "MCP_RECORDER_REDACT";
     readonly DISABLE: "MCP_RECORDER_DISABLE";
+    /** Additive (gateway mode): policy.yaml path honoured by `record` when `--policy` is absent. */
+    readonly POLICY: "MCP_RECORDER_POLICY";
     /** `hook`: MCP config file(s) to resolve server origins from — one path or
      *  comma-separated paths; default `/tmp/mcp-config-*.json` (cloud sessions).
      *  See src/hook/mcp-config.ts. */

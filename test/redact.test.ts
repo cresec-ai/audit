@@ -756,3 +756,173 @@ describe('structuralString (P0: capping verbatim protocol strings)', () => {
     expect(hashed).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 });
+
+/* ---------------------------------------------------------------------- *
+ * REGRESSION: a credential carried in a URL PATH reached ServerContext.command
+ * ---------------------------------------------------------------------- */
+
+/**
+ * `stripUrlUserinfo` runs BEFORE `looksSecret` in both scrubArgv branches,
+ * because the strip is the stronger outcome for a DSN (three separate refs,
+ * and a legible scheme/host/path). But stripping the userinfo says nothing
+ * about the REST of the URL: a token in the PATH survived it, and because
+ * the strip branch `continue`d, `looksSecret` never ran on the element —
+ * so the token landed verbatim in `ServerContext.command`, which is stamped
+ * on every event, rendered by the replay page and shipped in export bundles.
+ * That is the no-readable-payloads rule, broken.
+ */
+describe('scrubArgv: a credential in the URL PATH does not survive the userinfo strip', () => {
+  const redactor = new Redactor();
+
+  it('hashes the stripped remainder too when it still looks secret (standalone element)', () => {
+    const el = `https://u:p@hooks.example.com/services/${SECRETS.github}`;
+    const stripped = `https://hooks.example.com/services/${SECRETS.github}`;
+    const out = scrubArgv(['server', el], redactor);
+
+    expect(out.command).not.toContain(SECRETS.github);
+    expect(out.command).toBe(`server ${sha256Ref(stripped)}`);
+    const refs = out.fingerprints.map((f) => f.ref);
+    // The userinfo refs the strip exists for are still recorded separately...
+    expect(refs).toContain(sha256Ref('u:p'));
+    expect(refs).toContain(sha256Ref('p'));
+    expect(refs).toContain(sha256Ref('u'));
+    // ...and a blast-radius query for the leaked URL still finds it.
+    expect(refs).toContain(sha256Ref(stripped));
+  });
+
+  it('hashes the stripped remainder in the --flag=value half', () => {
+    const value = 'https://u:p@api.example.com/v1/sk-live-ABCDEFGHIJKLMNOPQR/stream';
+    const stripped = 'https://api.example.com/v1/sk-live-ABCDEFGHIJKLMNOPQR/stream';
+    const out = scrubArgv(['server', `--endpoint=${value}`], redactor);
+    expect(out.command).not.toContain('sk-live-ABCDEFGHIJKLMNOPQR');
+    expect(out.command).toBe(`server --endpoint=${sha256Ref(stripped)}`);
+    expect(out.fingerprints.map((f) => f.ref)).toContain(sha256Ref(stripped));
+  });
+
+  it('hashes the stripped remainder in a NAME=value element', () => {
+    const value = `https://u:p@api.example.com/${SECRETS.aws}/ingest`;
+    const stripped = `https://api.example.com/${SECRETS.aws}/ingest`;
+    const out = scrubArgv(['env', `DSN=${value}`, 'server'], redactor);
+    expect(out.command).not.toContain(SECRETS.aws);
+    expect(out.command).toBe(`env DSN=${sha256Ref(stripped)} server`);
+    expect(out.fingerprints.every((f) => f.name === 'DSN')).toBe(true);
+  });
+
+  it('an ordinary DSN still keeps its scheme, host and path legible', () => {
+    const out = scrubArgv(['cmd', 'postgres://admin:S3cretPassw0rd@db.internal/prod'], redactor);
+    expect(out.command).toBe('cmd postgres://db.internal/prod');
+    expect(out.fingerprints.map((f) => f.ref)).not.toContain(
+      sha256Ref('postgres://db.internal/prod'),
+    );
+  });
+});
+
+/* ---------------------------------------------------------------------- *
+ * REGRESSION: the widened assignment shape rewrote ordinary developer output
+ * ---------------------------------------------------------------------- */
+
+/** Ordinary source, config and log lines. None of these is a credential. */
+const NOT_ASSIGNMENTS = [
+  'const MAX_TOKEN_LENGTH = 512;',
+  'token_bucket_size: 100',
+  'refresh_token_ttl = 3600',
+  '  access_token_expires_in: 3600,',
+  'export const DEFAULT_TOKEN_BUDGET = 15000;',
+  'reset_token_sent_at: null',
+  'csrf-token-header: X-CSRF',
+  'INFO  auth_token_cache_hits=42 misses=3',
+  'secret_scanning_enabled: true',
+  'api_key_id: 7',
+  'secretary_id=5',
+  'tokenizer_count=3',
+  'passwordless=true',
+  '--secret-scanning enabled',
+  '--token to authenticate',
+  '--api-key <your-key-here>',
+  '--token $GITHUB_TOKEN',
+] as const;
+
+/** Credentials the widening was added for. Every one must still be caught. */
+const REAL_ASSIGNMENTS = [
+  'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  'DB_PASSWORD=hunter2-correct-horse',
+  'X-Api-Key: 0123456789abcdefghij',
+  'password=hunter2',
+  'api_key: abc',
+  '{"password": "hunter2-correct-horse"}',
+  '{"api_key":"abcdefghijklmnop1234"}',
+  "password: 'hunter2-correct-horse'",
+  '--password=hunter2',
+  'docker login --password hunter2-correct-horse',
+] as const;
+
+describe('alwaysPatterns: credential assignments, bare vs affixed', () => {
+  it.each(NOT_ASSIGNMENTS)('%s is not a credential', (line) => {
+    expect(looksSecret(line)).toBe(false);
+  });
+
+  it.each(REAL_ASSIGNMENTS)('%s is still hashed in every mode', (line) => {
+    expect(looksSecret(line)).toBe(true);
+    for (const mode of ['allowlist', 'off'] as const) {
+      const out = JSON.stringify(new Redactor({ mode }).scrub({ v: line }));
+      expect(out).not.toContain('hunter2');
+      expect(out).not.toContain('wJalrXUtnFEMI');
+      expect(out).not.toContain('0123456789abcdefghij');
+      expect(out).not.toContain('abcdefghijklmnop1234');
+    }
+  });
+
+  it('a JSON credential embedded in a larger leaf is caught, value and all', () => {
+    const leaf = 'config: {"password": "hunter2-correct-horse", "port": 5432}';
+    const out = new Redactor().scrub({ body: leaf }) as { body: RedactedRef };
+    expect(JSON.stringify(out)).not.toContain('hunter2');
+    expect(out.body.secret_refs).toBeDefined();
+  });
+
+  it('everyday developer output is untouched by a real-world corpus', () => {
+    const corpus = [
+      '  "resolved": "https://registry.npmjs.org/vitest/-/vitest-2.1.9.tgz",',
+      'the token docs explain how a token is minted; a password is required',
+      'Authorization: Bearer <token>',
+      'eyJhbGciOiJIUzI1NiJ9.<payload>.<signature>  # a JWT looks like this',
+    ];
+    for (const line of corpus) {
+      expect(looksSecret(line), line).toBe(false);
+    }
+  });
+});
+
+/* ---------------------------------------------------------------------- *
+ * NIT: github_pat_ and the url-userinfo lookbehind
+ * ---------------------------------------------------------------------- */
+
+describe('alwaysPatterns: shapes that are the credential and nothing else', () => {
+  const realPat =
+    'github_pat_11ABCDEFG0aBcDeFgHiJkL_KlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz0123456';
+
+  it('a real fine-grained PAT (22 + 59) is hashed', () => {
+    expect(looksSecret(realPat)).toBe(true);
+  });
+
+  it.each([
+    'github_pat_token_refresh_helper_result',
+    'github_pat_validation_middleware_options',
+    'github_pat_scopes_required_for_this_call',
+  ])('the snake_case identifier %s is not a PAT', (id) => {
+    expect(looksSecret(id)).toBe(false);
+  });
+
+  it('a URL that really carries userinfo is still matched', () => {
+    expect(looksSecret('postgres://user:pass@host/db')).toBe(true);
+    expect(looksSecret('psql redis://u:p@127.0.0.1:6379/0 --list')).toBe(true);
+    expect(looksSecret('https://u:p@[2001:db8::1]:8443/x')).toBe(true);
+  });
+
+  it.each([
+    'oci://redis:7.2@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'docker://library/nginx:1.25@sha256:abcdef0123456789abcdef',
+  ])('the container/tag reference %s is not userinfo', (ref) => {
+    const urlRe = DEFAULT_POLICY.alwaysPatterns.find((r) => r.source.startsWith('(?<=:\\/\\/)'))!;
+    expect(new RegExp(urlRe.source).test(ref)).toBe(false);
+  });
+});

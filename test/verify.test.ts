@@ -11,6 +11,7 @@ import type {
   AnyEvent,
   ChainRecord,
   IdentityContext,
+  PolicyDecisionEvent,
   ServerContext,
   SessionEndEvent,
   SessionStartEvent,
@@ -110,6 +111,48 @@ function sixEvents(): AnyEvent[] {
   ];
 }
 
+/* --- Gateway mode (additive v1): policy_decision events and tool_call.gateway
+ * / session_start.policy fields ride the same chain and must verify like any
+ * other event (canonical JSON simply covers the extra fields). */
+function policyDecision(sessionId: string, n: number): PolicyDecisionEvent {
+  return {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: sessionId,
+    timestamp: new Date(Date.UTC(2026, 5, 11, 10, 0, n)).toISOString(),
+    kind: 'policy_decision',
+    identity: IDENTITY,
+    server: SERVER,
+    attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny' },
+    decision: 'deny',
+    tool: 'http_post',
+    request_id: n,
+    rule_id: 'no-exfil',
+    policy_hash: sha256Ref('policy bytes'),
+    args_hash: sha256Ref('{"url":"https://evil.example"}'),
+  };
+}
+
+function gatewayEvents(): AnyEvent[] {
+  const start = sessionStart(SESSION_A, 0);
+  start.policy = { hash: sha256Ref('policy bytes'), name: 'laptop' };
+  const allowed = toolCall(SESSION_A, 1);
+  allowed.gateway = { decision: 'allow', boundary: { scanned: true, action: 'none', secrets_found: 0, injection_found: 0 } };
+  const denied = toolCall(SESSION_A, 3, 'http_post');
+  denied.is_error = true;
+  denied.error = { type: 'policy_denied' };
+  denied.gateway = { decision: 'deny', rule_id: 'no-exfil' };
+  const held: PolicyDecisionEvent = {
+    ...policyDecision(SESSION_A, 4),
+    decision: 'hold',
+    outcome: 'timeout',
+    tool: 'send_mail',
+    approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
+    waited_ms: 60000,
+  };
+  return [start, allowed, policyDecision(SESSION_A, 2), denied, held, sessionEnd(SESSION_A, 5)];
+}
+
 /* ------------------------- store-backed suites ------------------------- */
 
 const backends: Array<'sqlite' | 'jsonl'> = ['sqlite', 'jsonl'];
@@ -156,6 +199,28 @@ describe.each(backends)('verifyStore (%s)', (backend) => {
     expect(result.verified_signature?.seq).toBe(6);
     expect(result.verified_signature?.chain_hash).toBe(records[5]!.hash);
     expect(result.verified_signature?.public_key).toBe(signer.publicKeyHex);
+  });
+
+  it('a signed chain carrying policy_decision events and gateway fields verifies ok', async () => {
+    const signer = await Signer.load(dir);
+    const records = seal(gatewayEvents());
+    const store = open();
+    store.append(records);
+    const head = store.head();
+    store.addSignature(await signer.sign(head.seq, head.hash));
+
+    const result = await verifyStore(store);
+    expect(result.ok).toBe(true);
+    expect(result.problems).toEqual([]);
+    expect(result.checked_events).toBe(6);
+    expect(result.verified_signature?.seq).toBe(6);
+
+    // Doctoring the new kind is caught exactly like doctoring any other event.
+    const tampered = [...store.iterate()].map((r) => ({ ...r, event: { ...r.event } }));
+    (tampered[2]!.event as PolicyDecisionEvent).decision = 'hold';
+    const bad = await verifyRecords(tampered, store.signatures());
+    expect(bad.ok).toBe(false);
+    expect(bad.problems.some((p) => p.type === 'hash_mismatch' && p.seq === 3)).toBe(true);
   });
 
   it('unsigned tail after the newest signature is a warning, not a failure', async () => {

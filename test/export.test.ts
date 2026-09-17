@@ -25,6 +25,7 @@ import type {
   AnyEvent,
   ChainRecord,
   IdentityContext,
+  PolicyDecisionEvent,
   ServerContext,
   SessionStartEvent,
   ToolCallEvent,
@@ -95,6 +96,38 @@ function seal(events: AnyEvent[], head: ChainHead = { seq: 0, hash: GENESIS_HASH
     h = { seq: record.seq, hash: record.hash };
   }
   return out;
+}
+
+/** Gateway mode (additive v1): the new kind + fields, exported and verified by strangers too. */
+function gatewayRecords(): ChainRecord[] {
+  const start = sessionStart(SESSION_A, 0);
+  start.policy = { hash: sha256Ref('policy bytes'), name: 'laptop' };
+  const decision: PolicyDecisionEvent = {
+    schema: SCHEMA,
+    event_id: fakeUuid(),
+    session_id: SESSION_A,
+    timestamp: new Date(Date.UTC(2026, 5, 11, 10, 0, 1)).toISOString(),
+    kind: 'policy_decision',
+    identity: IDENTITY,
+    server: SERVER,
+    attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny' },
+    decision: 'deny',
+    tool: 'http_post',
+    request_id: 2,
+    rule_id: 'no-exfil',
+    policy_hash: sha256Ref('policy bytes'),
+    args_hash: sha256Ref('{"url":"https://evil.example"}'),
+  };
+  const denied = toolCall(SESSION_A, 2, 'http_post');
+  denied.is_error = true;
+  denied.error = { type: 'policy_denied' };
+  denied.gateway = { decision: 'deny', rule_id: 'no-exfil' };
+  const allowed = toolCall(SESSION_A, 3);
+  allowed.gateway = {
+    decision: 'allow',
+    boundary: { scanned: true, action: 'redact', secrets_found: 1, injection_found: 0, secret_refs: [sha256Ref('AKIAIOSFODNN7EXAMPLE')], delivered_result_hash: sha256Ref('delivered') },
+  };
+  return seal([start, decision, denied, allowed]);
 }
 
 /**
@@ -451,6 +484,55 @@ describe('exportBundle', () => {
       emptyStore.close();
     }
   });
+
+  it('a chain with policy_decision events and gateway fields exports and verifies (verify.cjs, our verifier, verify --bundle dir + zip)', async () => {
+    const gwDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-export-gw-'));
+    const gwRecords = gatewayRecords();
+    const gwSigner = await Signer.load(join(gwDir, 'data'));
+    const gwStore = openStore({ dataDir: join(gwDir, 'data'), backend: 'jsonl' });
+    try {
+      gwStore.append(gwRecords);
+      const bundleDir = join(gwDir, 'bundle');
+      const zipPath = join(gwDir, 'evidence.zip');
+      const manifest = await exportBundle({ store: gwStore, dirPath: bundleDir, zipPath, toolVersion: '0.1.0-test', signer: gwSigner });
+      expect(manifest.event_count).toBe(4);
+
+      // The new kind round-trips byte-exactly through the bundle.
+      const lines = readFileSync(join(bundleDir, BUNDLE_FILES.EVENTS), 'utf8')
+        .split('\n')
+        .filter((line) => line.trim() !== '');
+      const back = lines.map((line) => JSON.parse(line) as ChainRecord);
+      expect(back).toEqual(gwRecords);
+      expect(back.map((r) => r.event.kind)).toEqual(['session_start', 'policy_decision', 'tool_call', 'tool_call']);
+
+      const ours = await verifyRecords(back, [manifest.signature], { baseHash: manifest.base_hash, expectedPublicKeyHex: gwSigner.publicKeyHex });
+      expect(ours.ok).toBe(true);
+      expect(ours.checked_events).toBe(4);
+
+      const stranger = runVerifyCjs(bundleDir);
+      expect(stranger.stdout).toContain('PASS');
+      expect(stranger.status).toBe(0);
+
+      expect(runCliVerifyBundle(bundleDir).status).toBe(0);
+      expect(runCliVerifyBundle(zipPath).status).toBe(0);
+
+      // Doctoring the policy_decision is caught by the stranger's verifier too.
+      const doctored = JSON.parse(lines[1]!) as ChainRecord;
+      (doctored.event as PolicyDecisionEvent).rule_id = 'someone-else';
+      lines[1] = JSON.stringify(doctored);
+      writeFileSync(join(bundleDir, BUNDLE_FILES.EVENTS), lines.join('\n') + '\n');
+      const bad = runVerifyCjs(bundleDir);
+      expect(bad.status).toBe(1);
+      expect(bad.stdout).toContain('FAIL');
+    } finally {
+      try {
+        gwStore.close();
+      } catch {
+        /* already closed */
+      }
+      rmSync(gwDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('export --out .zip, then `mcp-recorder verify --bundle` on it: PASS; a tampered .zip: FAIL', async () => {
     const zipPath = join(dir, 'evidence.zip');

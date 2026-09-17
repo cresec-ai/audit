@@ -185,16 +185,31 @@ detail stays on each event's `server.name`, which `query`, `ui` and
   second `session_start`, and a `session_end` is recorded exactly as it
   always was; only the summary stops presenting a superseded one as an end.
 - `SERVER` is the session's first event's `server.name`, which for a hook
-  session is the client itself (`claude-code`); `SERVERS` (the
-  second-to-last column; additive `server_count` in `--json`) is the number
-  of distinct `server.name` values over the session's **`tool_call`
-  events** — the servers actually called — so a session that called
-  ClickUp, GitHub and a local server reads `3` (the client's own
-  session-level events are not a server). A proxy session reads `1` with or
-  without `--name` (without it, `server.name` is the argv-derived basename
-  until the `initialize` handshake and the learned `serverInfo.name` after
-  it, but every tool call carries one name), and a session that never
-  called a tool reads `0`.
+  session is the client itself (`claude-code`); `SERVERS` (additive
+  `server_count` in `--json`) is the number of distinct
+  `server.name` values over the session's **`tool_call` events** — the
+  servers actually called — so a session that called ClickUp, GitHub and a
+  local server reads `3` (the client's own session-level events are not a
+  server). A proxy session usually reads `1` with or without `--name`, and
+  a session that never called a tool reads `0`. Without `--name`,
+  `server.name` is the argv-derived basename until the `initialize`
+  handshake and the learned `serverInfo.name` after it, so a proxy session
+  reads `2` when a tool call was sealed on the early side of that line —
+  ordinary in gateway mode, where a denied call is answered by the proxy
+  without waiting for the server. Hook sessions are unaffected: they have
+  no such handshake.
+- `DECISIONS` (additive `policy_decision_count` in `--json`) counts the
+  enforcement actions gateway mode took. A hook session always reads `0`:
+  `hook --policy` decides with its own JSON allow/deny file (see
+  [Policy](#policy-allow--deny)) and records a denied call as a `tool_call`
+  with `error.type: "policy_denied"`, not as the `policy_decision` event
+  the stdio gateway seals. `ERRORS` is where a hook deny shows up.
+- `LAST_EVENT` (additive `last_event_at` in `--json`) is the timestamp of
+  the session's last event — the instant every count in the row runs
+  through. `ENDED` shows an end time only when the `session_end` really is
+  the last event; a session resumed under the same id keeps recording after
+  its `session_end` and reads `(reopened)` instead, which is the shape a
+  resumed Claude Code session takes.
 
 **MCP tool names.** Claude Code presents an MCP tool to hooks as
 `mcp__<server>__<tool>` (e.g. `mcp__ClickUp__clickup_get_task`). This is

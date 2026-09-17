@@ -92,7 +92,7 @@ mcp-recorder setup --client claude-desktop
 ```
 mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] [--wrapper local|npx|wsl]
                    [--only NAME[,NAME...]] [--except NAME[,NAME...]] [--bridge NAME=URL[,NAME=URL...]]
-                   [--data-dir D] [--dry-run] [--undo] [--json]
+                   [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]
 ```
 
 - `--client` picks the config file automatically:
@@ -130,6 +130,15 @@ mcp-recorder setup --client <claude-desktop|claude-code|cursor> [--config PATH] 
 - Every run writes a timestamped `.bak` of the config plus a sidecar record,
   so `mcp-recorder setup --client <same> --undo` restores the originals
   exactly.
+- `--policy FILE` switches the wrapped servers into **gateway mode**: the
+  policy is validated up front (a missing, invalid or `mcp`-less file exits 2
+  and leaves the config untouched), then baked into each wrapped entry as
+  `--policy <absolute path>` — absolute because clients launch servers from
+  their own working directory. Entries an earlier `setup` run already wrapped
+  are updated in place too (the flag is added, or an existing one repointed;
+  they are reported as `updated policy on: ...`), so one run really does
+  apply the policy to every server in the config. Ignored with `--undo`. See
+  [docs/gateway.md](gateway.md) for what enforcement does.
 - `--dry-run` prints the resulting config without writing anything.
 - `--data-dir D` sets the data directory baked into the wrapped commands
   (default `~/.mcp-recorder`).

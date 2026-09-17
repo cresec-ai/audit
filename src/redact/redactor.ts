@@ -138,11 +138,44 @@ const ALWAYS_PATTERNS: RegExp[] = [
   // JWTs (three dot-separated base64url segments starting "eyJ")
   /\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b/,
   // PEM private key blocks
-  /-----BEGIN [A-Z ]+PRIVATE KEY-----/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   // OpenAI-style keys
   /\bsk-[A-Za-z0-9_-]{10,}\b/,
   // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  // GitHub fine-grained PATs. NOT reachable by the `gh[pousr]_` shape above
+  // ("github_" has no matching second letter), and not by the generic base64
+  // run either (the embedded `_` kills the \b), so before this entry a
+  // fine-grained PAT crossed the recorder unhashed.
+  //
+  // The REAL shape is `github_pat_` + a 22-character base62 identifier + `_`
+  // + a 59-character base62 secret, and the pattern spells exactly that. The
+  // looser `[A-Za-z0-9_]{22,}` it used to carry put `_` in the character
+  // class, so every snake_case identifier that happens to start with the
+  // prefix — `github_pat_token_refresh_helper_result`,
+  // `github_pat_validation_middleware_options` — was hashed as a credential
+  // in the store and rewritten at the boundary. The two halves are fixed
+  // length, so nothing here can backtrack.
+  //
+  // But spelling ONLY that shape made a credential hinge on two exact
+  // lengths: a token from a format change, a variant, or a paste that lost a
+  // character then matches nothing at all and reaches the store in clear —
+  // which is strictly worse than the false positives the narrowing fixed. So
+  // a second, defensive arm follows it, keyed on what a token has and an
+  // identifier does not: 40+ characters, a digit, AND both letter cases.
+  // `github_pat_token_refresh_helper_result` is lower-case with no digit;
+  // `GITHUB_PAT_SOMETHING_LONG` has no lower case. A real base62 secret of
+  // 81 characters has all three with overwhelming probability. Each lookahead
+  // scans the same bounded run once, so this cannot backtrack either.
+  //
+  // The floor is 40 because a real token carries 82 characters of payload,
+  // so no genuine credential is near it. A floor of 24 was tried and
+  // reverted: it starts matching `github_pat_Handler2_Options_Result_Cache`,
+  // and all it buys is a heavily truncated paste, which is not a working
+  // credential. The case and digit tests, not the floor, keep identifiers
+  // out.
+  /\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b/,
+  /\bgithub_pat_(?=[A-Za-z0-9_]{40,}\b)(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[a-z])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]+\b/,
   // Slack tokens
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
   // Bearer auth headers
@@ -151,8 +184,75 @@ const ALWAYS_PATTERNS: RegExp[] = [
   /\b[0-9a-fA-F]{32,}\b/,
   // Long base64 blobs (>= 40 chars)
   /\b[A-Za-z0-9+/]{40,}={0,2}\b/,
-  // password-ish assignments ("password=...", "api_key: ...")
-  /\b(password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+/i,
+  // Credentials carried in a URL's userinfo ("postgres://user:pass@host/db").
+  // Only the `user:pass` is matched, so a redaction keeps the scheme, host
+  // and path readable, and the ref is sha256("user:pass") — the same value
+  // `scrubArgv` already fingerprints for a DSN on a server's command line.
+  //
+  // The trailing `(?=@)` alone was not userinfo: ANY `scheme://name:tag@...`
+  // reference matched it, and a container image ("oci://redis:7.2@sha256:…")
+  // had its name and tag hashed in the store and rewritten at the boundary.
+  // What follows the `@` in a real URL is a HOST, so the lookahead now spells
+  // one out — a dotted/word host or a bracketed IPv6 literal, an optional
+  // numeric port, and then a delimiter. `@sha256:e3b0…` fails it because a
+  // digest's `:` is not followed by a port. The lookahead adds no characters
+  // to the match, so the span stays exactly `user:pass`.
+  /(?<=:\/\/)[^\s:/?#@]{1,128}:[^\s/?#@]{1,128}(?=@(?:\[[0-9A-Fa-f:.]{2,45}\]|[\w.-]{1,255})(?::\d{1,5})?(?![\w.:-]))/,
+  // Credential assignments, in two shapes that need DIFFERENT confidence.
+  //
+  // BARE — the credential keyword IS the whole name ("password=hunter2",
+  // "api_key: x", `{"token":"x"}`, "--password=x"). Nothing else is called
+  // `password`, so any value is taken at face value. An optional closing
+  // quote before the separator is what makes the JSON shape — the single
+  // most common one in an MCP tool result — reachable at all: in
+  // `{"password": "hunter2"}` the `"` sits between the keyword and the `:`.
+  // A leading `-`/`--` is allowed so a `--password=…` flag still matches
+  // (the `(?<![\w-])` guard would otherwise reject the dash), and the value
+  // may be a quoted string, which keeps the trailing `"}` of a JSON object
+  // out of the span.
+  /(?<![\w-])-{0,2}(?:password|passwd|secret|token|api[_-]?key)["']?\s*[:=]\s*(?:"[^"\s]+"|'[^'\s]+'|\S+)/i,
+  // AFFIXED — the keyword is part of a longer name ("AWS_SECRET_ACCESS_KEY=",
+  // "DB_PASSWORD=", "X-Api-Key:"). The leading/trailing `\b` this used to
+  // carry made the pattern blind to exactly those: `_` is a word character,
+  // so there is no boundary before the `SECRET` in `AWS_SECRET_ACCESS_KEY`
+  // nor after it. A bounded, separator-anchored affix is allowed instead,
+  // which keeps "secretary_id=5", "tokenizer_count=3" and
+  // "passwordless=true" out.
+  //
+  // But an affix that may be ANY 62 characters also rides ordinary developer
+  // output — `MAX_TOKEN_LENGTH = 512`, `access_token_expires_in: 3600`,
+  // `secret_scanning_enabled: true` — which is the false-positive class the
+  // narrowing exists to prevent, so the VALUE has to look like a credential
+  // rather than be any `\S+`: at least 8 characters carrying a digit, or at
+  // least 16 characters. Every credential the widening was added for clears
+  // that (a 40-character AWS secret key, `hunter2-correct-horse`, a 20-hex
+  // API key header) and every counted false positive fails it. The digit
+  // lookahead is bounded, so it cannot backtrack superlinearly.
+  /(?<![\w-])(?:[A-Za-z0-9_-]{0,62}[_-])?(?:password|passwd|secret|token|api[_-]?key)(?:[_-][A-Za-z0-9_-]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/i,
+  // The SAME shape in camelCase or PascalCase, which is the dominant style
+  // in real tool output and which neither arm above can see: both require
+  // the affix to be separated by `_` or `-`, so `SecretAccessKey`,
+  // `accessToken`, `refreshToken` and `clientSecret` match neither. An
+  // `aws sts assume-role` response therefore handed the model
+  // `"SecretAccessKey":"wJalrXUtnFEMI/..."` and its `SessionToken` in clear.
+  //
+  // This one is deliberately CASE-SENSITIVE: the capital letter IS the word
+  // boundary. A lowercase keyword is the other two arms' business, and a
+  // suffix must start with an upper-case letter or a digit so `Secretary`
+  // and `tokens` are not credentials. The value gate is the affixed arm's,
+  // so `{"accessTokenExpiresIn": 3600}`, `{"SecretName": "prod/db"}` and
+  // `PasswordPolicy: minimum length 12` stay untouched.
+  /(?:(?<![\w-])(?:password|passwd|secret|token|credential)|Password|Passwd|Secret|Token|ApiKey|Credential)(?:[A-Z0-9][A-Za-z0-9]{0,62})?["']?\s*[:=]\s*(?:["'](?:(?=[^\s"']{0,255}\d)[^\s"']{8,}|[^\s"']{16,})["']|(?=\S{0,255}\d)\S{8,}|\S{16,})/,
+  // A credential passed as a command-line FLAG whose value is the NEXT
+  // argument ("--password hunter2", "--api-key 0123456789abcdef"): the
+  // separator is whitespace, so neither assignment shape above can see it.
+  // `scrubArgv` already covers this for the wrapped server's own argv via
+  // the previous-element flag check; tool RESULTS carry command lines too
+  // (shell output, CI logs, `ps` listings). The value must look like a
+  // credential — 6+ characters with a digit, or 16+ — and may not start with
+  // `<` or `$`, so "--secret-scanning enabled", "--token to authenticate",
+  // "--api-key <your-key-here>" and "--token $GITHUB_TOKEN" stay untouched.
+  /(?<![\w-])-{1,2}(?:[A-Za-z0-9-]{0,62}-)?(?:password|passwd|secret|token|api-?key)(?:-[A-Za-z0-9-]{0,62})?[ \t]+(?:(?=\S{0,255}\d)[^\s<$]\S{5,}|[^\s<$]\S{15,})/i,
 ];
 
 export const DEFAULT_POLICY: RedactionPolicy = {
@@ -562,6 +662,18 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
   // standalone-element branches below: records the joined `user:pass` AND
   // (P2) the user/password components separately, so a blast-radius query
   // for the password alone — without knowing the username — still finds it.
+  //
+  // Stripping the userinfo says nothing about the REST of the URL: a
+  // credential in the PATH ("https://u:p@hooks.example.com/services/ghp_…")
+  // survives it, and `looksSecret` never ran on the element because the
+  // strip branch returned first — so the token landed verbatim in
+  // `ServerContext.command`, which is stamped on every event, rendered by
+  // replay and shipped in export bundles. Re-checking the STRIPPED remainder
+  // closes that while keeping the strip's separate userinfo refs and the
+  // legible scheme/host for an ordinary DSN.
+  const scrubStrippedUrl = (label: string, stripped: string): string =>
+    looksSecret(stripped) ? fingerprint(label, stripped) : stripped;
+
   const fingerprintUrlHit = (
     name: string,
     hit: {
@@ -616,14 +728,25 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
       // throws on a `--flag=...` string, so the value half must be checked
       // on its own, and the `--flag=` prefix re-joined onto the scrubbed
       // result.
-      if (looksSecret(value)) {
-        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
-        continue;
-      }
+      //
+      // The URL check runs FIRST. `alwaysPatterns` now carries a
+      // url-userinfo shape, so `looksSecret` is true of a DSN too, and
+      // whichever branch runs first decides the outcome. Stripping wins on
+      // both counts: it fingerprints `user:pass`, the password and the
+      // username SEPARATELY (three refs a blast-radius query can hit) where
+      // hashing the element whole yields one ref for the entire DSN, and it
+      // keeps the scheme/host/path — which carry no credential — legible in
+      // `ServerContext.command`. The stripped remainder is then re-checked
+      // with `looksSecret` (see `scrubStrippedUrl`), so "wins" never means
+      // "skips the secret check".
       const eqUrlHit = stripUrlUserinfo(value);
       if (eqUrlHit !== undefined) {
         fingerprintUrlHit(label, eqUrlHit);
-        out.push(el.slice(0, eq + 1) + eqUrlHit.stripped);
+        out.push(el.slice(0, eq + 1) + scrubStrippedUrl(label, eqUrlHit.stripped));
+        continue;
+      }
+      if (looksSecret(value)) {
+        out.push(el.slice(0, eq + 1) + fingerprint(label, value));
         continue;
       }
     }
@@ -635,15 +758,17 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
       continue;
     }
 
-    if (looksSecret(el)) {
-      out.push(fingerprint(`argv[${i}]`, el));
-      continue;
-    }
-
+    // Same ordering as the `=` branch above, for the same reason: a URL with
+    // userinfo is now `looksSecret`, and the strip is the stronger outcome.
     const urlHit = stripUrlUserinfo(el);
     if (urlHit !== undefined) {
       fingerprintUrlHit(`argv[${i}]`, urlHit);
-      out.push(urlHit.stripped);
+      out.push(scrubStrippedUrl(`argv[${i}]`, urlHit.stripped));
+      continue;
+    }
+
+    if (looksSecret(el)) {
+      out.push(fingerprint(`argv[${i}]`, el));
       continue;
     }
 

@@ -12,8 +12,10 @@ import type {
   AnyEvent,
   ChainRecord,
   CredentialFingerprint,
+  GatewayOutcome,
   InitializeEvent,
   NotificationEvent,
+  PolicyDecisionEvent,
   ProtocolErrorEvent,
   RedactedRef,
   RpcEvent,
@@ -207,10 +209,125 @@ function renderInitialize(seq: number, e: InitializeEvent): string {
 </article>`;
 }
 
+/* ------------------------- gateway mode (additive) ------------------------ */
+
+/** CSS class for a gateway decision badge; anything off-schema falls back to the hold style. */
+function gatewayBadgeClass(decision: unknown): string {
+  return decision === 'allow' ? 'gw-allow' : decision === 'deny' ? 'gw-deny' : 'gw-hold';
+}
+
+/**
+ * One count as the boundary report claims it: `2 secrets`, `1 injection
+ * marker`. Returns undefined for a real zero (nothing to say). A tampered
+ * store can put a non-number here, and reporting that as "0 findings" would
+ * be a lie, so a non-numeric value is rendered as-is — through num(), which
+ * escapes it.
+ */
+function boundaryCount(value: unknown, singular: string, plural: string): string | undefined {
+  const n = Number(value);
+  if (Number.isFinite(n)) return n > 0 ? `${num(value)} ${n === 1 ? singular : plural}` : undefined;
+  return typeof value === 'string' ? `${num(value)} ${plural}` : undefined;
+}
+
+/**
+ * "redact · 2 secrets · 1 injection marker" — a one-line summary of what the
+ * boundary filter did to a tool result.
+ *
+ * The stored `action` is the MAXIMUM over both finding families, not a
+ * per-family fact: under the default policy (secrets: redact, injection:
+ * flag) a result holding one of each is stored as `action: 'redact'` even
+ * though the injection marker was only flagged. So the action is named ONCE
+ * and the counts follow it plainly — attaching the verb to each count would
+ * claim work the filter never did. `block` is the one action that covers
+ * everything (the whole result was replaced), and it reads as `blocked`.
+ * Every count goes through num() (a tampered store may put markup where a
+ * number belongs) and the action through escapeHtml() for the same reason.
+ */
+function boundarySummary(boundary: GatewayOutcome['boundary']): string {
+  if (boundary === undefined) return '';
+  if (!boundary.scanned) {
+    const why = boundary.error !== undefined ? `error ${escapeHtml(boundary.error)}` : 'oversize';
+    return `not scanned (${why})` + (boundary.action === 'block' ? ' · blocked' : '');
+  }
+  const action =
+    boundary.action === 'none'
+      ? 'scanned'
+      : boundary.action === 'block'
+        ? 'blocked'
+        : escapeHtml(String(boundary.action));
+  const bits: string[] = [action];
+  const secrets = boundaryCount(boundary.secrets_found, 'secret', 'secrets');
+  const injections = boundaryCount(boundary.injection_found, 'injection marker', 'injection markers');
+  if (secrets !== undefined) bits.push(secrets);
+  if (injections !== undefined) bits.push(injections);
+  if (bits.length === 1) bits.push('0 findings');
+  return bits.join(' · ');
+}
+
+/**
+ * Badge(s) on a tool_call card recorded in gateway mode: the decision
+ * (gw-allow / gw-hold / gw-deny), the hold outcome when there is one, and
+ * the boundary-filter summary. secret_refs are exposed as data-secret-refs
+ * so the client-side blast-radius search finds a value the filter scrubbed
+ * before the model ever saw it.
+ */
+function gatewayBadges(gw: GatewayOutcome | undefined): string {
+  if (gw === undefined) return '';
+  const cls = gatewayBadgeClass(gw.decision);
+  const label =
+    gw.outcome !== undefined ? `${escapeHtml(String(gw.decision))} · ${escapeHtml(String(gw.outcome))}` : escapeHtml(String(gw.decision));
+  const title: string[] = [];
+  // Why, when the gateway refused the message rather than evaluating it —
+  // otherwise the absent rule id reads as the section default.
+  if (gw.refusal !== undefined) title.push(`refused: ${gw.refusal}`);
+  if (gw.rule_id !== undefined) title.push(`rule ${gw.rule_id}`);
+  if (gw.approval_id !== undefined) title.push(`hold ${gw.approval_id}`);
+  if (gw.waited_ms !== undefined) title.push(`waited ${String(gw.waited_ms)} ms`);
+  const titleAttr = title.length > 0 ? ` title="${escapeHtml(title.join(' · '))}"` : '';
+  let html = `<span class="badge gw ${cls}"${titleAttr}>gateway ${label}</span>`;
+  const b = gw.boundary;
+  if (b !== undefined) {
+    const refs = Array.isArray(b.secret_refs) && b.secret_refs.length > 0
+      ? ` data-secret-refs="${escapeHtml(b.secret_refs.map(String).join(' '))}"`
+      : '';
+    const delivered =
+      b.delivered_result_hash !== undefined
+        ? ` title="delivered result ${escapeHtml(String(b.delivered_result_hash))}"`
+        : '';
+    html += ` <span class="badge boundary${b.action === 'block' ? ' gw-deny' : ''}"${refs}${delivered}>${boundarySummary(b)}</span>`;
+  }
+  return html;
+}
+
+function renderPolicyDecision(seq: number, e: PolicyDecisionEvent): string {
+  const cls = gatewayBadgeClass(e.decision);
+  const bits: string[] = [`request ${escapeHtml(String(e.request_id))}`];
+  // No rule_id does NOT mean "the configured default applied": the emitter
+  // also omits it for a fail-closed evaluation-error deny (reason "policy
+  // evaluation error: ..."), and for a tools/call refused before any rule was
+  // consulted. State the fact instead of inferring the cause.
+  bits.push(e.rule_id !== undefined ? `rule ${escapeHtml(e.rule_id)}` : 'no rule matched');
+  if (e.outcome !== undefined) bits.push(`outcome ${escapeHtml(String(e.outcome))}`);
+  if (e.waited_ms !== undefined) bits.push(`waited ${num(e.waited_ms)} ms`);
+  if (e.approval_id !== undefined) bits.push(`hold <code>${escapeHtml(String(e.approval_id))}</code>`);
+  if (e.approver !== undefined) bits.push(`by ${escapeHtml(String(e.approver))}`);
+  const argsHash =
+    typeof e.args_hash === 'string'
+      ? ` · args <code class="rh" data-ref="${escapeHtml(e.args_hash)}" title="${escapeHtml(e.args_hash)}">${escapeHtml(shortRef(e.args_hash))}</code>`
+      : '';
+  return `<article class="event row policy ${cls}" data-seq="${num(seq)}">
+  <span class="kind tag-policy">POLICY</span> <span class="tool">${escapeHtml(e.tool)}</span>
+  <span class="badge gw ${cls}">${escapeHtml(String(e.decision))}</span>
+  <span class="dim">· ${bits.join(' · ')}${argsHash} · policy <code title="${escapeHtml(String(e.policy_hash))}">${escapeHtml(shortRef(String(e.policy_hash)))}</code></span>
+  ${timeTag(e.timestamp)}
+</article>`;
+}
+
 function renderToolCall(seq: number, e: ToolCallEvent): string {
   const hasGenAi = Object.keys(e.attributes).some((k) => k.startsWith('gen_ai.'));
   const genAiBadge = hasGenAi ? '<span class="badge genai">gen_ai</span>' : '';
   const errorBadge = e.is_error ? '<span class="badge err">error</span>' : '';
+  const gwBadges = gatewayBadges(e.gateway);
   let errorInfo = '';
   if (e.error !== undefined) {
     const bits: string[] = [];
@@ -229,7 +346,7 @@ function renderToolCall(seq: number, e: ToolCallEvent): string {
   <div class="card-head act-head">
     <span class="kind tag-act">ACT</span>
     <span class="tool">${escapeHtml(e.tool)}</span>
-    ${genAiBadge}${errorBadge}
+    ${genAiBadge}${errorBadge}${gwBadges}
     <span class="dur">${num(e.duration_ms)} ms</span>
     ${timeTag(e.timestamp)}
   </div>
@@ -255,8 +372,13 @@ function renderRpc(seq: number, e: RpcEvent): string {
 
 function renderNotification(seq: number, e: NotificationEvent): string {
   const arrow = e.direction === 'client_to_server' ? '→' : '←';
+  // A refused `tools/call` notification carries the decision the chain
+  // cannot hold as a `policy_decision` event (it has no request id). Without
+  // the badge the timeline showed it as an ordinary client notification, so
+  // a reader could not tell a blocked call from one that went through.
+  const badges = gatewayBadges(e.gateway);
   return `<article class="event row notif" data-seq="${num(seq)}">
-  <span class="kind tag-notif">NOTIFY</span> ${arrow} <code>${escapeHtml(e.method)}</code>
+  <span class="kind tag-notif">NOTIFY</span> ${arrow} <code>${escapeHtml(e.method)}</code>${badges}
   ${timeTag(e.timestamp)}
   <pre class="tree">${renderTree(e.params)}</pre>
 </article>`;
@@ -298,6 +420,8 @@ function renderEvent(record: ChainRecord): string {
       return renderProtocolError(record.seq, e);
     case 'session_end':
       return renderSessionEnd(record.seq, e);
+    case 'policy_decision':
+      return renderPolicyDecision(record.seq, e);
     default:
       // Future kinds: render an inert row rather than dropping evidence.
       return `<article class="event row" data-seq="${num(record.seq)}"><span class="kind">${escapeHtml(
@@ -428,6 +552,13 @@ header .meta code { color: var(--fg); }
 .badge { font-size: .72em; font-weight: 700; padding: .05rem .4rem; border-radius: 999px; }
 .badge.genai { background: rgba(90,176,247,.15); color: var(--accent); border: 1px solid var(--accent); }
 .badge.err { background: rgba(224,108,117,.15); color: var(--bad); border: 1px solid var(--bad); }
+.badge.gw-allow { background: rgba(79,195,128,.15); color: var(--ok); border: 1px solid var(--ok); }
+.badge.gw-hold { background: rgba(224,169,63,.15); color: var(--warn); border: 1px solid var(--warn); }
+.badge.gw-deny { background: rgba(224,108,117,.15); color: var(--bad); border: 1px solid var(--bad); }
+.badge.boundary { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); }
+.tag-policy { background: rgba(224,169,63,.2); color: var(--warn); }
+.event.row.policy.gw-deny { background: rgba(224,108,117,.08); border-color: var(--bad); }
+.event.row.policy.gw-hold { background: rgba(224,169,63,.08); border-color: var(--warn); }
 .dur { color: var(--dim); font-size: .85em; }
 .sub { color: var(--dim); font-size: .85em; margin-top: .4rem; }
 pre.tree { margin: .35rem 0 0; padding: .5rem .65rem; background: var(--bg);
