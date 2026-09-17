@@ -519,6 +519,33 @@ function plainNotification(sessionId: string, timestamp: string): NotificationEv
   };
 }
 
+/* --------------------- resumed ("reopened") session --------------------- */
+
+/**
+ * A session that recorded its session_end and then KEPT RECORDING: cloud
+ * dogfood 4's Claude Code session was resumed under the same session_id, so
+ * a session_end at 07:59:20 is followed by real tool calls until 12:41:08.
+ * The counts are live aggregates over all of it, so a reader who takes
+ * ENDED as "nothing happened after this" misreads the row — the shape this
+ * fixture pins.
+ */
+const SESSION_REOPENED = '77777777-7777-4777-8777-777777777777';
+
+function reopenedSessionEvents(): AnyEvent[] {
+  return [
+    sessionStart(SESSION_REOPENED, '2026-09-15T07:00:00.000Z'),
+    toolCall(SESSION_REOPENED, '2026-09-15T07:30:00.000Z', 'list_issues', { requestId: 1 }),
+    sessionEnd(SESSION_REOPENED, '2026-09-15T07:59:20.000Z'),
+    // ... resumed here, under the same session_id and with no second
+    // session_start (the client only ever emits one per session).
+    toolCall(SESSION_REOPENED, '2026-09-15T12:40:00.000Z', 'create_issue', { requestId: 2 }),
+    toolCall(SESSION_REOPENED, '2026-09-15T12:41:08.000Z', 'get_file_contents', {
+      requestId: 3,
+      isError: true,
+    }),
+  ];
+}
+
 function fakeSignature(record: ChainRecord, signedAt: string): HeadSignature {
   return {
     seq: record.seq,
@@ -685,6 +712,9 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(a).toBeDefined();
     expect(a.started_at).toBe('2026-06-11T10:00:00.000Z');
     expect(a.ended_at).toBe('2026-06-11T10:00:03.000Z');
+    // Ended and stayed ended: the session_end IS the last event, so
+    // last_event_at repeats it and `sessions` prints the end time.
+    expect(a.last_event_at).toBe('2026-06-11T10:00:03.000Z');
     expect(a.server_name).toBe('github-mcp');
     expect(a.identity_fingerprint).toBe(IDENTITY.fingerprint);
     expect(a.event_count).toBe(4);
@@ -697,6 +727,7 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     expect(b).toBeDefined();
     expect(b.started_at).toBe('2026-06-11T11:00:00.000Z');
     expect(b.ended_at).toBeUndefined();
+    expect(b.last_event_at).toBe('2026-06-11T11:00:01.000Z'); // still open: last activity
     expect(b.server_name).toBe('github-mcp');
     expect(b.identity_fingerprint).toBe(IDENTITY.fingerprint);
     expect(b.event_count).toBe(2);
@@ -771,6 +802,41 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     const noCalls = sessions.find((s) => s.session_id === NO_CALLS)!;
     expect(noCalls.server_count).toBe(0);
     expect(noCalls.tool_call_count).toBe(0);
+  });
+
+  it('sessions() keeps a session honest when its events continue past its session_end', () => {
+    const store = open();
+    // The normally-ended session A shares the chain, so "unchanged for a
+    // clean end" is asserted against the same code path.
+    store.append(seal([...twoSessionEvents(), ...reopenedSessionEvents()]));
+
+    const sessions = store.sessions();
+    const reopened = sessions.find((s) => s.session_id === SESSION_REOPENED)!;
+    expect(reopened).toBeDefined();
+    expect(reopened.started_at).toBe('2026-09-15T07:00:00.000Z');
+    // The session_end is still reported — it happened — but it is NOT the
+    // session's last event, and last_event_at says so: the row cannot be
+    // read as "ended at 07:59:20, nothing after".
+    expect(reopened.ended_at).toBe('2026-09-15T07:59:20.000Z');
+    expect(reopened.last_event_at).toBe('2026-09-15T12:41:08.000Z');
+    expect(reopened.last_event_at! > reopened.ended_at!).toBe(true);
+    // The counts are live aggregates over the WHOLE session, before and
+    // after the session_end — that is what makes the plain ENDED reading
+    // wrong, and it does not change here.
+    expect(reopened.event_count).toBe(5);
+    expect(reopened.tool_call_count).toBe(3);
+    expect(reopened.error_count).toBe(1);
+    expect(reopened.server_count).toBe(1);
+
+    // A session that ended and stayed ended is untouched: its session_end is
+    // its last event, so ended_at and last_event_at agree.
+    const a = sessions.find((s) => s.session_id === SESSION_A)!;
+    expect(a.ended_at).toBe('2026-06-11T10:00:03.000Z');
+    expect(a.last_event_at).toBe('2026-06-11T10:00:03.000Z');
+    // And one that never ended reports its last activity, not an end.
+    const b = sessions.find((s) => s.session_id === SESSION_B)!;
+    expect(b.ended_at).toBeUndefined();
+    expect(b.last_event_at).toBe('2026-06-11T11:00:01.000Z');
   });
 
   it('sessions() reads non-conforming records the same way on both backends', () => {
@@ -1352,6 +1418,52 @@ describe('JsonlStore appendEvents across instances (simulates separate processes
       }
     } finally {
       verifyOpen.close();
+    }
+  });
+});
+
+/* -------------------- one chain, one answer, two backends -------------------- */
+
+describe('sessions() is backend-independent', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-store-parity-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('sqlite and jsonl serialize the same summaries for the same chain', () => {
+    // The parametrized suite above pins the same expectations on each
+    // backend separately; this compares them directly, which is the check
+    // that catches a field one backend sets and the other does not.
+    expect(isSqliteAvailable()).toBe(true); // the comparison is vacuous without it
+    const records = seal([
+      ...twoSessionEvents(),
+      ...hookSessionEvents(),
+      ...reopenedSessionEvents(),
+    ]);
+    const sqlite = openStore({ dataDir: join(dir, 'sqlite'), backend: 'sqlite' });
+    const jsonl = openStore({ dataDir: join(dir, 'jsonl'), backend: 'jsonl' });
+    try {
+      sqlite.append(records);
+      jsonl.append(records);
+      const fromSqlite = sqlite.sessions();
+      expect(fromSqlite.map((s) => s.session_id)).toEqual([
+        SESSION_A,
+        SESSION_B,
+        SESSION_HOOK,
+        SESSION_REOPENED,
+      ]);
+      // JSON.stringify, not toEqual: `sessions --json` is the stable machine
+      // interface (README), so the KEY ORDER and which optional keys are
+      // present must not depend on which backend produced it either.
+      expect(JSON.stringify(fromSqlite, null, 2)).toBe(JSON.stringify(jsonl.sessions(), null, 2));
+    } finally {
+      sqlite.close();
+      jsonl.close();
     }
   });
 });

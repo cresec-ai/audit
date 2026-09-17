@@ -80,6 +80,12 @@ BEGIN SELECT RAISE(ABORT, 'mcp-recorder: append-only'); END;
  * `{isError: true}`). A post whose pre was never recorded (the hook
  * installed mid-call) is therefore counted in error_count but not in
  * tool_call_count.
+ * ended_at is the LATEST session_end timestamp and last_event_at the
+ * latest timestamp of any event, so a caller can tell a session that ended
+ * and stayed ended (equal) from one that was REOPENED — resumed under the
+ * same session_id, recording more events after its session_end (cloud
+ * dogfood 4). Both are plain MAX() over the session's rows, so they stay
+ * live aggregates like the counts: nothing is frozen at session_end.
  * server_count is the number of distinct server.name values over the
  * session's tool_call events ONLY — the servers actually called. Counting
  * every event would read 2 for a plain proxy session recorded without
@@ -113,6 +119,7 @@ SELECT
   r.session_id                                          AS session_id,
   MIN(r.timestamp)                                      AS started_at,
   MAX(CASE WHEN r.kind = 'session_end' THEN r.timestamp END) AS ended_at,
+  MAX(r.timestamp)                                      AS last_event_at,
   COUNT(*)                                              AS event_count,
   SUM(CASE WHEN r.kind = 'tool_call'
             AND (json_extract(r.event, '$.phase') IS NULL
@@ -315,9 +322,15 @@ export class SqliteStore {
     sessions() {
         const rows = this.db.prepare(SESSIONS_SQL).all();
         return rows.map((row) => {
+            // Key insertion order is part of the contract with JsonlStore: both
+            // backends must produce byte-identical JSON for the same chain
+            // (test/store.test.ts compares JSON.stringify across the two), so
+            // last_event_at goes here, after started_at, in both — and ended_at
+            // is appended last in both, where it has always been.
             const summary = {
                 session_id: row.session_id,
                 started_at: row.started_at,
+                last_event_at: row.last_event_at,
                 server_name: row.server_name ?? '',
                 identity_fingerprint: row.identity_fingerprint ?? '',
                 event_count: row.event_count,
