@@ -1,0 +1,19 @@
+{
+  // Everything `tsconfig.json` does not compile: the tests, the benches and
+  // the demo. They are run by tsx and vitest, which strip types rather than
+  // check them, so nothing checked these until this file existed — a test
+  // could call a one-argument function with two and stay green forever.
+  //
+  // Separate from `tsconfig.json` because that one EMITS (`dist/` is
+  // committed and CI fails on it being stale). Adding `test` there would
+  // publish the tests; this config is `noEmit` and shares every other
+  // setting, so the two cannot drift.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src", "test", "bench", "demo"]
+}

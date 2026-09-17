@@ -82,14 +82,24 @@ function tmpDataDir(): string {
 }
 
 function sessionStart(): SessionStartEvent {
+  // This fixture claimed to be a `SessionStartEvent` and was not one: it
+  // carried a top-level `transport` and a `server.args_hash`, neither of
+  // which exists on the schema, and omitted five REQUIRED fields
+  // (`event_id`, `attributes`, `proxy_version`, `cwd`, `redaction_mode`).
+  // It passed for as long as nothing typechecked this directory, because
+  // the store only serializes what it is handed.
   return {
     schema: SCHEMA,
+    event_id: '00000000-0000-4000-8000-00000000cafe',
     kind: 'session_start',
     session_id: 'open-test-session',
     timestamp: new Date().toISOString(),
-    transport: 'stdio',
-    server: { name: 'echo', command: 'node', args_hash: 'sha256:x' },
     identity: { fingerprint: 'sha256:y' },
+    server: { name: 'echo', command: 'node', transport: 'stdio' },
+    attributes: { 'rpc.system': 'jsonrpc' },
+    proxy_version: '0.0.0-test',
+    cwd: '/tmp',
+    redaction_mode: 'allowlist',
   };
 }
 

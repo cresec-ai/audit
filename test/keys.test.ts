@@ -262,12 +262,20 @@ describe('Signer', () => {
     // utils.randomPrivateKey) read globalThis.crypto and throw when it's
     // missing — this suite proves Signer never calls them (see
     // src/chain/keys.ts's sync-only invariant).
+    /**
+     * The type of `globalThis.crypto` as @types/node declares it. `Crypto`
+     * itself is a DOM global, and this repository's tsconfig loads
+     * `lib: ["ES2022"]` only — deliberately, since `src` targets node and
+     * should not be able to reach for a browser API by accident.
+     */
+    type GlobalCrypto = typeof globalThis.crypto;
+
     let hadCrypto: boolean;
-    let original: Crypto | undefined;
+    let original: GlobalCrypto | undefined;
 
     beforeEach(() => {
       hadCrypto = Object.prototype.hasOwnProperty.call(globalThis, 'crypto');
-      original = (globalThis as { crypto?: Crypto }).crypto;
+      original = (globalThis as { crypto?: GlobalCrypto }).crypto;
       Object.defineProperty(globalThis, 'crypto', {
         value: undefined,
         configurable: true,
@@ -283,7 +291,7 @@ describe('Signer', () => {
           writable: true,
         });
       } else {
-        delete (globalThis as { crypto?: Crypto }).crypto;
+        delete (globalThis as { crypto?: GlobalCrypto }).crypto;
       }
     });
 

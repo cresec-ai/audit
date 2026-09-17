@@ -333,10 +333,15 @@ describe('validatePolicyObject: happy path', () => {
 
 describe('validatePolicyObject: error paths', () => {
   type Doc = Record<string, unknown>;
-  const mcpOf = (d: Doc) => d.mcp as { rules: Doc[]; hold: Doc; boundary: Doc; default: unknown };
-  const egressOf = (d: Doc) => d.egress as { rules: Doc[]; default: unknown };
-  const rule0 = (d: Doc) => mcpOf(d).rules[0] as { match: Doc; action: unknown; id: unknown; reason: unknown };
-  const erule0 = (d: Doc) => egressOf(d).rules[0] as { match: Doc; action: unknown; id: unknown };
+  // Intersected with `Doc` on purpose: half of what these tests do is add a
+  // key the schema must REJECT (`mcpOf(d).bogus = 1`), so a closed object
+  // type would make the test itself the error rather than the policy.
+  const mcpOf = (d: Doc) => d.mcp as Doc & { rules: Doc[]; hold: Doc; boundary: Doc; default: unknown };
+  const egressOf = (d: Doc) => d.egress as Doc & { rules: Doc[]; default: unknown };
+  const rule0 = (d: Doc) =>
+    mcpOf(d).rules[0] as Doc & { match: Doc; action: unknown; id: unknown; reason: unknown };
+  const erule0 = (d: Doc) =>
+    egressOf(d).rules[0] as Doc & { match: Doc; action: unknown; id: unknown; reason: unknown };
 
   it('non-object roots', () => {
     for (const raw of [null, undefined, 1, 'x', [], true]) {
@@ -799,7 +804,7 @@ describe('validatePolicyObject: error paths', () => {
     // The shipped example policies are the real over-rejection guard.
     for (const file of ['policy.demo.yaml', 'policy.laptop.yaml']) {
       const parsed = parsePolicyText(readFileSync(join(ROOT, 'docs', 'examples', file), 'utf8'), 'yaml', file);
-      expect(validatePolicyObject(parsed as PolicyInput).ok, file).toBe(true);
+      expect(validatePolicyObject(parsed).ok, file).toBe(true);
     }
   });
 

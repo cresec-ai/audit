@@ -496,6 +496,10 @@ describe('render.ts escapes fields the TYPE SYSTEM merely claims are numeric', (
       path: '/fake/evidence.jsonl',
       head: () => ({ seq: records.length, hash: GENESIS_HASH }),
       append: () => undefined,
+      // Read-only fake: `render` never writes, and a fake that silently
+      // omitted this drifted out of the interface unnoticed for as long as
+      // nothing typechecked this file.
+      appendEvents: () => [],
       addSignature: () => undefined,
       latestSignature: () => null,
       signatures: () => [],
@@ -751,6 +755,10 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
       path: '/fake/evidence.jsonl',
       head: () => ({ seq: records.length, hash: GENESIS_HASH }),
       append: () => undefined,
+      // Read-only fake: `render` never writes, and a fake that silently
+      // omitted this drifted out of the interface unnoticed for as long as
+      // nothing typechecked this file.
+      appendEvents: () => [],
       addSignature: () => undefined,
       latestSignature: () => null,
       signatures: () => [],
