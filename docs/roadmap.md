@@ -5,6 +5,12 @@ around it is larger than the package, and most of that plan is not code that
 lives here. This page separates the three, so that nobody installs the
 recorder expecting a hosted control plane.
 
+It also reconciles this repository with `cresec-ai/nhi`, the control plane that
+holds credentials. [docs/pov.md](pov.md) is the companion page: it tells the
+proof-of-value story these items serve, stage by stage, and carries the list of
+things we must not claim in a room. Read that first if you want the *why*; this
+page is the *what and in what order*.
+
 The source of truth for planning is the ClickUp list
 [🛠️ MVP — MCP Black Box](https://app.clickup.com/90182720801/v/l/li/901818701787),
 75 items when this page was written. This page is the engineering reading of
@@ -414,31 +420,80 @@ store *does* hold events, the same mistake produces a page about the wrong
 session with no warning at all — which is how it behaved when we reran it
 here.
 
-## What is planned but not in this repository?
+## The consolidated backlog (both repositories, one order)
 
-Everything below is the v2 plan. It targets a Go monorepo — an `agentctl`
-CLI, an edge daemon, and a hosted control plane — and **none of it is in this
-repository or in this package.** Some of it folds work from here: the
-hosted gateway phase folds the MCP proxy, and the evidence phase folds the
-tamper-evident store.
+This replaces the two separate roadmaps. Ordering is by **which proof-of-value
+stage an item unblocks**, not by which repository it lives in — see
+[docs/pov.md](pov.md) for the stages and for what we may and may not claim about
+each capability.
 
-| Phase | What it is | Relationship to this package |
+Owner is `recorder` (this repository), `nhi` (`cresec-ai/nhi`, the control
+plane), or `v2` (a Go monorepo that exists in neither).
+
+### P0 — the week-one POV does not work without these
+
+| Item | Unblocks | Size | Owner | Why |
+|---|---|---|---|---|
+| Pre-flight hardening: `hook install` creates `.claude/`; `--undo` byte-exact; backups gitignored; `ui --out` refuses to silently render the default store; demo cleans up and fails on the doubling retry | Stage 1 | S | recorder | Each has already made a live operator look incompetent. `ui --out` is the worst: without `--data-dir` it renders `~/.mcp-recorder`, so in a customer room it can display somebody else's traffic |
+| Publish `@edut/mcp-recorder` to npm | Stage 1 | S | recorder | `npm view` returns E404, so every `npx -y` line in our docs is a future form, and a GitHub-URL install is rejected outright by some security teams |
+| `sessions` DECISIONS counts both deny shapes; replay badges them consistently | Stage 2 | S | recorder | It reads 0 for hook sessions however many calls they denied. Any "how much did we block?" answer is wrong today, and the buyer finds it unaided |
+| Land the broker core + protocol + seven resolver sources | Stage 4B | M | recorder | Until it lands, the branch name is a claim nothing backs and nothing else in the credential story can integrate |
+| Land the `credentials` policy section + Rego emitter | Stage 4B | M | recorder | The policy surface the broker needs. `main`'s schema is still exactly `version`/`name`/`mcp`/`egress` |
+| Land the gateway swap + result scrub, deleting its temporary scaffold | Stage 4B | M | recorder | Integration is the risk here, not authorship: three units written in three isolated trees that have never run together |
+| End-to-end broker suite, plus the first tests for the gateway swap | Stage 4B | M | recorder | The unit that proves the three pieces work together rather than three pieces each working alone |
+| One dogfood run swapping a real credential, bundle committed | Stage 4B | S | recorder | Every other load-bearing claim has a named live run behind it. The credential claim needs the same or it is not in the same class |
+
+### P1 — makes the story hold together
+
+| Item | Unblocks | Size | Owner | Why |
+|---|---|---|---|---|
+| `decision_id` as an additive optional field on decision events | Stage 4B, every later NHI join | S | recorder | The only identifier joining the agent-side signed chain to the control-plane ledger. Cheap, and permitted by the frozen v1 schema |
+| Promote the deny-rule smoke test to `policy test --tool <name>` | Stage 3 | S | recorder | The thirty seconds where a rule prints nothing is the most persuasive moment in the second meeting. Today it is a `printf` someone has to remember — and forgetting it is exactly how dogfood 4 failed |
+| `sessions --tools` census | Stage 2 | S | recorder | Turns Stage 2 from an engineer improvising SQL into a product surface, and it is what makes the discovery claim defensible |
+| Ship `receiver/` in package `files`; add an HTTP export route for signed replica bundles | Stage 3, 4 | M | recorder | Today a receiver needs a repo clone, and a remote auditor cannot pull a signed replica without filesystem access to the receiver host — which undercuts "evidence you do not have to be handed" |
+
+### P2 — proves what we already shipped, and makes NHI serve one real exchange
+
+| Item | Unblocks | Size | Owner | Why |
+|---|---|---|---|---|
+| Exercise gateway `hold` in a live session; boundary secret filter against a real agent-driven secret | Stage 3 | S | recorder | Both shipped but marked Tested-not-Verified. One dogfood run each moves two beats from "we tested it" to "we watched it" |
+| One real client launching what `setup` wrote | Stage 1 | M | recorder | Removes the only awkward moment in the first meeting, where we recommend hand-editing the config we shipped a command to write |
+| NHI: fix preseed — insert the `data_plane_instance` row, store a real HMAC instead of the literal `fakeHash`, write the token to the vault | beyond Stage 4 | S | nhi | Three independent denies mean NHI cannot serve a single successful exchange from a clean checkout. This one fix makes the core swap real on the control-plane side |
+| NHI: synthetic issuance endpoint, called from handover completion | beyond Stage 4 | S | nhi | `issueSynthetic` has zero call sites, so nothing in the running system can hand out a working synthetic |
+| NHI: generic revoke endpoint, and point the console at it | beyond Stage 4 | M | nhi | Turns the designated "wow moment" from a client-side animation into a 403 on the wire. Their own `it.fails` test being green is a machine-checked assertion that it 404s today |
+| NHI: call `startCronJobs` | beyond Stage 4 | XS | nhi | The cron runner is built, tested and never started, so nothing changes on a timer: no posture snapshot is ever written and Gmail watches expire silently |
+| A Rego deny rule that can actually fire, with an OPA input document unified with the recorder's | Stage 3 handover becoming real enforcement | M | both | The sole deny rule keys on a field the broker never sends, so OPA returns allow unconditionally; the passing tests supply it by hand and mask the gap |
+| Add `cresec/broker/allow.rego` as a third compile target; generate NHI's hand-written bundle in CI from a `policy.yaml` in git | Stage 3, week 2+ | M | both | Removes the second authoring surface. Two places a rule can be wrong, neither smoke-tested, is precisely how dogfood 4 failed |
+
+### P3 — fleet, and the hard gate
+
+| Item | Unblocks | Size | Owner | Why |
+|---|---|---|---|---|
+| NHI: implement the three evidence-sink routes over the existing audit tables, using `receiver/` as the reference | fleet | L | nhi | The cleanest single piece of integration in the whole join: signed agent-side evidence lands in the control plane's append-only storage |
+| NHI: control-plane authentication, tenant middleware, RLS per transaction | any production use | XL | nhi | Zero auth hooks across 21 route plugins; tenant-scoped endpoints trust a caller-supplied `tenant_id`. This is the hard gate on everything after it |
+| Sub-second revocation reaching the agent gateway (NATS) | beyond Stage 4 | M | both | Answers "revoke it and show me the 403" at fleet speed rather than "delete it from the resolver and the next call fails" |
+| SIEM export (Splunk / Sentinel / Datadog / Elastic) | post-POV | M | recorder | The SOC wants the inventory in the tool they already watch; the frozen OTel-aligned schema makes it cheap on our side |
+| Fleet aggregation, retention and pruning, external anchoring of chain heads, MDM-pushed managed settings | beyond the POV | L | both | The store grows until deleted. The sink is the first half of anchoring, not the whole of it |
+| Gateway enforcement for HTTP MCP servers; egress enforcement of the compiled rules | not in this POV | L / XL | recorder, v2 | Two holes a technical buyer will find: `http --policy` exits 2, and the compiler emits egress rules nothing enforces |
+
+### P4 — not scheduled
+
+Approvals inbox, Slack approve/deny, hosted multi-tenant gateway, fleet console,
+mobile agents. Listed so nobody mistakes the local `holds` / `approve` / `deny`
+commands for them, and so nobody promises them in a room.
+
+### The v2 plan these fold into
+
+The ClickUp v2 phases remain the longer-range frame, and much of the backlog
+above is their laptop-scale ancestor rather than a replacement.
+
+| Phase | What it is | Relationship |
 |---|---|---|
-| [v2 · P0 — Harness Audit CLI (Wk 1–2)](https://app.clickup.com/t/z8n6b5yt92) | `agentctl scan` over CI workflows, local agent configs, secret reachability, egress and MCP inventory, with an HTML report | New code. Reads configuration; records nothing |
-| [v2 · P1 — Tier 1 Sidecar: secrets brokering + egress (Wk 2–7)](https://app.clickup.com/t/z8n6b5yt93) | forward proxy with a per-install CA, network-namespace launcher, synthetic credentials, request-aware policy, vendor policy packs | This is where compiled `egress` rules would finally be enforced. Its P1-5 child (the policy schema) is already delivered here, in TypeScript |
-| [v2 · P2 — Tier 2 Hosted Gateway + vendor compilers (Wk 6–11)](https://app.clickup.com/t/z8n6b5yt94) | multi-tenant hosted ingress, `compile --target claude-web / codex-cloud / copilot`, drift detection, sessions UI | The hosted version of what `record --policy` does locally. Option C in [docs/connector-coverage.md](connector-coverage.md). Its P2-7 child is the item gateway mode was closed under |
-| [v2 · P3 — Approval gates + evidence (Wk 9–13)](https://app.clickup.com/t/z8n6b5yt95) | hold state machine over a 428 contract, Slack approval service, one-shot tokens, approvals inbox UI | The local `holds` / `approve` / `deny` commands are the laptop-scale ancestor. There is no inbox, no Slack, no token here. Its P3-6 child (agent guidance) is delivered here, in TypeScript |
-| [v2 · P4 — Pilot instrumentation + hardening (Wk 10–14)](https://app.clickup.com/t/z8n6b5yt96) | pilot metrics, partner weekly report, per-tenant bypass mode and runbook | Nothing in this package |
-| [v2 · Red-team & hosted-conformance suites (nightly, from Wk 4)](https://app.clickup.com/t/z8n6b5yt97) | nightly adversarial and conformance runs | This repository has [docs/red-team.md](red-team.md) and a CI suite, not a nightly hosted one |
-
-Representative not-started items, so the shape is concrete:
-[P0-1 Scaffold apps/agentctl (cobra CLI, goreleaser, edge-daemon module conventions)](https://app.clickup.com/t/z8n6b5yt98),
-[P0-4 scan/secrets-reach — credentials readable by the agent UID, with redaction guarantees](https://app.clickup.com/t/z8n6b5yt9b),
-[P1-1 Forward proxy in edge daemon: CONNECT + TLS termination, per-install CA, child-only trust injection](https://app.clickup.com/t/z8n6b5yt9j),
-[P1-9 cresec/agentctl-action composite GitHub Action + POST /v1/sessions/ci OIDC bootstrap](https://app.clickup.com/t/z8n6b5yt9u),
-[P2-3 compile --target claude-web: custom cloud environment JSON + setup script + managed settings fragment](https://app.clickup.com/t/z8n6b5yta0),
-[P3-2 Approval service: approval table, NATS approvals.<tenant>, Slack Block Kit Approve/Deny, signed callbacks, expiry](https://app.clickup.com/t/z8n6b5yta9),
-[P3-5 UI: approvals inbox (discoveries-inbox card pattern) + policy simulation against last 7 days of decisions](https://app.clickup.com/t/z8n6b5ytac).
+| [v2 · P0 — Harness Audit CLI](https://app.clickup.com/t/z8n6b5yt92) | `agentctl scan` over CI workflows, agent configs, secret reachability, egress and MCP inventory | New code. Reads configuration; records nothing. `sessions --tools` is the observed-traffic answer to the same question |
+| [v2 · P1 — Tier 1 Sidecar: secrets brokering + egress](https://app.clickup.com/t/z8n6b5yt93) | forward proxy with a per-install CA, network-namespace launcher, synthetic credentials, vendor policy packs | Where compiled `egress` rules would finally be enforced. Its P1-5 child (the policy schema) shipped here; the `credentials` section closes the half that was descoped |
+| [v2 · P2 — Tier 2 Hosted Gateway](https://app.clickup.com/t/z8n6b5yt94) | multi-tenant ingress, vendor compile targets, drift detection, sessions UI | The hosted version of what `record --policy` does locally |
+| [v2 · P3 — Approval gates + evidence](https://app.clickup.com/t/z8n6b5yt95) | hold state machine, Slack approvals, one-shot tokens, inbox | The local `holds` / `approve` / `deny` commands are the ancestor. No inbox, no Slack, no token here |
+| [v2 · P4 — Pilot instrumentation](https://app.clickup.com/t/z8n6b5yt96) | pilot metrics, partner reporting, per-tenant bypass | Nothing in this package |
 
 ## How should I read the ClickUp week numbers?
 
@@ -617,6 +672,8 @@ instant the counts run through, and a named test covers it.
 
 ## Where to read next
 
+- [docs/pov.md](pov.md) — the proof-of-value story, the reconciliation with the
+  NHI control plane, the feature map, and what we do not claim.
 - [README.md](../README.md) — what the tool promises, and the honest security
   model.
 - [docs/install.md](install.md) — install per client, Windows and WSL,
