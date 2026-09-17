@@ -28,6 +28,7 @@ import { Buffer } from 'node:buffer';
 import { GENESIS_HASH, makeRecord } from '../chain/hash.js';
 import { validateExtendsHead } from './sqlite.js';
 import { FILES } from '../types.js';
+import { sleepSync } from '../util/sleep-sync.js';
 /**
  * Test-only I/O counters (bytes and call counts), so a test can prove a
  * sync did an incremental catch-up rather than a full reload without
@@ -334,13 +335,6 @@ const LOCK_RETRY_MAX_MS = 20;
  * of dropping the batch.
  */
 const STALE_LOCK_MS = 5_000;
-/** A real synchronous sleep, without a native dependency. */
-function sleepSync(ms) {
-    if (ms <= 0)
-        return;
-    const sab = new SharedArrayBuffer(4);
-    Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
 /** True when `dir`'s lock looks abandoned (missing/unreadable owner info). */
 function lockLooksStale(lockDir) {
     const ownerPath = join(lockDir, 'owner');
@@ -603,6 +597,7 @@ export class JsonlStore {
                         tool_call_count: 0,
                         error_count: 0,
                         server_count: 0,
+                        policy_decision_count: 0,
                     },
                     servers: new Set(),
                 };
@@ -633,6 +628,23 @@ export class JsonlStore {
             if (ev.kind === 'tool_call' && typeof ev.server?.name === 'string') {
                 servers.add(ev.server.name);
                 summary.server_count = servers.size;
+            }
+            // Gateway mode's enforcement: one per deny, one per resolved hold
+            // (an approved hold included). Counted off the kind alone, like
+            // event_count — the synthetic tool_call that carries a refusal back
+            // to the client is counted as a call and an error above, not here,
+            // and a policy_decision with missing or off-shape decision/outcome
+            // fields still counts because nothing below the kind is read.
+            // A refused `tools/call` NOTIFICATION is a decision with no request
+            // id, so it carries its outcome on the notification event rather than
+            // as a `policy_decision`. It counts here all the same, or the column
+            // reports 0 for a session where enforcement happened. Must stay in
+            // step with the sqlite backend's SQL.
+            if (ev.kind === 'notification' && ev.gateway?.decision !== undefined) {
+                summary.policy_decision_count += 1;
+            }
+            if (ev.kind === 'policy_decision') {
+                summary.policy_decision_count += 1;
             }
             if (ev.kind === 'session_end') {
                 if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {

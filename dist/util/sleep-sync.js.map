@@ -1,0 +1,1 @@
+{"version":3,"file":"sleep-sync.js","sourceRoot":"","sources":["../../src/util/sleep-sync.ts"],"names":[],"mappings":"AAAA;;;;;;;;GAQG;AACH,MAAM,IAAI,GAAG,IAAI,UAAU,CAAC,IAAI,iBAAiB,CAAC,CAAC,CAAC,CAAC,CAAC;AAEtD,MAAM,UAAU,SAAS,CAAC,EAAU;IAClC,IAAI,EAAE,IAAI,CAAC;QAAE,OAAO;IACpB,OAAO,CAAC,IAAI,CAAC,IAAI,EAAE,CAAC,EAAE,CAAC,EAAE,EAAE,CAAC,CAAC;AAC/B,CAAC"}

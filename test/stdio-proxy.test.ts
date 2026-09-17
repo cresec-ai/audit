@@ -1103,3 +1103,153 @@ describe('structuralString capping of protocol strings (P0)', () => {
     expect(init!.server.version).toBe(expectedVersionRef);
   });
 });
+
+/* ------------ record mode: byte fidelity and schema-legal ids ------------ */
+
+describe('record mode (no --policy) stays byte-for-byte on a hostile stream', () => {
+  /**
+   * A server that writes the exact bytes it receives to `$RECV` on stdin
+   * end, and answers with a fixed, deliberately nasty byte sequence: CRLF
+   * lines, a bare \r\n, non-JSON noise, a line past the 32 MiB tap cap and
+   * an unterminated trailing line.
+   */
+  const FIDELITY_SERVER = [
+    "'use strict';",
+    "const fs = require('fs');",
+    'const chunks = [];',
+    "process.stdin.on('data', (c) => chunks.push(c));",
+    "process.stdin.on('end', () => {",
+    '  fs.writeFileSync(process.env.RECV, Buffer.concat(chunks));',
+    '  process.exitCode = 0;',
+    '});',
+    "const pad = 'q'.repeat(32 * 1024 * 1024 + 7);",
+    'process.stdout.write(',
+    '  \'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\r\\n\' +',
+    "  '\\r\\n' +",
+    "  'server noise: not json\\n' +",
+    '  \'{"jsonrpc":"2.0","method":"notifications/message","params":{"big":\' + JSON.stringify(pad) + \'}}\\n\' +',
+    '  \'{"jsonrpc":"2.0","id":2,"result":{"n":12345678901234567890}}\\r\\n\' +',
+    '  \'{"unterminated":true\'',
+    ');',
+  ].join('\n');
+
+  /** CRLF, a bare \r\n, non-JSON noise, an OVERSIZED line, an unterminated tail. */
+  const CLIENT_BYTES = Buffer.from(
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",' +
+      '"clientInfo":{"name":"c","version":"1"},"capabilities":{}}}\r\n' +
+      '\r\n' +
+      'client noise: not json\n' +
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_big","arguments":{"pad":"' +
+      'z'.repeat(32 * 1024 * 1024 + 11) +
+      '"}}}\n' +
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"n":9007199254740993}}}\r\n' +
+      '{"trailing":"no newline"',
+  );
+
+  function serverScript(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-recorder-fid-'));
+    const file = join(dir, 'server.cjs');
+    writeFileSync(file, FIDELITY_SERVER);
+    return file;
+  }
+
+  it('every byte the client sent reaches the server, and every byte the server sent reaches the client', async () => {
+    const dirs: string[] = [];
+    const run = async (throughProxy: boolean): Promise<{ out: Buffer; recv: Buffer }> => {
+      const script = serverScript();
+      const recv = join(dirname(script), 'recv.bin');
+      dirs.push(dirname(script));
+      const env = { ...process.env, RECV: recv };
+      const parts: Buffer[] = [];
+      if (!throughProxy) {
+        const child = spawn(process.execPath, [script], { stdio: ['pipe', 'pipe', 'ignore'], env });
+        child.stdout.on('data', (c: Buffer) => parts.push(c));
+        child.stdin.end(CLIENT_BYTES);
+        await new Promise((r) => child.on('close', r));
+      } else {
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        stdout.on('data', (c: Buffer) => parts.push(c));
+        stderr.on('data', () => {
+          /* drain */
+        });
+        const done = runStdioProxy({
+          command: [process.execPath, script],
+          recorder: new Recorder({ store: new FakeStore(), signer: null }),
+          redactor: fakeRedactor,
+          proxyVersion: '0.1.0-test',
+          stdin,
+          stdout,
+          stderr,
+          env,
+        });
+        stdin.end(CLIENT_BYTES);
+        await done;
+        await new Promise((r) => setTimeout(r, 100)); // let the last stdout writes land
+      }
+      const { readFileSync } = await import('node:fs');
+      return { out: Buffer.concat(parts), recv: readFileSync(recv) };
+    };
+
+    const [direct, proxied] = await Promise.all([run(false), run(true)]);
+    try {
+      // Nothing about recording — not the tap, not the oversized line, not
+      // the unterminated tail — changes a single byte in either direction.
+      expect(proxied.recv.equals(CLIENT_BYTES)).toBe(true);
+      expect(proxied.recv.equals(direct.recv)).toBe(true);
+      expect(proxied.out.equals(direct.out)).toBe(true);
+    } finally {
+      for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
+describe('request_id can only ever be a string or a number (frozen schema)', () => {
+  it('a request whose id is true / {} / [] is recorded as an id-less message, in record mode too', async () => {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const out = collectLines(stdout);
+    stderr.on('data', () => {
+      /* drain */
+    });
+
+    const done = runStdioProxy({
+      command: [process.execPath, ECHO_SERVER],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin,
+      stdout,
+      stderr,
+    });
+
+    // echo-server answers all three (id !== undefined && id !== null), so a
+    // proxy that registered them in `pending` would correlate the responses
+    // and write `request_id: true` / `{}` / `[]` into the chain.
+    for (const id of [true, {}, []]) {
+      stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'echo', arguments: {} } }) + '\n');
+    }
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'echo', arguments: {} } }) + '\n');
+    await waitFor(() => out.lines().length >= 4, 'all four responses');
+    stdin.end();
+    await done;
+
+    // Record mode forwards everything untouched — all four were answered.
+    expect(out.lines()).toHaveLength(4);
+
+    for (const e of store.events()) {
+      const rid = (e as { request_id?: unknown }).request_id;
+      if (rid !== undefined) expect(['string', 'number']).toContain(typeof rid);
+    }
+    const calls = store.events().filter((e): e is ToolCallEvent => e.kind === 'tool_call');
+    expect(calls.map((c) => c.request_id)).toEqual([9]);
+    // The three unusable-id messages are recorded the way the tap has always
+    // recorded an id-less message: one notification event each.
+    const notes = store.events().filter((e): e is NotificationEvent => e.kind === 'notification' && e.method === 'tools/call');
+    expect(notes).toHaveLength(3);
+  });
+});

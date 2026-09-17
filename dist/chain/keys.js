@@ -24,14 +24,10 @@ import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
 import { signedPayload } from './hash.js';
 import { FILES } from '../types.js';
+import { sleepSync } from '../util/sleep-sync.js';
 // @noble/ed25519 v2 ships hash-less; wire sha512 so sync ops work everywhere.
 ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
 const HEX64 = /^[0-9a-f]{64}$/;
-/** A real synchronous sleep, without a native dependency. */
-function sleepSync(ms) {
-    const sab = new SharedArrayBuffer(4);
-    Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
 /**
  * Read and validate the private key file, tolerating the brief window where
  * a concurrent winner of the `wx` create race has created the file but not

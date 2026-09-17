@@ -1,0 +1,250 @@
+/**
+ * Policy evaluation: the local TypeScript twin of the emitted Rego.
+ *
+ * Rules are checked in order and the first match wins; when nothing matches
+ * the section's default applies. Every predicate here has a line-for-line
+ * counterpart in `rego.ts`, and the OPA comparison test proves they agree:
+ *
+ * - server / tool / host / path: `globMatch` with the section's delimiter,
+ *   any entry of the list matching.
+ * - args: each dot-path is resolved like `object.get(input.args, [...], null)`
+ *   — the root must be a plain object (Rego's `object.get` is undefined for
+ *   an array or scalar root), numeric segments address ARRAY INDEXES only,
+ *   other segments address OBJECT KEYS only; a missing path, a null, or a
+ *   non-scalar value means the rule does not match. Scalars are coerced with
+ *   `String()` (Rego: `scalar_text`, i.e. `json.marshal` for non-strings,
+ *   whose number formatting is the ES6 one `String()` also uses). A string
+ *   longer than `REGEX_VALUE_CAP` UTF-16 units is NOT matched at all: it used
+ *   to be truncated, which let `"x".repeat(5000) + "rm -rf /"` sail through a
+ *   `cmd: "rm -rf /"` deny rule, so an over-long value is now unevaluable and
+ *   denies (see {@link VALUE_TOO_LONG}).
+ * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
+ *
+ * Every `args` regex runs through `regex-guard.ts`, which matches it off the
+ * main thread under a hard deadline: V8's RegExp is a backtracking engine and
+ * RE2 is not, so a pattern that is linear under OPA can still hang the proxy
+ * thread here. A match that overruns its deadline is UNEVALUABLE — the rule
+ * neither matches nor is skipped, it denies — and the offending pattern is
+ * poisoned for the rest of the process.
+ *
+ * `evaluateMcp` / `evaluateEgress` NEVER throw: any internal error becomes a
+ * deny with `reason: "policy evaluation error: ..."` and `failClosed: true`
+ * (enforcement is fail-closed, unlike recording). A timed-out args regex
+ * lands there as `policy evaluation error: regex timed out (<rule id>)`.
+ * `failClosed` is how a caller tells that deny apart from one a rule or a
+ * section default actually decided, without parsing the reason string.
+ */
+
+import { globMatch } from './glob.js';
+import { RegexGuardError, matchBounded } from './regex-guard.js';
+import type { Action, EgressRule, McpRule, Policy } from './types.js';
+import { DEFAULTS, REGEX_VALUE_CAP } from './types.js';
+
+export interface McpRequestInput {
+  server: string;
+  tool: string;
+  args: unknown;
+  /** Byte length of the canonical JSON of `args`. */
+  argsBytes: number;
+}
+
+export interface EgressRequestInput {
+  host: string;
+  method: string;
+  path: string;
+  bodyBytes: number;
+}
+
+export interface Decision {
+  action: Action;
+  /** Absent when the default action applied. */
+  ruleId?: string;
+  ruleIndex?: number;
+  reason?: string;
+  /** True when a rule matched, false when the default applied. */
+  matched: boolean;
+  /**
+   * Only ever set (to `true`) on the fail-closed deny below: the policy
+   * could NOT be evaluated, so nothing was decided about this request. It is
+   * the difference between "the operator said no" and "the gateway refused
+   * rather than guess", which the proxy turns into the guidance an agent
+   * reads on a refusal (`FAIL_CLOSED_REFUSAL_GUIDANCE`). Additive and
+   * optional: a real allow/deny/hold decision simply omits it, so every
+   * existing consumer, and the Rego twin (which has no counterpart — OPA
+   * evaluates or it does not answer at all), is unaffected. This is an
+   * internal TypeScript type, not the frozen `edut.mcp-recorder.event.v1`
+   * schema; no event gains a field.
+   */
+  failClosed?: true;
+}
+
+export type McpDecision = Decision;
+export type EgressDecision = Decision;
+
+const ARRAY_INDEX = /^(0|[1-9][0-9]*)$/;
+
+/** Split a dot-path into Rego-style segments: canonical integers become numbers. */
+export function dotPathSegments(dotPath: string): Array<string | number> {
+  return dotPath.split('.').map((seg) => (ARRAY_INDEX.test(seg) ? Number(seg) : seg));
+}
+
+/**
+ * Resolve a dot-path like `object.get(root, segments, undefined)`: numeric
+ * segments index arrays only, string segments read own keys of plain
+ * objects only. Returns undefined when the path does not exist.
+ *
+ * The ROOT must be a plain (non-array) object: an array `params.arguments`
+ * (or a string, number, boolean or null) never matches any `args` condition.
+ * `params.arguments` is an object per MCP, so this only bites on malformed
+ * requests. The compiled Rego states the same rule as an explicit
+ * `is_object(input.args)` line — it used to inherit it from `object.get`
+ * erroring on a non-object root, which is undefined in Rego and so agreed
+ * with this by silent failure rather than by saying anything.
+ */
+export function getPath(root: unknown, dotPath: string): unknown {
+  if (typeof root !== 'object' || root === null || Array.isArray(root)) return undefined;
+  let cur: unknown = root;
+  for (const seg of dotPathSegments(dotPath)) {
+    if (typeof seg === 'number') {
+      if (!Array.isArray(cur) || seg >= cur.length) return undefined;
+      cur = cur[seg];
+    } else {
+      if (typeof cur !== 'object' || cur === null || Array.isArray(cur)) return undefined;
+      if (!Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
+      cur = (cur as Record<string, unknown>)[seg];
+    }
+  }
+  return cur;
+}
+
+/**
+ * A string argument too long to match against a backtracking regex.
+ *
+ * The cap bounds how much work one hostile argument can ask of V8, but
+ * TRUNCATING to it silently changed the answer: `"x".repeat(5000) + "rm -rf
+ * /"` did not match a `cmd: "rm -rf /"` deny rule, because the tail was cut
+ * off before matching, and the call was forwarded. RE2 (the Rego side) does
+ * not truncate and would have matched. Enforcement fails closed, so the local
+ * engine now refuses to answer instead of answering differently: `argsMatch`
+ * turns this into the same fail-closed deny a timed-out regex produces.
+ */
+export const VALUE_TOO_LONG: unique symbol = Symbol('policy: args value exceeds REGEX_VALUE_CAP');
+
+/**
+ * String form used for regex matching, {@link VALUE_TOO_LONG} when the value
+ * is a string longer than `REGEX_VALUE_CAP`, or undefined when the value is
+ * not a scalar at all.
+ */
+export function coerceScalar(value: unknown): string | typeof VALUE_TOO_LONG | undefined {
+  switch (typeof value) {
+    case 'string':
+      return value.length > REGEX_VALUE_CAP ? VALUE_TOO_LONG : value;
+    case 'number':
+    case 'boolean':
+      return String(value);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * All `args` conditions of one rule. Throws when a condition is unevaluable
+ * (deadline overrun, poisoned pattern, no guard worker for a pattern that is
+ * not provably linear, or a value past `REGEX_VALUE_CAP`): the rule is then
+ * neither a match nor a miss, and the caller's fail-closed path turns it into
+ * a deny naming `ruleId`.
+ */
+function argsMatch(args: Record<string, string>, input: unknown, ruleId: string): boolean {
+  for (const [dotPath, pattern] of Object.entries(args)) {
+    const s = coerceScalar(getPath(input, dotPath));
+    if (s === undefined) return false;
+    if (s === VALUE_TOO_LONG) {
+      throw new Error(
+        `args value at ${JSON.stringify(dotPath)} is longer than the ${REGEX_VALUE_CAP}-character regex cap` +
+          ` and cannot be matched safely (${ruleId})`,
+      );
+    }
+    let matched: boolean;
+    try {
+      matched = matchBounded(pattern, s);
+    } catch (err) {
+      if (err instanceof RegexGuardError) throw new Error(`${err.message} (${ruleId})`);
+      throw err;
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
+
+function mcpRuleMatches(rule: McpRule, input: McpRequestInput): boolean {
+  const m = rule.match;
+  if (!m.server.some((g) => globMatch(g, '/', input.server))) return false;
+  if (!m.tool.some((g) => globMatch(g, '/', input.tool))) return false;
+  if (m.args !== undefined && !argsMatch(m.args, input.args, rule.id)) return false;
+  if (m.max_args_bytes !== undefined && !(input.argsBytes <= m.max_args_bytes)) return false;
+  return true;
+}
+
+function egressRuleMatches(rule: EgressRule, input: EgressRequestInput): boolean {
+  const m = rule.match;
+  if (!m.host.some((g) => globMatch(g, '.', input.host))) return false;
+  if (m.methods !== undefined && !m.methods.includes(input.method)) return false;
+  if (!m.path.some((g) => globMatch(g, '/', input.path))) return false;
+  if (m.max_body_bytes !== undefined && !(input.bodyBytes <= m.max_body_bytes)) return false;
+  return true;
+}
+
+function decide<R extends { id: string; action: Action; reason?: string }>(
+  rules: readonly R[],
+  defaultAction: Action,
+  matches: (rule: R) => boolean,
+): Decision {
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i] as R;
+    if (matches(rule)) {
+      const d: Decision = { action: rule.action, ruleId: rule.id, ruleIndex: i, matched: true };
+      if (rule.reason !== undefined) d.reason = rule.reason;
+      return d;
+    }
+  }
+  return { action: defaultAction, matched: false };
+}
+
+function evaluationError(err: unknown): Decision {
+  const msg = err instanceof Error ? err.message : String(err);
+  return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}`, failClosed: true };
+}
+
+/**
+ * Decide a `tools/call`. A policy without an `mcp` section yields the
+ * documented default (`allow`, unmatched). Never throws.
+ */
+export function evaluateMcp(policy: Policy, input: McpRequestInput): McpDecision {
+  try {
+    const mcp = policy.mcp;
+    if (mcp === undefined) return { action: DEFAULTS.mcp.default, matched: false };
+    return decide(mcp.rules, mcp.default, (rule) => mcpRuleMatches(rule, input));
+  } catch (err) {
+    return evaluationError(err);
+  }
+}
+
+/**
+ * Decide an HTTP egress request (not enforced by mcp-recorder; kept 1:1 with
+ * the Rego so both can be tested). A policy without `egress` yields the
+ * documented default (`deny`, unmatched). Never throws.
+ */
+export function evaluateEgress(policy: Policy, input: EgressRequestInput): EgressDecision {
+  try {
+    const egress = policy.egress;
+    if (egress === undefined) return { action: DEFAULTS.egress.default, matched: false };
+    return decide(egress.rules, egress.default, (rule) => egressRuleMatches(rule, input));
+  } catch (err) {
+    return evaluationError(err);
+  }
+}
+
+/** The rule id that produced a decision, or "default". */
+export function ruleLabel(decision: Decision): string {
+  return decision.ruleId ?? 'default';
+}

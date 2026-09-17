@@ -11,6 +11,10 @@
  *                 larger leaf), OR an object KEY that was itself hashed to
  *                 sha256(needle)
  *   result_hash — the event's result_hash equals sha256(needle)
+ *   args_hash   — a policy_decision's args_hash equals sha256(needle), i.e.
+ *                 the needle is the canonical JSON of the arguments of a call
+ *                 the gateway denied or held (gateway mode; those arguments
+ *                 exist nowhere else in clear)
  *   credential  — an identity credential fingerprint equals sha256(needle)
  *   name        — tool / method / server.name equals the needle (case-insensitive)
  *   plain       — a plain string leaf contains the needle (case-sensitive)
@@ -24,9 +28,10 @@ import { sha256Ref } from '../chain/hash.js';
 const PRIORITY = {
     ref: 0,
     result_hash: 1,
-    credential: 2,
-    name: 3,
-    plain: 4,
+    args_hash: 2,
+    credential: 3,
+    name: 4,
+    plain: 5,
 };
 function isRedactedRef(value) {
     return (typeof value === 'object' &&
@@ -103,6 +108,14 @@ function findCandidates(seq, event, needle, needleHash) {
         event.result_hash === needleHash) {
         candidates.push({ matched_on: 'result_hash', path: '$.result_hash' });
     }
+    // Gateway mode (additive): a denied or held call never reached the server,
+    // so its arguments exist only as `args_hash` — sha256 of their canonical
+    // JSON — on the policy_decision. That is a plain string field, not a
+    // RedactedRef leaf, so the walk above never sees it. Querying the exact
+    // canonical-JSON arguments must still name the call that was refused.
+    if (event.kind === 'policy_decision' && event.args_hash === needleHash) {
+        candidates.push({ matched_on: 'args_hash', path: '$.args_hash' });
+    }
     const fingerprints = event.identity.credential_fingerprints;
     if (fingerprints !== undefined) {
         for (let i = 0; i < fingerprints.length; i++) {
@@ -115,13 +128,28 @@ function findCandidates(seq, event, needle, needleHash) {
             }
         }
     }
+    // Gateway mode (additive): a secret the boundary filter redacted out of a
+    // tool result before the model saw it is recorded only as its hash in
+    // `gateway.boundary.secret_refs` — plain strings, not a RedactedRef leaf,
+    // so the walk above does not see them. A needle that was redacted at the
+    // boundary must still trace to the call it was scrubbed from.
+    if (event.kind === 'tool_call' && event.gateway?.boundary?.secret_refs !== undefined) {
+        const refs = event.gateway.boundary.secret_refs;
+        if (Array.isArray(refs)) {
+            const idx = refs.indexOf(needleHash);
+            if (idx !== -1) {
+                candidates.push({ matched_on: 'ref', path: `$.gateway.boundary.secret_refs[${idx}]` });
+            }
+        }
+    }
     // `tool` / `method` stay plain strings by schema (never a RedactedRef), but
     // an over-long or oddly-shaped one is capped at the edge to its own
     // `sha256:<hex>` (structuralString, P0) — the generic RedactedRef walk
     // above never sees this since it isn't an object leaf. Check the raw field
     // against needleHash directly so a blast-radius query for the original
     // (oversized/malformed) name still finds the event that carried it.
-    if (event.kind === 'tool_call' && event.tool === needleHash) {
+    // policy_decision carries `tool` capped exactly like tool_call (gateway mode).
+    if ((event.kind === 'tool_call' || event.kind === 'policy_decision') && event.tool === needleHash) {
         candidates.push({ matched_on: 'ref', path: '$.tool' });
     }
     else if ((event.kind === 'rpc' || event.kind === 'notification') &&
@@ -130,7 +158,7 @@ function findCandidates(seq, event, needle, needleHash) {
     }
     if (needle.length > 0) {
         const lower = needle.toLowerCase();
-        const tool = event.kind === 'tool_call' ? event.tool : undefined;
+        const tool = event.kind === 'tool_call' || event.kind === 'policy_decision' ? event.tool : undefined;
         const method = event.kind === 'rpc' || event.kind === 'notification' ? event.method : undefined;
         if (tool !== undefined && tool.toLowerCase() === lower) {
             candidates.push({ matched_on: 'name', path: '$.tool' });
@@ -148,7 +176,9 @@ function findCandidates(seq, event, needle, needleHash) {
     return candidates.map((c) => toMatch(seq, event, c.matched_on, c.path));
 }
 function toMatch(seq, event, matchedOn, path) {
-    const name = event.kind === 'tool_call'
+    // policy_decision (gateway mode) names the tool the decision was about,
+    // exactly like tool_call — so `query` output reads the same for both.
+    const name = event.kind === 'tool_call' || event.kind === 'policy_decision'
         ? event.tool
         : event.kind === 'rpc' || event.kind === 'notification'
             ? event.method

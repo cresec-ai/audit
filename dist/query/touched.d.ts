@@ -11,6 +11,10 @@
  *                 larger leaf), OR an object KEY that was itself hashed to
  *                 sha256(needle)
  *   result_hash — the event's result_hash equals sha256(needle)
+ *   args_hash   — a policy_decision's args_hash equals sha256(needle), i.e.
+ *                 the needle is the canonical JSON of the arguments of a call
+ *                 the gateway denied or held (gateway mode; those arguments
+ *                 exist nowhere else in clear)
  *   credential  — an identity credential fingerprint equals sha256(needle)
  *   name        — tool / method / server.name equals the needle (case-insensitive)
  *   plain       — a plain string leaf contains the needle (case-sensitive)

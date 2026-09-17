@@ -33,6 +33,12 @@ export interface WrapOpts {
      * whichever one wsl.exe treats as default. Omitted entirely (no `-d`
      * pair) when unknown. */
     wslDistro?: string;
+    /** `setup --policy FILE`: ABSOLUTE path (cli.ts resolves it) baked into
+     * every wrapped entry as `--policy <path>` right after `--data-dir`, so
+     * those servers run in gateway mode (record --policy). Absolute because
+     * MCP clients launch servers from their own working directory. Entries an
+     * earlier run already wrapped get it too — see {@link WrapPlan.updated}. */
+    policyPath?: string;
 }
 export interface SkipEntry {
     name: string;
@@ -45,8 +51,15 @@ export interface WrapPlan {
     /** Names wrapped this run. */
     wrapped: string[];
     skipped: SkipEntry[];
-    /** Names left alone because they already referenced the recorder. */
+    /** Names left alone because they already referenced the recorder (and,
+     * with `--policy`, already carried exactly that policy). */
     alreadyWrapped: string[];
+    /** Names that were ALREADY wrapped and whose recorder arguments this run
+     * rewrote to carry `opts.policyPath` (inserted, or replacing the policy
+     * they pointed at before). Only ever non-empty when `opts.policyPath` is
+     * set; the entries' originals are NOT re-recorded in the sidecar, which
+     * already holds them from the run that wrapped them. */
+    updated: string[];
     /** Original entries for names wrapped this run — what the sidecar stores. */
     originals: Record<string, ServerEntry>;
     /** Free-text notices worth surfacing in the human/dry-run output but that
@@ -74,6 +87,20 @@ export declare function mergeWslEnv(existing: string | undefined, keys: readonly
  * keys are carried over untouched (`wrapper: 'wsl'` extends `env.WSLENV`,
  * see {@link buildWslWrappedEntry}); otherwise only `command`/`args` change. */
 export declare function buildWrappedEntry(name: string, original: ServerEntry, opts: WrapOpts): ServerEntry;
+/**
+ * Rewrite an ALREADY-wrapped entry so its recorder arguments carry
+ * `--policy <policyPath>`: replacing the value of an existing `--policy`
+ * (both the `--policy X` pair and the `--policy=X` spelling a hand edit may
+ * use) or, when there is none, inserting the pair immediately before the
+ * `--` that closes the recorder's own arguments. Everything else — the
+ * wrapper form, `--name`, `--data-dir`, the wrapped server's argv, `env`,
+ * `cwd` — is left exactly as it was.
+ *
+ * Returns undefined when the entry has no readable recorder-args segment
+ * (no `args` array, or no `--` separator), so the caller can leave such an
+ * entry untouched rather than guess at its shape.
+ */
+export declare function withPolicyArg(entry: ServerEntry, policyPath: string): ServerEntry | undefined;
 export interface BridgeSpec {
     name: string;
     url: string;
@@ -112,9 +139,9 @@ export declare function bridgeEntry(url: string): ServerEntry;
  * caller must refuse to silently replace it.
  */
 export declare function isSameBridgeEntry(entry: ServerEntry, url: string): boolean;
-/** Decide, for every entry in `servers`, whether it gets wrapped, skipped, or
- * is already wrapped — and build the replacement map. Order of entries in
- * `next` follows `servers`' own key order. */
+/** Decide, for every entry in `servers`, whether it gets wrapped, skipped,
+ * policy-updated, or is already wrapped — and build the replacement map.
+ * Order of entries in `next` follows `servers`' own key order. */
 export declare function planWrap(servers: McpServersMap, opts: WrapOpts): WrapPlan;
 /**
  * `setup --undo` fallback when the sidecar file is missing: strip a

@@ -1,0 +1,26 @@
+# Egress-only policy (no mcp section): host lists with the "." delimiter,
+# method lists, path globs and a body cap. mcp.rego still compiles (default allow).
+version: 1
+name: ci/egress.v1
+egress:
+  default: deny
+  rules:
+    - id: github
+      match:
+        host: ["api.github.com", "*.githubusercontent.com"]
+        methods: [GET, HEAD]
+      action: allow
+    - id: npm-publish
+      match:
+        host: registry.npmjs.org
+        methods: [PUT]
+        path: "/-/**"
+        max_body_bytes: 4096
+      action: hold
+      reason: "publishing needs a human"
+    - id: telemetry
+      match:
+        host: "*.telemetry.*"
+        path: ["/v1/*", "/v2/**"]
+      action: deny
+      reason: "no telemetry"
