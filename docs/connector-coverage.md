@@ -30,13 +30,17 @@ than resolved.
   repository run in cloud sessions, and organisations can push them to every
   CLI, IDE and Desktop Code-tab session through managed settings. That is
   why `mcp-recorder hook` exists (PR #10): it turns those hooks into
-  evidence-chain events with an allow/deny policy. **The visibility half of
-  that has been proven live; the control half has not.** In cloud dogfood 4 a
-  two-route deny policy failed to block either of the two live connector calls
-  it targeted, while the same hook recorded every one of them — see
-  [Dogfood 4](#dogfood-4-a-live-deny-that-did-not-fire). [observed: hooks run
-  in cloud sessions and record; observed: that deny did not fire; docs:
-  managed settings reach]
+  evidence-chain events with an allow/deny policy. **Both halves have now
+  been proven live, the control half only after a failure.** In cloud dogfood
+  4 a two-route deny policy failed to block either of the two live connector
+  calls it targeted, while the same hook recorded every one of them — see
+  [Dogfood 4](#dogfood-4-a-live-deny-that-did-not-fire). In cloud dogfood 5,
+  after the resolution fix in PR #16, both deny routes blocked their live
+  ClickUp calls, twice each, and the signed bundle carries the refusals. Read
+  the caveat in [Dogfood 5](#dogfood-5-the-deny-fired-for-a-reason-worth-reading)
+  before relying on it: that session's naming conventions agreed, so the fix's
+  own new code path did not run. [observed:
+  hooks run in cloud sessions, record, and deny; docs: managed settings reach]
 - **On claude.ai web, Desktop chat and Cowork, the only customer-side taps
   are Anthropic's own feeds, and they are Enterprise-gated.** Inference hooks
   (beta) deliver each turn's `tool_use`/`tool_result` blocks in real time and
@@ -149,9 +153,43 @@ derived from a file the agent under policy can rewrite, and hooks are still
 captured at session start. The durable mitigation is in how rules are
 written — anchor them to the tool and leave the server segment open — see
 [docs/hooks.md](hooks.md#write-deny-rules-against-the-tool-not-the-server-segment).
-Until a dogfood shows a deny blocking a live connector call, this memo claims
-pre-execution *visibility* on Claude Code, and pre-execution *control* only as
-a mechanism the platform offers, not as something this tool has demonstrated.
+### Dogfood 5: the deny fired, for a reason worth reading
+
+Cloud dogfood 5 ran after the resolution fix in PR #16, from
+`dogfood/5-policy`, with two deny routes written so each could fail on its
+own: one spelled as the host alias only (`^mcp__mcp\.clickup\.com__…$`,
+which exists only if resolution worked) and one tool-anchored with the server
+segment left open (`^mcp__.*__…$`). Evidence: `evidence/cloud-dogfood-5`.
+
+- **Both routes fired.** Neither ClickUp call reached the workspace, on either
+  of two attempts each.
+- **The bundle records it.** 46 events, `verify --bundle` and the standalone
+  `verify.cjs` both PASS. Every count that was zero in dogfood 4 is non-zero:
+  1 `policy_decision` event, 4 events carrying a `gateway` field, 5
+  `"policy_denied"` occurrences. `server.url` is present on 14 events across
+  ClickUp, GitHub, Gmail, Calendar and Drive, against 2 (GitHub's relay only)
+  in dogfood 4.
+- **Gateway mode ran in a live agent session for the first time**, denying
+  `http_post` through `record --policy` with a refusal the model could read.
+- **The caveat, which matters more than the result.** That session's config
+  keys and its tool-name segments were *both* UUIDs — they agreed — so
+  resolution succeeded on the plain key lookup and PR #16's new declared-tool
+  fallback never executed. Across dogfood 3, 4 and 5 that fallback has run
+  live zero times: in 3 the key lookup sufficed, in 4 it broke and the
+  fallback did not exist, in 5 it sufficed again. The denies firing proved the
+  old path still works, not that the fix does. The fallback was instead
+  exercised against the real binary by rebuilding a real session config into
+  dogfood 4's shape (keys replaced by UUIDs so no friendly key exists,
+  `tools[]` intact): the host-alias-only rule fired, `server.url` resolved
+  through the fallback, and a control run with no config file correctly
+  allowed the same call. So it is proven against the binary in the shape that
+  defeated dogfood 4, and not yet by a live session that naturally presents
+  that mismatch.
+
+So this memo now claims pre-execution *visibility* and pre-execution *control*
+on Claude Code, both demonstrated live — with the resolution caveat above, and
+with the standing warning that the platform controls the naming convention on
+both sides and has already changed it twice.
 
 ## Anthropic-provided controls and feeds
 
@@ -211,8 +249,8 @@ can ingest them as evidence sources but cannot replace them. [docs]
 
 | Option | Covers | Pre-execution control | Effort | Status |
 |---|---|---|---|---|
-| A. `mcp-recorder hook` (Claude Code hooks) | Claude Code CLI, IDE, Desktop Code tab, cloud sessions, Agent SDK; every `mcp__*` tool including connectors | The mechanism allows deny or rewrite per call from a policy file; the one live test of a deny (dogfood 4) did not fire — see above | Done | Merged in PR #10; `hook install` writes the settings entries; recording proven live in dogfood 3 and 4, enforcement not yet |
-| B. Local bridge (`setup --bridge`, `mcp-remote`) | Claude Desktop and Claude Code for vendors with public MCP endpoints, when the user replaces the directory connector | Yes, through the stdio proxy (gateway mode once PR #8 lands) | Done | Merged in PR #9; user re-authorises through the bridge |
+| A. `mcp-recorder hook` (Claude Code hooks) | Claude Code CLI, IDE, Desktop Code tab, cloud sessions, Agent SDK; every `mcp__*` tool including connectors | The mechanism allows deny or rewrite per call from a policy file; the first live test of a deny (dogfood 4) did not fire, the second (dogfood 5, after PR #16) blocked all four attempts — see above | Done | Merged in PR #10; `hook install` writes the settings entries; recording proven live in dogfood 3, 4 and 5; enforcement proven live in dogfood 5 |
+| B. Local bridge (`setup --bridge`, `mcp-remote`) | Claude Desktop and Claude Code for vendors with public MCP endpoints, when the user replaces the directory connector | Yes, through the stdio proxy (gateway mode, merged in PR #8) | Done | Merged in PR #9; user re-authorises through the bridge |
 | C. Hosted recording gateway as a custom connector | claude.ai web, Desktop chat, Cowork, Claude Code, for vendors with public MCP endpoints (Google, Slack, ClickUp; not GitHub) | Yes, at our gateway | High: OAuth 2.1 authorisation server toward Claude (metadata, PKCE, claude.ai callback, sub-10-second token endpoint), OAuth client per vendor with an encrypted per-user token vault (the MCP spec forbids token passthrough), multi-tenant public HTTPS host reachable from Anthropic's egress range, plus the evidence sink | Not started. This is the product-shaped option: every incumbent gateway logs to a conventional store; the tamper-evident chain is the differentiator |
 | D. Ingest Anthropic feeds (inference-hook receiver, Compliance API puller, OTel collector) | Everything the feeds cover, including claude.ai web | Inference hooks: stop the next turn; others: none | Medium: an HTTPS receiver that seals each frame into the chain; a poller; an OTLP endpoint | Not started; Enterprise customers only |
 | E. Vendor audit-log correlation | Slack, Atlassian, Google Drive, Notion well; Gmail, Calendar, GitHub partially; ClickUp not at all | None | Medium; no shared correlation id, lag of hours, plan-gated | Not started |
@@ -221,11 +259,11 @@ can ingest them as evidence sources but cannot replace them. [docs]
 
 ## Recommendation
 
-1. **Ship A and prove it** (shipped; visibility proven in dogfood 3 and 4,
-   enforcement **disproven** in dogfood 4, to be re-tested in dogfood 5): every
+1. **Ship A and prove it** (shipped; visibility proven in dogfood 3, 4 and
+   5; enforcement disproven in dogfood 4 and then proven in dogfood 5): every
    Claude Code surface gets pre-execution visibility over connector calls
-   today, with nothing from Anthropic. Control is available from the platform
-   and not yet demonstrated by this tool.
+   today, with nothing from Anthropic, and a deny rule written against the
+   tool rather than the server segment now blocks one.
 2. **Decide on C.** It is the only path to visibility and control on
    claude.ai web, Desktop chat and Cowork without an Enterprise contract, and
    it is a real product: a hosted gateway that is an OAuth 2.1 authorisation
