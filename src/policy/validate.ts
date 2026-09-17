@@ -4,8 +4,9 @@
  *
  * Schema validation (`schema.ts` via `jsonschema.ts`) covers shapes, enums,
  * identifier patterns, numeric ranges (hold timeout, boundary scan size),
- * upper-case methods, non-empty glob strings/lists and the "at least one of
- * mcp / egress" rule (a root `anyOf`, whose error is reworded here).
+ * upper-case methods, non-empty glob strings/lists, the discriminated union a
+ * credential `source` / `host` / `path` is, and the "at least one of mcp /
+ * credentials / egress" rule (a root `anyOf`, whose error is reworded here).
  *
  * Semantic checks add what JSON Schema (in our keyword subset) cannot say:
  * - duplicate rule ids within a section;
@@ -29,7 +30,13 @@
  *   not;
  * - globs are not blank and use neither `[ ] { } \`, which OPA's glob library
  *   interprets and ours does not, nor `?`, which both interpret but not the
- *   same way (OPA's `?` is ASCII-only).
+ *   same way (OPA's `?` is ASCII-only);
+ * - `credentials` entries hold together: ids unique within the section and
+ *   site ids within their credential, dot-paths well-formed, every path a
+ *   source names absolute (a relative one resolves against the CLIENT's
+ *   working directory), a `github-app` with exactly one private-key
+ *   spelling, and a destination that is not read from the same argument the
+ *   credential is about to overwrite.
  *
  * Every error keeps an RFC 6901 pointer (`/mcp/rules/1/match/tool`).
  */
@@ -39,7 +46,16 @@ import type { SchemaError } from './jsonschema.js';
 import { checkCatastrophicShape } from './redos.js';
 import { POLICY_SCHEMA } from './schema.js';
 import { normalizePolicy } from './types.js';
-import type { EgressRuleInput, GlobOrList, McpRuleInput, Policy, PolicyInput } from './types.js';
+import type {
+  CredentialInput,
+  CredentialSourceInput,
+  CredentialUseInput,
+  EgressRuleInput,
+  GlobOrList,
+  McpRuleInput,
+  Policy,
+  PolicyInput,
+} from './types.js';
 
 export type PolicyError = SchemaError;
 
@@ -538,15 +554,16 @@ function checkGlobField(value: GlobOrList, path: string, errors: PolicyError[]):
   });
 }
 
-function checkDuplicateIds(rules: ReadonlyArray<{ id?: string }>, section: string, errors: PolicyError[]): void {
+/** `base` is the pointer to the array, e.g. `/mcp/rules`; ids are compared within it only. */
+function checkDuplicateIds(rules: ReadonlyArray<{ id?: string }>, base: string, errors: PolicyError[], noun = 'rule'): void {
   const seen = new Map<string, number>();
   rules.forEach((rule, i) => {
     if (rule.id === undefined) return;
     const first = seen.get(rule.id);
     if (first !== undefined) {
       errors.push({
-        path: `/${section}/rules/${i}/id`,
-        message: `duplicate rule id ${JSON.stringify(rule.id)} (already used by rule ${first})`,
+        path: `${base}/${i}/id`,
+        message: `duplicate ${noun} id ${JSON.stringify(rule.id)} (already used by ${noun} ${first})`,
         keyword: 'duplicateId',
       });
     } else {
@@ -588,23 +605,150 @@ function checkEgressRule(rule: EgressRuleInput, i: number, errors: PolicyError[]
   if (rule.match.path !== undefined) checkGlobField(rule.match.path, `${base}/path`, errors);
 }
 
+/* ------------------------------ credentials ------------------------------- */
+
+/**
+ * An absolute path in the two spellings this tool runs under: POSIX, and
+ * Windows drive / UNC. Checked rather than resolved, because a RELATIVE path
+ * in a credential source resolves against the recorder's working directory —
+ * which in a stdio deployment is whatever directory the client happened to
+ * launch from, i.e. not a place the policy author chose.
+ */
+const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+
+/** Permission values GitHub's installation-token API accepts. */
+const GITHUB_PERMISSION_LEVELS: ReadonlySet<string> = new Set(['read', 'write', 'admin']);
+
+function checkAbsolutePath(value: unknown, path: string, errors: PolicyError[]): void {
+  if (typeof value !== 'string') return; // the schema already reported the type
+  if (!ABSOLUTE_PATH.test(value)) {
+    errors.push({
+      path,
+      message: `must be an absolute path, got ${JSON.stringify(value)} (a relative one resolves against the client's working directory, not the policy's)`,
+      keyword: 'absolutePath',
+    });
+  }
+}
+
+function checkDotPath(value: unknown, path: string, errors: PolicyError[]): void {
+  if (typeof value !== 'string') return;
+  if (!DOT_PATH.test(value)) {
+    errors.push({ path, message: `invalid dot-path ${JSON.stringify(value)} (expected e.g. "a.b.0.c")`, keyword: 'dotPath' });
+  }
+}
+
+function checkCredentialSource(source: CredentialSourceInput, base: string, errors: PolicyError[]): void {
+  switch (source.type) {
+    case 'file':
+      checkAbsolutePath(source.path, `${base}/path`, errors);
+      if (source.field !== undefined) checkDotPath(source.field, `${base}/field`, errors);
+      return;
+    case 'exec':
+      // An executable named without a path is resolved through PATH, which
+      // the agent can prepend to; the config must say which binary it means.
+      checkAbsolutePath(source.command, `${base}/command`, errors);
+      return;
+    case 'github-app': {
+      const given = [source.private_key_file, source.private_key_env].filter((v) => v !== undefined);
+      if (given.length !== 1) {
+        errors.push({
+          path: base,
+          message:
+            given.length === 0
+              ? 'github-app needs exactly one of "private_key_file" or "private_key_env"'
+              : 'github-app takes "private_key_file" or "private_key_env", not both',
+          keyword: 'source',
+        });
+      }
+      if (source.private_key_file !== undefined) checkAbsolutePath(source.private_key_file, `${base}/private_key_file`, errors);
+      if (source.permissions !== undefined) {
+        for (const [name, level] of Object.entries(source.permissions)) {
+          if (typeof level !== 'string' || !GITHUB_PERMISSION_LEVELS.has(level)) {
+            errors.push({
+              path: `${base}/permissions/${escapePointerToken(name)}`,
+              message: `permission level must be one of ${[...GITHUB_PERMISSION_LEVELS].map((l) => JSON.stringify(l)).join(', ')}`,
+              keyword: 'enum',
+            });
+          }
+        }
+      }
+      return;
+    }
+    case 'vault':
+      if (source.addr !== undefined) {
+        let scheme: string | undefined;
+        try {
+          scheme = new URL(source.addr).protocol;
+        } catch {
+          scheme = undefined;
+        }
+        if (scheme !== 'http:' && scheme !== 'https:') {
+          errors.push({
+            path: `${base}/addr`,
+            message: `must be an absolute http(s) URL, got ${JSON.stringify(source.addr)}`,
+            keyword: 'url',
+          });
+        }
+      }
+      return;
+    default:
+      return; // env / aws-sts / clickup are fully covered by the schema patterns
+  }
+}
+
+function checkCredentialUse(use: CredentialUseInput, base: string, errors: PolicyError[]): void {
+  checkReason(use.reason, `${base}/reason`, errors);
+  if (use.server !== undefined) checkGlobField(use.server, `${base}/server`, errors);
+  checkGlobField(use.tool, `${base}/tool`, errors);
+  checkDotPath(use.arg, `${base}/arg`, errors);
+  if (use.host !== undefined && 'from_arg' in use.host) {
+    checkDotPath(use.host.from_arg, `${base}/host/from_arg`, errors);
+    checkGlobField(use.host.allow, `${base}/host/allow`, errors);
+    // Reading the destination out of the same argument the token is spliced
+    // into means the policy checks a value the swap is about to overwrite.
+    if (use.host.from_arg === use.arg) {
+      errors.push({
+        path: `${base}/host/from_arg`,
+        message: 'the host cannot be read from the same argument the credential is spliced into',
+        keyword: 'credentialSite',
+      });
+    }
+  }
+  if (use.path !== undefined && 'from_arg' in use.path) {
+    checkDotPath(use.path.from_arg, `${base}/path/from_arg`, errors);
+    checkGlobField(use.path.allow, `${base}/path/allow`, errors);
+  }
+}
+
+function checkCredential(credential: CredentialInput, i: number, errors: PolicyError[]): void {
+  const base = `/credentials/${i}`;
+  if (credential.source !== undefined) checkCredentialSource(credential.source, `${base}/source`, errors);
+  if (credential.use === undefined) return;
+  checkDuplicateIds(credential.use, `${base}/use`, errors, 'use site');
+  credential.use.forEach((use, j) => checkCredentialUse(use, `${base}/use/${j}`, errors));
+}
+
 function semanticErrors(raw: PolicyInput): PolicyError[] {
   const errors: PolicyError[] = [];
   if (raw.mcp?.rules !== undefined) {
-    checkDuplicateIds(raw.mcp.rules, 'mcp', errors);
+    checkDuplicateIds(raw.mcp.rules, '/mcp/rules', errors);
     raw.mcp.rules.forEach((rule, i) => checkMcpRule(rule, i, errors));
   }
+  if (raw.credentials !== undefined) {
+    checkDuplicateIds(raw.credentials, '/credentials', errors, 'credential');
+    raw.credentials.forEach((credential, i) => checkCredential(credential, i, errors));
+  }
   if (raw.egress?.rules !== undefined) {
-    checkDuplicateIds(raw.egress.rules, 'egress', errors);
+    checkDuplicateIds(raw.egress.rules, '/egress/rules', errors);
     raw.egress.rules.forEach((rule, i) => checkEgressRule(rule, i, errors));
   }
   return errors;
 }
 
-/** Reword the root `anyOf` (which encodes "mcp or egress") into plain language. */
+/** Reword the root `anyOf` (which encodes "mcp, credentials or egress") into plain language. */
 function friendly(err: SchemaError): PolicyError {
   if (err.path === '' && err.keyword === 'anyOf') {
-    return { ...err, message: 'at least one of "mcp" or "egress" is required' };
+    return { ...err, message: 'at least one of "mcp", "credentials" or "egress" is required' };
   }
   return err;
 }

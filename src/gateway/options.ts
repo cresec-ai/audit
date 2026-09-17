@@ -9,6 +9,7 @@
  */
 
 import type { LoadedPolicy } from '../policy/load.js';
+import type { CredentialSwap } from './credentials.js';
 import type { HoldStore } from './holds.js';
 
 export interface GatewayOptions {
@@ -18,4 +19,11 @@ export interface GatewayOptions {
   holdStore: HoldStore;
   /** Poll interval for hold decisions (tests shrink it); default 200 ms. */
   pollMs?: number;
+  /**
+   * Additive: present ONLY when the policy declares a `credentials` section
+   * AND a broker was configured. Absent = no call is ever rewritten and the
+   * proxy behaves exactly as it did before credential brokering existed.
+   * See ./credentials.ts for what the swap is and is not.
+   */
+  credentials?: CredentialSwap;
 }

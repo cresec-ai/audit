@@ -13,8 +13,14 @@
  * Failures are `PolicyLoadError` (unreadable / unparseable / bad root) or its
  * subclass `PolicyValidationError` (schema / semantic errors, with the error
  * list attached). Both name the file path in their message.
+ *
+ * A loaded policy also carries `trust`: whether the uid running this process
+ * can write the file it came from. That is not a property of the document, so
+ * it is never a validation error; it is what an ENFORCING caller needs before
+ * it resolves a credential source named by that file
+ * (see {@link credentialTrustProblems}).
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { extname } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { sha256Hex } from '../chain/hash.js';
@@ -34,6 +40,86 @@ export class PolicyValidationError extends PolicyLoadError {
         this.name = 'PolicyValidationError';
         this.errors = errors;
     }
+}
+/**
+ * Decide writability from stat facts alone — injected rather than read, so
+ * the table of cases is testable without chmod games or a second uid.
+ *
+ * Anything unknown is treated as writable: on Windows there are no POSIX
+ * mode bits to read, and guessing "safe" there would turn a control into a
+ * decoration.
+ */
+export function fileTrustFrom(owner, me) {
+    if (owner === undefined)
+        return { writableByThisUid: true, detail: 'the policy file could not be stat()ed' };
+    if (me === undefined) {
+        return {
+            writableByThisUid: true,
+            detail: 'this platform reports no uid or mode bits, so the recorder cannot tell who may write the policy',
+        };
+    }
+    const mode = owner.mode & 0o777;
+    if (me.uid === 0)
+        return { writableByThisUid: true, detail: 'the recorder runs as root, which ignores the mode bits' };
+    if ((mode & 0o002) !== 0)
+        return { writableByThisUid: true, detail: `the policy file is world-writable (mode ${mode.toString(8).padStart(4, '0')})` };
+    if ((mode & 0o020) !== 0 && (me.gid === owner.gid || me.groups.includes(owner.gid))) {
+        return { writableByThisUid: true, detail: `the policy file is group-writable by a group this process is in (mode ${mode.toString(8).padStart(4, '0')})` };
+    }
+    if ((mode & 0o200) !== 0 && owner.uid === me.uid) {
+        return { writableByThisUid: true, detail: 'the policy file is owned by the uid running the recorder, which is also the uid the agent runs as' };
+    }
+    return { writableByThisUid: false, detail: `the policy file is not writable by uid ${me.uid} (mode ${mode.toString(8).padStart(4, '0')}, owner uid ${owner.uid})` };
+}
+/** This process's uid/gid/groups, or undefined where the platform has none. */
+export function processIdentity() {
+    if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function')
+        return undefined;
+    let groups = [];
+    try {
+        groups = process.getgroups?.() ?? [];
+    }
+    catch {
+        groups = []; // getgroups can fail on a stripped-down container; treat it as "no extra groups"
+    }
+    return { uid: process.getuid(), gid: process.getgid(), groups };
+}
+/** `fileTrustFrom` against the real filesystem. Never throws. */
+export function policyFileTrust(path) {
+    let owner;
+    try {
+        const st = statSync(path);
+        owner = { uid: st.uid, gid: st.gid, mode: st.mode };
+    }
+    catch {
+        owner = undefined;
+    }
+    return fileTrustFrom(owner, processIdentity());
+}
+/**
+ * Why this policy's credential sources must not be resolved from a file this
+ * uid can write — one message per offending credential, empty when there is
+ * nothing to say.
+ *
+ * Only `exec` is refused. The difference is not that `env` and `file` are
+ * safe (an attacker who can edit the policy can point either at whatever they
+ * like); it is that `exec` runs a command of their choosing AS THE RECORDER
+ * on every call, so a writable policy is a shell rather than a redirection.
+ * Callers that enforce — the gateway, the broker — refuse the source and say
+ * this on stderr; `policy validate` reports the document, not the machine it
+ * happens to be sitting on, so it does not fail on this.
+ */
+export function credentialTrustProblems(policy, trust) {
+    if (!trust.writableByThisUid)
+        return [];
+    const out = [];
+    for (const credential of policy.credentials ?? []) {
+        if (credential.source.type !== 'exec')
+            continue;
+        out.push(`credential ${JSON.stringify(credential.id)} resolves through an \`exec\` source, but ${trust.detail} — ` +
+            'anything that can write the policy can choose the command it runs, as the recorder, on every call');
+    }
+    return out;
 }
 /** Max aliases a YAML document may expand; policies never need many. */
 const MAX_ALIASES = 100;
@@ -125,7 +211,13 @@ export function loadPolicyFile(path) {
     const result = validatePolicyObject(doc);
     if (!result.ok)
         throw new PolicyValidationError(path, result.errors);
-    const out = { policy: result.policy, hash: 'sha256:' + sha256Hex(bytes), source, path };
+    const out = {
+        policy: result.policy,
+        hash: 'sha256:' + sha256Hex(bytes),
+        source,
+        path,
+        trust: policyFileTrust(path),
+    };
     if (result.policy.name !== undefined)
         out.name = result.policy.name;
     return out;

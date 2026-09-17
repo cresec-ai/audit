@@ -8,22 +8,28 @@
  * JSON file from disk. Only keywords from `jsonschema.ts`'s
  * `SUPPORTED_KEYWORDS` may appear here.
  */
-import { ID_PATTERN, LIMITS } from './types.js';
+import { ENV_VAR_PATTERN, HOSTNAME_PATTERN, ID_PATTERN, LIMITS, ROLE_ARN_PATTERN } from './types.js';
 export const POLICY_SCHEMA_ID = 'https://cresec.ai/schemas/agent-policy.v1.json';
 const ACTION = { type: 'string', enum: ['allow', 'hold', 'deny'] };
 export const POLICY_SCHEMA = {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
     $id: POLICY_SCHEMA_ID,
     title: 'mcp-recorder agent policy v1',
-    description: 'policy.yaml v1: MCP tool-call policy (enforced by mcp-recorder gateway mode) and HTTP egress policy (validated and compiled to Rego only). Rules are ordered; the first matching rule wins.',
+    description: 'policy.yaml v1: MCP tool-call policy and credential-broker policy (both enforced by mcp-recorder gateway mode) plus HTTP egress policy (validated and compiled to Rego only). Rules are ordered; the first matching rule wins.',
     type: 'object',
     additionalProperties: false,
     required: ['version'],
-    anyOf: [{ required: ['mcp'] }, { required: ['egress'] }],
+    anyOf: [{ required: ['mcp'] }, { required: ['credentials'] }, { required: ['egress'] }],
     properties: {
         version: { const: 1, description: 'Schema version. Always the literal 1.' },
         name: { $ref: '#/$defs/identifier', description: 'Optional policy identifier, stamped on events.' },
         mcp: { $ref: '#/$defs/mcpPolicy' },
+        credentials: {
+            type: 'array',
+            minItems: 1,
+            items: { $ref: '#/$defs/credential' },
+            description: 'Credentials the gateway may swap a synthetic for, and the declared sites where it may do so. A use site not listed here is never swapped.',
+        },
         egress: { $ref: '#/$defs/egressPolicy' },
     },
     $defs: {
@@ -98,6 +104,210 @@ export const POLICY_SCHEMA = {
             },
         },
         boundaryMode: { type: 'string', enum: ['redact', 'block', 'flag', 'off'] },
+        credentialAction: {
+            type: 'string',
+            enum: ['allow', 'deny'],
+            description: 'What a matching swap site does. "hold" is not available in v1: nothing resolves a credential after an approval, and an action the gateway cannot honour must not be writable.',
+        },
+        credential: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id', 'source', 'use'],
+            properties: {
+                id: { $ref: '#/$defs/identifier', description: 'Unique within the section. Recorded on every decision; never the credential value.' },
+                provider: { $ref: '#/$defs/identifier', description: 'Informational, e.g. "github". Recorded on the decision.' },
+                scopes: {
+                    type: 'array',
+                    items: { type: 'string', minLength: 1, maxLength: 128 },
+                    description: 'Informational: what the REAL credential can do. Recorded on the decision so blast radius is answerable from the chain rather than reconstructed.',
+                },
+                source: { $ref: '#/$defs/credentialSource' },
+                use: {
+                    type: 'array',
+                    minItems: 1,
+                    items: { $ref: '#/$defs/credentialUse' },
+                    description: 'Declared swap sites, in order; the first match decides. A site not declared here is never swapped.',
+                },
+                ttl_seconds: {
+                    type: 'integer',
+                    minimum: LIMITS.credential_ttl_seconds.min,
+                    maximum: LIMITS.credential_ttl_seconds.max,
+                    description: 'How long a positive decision may be cached, keyed on the whole (synthetic, method, host, path_template) tuple. Default 30, matching the control plane. 0 disables the cache.',
+                },
+                timeout_ms: {
+                    type: 'integer',
+                    minimum: LIMITS.credential_timeout_ms.min,
+                    maximum: LIMITS.credential_timeout_ms.max,
+                    description: 'Deadline for resolving the source. Overrunning it denies this call. Default 5000.',
+                },
+                on_unresolved: {
+                    type: 'string',
+                    enum: ['deny'],
+                    description: 'What happens when the credential cannot be resolved. Only "deny": forwarding the call would forward the synthetic to the upstream.',
+                },
+            },
+        },
+        credentialSource: {
+            description: 'Where the real credential is resolved from. Named by the config and only ever by the config — never by the call.',
+            oneOf: [
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'var'],
+                    properties: {
+                        type: { const: 'env' },
+                        var: { type: 'string', pattern: ENV_VAR_PATTERN, description: 'Environment variable of the recorder process.' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'path'],
+                    properties: {
+                        type: { const: 'file' },
+                        path: { type: 'string', minLength: 1, description: 'Absolute path. A relative one would resolve against the client process’s working directory.' },
+                        field: { type: 'string', minLength: 1, description: 'Dot-path into the file parsed as JSON; absent = the whole file, trimmed.' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'command'],
+                    properties: {
+                        type: { const: 'exec' },
+                        command: { type: 'string', minLength: 1, description: 'Absolute path to the executable. No shell: argv is passed through as written.' },
+                        args: { type: 'array', items: { type: 'string' } },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'app_id', 'installation_id'],
+                    properties: {
+                        type: { const: 'github-app' },
+                        app_id: { type: 'string', pattern: '^[0-9]{1,20}$' },
+                        installation_id: { type: 'string', pattern: '^[0-9]{1,20}$' },
+                        private_key_file: { type: 'string', minLength: 1, description: 'Absolute path to the app private key (PEM). Exactly one of private_key_file / private_key_env.' },
+                        private_key_env: { type: 'string', pattern: ENV_VAR_PATTERN },
+                        repositories: { type: 'array', items: { type: 'string', minLength: 1 }, description: 'Narrows the minted installation token to these repositories.' },
+                        permissions: { type: 'object', description: 'Permission name -> "read" | "write" | "admin". Narrows the minted installation token.' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'role_arn'],
+                    properties: {
+                        type: { const: 'aws-sts' },
+                        role_arn: { type: 'string', pattern: ROLE_ARN_PATTERN },
+                        region: { type: 'string', pattern: '^[a-z0-9-]{1,32}$' },
+                        session_name: { type: 'string', pattern: '^[A-Za-z0-9=,.@_-]{2,64}$' },
+                        duration_seconds: { type: 'integer', minimum: LIMITS.aws_duration_seconds.min, maximum: LIMITS.aws_duration_seconds.max },
+                        external_id: { type: 'string', minLength: 2, maxLength: 1224 },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type', 'path'],
+                    properties: {
+                        type: { const: 'vault' },
+                        path: { type: 'string', minLength: 1, description: 'Secret path in OpenBao/Vault.' },
+                        field: { type: 'string', minLength: 1, description: 'Key inside the secret blob. Default "token" — the key the control plane reads.' },
+                        addr: { type: 'string', minLength: 1, description: 'Base URL; http(s) only. Absent = the resolver’s own default.' },
+                        namespace: { type: 'string', minLength: 1 },
+                        token_env: { type: 'string', pattern: ENV_VAR_PATTERN, description: 'Environment variable holding the vault token.' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['type'],
+                    properties: {
+                        type: { const: 'clickup' },
+                        token_env: { type: 'string', pattern: ENV_VAR_PATTERN, description: 'Default CLICKUP_API_TOKEN.' },
+                        team_id: { type: 'string', pattern: '^[0-9]{1,20}$' },
+                    },
+                },
+            ],
+        },
+        credentialUse: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['tool', 'arg', 'host'],
+            description: 'One declared swap site: (server, tool, argument dot-path) plus the destination the credential is allowed to reach.',
+            properties: {
+                id: { $ref: '#/$defs/identifier', description: 'Unique within the credential. Default "use[<index>]"; the recorded id is "<credential id>/<this>".' },
+                server: { $ref: '#/$defs/globOrList', description: 'Glob or list of globs on the logical server name (delimiter "/"). Default "*".' },
+                tool: { $ref: '#/$defs/globOrList', description: 'Glob or list of globs on the tool name (delimiter "/").' },
+                arg: {
+                    type: 'string',
+                    minLength: 1,
+                    description: 'Dot-path (a.b.0.c) into params.arguments. The synthetic is replaced ONLY inside the string at this path, never wherever else it occurs.',
+                },
+                host: { $ref: '#/$defs/credentialHost' },
+                path: { $ref: '#/$defs/credentialPath' },
+                action: { $ref: '#/$defs/credentialAction', description: 'Default "allow".' },
+                reason: { type: 'string', maxLength: 512, description: 'Shown to the model on a deny; also copied into the compiled Rego.' },
+            },
+        },
+        credentialHost: {
+            description: 'Where request.host comes from, and what it must be. Required: a swap site with no host constraint is a full-privilege credential with extra steps.',
+            oneOf: [
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['from_arg', 'allow'],
+                    properties: {
+                        from_arg: { type: 'string', minLength: 1, description: 'Dot-path to an argument holding an absolute URL; its hostname is the destination.' },
+                        allow: { $ref: '#/$defs/globOrList', description: 'Globs on the host (delimiter "."). The call is denied unless one matches.' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['fixed'],
+                    properties: {
+                        fixed: {
+                            type: 'string',
+                            pattern: HOSTNAME_PATTERN,
+                            description: 'The upstream this server always talks to, asserted by the operator. Recorded as host_source "declared" — checked against nothing in the call.',
+                        },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['from'],
+                    properties: {
+                        from: {
+                            const: 'server',
+                            description: 'No destination: the logical server name stands in for the host. Recorded as host_source "server_name", which authorises the tool and not the destination.',
+                        },
+                    },
+                },
+            ],
+        },
+        credentialPath: {
+            description: 'Where request.path_template comes from. Absent = the tool name.',
+            oneOf: [
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['from_arg', 'allow'],
+                    properties: {
+                        from_arg: { type: 'string', minLength: 1, description: 'Dot-path to an argument carrying the path or resource being addressed.' },
+                        allow: { $ref: '#/$defs/globOrList', description: 'Globs on that value (delimiter "/").' },
+                    },
+                },
+                {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['from'],
+                    properties: { from: { const: 'tool' } },
+                },
+            ],
+        },
         egressPolicy: {
             type: 'object',
             additionalProperties: false,

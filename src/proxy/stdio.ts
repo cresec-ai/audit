@@ -39,6 +39,31 @@
  * nowhere to park — inside a JSON-RPC batch, or on a notification — is
  * treated as a fail-closed deny.
  *
+ * THE CREDENTIAL SWAP IS THE SECOND SANCTIONED EXCEPTION to byte
+ * transparency, and the only one that rewrites a CLIENT line. When the
+ * policy declares a `credentials` site (see ../gateway/credentials.ts) and
+ * the argument at that site holds a synthetic placeholder, the gateway
+ * exchanges it at the broker and splices the real token into the outbound
+ * bytes — at the declared (server, tool, dot-path) site and nowhere else,
+ * never wherever the placeholder string happens to occur. Four orders matter
+ * and are load-bearing:
+ *  - the tap records the PRE-swap message, always, because the swap is
+ *    applied to a COPY and the entry the event is built from keeps the
+ *    synthetic. Record-then-swap is a pipeline order, not a check;
+ *  - a broker that cannot authorise the call DENIES it (invariant 1); the
+ *    synthetic is never forwarded on to the upstream and the failure path
+ *    never returns the request unmodified;
+ *  - the exchange is asynchronous, so the call is parked exactly as a hold
+ *    is (its id stays in flight for the duplicate-id gate) and released on
+ *    the next line boundary. Inside a JSON-RPC batch, and on a `tools/call`
+ *    NOTIFICATION, there is nowhere to park it and nothing to answer on, so
+ *    it is a fail-closed deny — the same v1 limit a `hold` carries;
+ *  - on the way back, every server line is swept for the exact resolved
+ *    token and any occurrence is replaced by the synthetic BEFORE the result
+ *    is hashed into an event or reaches the client. That is the seatbelt for
+ *    a tool that reflects its own arguments; the real control is that the
+ *    swap only ever fires at a declared site.
+ *
  * NO CLIENT BYTE REACHES THE SERVER UNEVALUATED. That is the whole promise,
  * and every shape that used to get around it is now gated:
  *
@@ -135,6 +160,14 @@ import {
   synthesizeDeniedResult,
   type BoundaryDeps,
 } from '../gateway/boundary.js';
+import {
+  MAX_INFLIGHT_SWAPS,
+  SWAP_DENY,
+  swapDenyReason,
+  unplannableSwap,
+  type PlannedSwap,
+  type SwapOutcome,
+} from '../gateway/credentials.js';
 import type { HoldRecord, HoldWaitResult } from '../gateway/holds.js';
 import type { GatewayOptions } from '../gateway/options.js';
 import { evaluateMcp, type McpDecision } from '../policy/engine.js';
@@ -197,6 +230,14 @@ interface PendingEntry {
   id: string | number;
   /** Gateway mode: the decision already taken for this tools/call (no boundary yet). */
   gateway?: GatewayOutcome;
+  /**
+   * Gateway mode: extra attributes the request-time decision produced, merged
+   * onto the event this entry eventually becomes. Today only the credential
+   * swap writes them (which credential, which decision id, which destination
+   * — never the value). `attributes` is an open map on the frozen v1 schema,
+   * so this adds no field to any event type.
+   */
+  attributes?: Attributes;
 }
 
 /* ------------------------------ gateway types ----------------------------- */
@@ -216,6 +257,13 @@ interface GatewayCall {
   rawRuleId?: string;
   ruleId?: string;
   reason?: string;
+  /**
+   * Credential-swap attributes for the events this call produces: which
+   * credential, which `decision_id`, which destination the broker was asked
+   * about. Never the resolved value and never a hash of it — refs are
+   * unsalted, so a ref of a brokered token is a copy of it.
+   */
+  swapAttributes?: Attributes;
   /**
    * True when this refusal is the gateway FAILING CLOSED, not the operator
    * deciding: the policy could not be evaluated, the hold file could not be
@@ -238,6 +286,15 @@ interface HoldEntry extends GatewayCall {
   /** pendingKey('c2s:', id) — so `notifications/cancelled` can find it. */
   key: string;
   raw: Buffer;
+  /**
+   * The parsed request and the line it arrived on, kept only so an APPROVED
+   * hold can still have its credential swapped in: the swap splices into the
+   * original line exactly as the boundary rewrite does, and it deliberately
+   * runs after the human answers, so no real token is resident in memory
+   * while a hold waits.
+   */
+  msg?: ToolsCallRequest;
+  line?: ScannedLine;
   /** When the hold started (performance.now()); `waited_ms` = now - t0. */
   t0: number;
   abort: AbortController;
@@ -1368,6 +1425,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
   let sessionClosing = false;
   /** Gateway mode: resolve every parked hold as `session_end` (idempotent). */
   let resolveAllHolds: (() => void) | undefined;
+  /**
+   * Gateway mode with credential brokering: drop every resolved token the
+   * reverse scrub is holding. Residency ends with the session rather than
+   * with the retention window. JS strings cannot be reliably zeroed, so the
+   * claim is that nothing references them any more, not that the bytes are
+   * gone from the heap.
+   */
+  let forgetBrokeredTokens: (() => void) | undefined;
 
   if (gateway === undefined) {
     // Forwarding: plain pipes, untouched. (pipe() ends child.stdin when
@@ -1737,6 +1802,10 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
           attributes['cresec.policy.rule_id'] = gatewayOutcome.rule_id;
         }
       }
+      // Request-time decisions that have no field on the frozen schema: today
+      // the credential swap's id/decision_id/destination. Namespaced, so they
+      // cannot collide with the keys set above.
+      if (entry.attributes !== undefined) Object.assign(attributes, entry.attributes);
       const ev: ToolCallEvent = {
         ...base('tool_call', attributes),
         kind: 'tool_call',
@@ -1889,6 +1958,22 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       hashString: (value) => redactor.hashString(value),
     };
     const holds = new Map<string, HoldEntry>();
+    /**
+     * Credential brokering, or undefined when no `credentials` section is in
+     * force. Every swap path below is gated on this, so a policy without one
+     * leaves the proxy byte-for-byte as it was.
+     */
+    const swap = gateway.credentials;
+    /**
+     * `pending` keys of calls whose credential exchange is in flight.
+     *
+     * They are in flight from the client's point of view — the request has
+     * been sent and no response has come back — so the duplicate-id gate has
+     * to see them. Without this, a second request reusing the id would take
+     * the slot while the first was still at the broker, and the first call's
+     * real response would land as an orphan.
+     */
+    const swapping = new Set<string>();
     /** Synthesized client lines waiting for the server's partial line to complete. */
     const deferredClientWrites: Buffer[] = [];
     /** Approved hold lines waiting for a partially forwarded client line to complete. */
@@ -2124,6 +2209,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         'cresec.policy.decision': decision,
       };
       if (call.ruleId !== undefined) attributes['cresec.policy.rule_id'] = call.ruleId;
+      if (call.swapAttributes !== undefined) Object.assign(attributes, call.swapAttributes);
       return attributes;
     };
 
@@ -2263,7 +2349,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const idInUse = (id: string | number, claimed?: ReadonlySet<string>): DuplicateIdState | undefined => {
       const key = pendingKey('c2s:', id);
       if (holds.has(key)) return 'held';
-      if (pending.has(key) || claimed?.has(key) === true) return 'pending';
+      // `swapping`: sent by the client, not yet forwarded because its
+      // credential is still being exchanged. In flight either way.
+      if (pending.has(key) || swapping.has(key) || claimed?.has(key) === true) return 'pending';
       return undefined;
     };
 
@@ -2382,8 +2470,25 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       const name = typeof params['name'] === 'string' ? params['name'] : '';
       const args: unknown = params['arguments'] ?? {};
       const { decision } = evaluate(name, args);
-      if (decision.action === 'allow') return { allowed: true };
+      const swapPlan = decision.action === 'allow' && swap !== undefined ? planSwap(name, args) : [];
+      if (decision.action === 'allow' && swapPlan.length === 0) return { allowed: true };
       const tool = name === '' ? '' : structuralString(name, 'identifier');
+      if (swapPlan.length > 0) {
+        // A notification cannot be answered and has no request id, so it can
+        // neither be parked for the exchange nor carry a `policy_decision`.
+        // Forwarding it would send the SYNTHETIC to the upstream. Dropped —
+        // which is exactly what "notification" promises its sender — and
+        // recorded on the `notification` event's additive gateway field.
+        diag(
+          `gateway: denied tools/call NOTIFICATION "${tool}" — a credential swap cannot be parked on a` +
+            ` notification (${SWAP_DENY.onNotification})${inBatch ? ' inside a JSON-RPC batch' : ''}; not forwarded`,
+        );
+        // No `refusal`: that field says the gateway refused the MESSAGE
+        // rather than evaluating it, and this one WAS evaluated and allowed
+        // before its credential proved unparkable. Recorded as the plain deny
+        // a `hold` on a notification already produces.
+        return { allowed: false, gateway: { decision: 'deny' } };
+      }
       // A `hold` has nowhere to park and nothing to answer on, so it is a
       // deny — the gateway failing closed, exactly as a hold inside a batch.
       diag(
@@ -2402,15 +2507,19 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     };
 
     /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
-    const registerCall = (call: GatewayCall, gatewayOutcome: GatewayOutcome): void => {
+    const registerCall = (call: GatewayCall, gatewayOutcome: GatewayOutcome, attributes?: Attributes): void => {
       const entry: PendingEntry = {
         method: 'tools/call',
+        // The PRE-swap params: this is what the `tool_call` event's `args`
+        // are scrubbed from, so the chain records the synthetic and never the
+        // brokered value. The swap builds a separate tree (see `beginSwap`).
         params: call.params,
         t0: performance.now(),
         toolName: call.tool,
         id: call.id,
         gateway: gatewayOutcome,
       };
+      if (attributes !== undefined) entry.attributes = attributes;
       registerPending(pendingKey('c2s:', call.id), entry);
     };
 
@@ -2469,6 +2578,24 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       if (forward && c2sOpen && !clientGone && !sessionClosing) {
         guarded(() => recordPolicyDecision(entry, resolution));
         reclaimPendingSlot(entry.key);
+        // The credential is resolved HERE, after the human answered — not
+        // when the hold was parked. A hold nobody answers therefore leaves no
+        // real token resident in memory at all. If the exchange then denies,
+        // both events are written and both are true: the operator approved
+        // the call and the broker refused the credential.
+        const plan = entry.msg === undefined || entry.line === undefined ? [] : planSwap(entry.rawTool, entry.args);
+        if (plan.length > 0) {
+          diag(`gateway: hold ${entry.approvalId} ${status}; resolving credential for tools/call "${entry.tool}" after ${resolution.waitedMs} ms`);
+          beginSwap(
+            swap as NonNullable<typeof swap>,
+            entry,
+            entry.msg as ToolsCallRequest,
+            entry.line as ScannedLine,
+            plan,
+            resolution,
+          );
+          return;
+        }
         registerCall(entry, gatewayOutcomeFor(entry, resolution));
         forwardHeldC2s(entry.raw);
         diag(`gateway: hold ${entry.approvalId} ${status}; forwarding tools/call "${entry.tool}" after ${resolution.waitedMs} ms`);
@@ -2485,7 +2612,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       diag(`gateway: hold ${entry.approvalId} ${resolution.outcome} after ${resolution.waitedMs} ms; tools/call "${entry.tool}" not forwarded`);
     };
 
-    const startHold = (call: GatewayCall, raw: Buffer): void => {
+    const startHold = (call: GatewayCall, raw: Buffer, msg: ToolsCallRequest, line: ScannedLine): void => {
       if (holds.size >= MAX_HOLDS) {
         // Fail closed: the holds map is bounded, so a client that parks
         // holds nobody ever resolves cannot grow it without limit.
@@ -2523,6 +2650,9 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         approvalId: created.approval_id,
         key: pendingKey('c2s:', call.id),
         raw,
+        // Kept for the swap on the approved path only; see HoldEntry.
+        msg,
+        line,
         t0: performance.now(),
         abort: new AbortController(),
         settled: false,
@@ -2560,6 +2690,10 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
     resolveAllHolds = (): void => {
       for (const entry of [...holds.values()]) settleHold(entry, 'session_end');
+    };
+
+    forgetBrokeredTokens = (): void => {
+      swap?.scrubber.clear();
     };
 
     /* ---- client -> server ---- */
@@ -2630,7 +2764,145 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       for (const bytes of deferredServerWrites.splice(0)) forwardHeldC2s(bytes);
     };
 
-    const c2sToolsCall = (msg: ToolsCallRequest, raw: Buffer): void => {
+    /* ---- credential swap (client -> server) ---- */
+
+    /**
+     * The swaps a `tools/call` asks for, or [] when the policy declares no
+     * `credentials` site that this call engages. Reads the SAME parsed
+     * arguments the policy was evaluated against — never a re-parse, never
+     * the raw text.
+     */
+    const planSwap = (tool: string, args: unknown): PlannedSwap[] => {
+      if (swap === undefined || !swap.hasSites) return [];
+      try {
+        return swap.plan({ server: currentServer().name, tool, args });
+      } catch (err) {
+        // Planning is pure and must not throw; if it ever does, the call is
+        // NOT forwarded unevaluated — this plan refuses, so the caller's
+        // ordinary deny path runs rather than a second failure mode.
+        tapError(err);
+        return [unplannableSwap(SWAP_DENY.unavailable)];
+      }
+    };
+
+    /** `user_agent` for the broker request: the MCP client from `initialize`. */
+    const clientUserAgent = (): string | undefined => {
+      if (clientName === undefined) return undefined;
+      return clientVersion === undefined ? clientName : `${clientName}/${clientVersion}`;
+    };
+
+    /**
+     * What the gateway does once the broker has answered.
+     *
+     * ALLOW forwards the original line with ONLY the credential spans
+     * spliced into it — the same mechanism the boundary rewrite uses, and for
+     * the same reason: re-serializing the whole message to rewrite one string
+     * silently rewrites unrelated numbers in it. DENY refuses the call
+     * exactly as a policy deny does, with a reason that is a CODE.
+     *
+     * The `pending` entry is registered from the PRE-swap call, so the
+     * `tool_call` event this eventually becomes carries the synthetic in its
+     * args and the credential's id + decision id in its attributes.
+     */
+    const settleSwap = (
+      call: GatewayCall,
+      msg: ToolsCallRequest,
+      line: ScannedLine,
+      outcome: SwapOutcome,
+      hold?: HoldResolution,
+    ): void => {
+      const refuse = (code: string, failClosed: boolean): void => {
+        const refused: GatewayCall = {
+          ...call,
+          reason: swapDenyReason(code),
+          swapAttributes: outcome.attributes,
+          ...(failClosed ? { failClosed: true as const } : {}),
+        };
+        denyCall(refused, undefined, `gateway: credential swap refused tools/call "${call.tool}" (${code})`);
+      };
+      if (outcome.kind === 'deny') {
+        refuse(outcome.code, outcome.failClosed);
+        return;
+      }
+      if (outcome.message === msg) {
+        // An allow that changed nothing would forward the SYNTHETIC to the
+        // upstream, which invariant 1 forbids outright. Unreachable by
+        // construction; refused rather than trusted.
+        refuse(SWAP_DENY.noToken, true);
+        return;
+      }
+      if (!c2sOpen || clientGone || sessionClosing) {
+        // The session ended while the broker was answering. Nothing can be
+        // forwarded, and nobody decided this, so it reads as fail-closed.
+        refuse(SWAP_DENY.sessionEnd, true);
+        return;
+      }
+      guarded(() => registerCall(call, gatewayOutcomeFor(call, hold), outcome.attributes));
+      forwardHeldC2s(spliceRewrittenLine(line, msg, outcome.message));
+      for (const d of outcome.decisions) {
+        // Host and path come off the wire, so they are capped like every
+        // other client-supplied string before reaching a diagnostic line.
+        diag(
+          `gateway: swapped credential "${structuralString(d.credential, 'identifier')}" into tools/call` +
+            ` "${call.tool}" for ${structuralString(d.host, 'identifier')}` +
+            `${d.hostSource === 'server_name' ? ' (host is the server name, not a checked destination)' : ''}` +
+            ` (decision ${structuralString(d.decisionId, 'identifier')}, ttl ${d.ttlSeconds}s)`,
+        );
+      }
+    };
+
+    /**
+     * Park a `tools/call` while its credential is exchanged.
+     *
+     * The exchange is I/O — a local `exec`, an OpenBao round-trip, an STS
+     * call — so the call waits exactly as a hold does: its id stays in flight
+     * for the duplicate-id gate, and the rewritten line is released on the
+     * next line boundary rather than spliced into a partial one. The engine
+     * bounds every exchange with its own deadline
+     * (BROKER_EXCHANGE_DEADLINE_MS, 5 s — the same bound NHI's Go client
+     * carries), so this can park for that long at worst and then denies.
+     */
+    const beginSwap = (
+      engine: NonNullable<typeof swap>,
+      call: GatewayCall,
+      msg: ToolsCallRequest,
+      line: ScannedLine,
+      plan: PlannedSwap[],
+      hold?: HoldResolution,
+    ): void => {
+      if (swapping.size >= MAX_INFLIGHT_SWAPS) {
+        // Fail closed, exactly as MAX_HOLDS does: a client that opens swaps
+        // faster than the broker answers them must not grow this without
+        // limit.
+        denyCall(
+          { ...call, reason: swapDenyReason(SWAP_DENY.tooMany), failClosed: true },
+          undefined,
+          `gateway: ${MAX_INFLIGHT_SWAPS} credential swaps already in flight; denying tools/call "${call.tool}"`,
+        );
+        return;
+      }
+      const key = pendingKey('c2s:', call.id);
+      swapping.add(key);
+      const ctx: Parameters<typeof engine.exchange>[2] = { server: currentServer().name, tool: call.rawTool };
+      const ua = clientUserAgent();
+      if (ua !== undefined) ctx.userAgent = ua;
+      engine.exchange(msg, plan, ctx).then(
+        (outcome) => {
+          swapping.delete(key);
+          settleSwap(call, msg, line, outcome, hold);
+        },
+        (err: unknown) => {
+          // `exchange` never rejects by contract; deny if it ever does. The
+          // error text is NOT quoted anywhere: it can carry a command line,
+          // a vault path or an upstream body.
+          swapping.delete(key);
+          tapError(err);
+          denyCall({ ...call, reason: swapDenyReason(SWAP_DENY.unavailable), failClosed: true });
+        },
+      );
+    };
+
+    const c2sToolsCall = (msg: ToolsCallRequest, raw: Buffer, line: ScannedLine): void => {
       // Fail closed on id reuse BEFORE the policy is consulted (see the
       // module header): a `tools/call` on an id that is currently held, or
       // that belongs to a request the server has not answered yet, is
@@ -2644,6 +2916,13 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       }
       const { call, action } = buildCall(msg);
       if (action === 'allow') {
+        // The swap runs AFTER the policy allowed the call and only at a
+        // declared site: the policy decides, the broker resolves.
+        const plan = swap === undefined ? [] : planSwap(call.rawTool, call.args);
+        if (plan.length > 0) {
+          beginSwap(swap as NonNullable<typeof swap>, call, msg, line, plan);
+          return;
+        }
         forwardC2s(raw);
         guarded(() => registerCall(call, gatewayOutcomeFor(call)));
         return;
@@ -2665,7 +2944,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         );
         return;
       }
-      startHold(call, raw);
+      startHold(call, raw, msg, line);
     };
 
     /**
@@ -2780,6 +3059,24 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         }
         const { call, action } = buildCall(el);
         if (action === 'allow') {
+          const plan = swap === undefined ? [] : planSwap(call.rawTool, call.args);
+          if (plan.length > 0) {
+            // A credential swap inside a batch is a deny for the same reason
+            // a `hold` is: the exchange is asynchronous and a batch element
+            // has nowhere to park — the other elements travel now, as the
+            // client wrote them. Forwarding it unswapped would put the
+            // SYNTHETIC on the wire, which invariant 1 forbids, so the only
+            // honest answer is a refusal, and the gateway failed closed
+            // rather than the operator deciding. Same v1 limit, documented
+            // in the module header.
+            claimed.add(pendingKey('c2s:', call.id));
+            answer(
+              call.id,
+              synthesizeDeny({ ...call, reason: swapDenyReason(SWAP_DENY.inBatch), failClosed: true as const }),
+            );
+            diag(`gateway: credential swap inside a JSON-RPC batch is treated as deny (tools/call "${call.tool}")`);
+            return;
+          }
           keep(el, index);
           forwardedCalls.push(call);
           return;
@@ -2905,7 +3202,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         return;
       }
       if (isToolsCallRequest(msg)) {
-        c2sToolsCall(msg, raw);
+        c2sToolsCall(msg, raw, line);
         return;
       }
       if (isInvalidIdToolsCall(msg)) {
@@ -2941,9 +3238,48 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
     /* ---- server -> client ---- */
 
-    const forwardS2c = (bytes: Buffer): void => {
+    const forwardS2c = (rawBytes: Buffer): void => {
+      // LAST-RESORT sweep at the one point server bytes leave for the client.
+      // The structural scrub in `s2cLine`/`s2cBatch` is the one that matters
+      // — it runs before the result is hashed into an event — and this
+      // catches what never becomes a parsed message: an unparseable line, a
+      // line forwarded verbatim, the chunks of an oversized one. It cannot
+      // catch a token straddling two chunks of an oversized line (those are
+      // streamed as they arrive), which is the same class of gap as an
+      // encoding transform and is documented, not papered over.
+      const bytes = swap === undefined ? rawBytes : swap.scrubber.scrubBytes(rawBytes);
       if (bytes.length > 0) clientAtLineStart = bytes[bytes.length - 1] === NL;
       s2c.push(bytes);
+    };
+
+    /**
+     * Replace every occurrence of a live brokered token in one parsed server
+     * message with the synthetic the client sent.
+     *
+     * This runs BEFORE the boundary filter and before `handleResponse`, so a
+     * reflected token is gone from the tree that gets hashed, scrubbed into
+     * `tool_call.result` and fingerprinted into `secret_refs`. That ordering
+     * is the whole point: `RedactedRef`s are unsalted sha256 by design, so a
+     * ref of a real token is a brute-forceable copy of it — the boundary
+     * filter finding a reflected credential and writing its ref into the
+     * chain would be the leak, not the fix.
+     *
+     * Copy-on-write, so an untouched message comes back by reference and the
+     * original bytes still cross byte-for-byte.
+     */
+    const scrubBrokered = (msg: unknown, text: string | null): { message: unknown; changed: boolean } => {
+      if (swap === undefined || text === null || !swap.scrubber.mightContain(text)) {
+        return { message: msg, changed: false };
+      }
+      try {
+        return swap.scrubber.scrubMessage(msg);
+      } catch (err) {
+        // Never let the seatbelt break the line: the byte-level sweep in
+        // forwardS2c still catches the value on its way out, and the event
+        // for this response is the only thing at risk.
+        tapError(err);
+        return { message: msg, changed: false };
+      }
     };
 
     /** A result shaped like a tools/call result (MCP content blocks). */
@@ -3036,14 +3372,36 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
      */
     const s2cBatch = (batch: unknown[], raw: Buffer, line: ScannedLine): void => {
       const out: unknown[] = [...batch];
+      /**
+       * The elements as the CHAIN must see them: brokered tokens replaced,
+       * boundary rewrites NOT applied. `out` carries both rewrites because it
+       * is what the client receives; `recorded` carries only the first,
+       * because `tool_call.result`/`result_hash` are defined as the RAW
+       * server result and only `gateway.boundary.delivered_result_hash`
+       * describes the delivered variant. A brokered token is the one thing
+       * that must not survive into either.
+       */
+      const recorded: unknown[] = [...batch];
       const reports = new Map<number, BoundaryReport>();
       let changed = false;
       let orphans = 0;
       batch.forEach((el, index) => {
-        if (!isPlainObject(el)) return;
-        const target = boundaryTarget(el);
+        // Same order as the standalone path: the brokered-token scrub first,
+        // so nothing below this line ever sees the real value — including an
+        // element that is not a tool result and is otherwise forwarded and
+        // recorded verbatim.
+        const unbrokered = scrubBrokered(el, line.text);
+        if (unbrokered.changed) {
+          changed = true;
+          out[index] = unbrokered.message;
+          recorded[index] = unbrokered.message;
+          diag('gateway: a brokered credential came back in a batched server message; replaced with its placeholder');
+        }
+        const scrubbed = unbrokered.message;
+        if (!isPlainObject(scrubbed)) return;
+        const target = boundaryTarget(scrubbed);
         if (target === undefined) return;
-        const filtered = filterResult(el, line.bytesLen, target.tool);
+        const filtered = filterResult(scrubbed, line.bytesLen, target.tool);
         if (filtered.changed) {
           changed = true;
           out[index] = filtered.message;
@@ -3057,12 +3415,13 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       }
       guarded(() => {
         batch.forEach((el, index) => {
+          const el2 = recorded[index];
           const report = reports.get(index);
           if (report === undefined) {
-            handleMessage(el, 'server_to_client', line);
+            handleMessage(el2, 'server_to_client', line);
             return;
           }
-          handleResponse(el as Record<string, unknown>, 'server_to_client', line, report);
+          handleResponse(el2 as Record<string, unknown>, 'server_to_client', line, report);
         });
       });
     };
@@ -3086,25 +3445,37 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         s2cBatch(msg, raw, line);
         return;
       }
+      // The reverse scrub comes FIRST, so every step below — the boundary
+      // filter, the result hash, the recorded result tree — sees the
+      // synthetic where the server echoed the real token. `arrived` is kept
+      // so the splice still measures its edits against the bytes that came
+      // off the wire.
+      const arrived = msg;
+      const unbrokered = scrubBrokered(msg, line.text);
+      msg = unbrokered.message;
+      if (unbrokered.changed) {
+        diag('gateway: a brokered credential came back in a server message; replaced with its placeholder');
+      }
       if (isPlainObject(msg)) {
         // Look the request up BEFORE handleResponse deletes it.
         const target = boundaryTarget(msg);
         if (target !== undefined) {
           const filtered = filterResult(msg, line.bytesLen, target.tool);
-          forwardS2c(filtered.changed ? spliceRewrittenLine(line, msg, filtered.message) : raw);
+          const delivered = filtered.changed ? filtered.message : msg;
+          forwardS2c(delivered === arrived ? raw : spliceRewrittenLine(line, arrived, delivered));
           if (target.kind === 'orphan') {
             // The id is the server's, so it is capped like any other
             // protocol string before it reaches a diagnostic line.
             diag(
               'gateway: boundary-filtered a tool result with no pending request' +
-                ` (id ${structuralString(String(msg['id']), 'identifier')})`,
+                ` (id ${structuralString(String((msg as Record<string, unknown>)['id']), 'identifier')})`,
             );
           }
           guarded(() => handleResponse(msg as Record<string, unknown>, 'server_to_client', line, filtered.report));
           return;
         }
       }
-      forwardS2c(raw);
+      forwardS2c(unbrokered.changed ? spliceRewrittenLine(line, arrived, msg) : raw);
       guarded(() => handleMessage(msg, 'server_to_client', line));
     };
     const s2cSplitter = new GatewayLineSplitter(forwardS2c, s2cLine);
@@ -3245,6 +3616,11 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // parked a hold in that window is resolved here, before session_end
         // seals the session.
         resolveAllHolds?.();
+      } catch (err) {
+        tapError(err);
+      }
+      try {
+        forgetBrokeredTokens?.();
       } catch (err) {
         tapError(err);
       }

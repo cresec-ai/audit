@@ -172,3 +172,76 @@ export declare function isRecorderOwnEnvVar(name: string): boolean;
  * "fewer fingerprints", never to a broken session.
  */
 export declare function collectEnvCredentialFingerprints(env: NodeJS.ProcessEnv, redactor: RedactorLike, cap?: number): CredentialFingerprint[];
+/**
+ * What a brokered value is replaced by, and the ref that stands in for it.
+ *
+ * A constant, so it is greppable in a store and identical across sessions,
+ * and a genuine `sha256:<hex>` so every consumer of `RedactedRef.ref` — the
+ * `query` matcher, the replay renderer, the bundle exporter — keeps working
+ * on a shape it already understands. It is the hash of a literal, so it
+ * discloses nothing: anyone can compute it, which is the point.
+ */
+export declare const BROKERED_PLACEHOLDER = "[brokered-credential]";
+export declare const BROKERED_REF: Sha256Ref;
+/**
+ * Cap on distinct brokered values held in the exclusion set. One entry per
+ * distinct resolved credential per process; a session that legitimately mints
+ * more than this many distinct tokens does not exist, and the cap is what
+ * makes the set's memory bounded by configuration rather than by traffic.
+ * Registration FAILS at the cap rather than evicting: evicting would silently
+ * un-protect a credential that is still live, and the broker turns a failed
+ * registration into a denial (`exclusion_capacity`).
+ */
+export declare const MAX_BROKERED_SECRETS = 1024;
+/**
+ * Remember that `value` is a REAL credential the broker resolved, so that no
+ * surface in the recorder ever fingerprints it.
+ *
+ * WHY THIS EXISTS, and why it is the same shape as `isRecorderOwnEnvVar`.
+ * Refs here are unsalted sha256 by design (`Redactor.hashString` / `sha256Ref`),
+ * because a blast-radius `query` has to be able to match a known probe value
+ * by hashing it the same way. That trade is right for a credential the AGENT
+ * already saw. It is exactly wrong for a brokered one: the whole claim of the
+ * broker is that the real token is absent from the model's context and from
+ * the transcript, so hashing it into the evidence chain would hand anybody
+ * holding the chain a brute-forceable copy — and a confirmable one for
+ * anybody who already has a candidate. There are at least six surfaces that
+ * would do it by default: `scrubToolArguments` on a post-swap message,
+ * `RedactedRef.ref`, `RedactedRef.secret_refs` when the token is embedded in
+ * a bigger leaf, `collectEnvCredentialFingerprints` on `GITHUB_TOKEN`,
+ * `scrubArgv` on a server command line, and the boundary filter's own
+ * `secret_refs` when a tool reflects the token back. One test, called from
+ * every one of them, is the only shape that survives a new call site being
+ * added — a filter applied afterwards to an assembled list would not be.
+ *
+ * WHAT IT DELIBERATELY FORFEITS. `query <the real token>` will not find the
+ * sessions that used it, so blast radius for a brokered credential cannot be
+ * answered from a hash. That is the correct trade and it costs less than it
+ * looks: the agent never saw the value, and the question is answered better
+ * anyway by the credential id and `decision_id` that the broker records for
+ * every use — which name the credential, the policy that allowed it and the
+ * destination it was allowed to, instead of proving that some hash appeared.
+ *
+ * Process-local and in memory only: a file of "secrets not to fingerprint"
+ * beside the store would be written by the same uid the store is, and would
+ * be a list of hashes of live credentials, which is the thing we just refused
+ * to write down.
+ *
+ * Returns false when the set is full; the caller must treat that as a
+ * resolution failure and DENY, never as permission to hand the value on.
+ */
+export declare function registerBrokeredSecret(value: string): boolean;
+/** THE exclusion test, by value. */
+export declare function isBrokeredSecret(value: string): boolean;
+/** THE exclusion test, for a caller that has already hashed the value. */
+export declare function isBrokeredRef(ref: Sha256Ref): boolean;
+/**
+ * THE exclusion test for a string that may merely CONTAIN a brokered
+ * credential — `Bearer <token>`, `token=<token>`, a JSON blob quoting it.
+ * See `brokeredValues` for why this exists and what it costs.
+ */
+export declare function containsBrokeredSecret(value: string): boolean;
+/** Size of the exclusion set (tests, and the broker's own capacity check). */
+export declare function brokeredSecretCount(): number;
+/** Drop every registered brokered secret — tests only. */
+export declare function forgetBrokeredSecrets(): void;

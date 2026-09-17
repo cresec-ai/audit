@@ -39,6 +39,31 @@
  * nowhere to park — inside a JSON-RPC batch, or on a notification — is
  * treated as a fail-closed deny.
  *
+ * THE CREDENTIAL SWAP IS THE SECOND SANCTIONED EXCEPTION to byte
+ * transparency, and the only one that rewrites a CLIENT line. When the
+ * policy declares a `credentials` site (see ../gateway/credentials.ts) and
+ * the argument at that site holds a synthetic placeholder, the gateway
+ * exchanges it at the broker and splices the real token into the outbound
+ * bytes — at the declared (server, tool, dot-path) site and nowhere else,
+ * never wherever the placeholder string happens to occur. Four orders matter
+ * and are load-bearing:
+ *  - the tap records the PRE-swap message, always, because the swap is
+ *    applied to a COPY and the entry the event is built from keeps the
+ *    synthetic. Record-then-swap is a pipeline order, not a check;
+ *  - a broker that cannot authorise the call DENIES it (invariant 1); the
+ *    synthetic is never forwarded on to the upstream and the failure path
+ *    never returns the request unmodified;
+ *  - the exchange is asynchronous, so the call is parked exactly as a hold
+ *    is (its id stays in flight for the duplicate-id gate) and released on
+ *    the next line boundary. Inside a JSON-RPC batch, and on a `tools/call`
+ *    NOTIFICATION, there is nowhere to park it and nothing to answer on, so
+ *    it is a fail-closed deny — the same v1 limit a `hold` carries;
+ *  - on the way back, every server line is swept for the exact resolved
+ *    token and any occurrence is replaced by the synthetic BEFORE the result
+ *    is hashed into an event or reaches the client. That is the seatbelt for
+ *    a tool that reflects its own arguments; the real control is that the
+ *    swap only ever fires at a declared site.
+ *
  * NO CLIENT BYTE REACHES THE SERVER UNEVALUATED. That is the whole promise,
  * and every shape that used to get around it is now gated:
  *

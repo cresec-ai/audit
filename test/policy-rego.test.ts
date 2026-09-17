@@ -8,6 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { sha256Hex } from '../src/chain/hash.js';
 import {
   BUNDLE_FILE_ORDER,
+  CREDENTIALS_REGO_PATH,
+  CREDENTIALS_ROOT,
   DECISION_SHAPE,
   EGRESS_REGO_PATH,
   EGRESS_ROOT,
@@ -24,6 +26,7 @@ import {
   resetRegexGuard,
   loadPolicyFile,
   policyRevision,
+  renderCredentialsModule,
   renderEgressModule,
   renderMcpModule,
   REGEX_VALUE_CAP,
@@ -35,7 +38,7 @@ import type { Decision, EgressRequestInput, McpRequestInput, Policy, RegoBundle 
 const ROOT = join(__dirname, '..');
 const FIXTURES = join(ROOT, 'test', 'fixtures', 'policies');
 const EXPECTED = join(FIXTURES, 'expected');
-const FIXTURE_FILES = ['laptop-default.yaml', 'mcp-only.yaml', 'egress-only.yaml', 'empty.json'] as const;
+const FIXTURE_FILES = ['laptop-default.yaml', 'mcp-only.yaml', 'credentials.yaml', 'egress-only.yaml', 'empty.json'] as const;
 const TOOL_VERSION = '0.0.0-test';
 
 /** Goldens use a hash derived from the fixture NAME so they do not churn when a comment changes. */
@@ -167,7 +170,7 @@ describe('compileToRego: bundle layout', () => {
   });
 
   it('bundleFileOrder puts known files first in canonical order, then extras sorted', () => {
-    expect(BUNDLE_FILE_ORDER).toEqual([MANIFEST_PATH, MCP_REGO_PATH, EGRESS_REGO_PATH]);
+    expect(BUNDLE_FILE_ORDER).toEqual([MANIFEST_PATH, MCP_REGO_PATH, CREDENTIALS_REGO_PATH, EGRESS_REGO_PATH]);
     expect(bundleFileOrder(bundle.files)).toEqual([MANIFEST_PATH, MCP_REGO_PATH, EGRESS_REGO_PATH]);
     expect(bundleFileOrder({ 'z/extra.rego': '', [MCP_REGO_PATH]: '', 'a/extra.rego': '' })).toEqual([MCP_REGO_PATH, 'a/extra.rego', 'z/extra.rego']);
   });
@@ -304,6 +307,79 @@ describe('compileToRego: bundle layout', () => {
     const loaded = loadPolicyFile(join(FIXTURES, 'empty.json'));
     const out = compileToRego(loaded.policy, { policyHash: loaded.hash, toolVersion: 'v' });
     expect(JSON.parse(out.files[MANIFEST_PATH]!).revision).toBe(loaded.hash.slice('sha256:'.length));
+  });
+});
+
+/* ------------------------ the credentials module -------------------------- */
+
+describe('compileToRego: cresec/credentials/broker.rego', () => {
+  const { bundle, policy } = compileFixture('credentials.yaml');
+  const credentials = bundle.files[CREDENTIALS_REGO_PATH]!;
+
+  it('is emitted, rooted and ordered like the other optional section', () => {
+    expect(CREDENTIALS_REGO_PATH).toBe('cresec/credentials/broker.rego');
+    expect(CREDENTIALS_ROOT).toBe('cresec/credentials');
+    expect(CREDENTIALS_REGO_PATH.startsWith(CREDENTIALS_ROOT + '/')).toBe(true);
+    // The Helm ConfigMap flattens by basename, so all three must differ.
+    const basenames = [MCP_REGO_PATH, CREDENTIALS_REGO_PATH, EGRESS_REGO_PATH].map((p) => p.split('/').pop());
+    expect(new Set(basenames).size).toBe(3);
+    expect(BUNDLE_FILE_ORDER).toEqual([MANIFEST_PATH, MCP_REGO_PATH, CREDENTIALS_REGO_PATH, EGRESS_REGO_PATH]);
+    expect(bundleRoots(policy)).toEqual([MCP_ROOT, CREDENTIALS_ROOT]);
+    expect(JSON.parse(bundle.files[MANIFEST_PATH]!).roots).toEqual([MCP_ROOT, CREDENTIALS_ROOT]);
+    expect(Object.keys(bundle.files).sort()).toEqual([MANIFEST_PATH, CREDENTIALS_REGO_PATH, MCP_REGO_PATH].sort());
+    // And not emitted at all when the policy has no credentials section.
+    expect(compileFixture('mcp-only.yaml').bundle.files[CREDENTIALS_REGO_PATH]).toBeUndefined();
+    expect(() => renderCredentialsModule(compileFixture('mcp-only.yaml').policy, { policyHash: goldenHash('x'), toolVersion: 'v' })).toThrow(
+      /no credentials section/,
+    );
+    expect(renderCredentialsModule(policy, { policyHash: goldenHash('credentials'), toolVersion: TOOL_VERSION, policyName: 'credentials-example' })).toBe(
+      credentials,
+    );
+  });
+
+  it('defaults to deny, and says in the module that it is the one section enforced on BOTH sides', () => {
+    expect(credentials.startsWith('package cresec.credentials\n\nimport rego.v1\n\n')).toBe(true);
+    expect(credentials).toContain(
+      '# Input:    {"credential": "...", "server": "...", "tool": "...", "host": "...", "host_source": "argument"|"declared"|"server_name", "path_template": "..."}',
+    );
+    expect(credentials).toContain(`# Decision: ${DECISION_SHAPE}`);
+    expect(credentials).toContain('# Enforced BOTH locally (the gateway broker');
+    expect(credentials).toContain('default_action := "deny"');
+    // There is no author-settable default: an undeclared use is a deny in
+    // every credentials module, whatever the file says elsewhere.
+    expect(credentials).not.toContain('default_action := "allow"');
+    expect(credentials).not.toMatch(/^ +/m); // tabs only, like the rest of the bundle
+  });
+
+  it('gives every site the composed id and keeps file order, so the carve-out still wins', () => {
+    expect(credentials).toContain('{"id": "github-issues/no-deletes", "action": "deny", "reason": "an issues token does not delete things"},');
+    expect(credentials).toContain('{"id": "github-issues/create-issue", "action": "allow", "reason": ""},');
+    expect(credentials.indexOf('"github-issues/no-deletes"')).toBeLessThan(credentials.indexOf('"github-issues/create-issue"'));
+    expect(credentials).toContain('# github-issues/no-deletes\nrule_matches contains 0 if {');
+  });
+
+  it('matches the credential by id and the site by the same globs the mcp module uses', () => {
+    expect(credentials).toContain('\tinput.credential == "github-issues"\n\tregex.match("^corp\\\\-notes$", input.server)\n\tregex.match("^http_delete$", input.tool)\n');
+    // A glob list is a `some ... in` over the SAME regex sources glob.ts
+    // compiles, not a second matcher.
+    expect(credentials).toContain('\tsome h in ["^api\\\\.github\\\\.com$", "^[^\\\\.]*\\\\.github\\\\.com$"]\n\tregex.match(h, input.host)\n');
+    expect(credentials).toContain('regex.match("^clickup_[^\\\\/]*$", input.tool)');
+  });
+
+  it('carries host_source as a CONDITION, so a checked destination cannot be satisfied by a server name', () => {
+    // Three forms, three conditions. Without this line a data plane that
+    // filled `host` with the server name would satisfy a site that declared
+    // an argument-derived destination, and the decision log could not tell
+    // the two apart afterwards.
+    expect(credentials).toContain('\tinput.host_source == "argument"\n');
+    expect(credentials).toContain('\tinput.host_source == "declared"\n\tinput.host == "api.clickup.com"\n');
+    expect(credentials).toContain('\tinput.host_source == "server_name"\n\tregex.match("^db$", input.host)\n');
+    expect(credentials.match(/input\.host_source == /g)).toHaveLength(policy.credentials!.flatMap((c) => c.use).length);
+  });
+
+  it('binds path_template to the tool name unless the site derived it from an argument', () => {
+    expect(credentials).toContain('\tinput.host == "registry.npmjs.org"\n\tinput.path_template == input.tool\n');
+    expect(credentials).toContain('\tregex.match("^901[^\\\\/]*$", input.path_template)\n');
   });
 });
 
@@ -516,6 +592,72 @@ describe('OPA parity (skipped when no opa binary is available, required in CI)',
     expect(check.status, check.stderr + check.stdout).toBe(0);
     const fmt = spawnSync(opa, ['fmt', '--fail', '--list', join(dir, 'cresec')], { encoding: 'utf8' });
     expect(fmt.status, `opa fmt would reformat:\n${fmt.stdout}${fmt.stderr}`).toBe(0);
+  });
+
+  /**
+   * The credentials module has no local twin to compare against (the swap is
+   * decided by the broker, not by `engine.ts`), so these assert the decision
+   * the CONTROL PLANE would return for a handful of exchanges — including the
+   * three that must not be authorised.
+   */
+  describe('credentials: what the control plane answers', () => {
+    const dir = dirs.get('credentials.yaml')!;
+    const exchange = (over: Record<string, string>): OpaDecision =>
+      opaEval(opa, dir, 'data.cresec.credentials.decision', {
+        credential: 'github-issues',
+        server: 'corp-notes',
+        tool: 'http_post',
+        host: 'api.github.com',
+        host_source: 'argument',
+        path_template: 'http_post',
+        ...over,
+      });
+
+    it('allows a declared site, and lets the carve-out above it win', () => {
+      expect(exchange({})).toMatchObject({ allow: true, action: 'allow', rule_id: 'github-issues/create-issue', matched: true, deny_reason: '' });
+      expect(exchange({ host: 'uploads.github.com' })).toMatchObject({ allow: true, rule_id: 'github-issues/create-issue' });
+      expect(exchange({ tool: 'http_delete', path_template: 'http_delete' })).toMatchObject({
+        allow: false,
+        action: 'deny',
+        rule_id: 'github-issues/no-deletes',
+        deny_reason: 'rule github-issues/no-deletes: an issues token does not delete things',
+      });
+    });
+
+    it('denies by default when anything about the tuple is undeclared', () => {
+      const unmatched = { allow: false, action: 'deny', matched: false, rule_id: '', deny_reason: 'default deny' };
+      // The destination is the agent's to choose, so it is the one that matters.
+      expect(exchange({ host: 'attacker.example' }), 'undeclared host').toMatchObject(unmatched);
+      expect(exchange({ server: 'echo-server' }), 'undeclared server').toMatchObject(unmatched);
+      expect(exchange({ tool: 'echo' }), 'undeclared tool').toMatchObject(unmatched);
+      // One credential's site does not authorise another credential.
+      expect(exchange({ credential: 'clickup-api' }), 'wrong credential').toMatchObject(unmatched);
+      // And a data plane that filled `host` with the server name cannot
+      // satisfy a site that declared an argument-derived destination — this
+      // is the difference between "host was checked" and "host was a name".
+      expect(exchange({ host_source: 'server_name' }), 'host_source downgraded').toMatchObject(unmatched);
+      expect(exchange({ host_source: 'declared' }), 'host_source downgraded').toMatchObject(unmatched);
+    });
+
+    it('checks the other two host bindings and the argument-derived path', () => {
+      const clickup = { credential: 'clickup-api', server: 'clickup', tool: 'clickup_create_task', host: 'api.clickup.com', host_source: 'declared' };
+      expect(opaEval(opa, dir, 'data.cresec.credentials.decision', { ...clickup, path_template: '901234' })).toMatchObject({
+        allow: true,
+        rule_id: 'clickup-api/tasks',
+      });
+      expect(opaEval(opa, dir, 'data.cresec.credentials.decision', { ...clickup, path_template: '123' })).toMatchObject({ allow: false, matched: false });
+      const db = { credential: 'db-readonly', server: 'db', tool: 'query', path_template: 'query' };
+      expect(opaEval(opa, dir, 'data.cresec.credentials.decision', { ...db, host: 'db', host_source: 'server_name' })).toMatchObject({
+        allow: true,
+        rule_id: 'db-readonly/query',
+      });
+      // `host` is the SERVER NAME in that form, so a real hostname there is
+      // a request this policy never described.
+      expect(opaEval(opa, dir, 'data.cresec.credentials.decision', { ...db, host: 'db.internal', host_source: 'server_name' })).toMatchObject({
+        allow: false,
+        matched: false,
+      });
+    });
   });
 
   it.each(FIXTURE_FILES)('%s: the packages live at data.cresec.mcp / data.cresec.egress (no data.cresec.gateway)', (file) => {

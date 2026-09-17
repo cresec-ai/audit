@@ -7,8 +7,10 @@ line of tools. Two consumers read it:
   enforces the `mcp` section on every MCP `tools/call` that crosses the proxy:
   per-tool **allow / hold / deny**, plus a **tool-result boundary filter** that
   redacts secret-shaped values and flags prompt-injection markers in tool
-  results before the model sees them. See [docs/gateway.md](gateway.md) for the
-  10-minute walkthrough.
+  results before the model sees them. It also enforces the `credentials`
+  section: at a declared swap site, and only there, a synthetic credential in
+  an outbound argument is exchanged for a real one under a recorded decision.
+  See [docs/gateway.md](gateway.md) for the 10-minute walkthrough.
 - **The Cresec sidecar / hosted gateway** (the Go edge daemon and control plane)
   consumes the same file compiled to Rego (`mcp-recorder policy compile`) and
   served through the control plane's OPA bundle endpoint. The `egress` section
@@ -75,6 +77,22 @@ mcp:
     max_scan_bytes: 1048576           # results larger than this are not scanned ...
     on_oversize: flag                 # ... and are flagged (or blocked)
 
+credentials:                          # synthetic -> real, only at the sites declared here
+  - id: github-issues
+    provider: github                  # informational; recorded on the decision
+    scopes: ["repo:issues"]           # informational; recorded on the decision
+    source:
+      type: env
+      var: GITHUB_TOKEN
+    use:
+      - id: create-issue
+        server: corp-notes
+        tool: http_post
+        arg: headers.Authorization    # the ONLY place this credential is spliced
+        host:
+          from_arg: url               # the destination comes from the CALL ...
+          allow: ["api.github.com"]   # ... and has to be one of these
+
 egress:                               # for the Cresec sidecar — compiled, not enforced here
   default: deny
   rules:
@@ -102,8 +120,9 @@ egress:                               # for the Cresec sidecar — compiled, not
 | --- | --- | --- | --- |
 | `version` | `1` | yes | Literal `1`. Breaking changes will bump this. |
 | `name` | identifier | no | `^[A-Za-z0-9_.:/-]{1,64}$`. Stamped on the `session_start` event and into the compiled Rego header. |
-| `mcp` | object | one of `mcp`/`egress` | MCP tool-call policy (enforced by `mcp-recorder`). |
-| `egress` | object | one of `mcp`/`egress` | HTTP egress policy (compiled for the sidecar). |
+| `mcp` | object | one of the three | MCP tool-call policy (enforced by `mcp-recorder`). |
+| `credentials` | array | one of the three | Credential-broker policy (enforced by `mcp-recorder`). |
+| `egress` | object | one of the three | HTTP egress policy (compiled for the sidecar). |
 
 Unknown keys are rejected everywhere (`additionalProperties: false`): a typo
 never silently disables a rule.
@@ -144,6 +163,167 @@ never silently disables a rule.
 | `injection` | `redact` \| `block` \| `flag` \| `off` | `flag` | Prompt-injection markers in tool results. |
 | `max_scan_bytes` | integer | `1048576` | 4 096 – 67 108 864. A result line larger than this is not scanned. |
 | `on_oversize` | `flag` \| `block` | `flag` | What happens to an unscanned oversize result. |
+
+## `credentials`
+
+A list of credentials the gateway may hand to a server, and the **declared
+swap sites** where it may do so. At a declared site the synthetic credential
+found in one named argument is exchanged for the real one, under a decision
+recorded in the evidence chain; everywhere else the synthetic is forwarded
+untouched and the upstream rejects it.
+
+**What this buys, stated honestly.** The real credential is absent from the
+model's context and from the transcript, and every use of it is a
+policy-checked, revocable decision recorded under a decision id. It is **not**
+hidden from anything that can run code as the same OS user — which includes
+the agent's own shell. The agent can read the env var, the file or the
+command this section names, and it can read this section to learn which one to
+read. Brokering is a *context and audit* control on a single-uid developer
+machine, and a *confidentiality* control only when the resolver runs as a
+principal the agent is not (a root-owned policy plus a root-owned resolver, or
+the hosted control plane). See [docs/red-team.md](red-team.md).
+
+```yaml
+credentials:
+  - id: github-issues
+    provider: github
+    scopes: ["repo:issues"]
+    ttl_seconds: 30
+    timeout_ms: 5000
+    on_unresolved: deny
+    source: { type: env, var: GITHUB_TOKEN }
+    use:
+      - id: no-deletes                # first match wins: carve-outs go first
+        server: corp-notes
+        tool: http_delete
+        arg: headers.Authorization
+        host: { from_arg: url, allow: ["api.github.com"] }
+        action: deny
+        reason: an issues token does not delete things
+      - id: create-issue
+        server: corp-notes
+        tool: http_post
+        arg: headers.Authorization
+        host: { from_arg: url, allow: ["api.github.com"] }
+```
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `id` | identifier | required | Unique within the section. Recorded on every decision — the credential's **name**, never its value. |
+| `provider` | identifier | — | Informational (`github`, `clickup`, …). Recorded on the decision. |
+| `scopes` | string[] | — | Informational: what the **real** credential can do. Recorded on the decision, so blast radius is answerable from the chain instead of reconstructed later. |
+| `source` | object | required | Where the real credential is resolved from. See below. |
+| `use[]` | array | required, ≥ 1 | Declared swap sites, in order; first match wins. |
+| `ttl_seconds` | integer 0–300 | `30` | How long a positive decision may be cached. |
+| `timeout_ms` | integer 100–30000 | `5000` | Deadline for resolving the source. Overrunning it **denies this call**. |
+| `on_unresolved` | `deny` | `deny` | The only value the schema admits. It is spelled out because the alternative — forwarding the call anyway — forwards the *synthetic* to the upstream. |
+
+### `credentials[].source`
+
+Named by the config and only ever by the config; a call can never choose its
+own source. Every path is absolute, because a relative one would resolve
+against the client's working directory rather than the policy's.
+
+| `type` | Keys | Notes |
+| --- | --- | --- |
+| `env` | `var` | Environment variable of the **recorder** process. |
+| `file` | `path`, `field?` | `field` is a dot-path into the file parsed as JSON; absent = the whole file, trimmed. |
+| `exec` | `command`, `args?` | argv, no shell. `command` must be an absolute path: a bare name resolves through `PATH`, which the agent can prepend to. |
+| `github-app` | `app_id`, `installation_id`, exactly one of `private_key_file` / `private_key_env`, `repositories?`, `permissions?` | Mints a short-lived installation token; `repositories` / `permissions` narrow it. |
+| `aws-sts` | `role_arn`, `region?`, `session_name?`, `duration_seconds?` (900–43200, default 900), `external_id?` | Mints a short-lived session. |
+| `vault` | `path`, `field?` (default `token`), `addr?`, `namespace?`, `token_env?` | OpenBao / Vault. `field` defaults to the key the Cresec control plane reads. |
+| `clickup` | `token_env?` (default `CLICKUP_API_TOKEN`), `team_id?` | |
+
+Prefer `github-app` and `aws-sts` over `env` even locally: they mint
+short-lived, narrowly-scoped tokens, which shrinks the *window* in which a
+leaked value is worth anything. None of them shrinks the *readership* — the
+root credential (the app private key, the AWS credentials, the OpenBao token)
+sits in an env var or a file with the same permissions, so an agent on the
+same uid mints its own token rather than stealing the brokered one.
+
+### `credentials[].use[]` — the declared swap site
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `id` | identifier | `use[<index>]` | Unique within the credential. Recorded (and used as the Rego rule id) as `<credential id>/<id>`. |
+| `server` | glob \| glob[] | `*` | The logical server name. Delimiter `/`, same globs as `mcp`. |
+| `tool` | glob \| glob[] | required | The `tools/call` `params.name`. Delimiter `/`. |
+| `arg` | dot-path | required | Where in `params.arguments` the swap happens — and **the only place it happens**. |
+| `host` | object | required | Where the request is allowed to go. See below. |
+| `path` | object | `{ from: tool }` | What `request.path_template` is. |
+| `action` | `allow` \| `deny` | `allow` | `hold` is not available in v1 (see Limitations). |
+| `reason` | string ≤ 512 | — | Shown to the model on a deny. |
+
+The swap is **destination-bound, never value-bound**: the real token replaces
+the synthetic inside the string at `arg`, at a site whose `server`, `tool`,
+`host` and `path` all match, and nowhere else the synthetic string happens to
+occur. That is what stops the reflection attack — ask an `echo`-shaped tool to
+return its input and it is simply not a declared site, so it receives the
+synthetic and the upstream rejects it.
+
+### `credentials[].use[].host` — the destination
+
+Required. A swap site with no host constraint is a full-privilege credential
+with extra steps: a policy that allows `corp-notes/http_post` with a
+credential in `headers.Authorization` and says nothing about the destination
+authorises `http_post` to `attacker.example` exactly as happily as to
+`api.github.com`, and the destination is the agent's to choose.
+
+| Form | Meaning | `host_source` on the decision |
+| --- | --- | --- |
+| `{ from_arg: <dot-path>, allow: <glob\|glob[]> }` | The named argument is parsed as an absolute URL and its hostname must match one of the globs (delimiter `.`). An argument that is not an absolute URL cannot be resolved to a host, and the call is denied. | `argument` |
+| `{ fixed: <hostname> }` | The operator asserts the upstream a server always talks to. Checked against nothing in the call. | `declared` |
+| `{ from: server }` | There is no destination: the logical server name stands in for the host, which is what NHI's contract means by "the resolved server origin or server name". This authorises the **tool**, not the **destination**. | `server_name` |
+
+`host_source` is recorded, and it is also a condition in the compiled Rego, so
+the log — and the control plane — distinguish "the host was checked" from "the
+host was the server name" without anyone having to reconstruct which it was.
+
+`path` takes the same two argument-derived / default forms:
+`{ from_arg: <dot-path>, allow: <glob|glob[]> }` (delimiter `/`) or the
+default `{ from: tool }`, which says `request.path_template` is the tool name.
+
+### What the gateway does with all this
+
+- **First match wins**, then **deny**. The section default is not settable:
+  a use that is not declared is not authorised.
+- **The decision cache is keyed on the whole tuple** — synthetic, method,
+  host, path_template — for `ttl_seconds`. Keying it on the synthetic alone
+  would turn one allow for `create_issue` into 30 seconds of allow for
+  `delete_repo`.
+- **Revocation is not instant.** A cached decision stays live for up to
+  `ttl_seconds` (default 30), and revoking a synthetic does not recall a call
+  already in flight. Quote the number, not the word.
+- **Resolution is bounded and fail-closed.** A source that overruns
+  `timeout_ms` denies *this* call rather than stalling the proxy thread the
+  client is waiting on, and the failure path returns a denial — it never
+  returns the request unmodified, because that would forward the synthetic.
+- **The real value never enters the evidence chain.** Redaction refs are
+  unsalted sha256 by design, so a ref of a brokered secret would be a
+  brute-forceable copy of it. What is recorded is the credential id, the site
+  id and the decision id. The same class of exclusion already exists for the
+  recorder's own environment (`isRecorderOwnEnvVar` in `src/redact/redactor.ts`).
+
+### Who may write this file
+
+Anything that can write `policy.yaml` controls the swap: it can add a site
+pointing at a host it controls, widen a host glob, or repoint a source — and
+an `exec` source is arbitrary code execution by configuration, running as the
+recorder, on every call. The file is also a map of where the real secrets on
+this machine live.
+
+So the loader records what the filesystem says about the file (owner and mode)
+and lists the credentials that must not be resolved from it — the `exec` ones,
+because a writable policy picks the *command* and not merely the value. That
+is a fact about the machine rather than about the document, so `policy
+validate` does not fail on it; the enforcing side (the broker, before it
+resolves a source) is where it turns into a refusal. On a
+single-uid developer machine that is **advisory** — the same caveat as the
+documented `MCP_RECORDER_DISABLE=1` kill switch, but louder, because this file
+does not merely switch enforcement off, it aims the credential. The property
+to lean on is the chain: the policy's sha256 is stamped on every event, so a
+mid-session edit is **evident** even where it cannot be prevented. Say
+evident, not tamper-proof.
 
 ## `egress`
 
@@ -549,16 +729,26 @@ the existing `cresec.broker`, one `decision` object rule each:
 
 ```
 bundle/
-├── .manifest                {"revision": "<sha256 of policy.yaml>", "roots": ["cresec/mcp", "cresec/egress"]}
+├── .manifest                    {"revision": "<sha256 of policy.yaml>", "roots": ["cresec/mcp", ...]}
 └── cresec/
-    ├── mcp/tool.rego        package cresec.mcp
-    └── egress/http.rego     package cresec.egress   (only if `egress` is present)
+    ├── mcp/tool.rego            package cresec.mcp
+    ├── credentials/broker.rego  package cresec.credentials  (only if `credentials` is present)
+    └── egress/http.rego         package cresec.egress       (only if `egress` is present)
 ```
 
 `cresec/mcp/tool.rego` is always emitted (a policy without `mcp` compiles to
-`default allow`, no rules); `cresec/egress/http.rego` — and the
-`"cresec/egress"` entry in `roots` — only when the policy has an `egress`
-section. The two files deliberately have distinct basenames.
+`default allow`, no rules); the other two modules — and their entries in
+`roots` — only when the policy has that section. The files deliberately have
+distinct basenames.
+
+`cresec.credentials` is the one compiled module that is **also** enforced
+locally: the gateway checks the same site list before it swaps anything, and
+this module is the control plane's copy of that decision for the day the swap
+is pointed at `/broker/exchange` instead. `egress`, by contrast, is compiled
+and never enforced here. Its default is `deny` and is not author-settable, and
+every swap site emits its `host_source` as a condition, so a request that
+filled `host` with the server name cannot satisfy a site that declared a
+checked destination.
 
 Input and decision shapes. The decision is a superset of the broker's
 (`allow` + `deny_reason`), so a consumer that only understands those two keys
@@ -575,6 +765,13 @@ still fails closed on `hold`. `allow` is `action == "allow"`; `deny_reason` is
 { "allow": false, "action": "deny", "rule_id": "no-secrets-files",
   "reason": "credential files are off limits", "matched": true,
   "deny_reason": "rule no-secrets-files: credential files are off limits" }
+
+// package cresec.credentials — input
+{ "credential": "github-issues", "server": "corp-notes", "tool": "http_post",
+  "host": "api.github.com", "host_source": "argument", "path_template": "http_post" }
+// data.cresec.credentials.decision
+{ "allow": true, "action": "allow", "rule_id": "github-issues/create-issue",
+  "reason": "", "matched": true, "deny_reason": "" }
 
 // package cresec.egress — input
 { "host": "api.github.com", "method": "POST", "path": "/repos/o/r/pulls", "body_bytes": 812 }
@@ -635,7 +832,15 @@ See [docs/event-schema.md](event-schema.md) for the exact fields.
   so the variable can stay exported in a shell that also runs stdio servers.
 - A policy without an `mcp` section is valid, and `policy validate` exits 0
   (with a warning), but `record --policy` and `setup --policy` refuse it with
-  exit 2 — the gateway would have nothing to enforce.
+  exit 2 — the gateway would have nothing to enforce. That applies to a
+  `credentials`-only policy too: pair the section with an `mcp` section.
+- `credentials[].use[].action` is `allow` or `deny`; **`hold` is not available
+  in v1**. Holding a credential call means resolving the secret only after a
+  human answers — otherwise a real token sits in memory across an abandoned
+  hold — and v1 has no code that does that, so the file cannot ask for it.
+- A `credentials` site whose `host` is `{ fixed: ... }` or `{ from: server }`
+  constrains the *tool*, not the *destination*. Only `{ from_arg: ..., allow:
+  [...] }` checks where the credential actually goes.
 - `egress` rules are validated and compiled but not enforced by
   `mcp-recorder`.
 - Denied tools are not hidden from `tools/list`; the model may still attempt

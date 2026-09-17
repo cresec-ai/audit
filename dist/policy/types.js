@@ -29,14 +29,61 @@ export const DEFAULTS = {
     },
     egress: { default: 'deny' },
     match: { server: '*', path: '/**' },
+    credential: {
+        /**
+         * How long a positive decision may be cached. 30 s is NHI's
+         * `BROKER_DEFAULT_TTL_SECONDS` (apps/api/src/broker/exchange.ts) — the
+         * same number the hosted data plane caches for — so the local broker and
+         * the remote one bound staleness identically. It is a bound on staleness,
+         * not a promise about the token: a revoked credential stays usable at a
+         * cached site for up to this many seconds, which is why the docs quote
+         * the number instead of calling revocation instant.
+         */
+        ttl_seconds: 30,
+        /**
+         * Deadline for resolving one credential, denied on expiry. 5 000 ms is
+         * the timeout NHI's own broker client already carries for the same call
+         * (`packages/brokerclient/client.go`, `&http.Client{Timeout: 5 *
+         * time.Second}`), so swapping a local resolver for the control plane
+         * does not change how long a stuck source can hold the proxy thread the
+         * client is waiting on.
+         */
+        timeout_ms: 5_000,
+        on_unresolved: 'deny',
+        action: 'allow',
+        /** NHI's broker reads `{"token": ...}` out of the vault blob; same key here. */
+        vault_field: 'token',
+        /** AWS's minimum session length: the shortest-lived token STS will mint. */
+        aws_duration_seconds: 900,
+        clickup_token_env: 'CLICKUP_API_TOKEN',
+    },
 };
 /** Range limits enforced by the JSON Schema (`minimum` / `maximum`). */
 export const LIMITS = {
     hold_timeout_ms: { min: 1_000, max: 3_600_000 },
     max_scan_bytes: { min: 4_096, max: 64 * 1024 * 1024 },
+    /** 0 disables the decision cache; the cap keeps a stale allow inside five minutes. */
+    credential_ttl_seconds: { min: 0, max: 300 },
+    credential_timeout_ms: { min: 100, max: 30_000 },
+    /** AWS STS: 15 minutes to 12 hours. */
+    aws_duration_seconds: { min: 900, max: 43_200 },
 };
 /** Identifier pattern shared by `name` and rule `id`. */
 export const ID_PATTERN = '^[A-Za-z0-9_.:/-]{1,64}$';
+/**
+ * A POSIX environment variable name. Narrower than what `execve` permits (no
+ * `=`, any other byte goes) because a policy that names a variable no shell
+ * can export is a typo, not a feature.
+ */
+export const ENV_VAR_PATTERN = '^[A-Za-z_][A-Za-z0-9_]{0,127}$';
+/**
+ * A hostname as `host: {fixed: ...}` accepts it: labels of letters, digits
+ * and hyphens, optionally with a port. No scheme, no path, no glob — this is
+ * the destination the operator asserts, not a pattern to match.
+ */
+export const HOSTNAME_PATTERN = '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]{1,5})?$';
+/** An IAM role ARN, the one `aws-sts` field where a typo is otherwise invisible until first use. */
+export const ROLE_ARN_PATTERN = '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$';
 /**
  * The longest `args` value (UTF-16 units) the local engine will match a regex
  * against. A longer one is UNEVALUABLE: the rule neither matches nor is
@@ -60,6 +107,22 @@ function toList(v) {
 /** Auto-assigned id for a rule without one; brackets keep it outside ID_PATTERN so it can never collide. */
 export function autoRuleId(index) {
     return `rule[${index}]`;
+}
+/** Auto-assigned id for a swap site without one, outside ID_PATTERN for the same reason. */
+export function autoUseId(index) {
+    return `use[${index}]`;
+}
+/**
+ * The id a swap site is known by everywhere else: in the decision, in the
+ * chain and as the rule id in the compiled Rego. Composed rather than
+ * author-given so that uniqueness across the section follows from two local
+ * checks — credential ids are unique, and site ids are unique within their
+ * credential — instead of a third global one the author has to keep in their
+ * head. `/` is inside `ID_PATTERN`, so a composed id is still a legal
+ * identifier.
+ */
+export function credentialUseId(credentialId, siteId) {
+    return `${credentialId}/${siteId}`;
 }
 function normalizeMcpRule(rule, index) {
     const match = {
@@ -89,6 +152,115 @@ function normalizeEgressRule(rule, index) {
         out.reason = rule.reason;
     return out;
 }
+function normalizeCredentialSource(source) {
+    switch (source.type) {
+        case 'env':
+            return { type: 'env', var: source.var };
+        case 'file': {
+            const out = { type: 'file', path: source.path };
+            if (source.field !== undefined)
+                out.field = source.field;
+            return out;
+        }
+        case 'exec':
+            return { type: 'exec', command: source.command, args: [...(source.args ?? [])] };
+        case 'github-app': {
+            const out = {
+                type: 'github-app',
+                app_id: source.app_id,
+                installation_id: source.installation_id,
+            };
+            if (source.private_key_file !== undefined)
+                out.private_key_file = source.private_key_file;
+            if (source.private_key_env !== undefined)
+                out.private_key_env = source.private_key_env;
+            if (source.repositories !== undefined)
+                out.repositories = [...source.repositories];
+            if (source.permissions !== undefined)
+                out.permissions = { ...source.permissions };
+            return out;
+        }
+        case 'aws-sts': {
+            const out = {
+                type: 'aws-sts',
+                role_arn: source.role_arn,
+                duration_seconds: source.duration_seconds ?? DEFAULTS.credential.aws_duration_seconds,
+            };
+            if (source.region !== undefined)
+                out.region = source.region;
+            if (source.session_name !== undefined)
+                out.session_name = source.session_name;
+            if (source.external_id !== undefined)
+                out.external_id = source.external_id;
+            return out;
+        }
+        case 'vault': {
+            const out = {
+                type: 'vault',
+                path: source.path,
+                field: source.field ?? DEFAULTS.credential.vault_field,
+            };
+            if (source.addr !== undefined)
+                out.addr = source.addr;
+            if (source.namespace !== undefined)
+                out.namespace = source.namespace;
+            if (source.token_env !== undefined)
+                out.token_env = source.token_env;
+            return out;
+        }
+        case 'clickup': {
+            const out = {
+                type: 'clickup',
+                token_env: source.token_env ?? DEFAULTS.credential.clickup_token_env,
+            };
+            if (source.team_id !== undefined)
+                out.team_id = source.team_id;
+            return out;
+        }
+    }
+}
+function normalizeCredentialHost(host) {
+    if ('from_arg' in host)
+        return { from: 'argument', arg: host.from_arg, allow: toList(host.allow) };
+    if ('fixed' in host)
+        return { from: 'declared', host: host.fixed };
+    return { from: 'server_name' };
+}
+function normalizeCredentialPath(path) {
+    if (path !== undefined && 'from_arg' in path) {
+        return { from: 'argument', arg: path.from_arg, allow: toList(path.allow) };
+    }
+    return { from: 'tool_name' };
+}
+function normalizeCredentialUse(use, index, credentialId) {
+    const out = {
+        id: credentialUseId(credentialId, use.id ?? autoUseId(index)),
+        server: toList(use.server ?? DEFAULTS.match.server),
+        tool: toList(use.tool),
+        arg: use.arg,
+        host: normalizeCredentialHost(use.host),
+        path: normalizeCredentialPath(use.path),
+        action: use.action ?? DEFAULTS.credential.action,
+    };
+    if (use.reason !== undefined)
+        out.reason = use.reason;
+    return out;
+}
+function normalizeCredential(credential) {
+    const out = {
+        id: credential.id,
+        source: normalizeCredentialSource(credential.source),
+        use: credential.use.map((use, i) => normalizeCredentialUse(use, i, credential.id)),
+        ttl_seconds: credential.ttl_seconds ?? DEFAULTS.credential.ttl_seconds,
+        timeout_ms: credential.timeout_ms ?? DEFAULTS.credential.timeout_ms,
+        on_unresolved: credential.on_unresolved ?? DEFAULTS.credential.on_unresolved,
+    };
+    if (credential.provider !== undefined)
+        out.provider = credential.provider;
+    if (credential.scopes !== undefined)
+        out.scopes = [...credential.scopes];
+    return out;
+}
 /**
  * Fill defaults, coerce single globs to lists and assign missing rule ids.
  * Assumes `raw` already passed schema validation (see `validatePolicyObject`).
@@ -115,6 +287,8 @@ export function normalizePolicy(raw) {
             },
         };
     }
+    if (raw.credentials !== undefined)
+        policy.credentials = raw.credentials.map(normalizeCredential);
     if (raw.egress !== undefined) {
         const e = raw.egress;
         policy.egress = {
