@@ -828,6 +828,9 @@ It does not fit if:
 
 - [docs/install.md](install.md) — installation, per-client config, Windows and
   WSL, uninstall, troubleshooting.
+- [docs/deployment.md](deployment.md) — what deploying this in a customer looks
+  like, per agent platform: what the install is, how it reaches a fleet, what
+  breaks it, and a rollout order.
 - [docs/connector-coverage.md](connector-coverage.md) — the authority on what
   each surface exposes, and what needs Anthropic.
 - [docs/hooks.md](hooks.md) — the Claude Code tap in detail, including the

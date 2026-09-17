@@ -134,6 +134,24 @@ export class Signer implements SignerLike {
     return new Signer(priv, pubHex);
   }
 
+  /**
+   * Sign arbitrary, ALREADY DOMAIN-SEPARATED bytes with this data dir's key,
+   * returning the 128-hex raw signature. The evidence sink's per-request
+   * signature is the only caller (`sinkSignedPayload`, domain
+   * `edut.mcp-recorder.sink.v1`), and it is deliberately NOT part of the
+   * `SignerLike` contract in src/types.ts: that interface stays two members
+   * wide so a TPM / Secure Enclave / YubiKey signer remains a drop-in.
+   *
+   * Callers must pass a domain-separated payload. Signing raw caller bytes
+   * with no prefix would let a signature made for one purpose be replayed as
+   * another — which is exactly what `signedPayload`'s prefix prevents for
+   * head signatures.
+   */
+  signBytes(payload: Uint8Array): string {
+    // Sync ed.sign, same reason as `sign` below.
+    return ed.etc.bytesToHex(ed.sign(payload, this.#privateKey));
+  }
+
   /** Sign the chain head; the exact bytes are signedPayload(seq, chainHash). */
   async sign(seq: number, chainHash: string): Promise<HeadSignature> {
     const payload = signedPayload(seq, chainHash);

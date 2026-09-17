@@ -21,7 +21,7 @@ import { sha256Hex } from './chain/hash.js';
 import { openConfiguredStore, setupProxyRecording } from './capture/setup.js';
 import type { ProxySetup } from './capture/setup.js';
 import { Signer, publicKeyHexFromPem } from './chain/keys.js';
-import { resolveConfig, resolveConfigLenient } from './config.js';
+import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js';
 import { BUNDLE_FILES, exportBundle } from './export/bundle.js';
 import { readZipEntries } from './export/unzip.js';
 import { HoldError, HoldStore } from './gateway/holds.js';
@@ -37,6 +37,15 @@ import { runHook } from './hook/run.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
 import { queryStore } from './query/touched.js';
+import { resolveSinkConfig } from './sink/config.js';
+import type { SinkSurface } from './sink/protocol.js';
+import { runShipper } from './sink/shipper.js';
+import {
+  acquireShipLock,
+  readCursorCache,
+  readShipStatus,
+  shipperLooksAlive,
+} from './sink/state.js';
 import { renderTimelineHtml } from './replay/render.js';
 import { serveUi } from './replay/serve.js';
 import { CLIENT_KINDS, isClientKind, resolveClientConfigPath } from './setup/client-config.js';
@@ -94,6 +103,7 @@ const SUBCOMMANDS = [
   'approve',
   'deny',
   'hook',
+  'ship',
 ] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -173,6 +183,21 @@ Usage:
       missing), safely (timestamped backup) and reversibly (--undo).
       --command overrides the generated command verbatim (e.g. a
       repo-relative dogfood form)
+  mcp-recorder ship     [--data-dir D] [--sink URL] [--token T | --token-file F]
+                        [--drain [--timeout 30s]] [--idle-exit 15m] [--status [--json]]
+      replicate sealed chain records to an evidence sink as they are
+      recorded, so evidence is no longer something the observed party has to
+      remember to hand over. One shipper per data dir (<data-dir>/ship.lock);
+      record/http/hook auto-start it when a sink is configured, so you rarely
+      run this yourself. --drain ships the backlog and exits (the CI form:
+      put it in a final step with '|| true' — a sink outage must never fail a
+      build). --status prints sink, key, chain_id, local head, receiver
+      next_seq, attested_seq, lag and the last error/success, without
+      touching the network.
+      Fail-open: a sink that is down, slow, 500ing, 401ing or hostile never
+      blocks a tool call, never denies one, never changes a proxy's stdout or
+      exit code, and never loses a local event. The local store stays the
+      source of truth; the sink is a replica.
   mcp-recorder --help | --version
 
 Flags:
@@ -215,6 +240,17 @@ Flags:
   --settings PATH hook install: settings file to edit (default
                    .claude/settings.json in cwd)
   --command CMD   hook install: override the generated hook command verbatim
+  --sink URL      evidence sink base URL (env MCP_RECORDER_SINK); https only,
+                   loopback is the only http exception. Setting it is the
+                   whole opt-in — absent, nothing changes at all
+  --token T       sink bearer token                 (env MCP_RECORDER_SINK_TOKEN)
+  --token-file F  read the bearer token from a file (env MCP_RECORDER_SINK_TOKEN_FILE)
+  --drain         ship: ship the backlog and exit, for short-lived CI runners
+  --timeout D     ship --drain: wall-clock budget (default 30s)
+  --idle-exit D   ship: exit after this long with no new records and no
+                   delivery (default 15m; 0 keeps it running, for a
+                   supervised systemd/launchd unit)
+  --status        ship: print sink/key/chain/lag/last error and exit
   --help, -h      show this help and exit
   --version, -V   show the version and exit
 
@@ -228,6 +264,19 @@ Environment:
                            server origins (server.url, policy alias
                            mcp__<host>__<tool>) from; default: the cloud
                            session's /tmp/mcp-config-*.json (see docs/hooks.md)
+  MCP_RECORDER_SINK=URL    replicate sealed records to this evidence sink.
+                           SETTING IT IS THE ENTIRE OPT-IN — with it absent
+                           there is no sink, no shipper, and behaviour is
+                           byte-identical to a build without the feature
+  MCP_RECORDER_SINK_TOKEN=T        bearer token for the sink
+  MCP_RECORDER_SINK_TOKEN_FILE=F   ...or a file holding it, for platforms
+                           where a root-owned file is easier to protect than
+                           an environment variable
+  HTTPS_PROXY / NO_PROXY / NODE_EXTRA_CA_CERTS
+                           honoured by the shipper (node:https does not read
+                           the first two itself). Certificate verification is
+                           never disabled — point NODE_EXTRA_CA_CERTS at the
+                           proxy's CA instead
 `;
 
 const FLAG_DEFS = {
@@ -259,6 +308,14 @@ const FLAG_DEFS = {
   'all-tools': { type: 'boolean' },
   settings: { type: 'string' },
   command: { type: 'string' },
+  sink: { type: 'string' },
+  token: { type: 'string' },
+  'token-file': { type: 'string' },
+  drain: { type: 'boolean' },
+  status: { type: 'boolean' },
+  timeout: { type: 'string' },
+  'idle-exit': { type: 'string' },
+  surface: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } as const;
@@ -582,7 +639,7 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
     }
   }
 
-  const setup = await setupProxyRecording(config, diag);
+  const setup = await setupProxyRecording(config, diag, { surface: 'record', flags });
 
   const exitCode = await runStdioProxy({
     command: serverCommand,
@@ -619,7 +676,7 @@ async function cmdHttp(flags: Flags): Promise<void> {
   // from standing up. Bad --redact/--store values fall back to defaults.
   const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
   for (const w of warnings) diag(w);
-  const setup = await setupProxyRecording(config, diag);
+  const setup = await setupProxyRecording(config, diag, { surface: 'http', flags });
 
   const proxy = await runHttpProxy({
     targetUrl,
@@ -1525,6 +1582,200 @@ async function cmdDecide(flags: Flags, positionals: string[], decision: HoldDeci
   out(`${decision} ${rec.approval_id}: ${rec.tool} on ${rec.server}${rule}${by}`);
 }
 
+/* ---------------------------------- ship ----------------------------------
+ * `mcp-recorder ship` is the evidence sink's SENDER: it replicates sealed
+ * chain records to a receiver as they are recorded, so evidence stops being
+ * something the observed party has to remember to hand over.
+ *
+ * It is a SEPARATE PROCESS on purpose, and that is forced rather than
+ * preferred: `hook` is a short-lived process per hook invocation, so there is
+ * no long-lived event loop to host an in-process shipper, and blocking a hook
+ * on a POST would put sink latency in front of every tool call. One shipper
+ * per data dir, enforced by the <data-dir>/ship.lock directory.
+ *
+ * Fail-open, absolutely: nothing this command does — or fails to do — can
+ * block a tool call, deny one, change a proxy's stdout or its exit code.
+ */
+
+/** Accept `30s`, `5m`, `2h` or bare seconds. */
+function parseDurationMs(raw: string, what: string): number {
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(raw.trim());
+  if (m === null) err(`invalid ${what} '${raw}' (expected e.g. 30s, 5m, 2h)`);
+  const value = Number(m[1]);
+  switch (m[2] ?? 's') {
+    case 'ms':
+      return Math.round(value);
+    case 's':
+      return Math.round(value * 1000);
+    case 'm':
+      return Math.round(value * 60_000);
+    default:
+      return Math.round(value * 3_600_000);
+  }
+}
+
+function shipStatusReport(config: RecorderConfig, sinkUrl: string | undefined): {
+  sink: string;
+  state: string;
+  key?: string;
+  chain_id?: string;
+  local_head_seq: number;
+  next_seq?: number;
+  attested_seq?: number;
+  lag: number;
+  last_success_at?: string;
+  last_error?: string;
+  last_error_at?: string;
+  shipper_running: boolean;
+} {
+  const status = readShipStatus(config.dataDir);
+  let localHeadSeq = 0;
+  let store: EvidenceStore | undefined;
+  try {
+    store = openConfiguredStore(config, { readOnly: true });
+    localHeadSeq = store.head().seq;
+  } catch {
+    /* status must work on a data dir nothing has recorded to */
+  } finally {
+    try {
+      store?.close();
+    } catch {
+      /* best effort */
+    }
+  }
+  const resolvedSink = sinkUrl ?? status?.sink ?? '(none configured)';
+  const cached = sinkUrl !== undefined ? readCursorCache(config.dataDir, sinkUrl) : undefined;
+  const nextSeq = status?.next_seq ?? cached?.next_seq;
+  const report = {
+    sink: resolvedSink,
+    state: status?.state ?? 'never run',
+    local_head_seq: localHeadSeq,
+    lag: nextSeq !== undefined ? Math.max(0, localHeadSeq - (nextSeq - 1)) : localHeadSeq,
+    shipper_running: shipperLooksAlive(config.dataDir),
+  } as ReturnType<typeof shipStatusReport>;
+  const key = status?.key ?? cached?.key;
+  if (key !== undefined) report.key = key;
+  const chainId = status?.chain_id ?? cached?.chain_id;
+  if (chainId !== undefined) report.chain_id = chainId;
+  if (nextSeq !== undefined) report.next_seq = nextSeq;
+  const attested = status?.attested_seq ?? cached?.attested_seq;
+  if (attested !== undefined) report.attested_seq = attested;
+  if (status?.last_success_at !== undefined) report.last_success_at = status.last_success_at;
+  if (status?.last_error !== undefined) report.last_error = status.last_error;
+  if (status?.last_error_at !== undefined) report.last_error_at = status.last_error_at;
+  return report;
+}
+
+async function cmdShip(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+  const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
+  for (const w of warnings) diag(w);
+  const { sink, warnings: sinkWarnings } = resolveSinkConfig({ flags, env: process.env });
+
+  /* --status is a pure read: no network, no lock, no side effect. It is the
+   * operator's whole mental model in one screen, and what turns a stall from
+   * an invisible condition into a human-legible one. */
+  if (flags.status === true) {
+    const report = shipStatusReport(config, sink?.url);
+    if (flags.json === true) {
+      out(JSON.stringify(report, null, 2));
+      return;
+    }
+    out(`sink:         ${report.sink}`);
+    out(`key:          ${report.key ?? '(unknown)'}`);
+    out(`chain_id:     ${report.chain_id ?? '(unknown)'}`);
+    out(`state:        ${report.state}${report.shipper_running ? ' (shipper running)' : ''}`);
+    out(`local head:   seq ${String(report.local_head_seq)}`);
+    out(`receiver:     next_seq ${report.next_seq !== undefined ? String(report.next_seq) : '?'}` +
+      `${report.attested_seq !== undefined ? `, attested_seq ${String(report.attested_seq)}` : ''}`);
+    out(`lag:          ${String(report.lag)} record(s) not yet at the receiver`);
+    out(`last success: ${report.last_success_at ?? '(never)'}`);
+    out(`last error:   ${report.last_error ?? '(none)'}${report.last_error_at !== undefined ? ` @ ${report.last_error_at}` : ''}`);
+    return;
+  }
+
+  for (const w of sinkWarnings) diag(w);
+  if (sink === undefined) {
+    err(`ship: no sink configured (set ${ENV.SINK} or pass --sink https://...)`);
+  }
+
+  const drain = flags.drain === true;
+  const timeoutRaw = asStr(flags.timeout);
+  const drainTimeoutMs = drain ? parseDurationMs(timeoutRaw ?? '30s', '--timeout') : undefined;
+  const idleExitRaw = asStr(flags['idle-exit']);
+  const idleExitMs = idleExitRaw !== undefined ? parseDurationMs(idleExitRaw, '--idle-exit') : undefined;
+  const surfaceRaw = asStr(flags.surface);
+  const surface: SinkSurface =
+    surfaceRaw === 'record' || surfaceRaw === 'hook' || surfaceRaw === 'http' ? surfaceRaw : 'ship';
+
+  ensureDataDir(config.dataDir);
+  const lock = acquireShipLock(config.dataDir);
+  if (lock === undefined) {
+    // One in-flight shipper per chain is the whole ordering rule; a second
+    // one would pipeline batches against the same cursor.
+    diag('ship: another shipper is already running for this data dir');
+    return;
+  }
+
+  let signer: Signer;
+  try {
+    // loadExisting, never load(): a shipper that MINTED a key would start
+    // signing under an identity that never touched the evidence — the same
+    // failure loadExisting exists to prevent for `export`.
+    signer = await Signer.loadExisting(config.dataDir);
+  } catch (cause) {
+    lock.release();
+    diag(`ship: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return;
+  }
+
+  const store = openConfiguredStore(config, { readOnly: true });
+  const release = (): void => {
+    try {
+      store.close();
+    } catch {
+      /* best effort */
+    }
+    lock.release();
+  };
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      release();
+      process.exit(0);
+    });
+  }
+
+  try {
+    const result = await runShipper({
+      dataDir: config.dataDir,
+      sink,
+      store,
+      signer,
+      toolVersion: VERSION,
+      surface,
+      log: (msg) => {
+        try {
+          process.stderr.write(msg.endsWith('\n') ? msg : `${msg}\n`);
+        } catch {
+          /* fail-open */
+        }
+      },
+      touchLock: () => lock.touch(),
+      ...(drain ? { drain: true } : {}),
+      ...(drainTimeoutMs !== undefined ? { drainTimeoutMs } : {}),
+      ...(idleExitMs !== undefined ? { idleExitMs } : {}),
+    });
+    if (drain) {
+      diag(
+        `ship: delivered ${String(result.delivered)} record(s), ` +
+          `receiver next_seq ${String(result.nextSeq)}, lag ${String(result.lag)} (${result.state})`,
+      );
+    }
+  } finally {
+    release();
+  }
+}
+
 /* --------------------------------- setup ---------------------------------
  * `mcp-recorder setup` rewrites a client config's `mcpServers` entries to run
  * behind this recorder. cli.ts owns every filesystem side effect and exit
@@ -2289,6 +2540,8 @@ async function main(): Promise<void> {
       return cmdDecide(flags, positionals, 'denied');
     case 'hook':
       return cmdHook(flags, positionals);
+    case 'ship':
+      return cmdShip(flags);
   }
 }
 

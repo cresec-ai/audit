@@ -44,6 +44,14 @@ export { evaluateEgress, evaluateMcp, getPath, ruleLabel } from './policy/engine
 export { bundleFileOrder, compileToRego, policyRevision, renderEgressModule, renderMcpModule, } from './policy/rego.js';
 /* gateway primitives (record --policy): boundary filter, injection markers, hold store */
 export { BOUNDARY_SECRET_FAMILIES, FAIL_CLOSED_REFUSAL_GUIDANCE, INJECTION_MARKER, INJECTION_PATTERNS, MARKER_HASH_HEX, MAX_SECRET_REFS as BOUNDARY_MAX_SECRET_REFS, POLICY_REFUSAL_GUIDANCE, applyBoundary, blockedText, boundarySecretPatterns, deniedText, findInjectionSpans, findSecretSpans, matchSpans, mergeSpans, oversizeBlockedText, redactSpans, synthesizeDeniedResult, DEFAULT_POLL_MS as HOLD_DEFAULT_POLL_MS, HoldError, HoldStore, } from './gateway/index.js';
+/* evidence sink (the SENDER half): wire protocol, client, shipper, spawn */
+export { BACKOFF_BASE_MS as SINK_BACKOFF_BASE_MS, BACKOFF_CAP_MS as SINK_BACKOFF_CAP_MS, GZIP_THRESHOLD_BYTES as SINK_GZIP_THRESHOLD_BYTES, HEALTH_PATH as SINK_HEALTH_PATH, HEARTBEAT_INTERVAL_S as SINK_HEARTBEAT_INTERVAL_S, SENDER_MAX_BYTES as SINK_SENDER_MAX_BYTES, SENDER_MAX_RECORDS as SINK_SENDER_MAX_RECORDS, SINK_HEADERS, SINK_PROTOCOL, SINK_SIGNATURE_DOMAIN, backoffMs as sinkBackoffMs, chainIdFromGenesisRecord, cursorPath as sinkCursorPath, parseCursor as parseSinkCursor, recordsPath as sinkRecordsPath, sinkSignedPayload, } from './sink/protocol.js';
+export { normalizeSinkUrl, resolveSinkConfig } from './sink/config.js';
+export { SinkClient } from './sink/client.js';
+export { agentFor as sinkAgentFor, noProxyMatches, proxyUrlFor, sinkFetch } from './sink/http.js';
+export { collectBatch, runShipper, signaturesInRange } from './sink/shipper.js';
+export { acquireShipLock, readCursorCache, readShipStatus, shipperLooksAlive, writeCursorCache, writeShipStatus, } from './sink/state.js';
+export { cliEntryPoint, ensureShipper } from './sink/spawn.js';
 /* config + version */
 export { resolveConfig } from './config.js';
 export { VERSION } from './version.js';

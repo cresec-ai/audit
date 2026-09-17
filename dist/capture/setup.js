@@ -18,6 +18,8 @@ import { Signer } from '../chain/keys.js';
 import { ensureDataDir } from '../config.js';
 import { openStore, openStoreReadOnly } from '../store/index.js';
 import { Redactor } from '../redact/redactor.js';
+import { resolveSinkConfig } from '../sink/config.js';
+import { ensureShipper } from '../sink/spawn.js';
 /**
  * `readOnly: true` (used by the inspection commands — verify/query/sessions/
  * ui/export) resolves the backend without ever creating a store file as a
@@ -50,8 +52,14 @@ function tapSessionId(recorder) {
  * Build redactor/store/signer/recorder for one CLI invocation. `diag` is the
  * caller's own stderr diagnostic writer (record/http and hook each keep
  * their own, matching their own message prefix conventions).
+ *
+ * If (and only if) a sink is configured, this ALSO makes sure a shipper
+ * process exists for the data dir. That is a `statSync` plus, at most, a
+ * detached spawn that is immediately `unref`'d — no awaiting, no I/O on the
+ * forwarding path, and a failure is a silent no-op. The sink never runs in
+ * this process.
  */
-export async function setupProxyRecording(config, diag) {
+export async function setupProxyRecording(config, diag, opts = {}) {
     const redactor = new Redactor({ mode: config.redactMode });
     let store = null;
     let signer = null;
@@ -83,6 +91,25 @@ export async function setupProxyRecording(config, diag) {
                 diag(`recording without head signatures (identity key init failed): ${msg}`);
                 signer = null;
             }
+        }
+    }
+    if (store !== null) {
+        // Fail-open by construction: resolveSinkConfig never throws, ensureShipper
+        // never throws, and neither one can delay or deny a single byte of the
+        // traffic being forwarded.
+        const { sink, warnings } = resolveSinkConfig({
+            ...(opts.flags !== undefined ? { flags: opts.flags } : {}),
+            env: process.env,
+        });
+        // `hook` is a fresh process per tool call, so an advisory that repeats on
+        // every invocation is noise in the agent's own stderr. A misconfiguration
+        // that actually DISABLED the sink is still said out loud there.
+        if (sink === undefined || opts.surface !== 'hook') {
+            for (const w of warnings)
+                diag(w);
+        }
+        if (sink !== undefined) {
+            ensureShipper({ config, sink, surface: opts.surface ?? 'record' });
         }
     }
     const inner = new Recorder({ store, signer });

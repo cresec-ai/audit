@@ -187,6 +187,51 @@ export type {
 } from './gateway/index.js';
 export type { GatewayOptions } from './gateway/options.js';
 
+/* evidence sink (the SENDER half): wire protocol, client, shipper, spawn */
+export {
+  BACKOFF_BASE_MS as SINK_BACKOFF_BASE_MS,
+  BACKOFF_CAP_MS as SINK_BACKOFF_CAP_MS,
+  GZIP_THRESHOLD_BYTES as SINK_GZIP_THRESHOLD_BYTES,
+  HEALTH_PATH as SINK_HEALTH_PATH,
+  HEARTBEAT_INTERVAL_S as SINK_HEARTBEAT_INTERVAL_S,
+  SENDER_MAX_BYTES as SINK_SENDER_MAX_BYTES,
+  SENDER_MAX_RECORDS as SINK_SENDER_MAX_RECORDS,
+  SINK_HEADERS,
+  SINK_PROTOCOL,
+  SINK_SIGNATURE_DOMAIN,
+  backoffMs as sinkBackoffMs,
+  chainIdFromGenesisRecord,
+  cursorPath as sinkCursorPath,
+  parseCursor as parseSinkCursor,
+  recordsPath as sinkRecordsPath,
+  sinkSignedPayload,
+} from './sink/protocol.js';
+export type {
+  SinkBatchBody,
+  SinkCursor,
+  SinkHead,
+  SinkSender,
+  SinkSurface,
+} from './sink/protocol.js';
+export { normalizeSinkUrl, resolveSinkConfig } from './sink/config.js';
+export type { SinkConfig, SinkResolution } from './sink/config.js';
+export { SinkClient } from './sink/client.js';
+export type { SinkClientOpts, SinkOutcome, SinkSigner } from './sink/client.js';
+export { agentFor as sinkAgentFor, noProxyMatches, proxyUrlFor, sinkFetch } from './sink/http.js';
+export { collectBatch, runShipper, signaturesInRange } from './sink/shipper.js';
+export type { ShipSigner, ShipperOpts, ShipperResult } from './sink/shipper.js';
+export {
+  acquireShipLock,
+  readCursorCache,
+  readShipStatus,
+  shipperLooksAlive,
+  writeCursorCache,
+  writeShipStatus,
+} from './sink/state.js';
+export type { CursorCache, ShipLock, ShipState, ShipStatus } from './sink/state.js';
+export { cliEntryPoint, ensureShipper } from './sink/spawn.js';
+export type { SpawnShipperOpts } from './sink/spawn.js';
+
 /* config + version */
 export { resolveConfig } from './config.js';
 export type { ResolveConfigOpts } from './config.js';

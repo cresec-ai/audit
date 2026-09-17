@@ -22,7 +22,14 @@ export default defineConfig([
   ]),
 
   {
-    files: ['src/**/*.ts', 'test/**/*.ts', 'demo/**/*.ts', 'bench/**/*.ts', 'eslint.config.js'],
+    files: [
+      'src/**/*.ts',
+      'test/**/*.ts',
+      'demo/**/*.ts',
+      'bench/**/*.ts',
+      'receiver/**/*.ts',
+      'eslint.config.js',
+    ],
     extends: [js.configs.recommended, tseslint.configs.recommended],
     languageOptions: {
       ecmaVersion: 'latest',

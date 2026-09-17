@@ -222,7 +222,7 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
     /* -------------------------- recording setup -------------------------- */
     let setup: Awaited<ReturnType<typeof setupProxyRecording>>;
     try {
-      setup = await setupProxyRecording(opts.config, diagStderr);
+      setup = await setupProxyRecording(opts.config, diagStderr, { surface: 'hook' });
     } catch {
       return ALLOW; // recording could not initialize: still allow, fail-open
     }
