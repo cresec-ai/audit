@@ -221,6 +221,13 @@ export { agentFor as sinkAgentFor, noProxyMatches, proxyUrlFor, sinkFetch } from
 export { collectBatch, runShipper, signaturesInRange } from './sink/shipper.js';
 export type { ShipSigner, ShipperOpts, ShipperResult } from './sink/shipper.js';
 export {
+  SELF_CHECK_MAX_SIGS_PER_WINDOW,
+  SELF_CHECK_WINDOW,
+  advanceSelfCheck,
+  newSelfCheck,
+} from './sink/selfcheck.js';
+export type { ChainSelfCheck, SelfCheckOpts } from './sink/selfcheck.js';
+export {
   acquireShipLock,
   readCursorCache,
   readShipStatus,

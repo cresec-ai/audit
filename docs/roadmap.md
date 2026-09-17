@@ -491,8 +491,12 @@ file was keyed by UUID while Claude Code handed the hook the friendly segment
 UUID-shaped rule could not match a name that was never a UUID. Both
 conventions are the platform's, and which one a session uses varies. Dogfood
 3 saw UUID keys with UUID tool names. Dogfood 4 saw UUID keys with friendly
-tool names. A local session has friendly keys with friendly names, as this
-one does.
+tool names. And a local session has **no keys at all**: local dogfood 6 found
+no `/tmp/mcp-config-*.json` on a laptop, before, during or after a session,
+and no claude.ai connector in any `mcpServers` map on that machine — so
+nothing resolves there under either route, and only tool-anchored deny rules
+can fire (an earlier version of this paragraph claimed local sessions had
+friendly keys with friendly names; that was an assumption, and it is wrong).
 
 Two things changed, and both are on `origin/main`.
 

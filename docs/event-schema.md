@@ -21,7 +21,9 @@ The schema id is `edut.mcp-recorder.event.v1`. Every field shipped under this id
 Payloads never land in the store readable. String values are replaced at the edge by
 **redacted refs** — a SHA-256 of the exact value plus its length. Hashes are
 **deliberately unsalted** so a blast-radius query can match a known probe value by
-hashing it the same way. See the tradeoff discussion in the
+hashing it the same way. The ref covers the *whole* value, so that search is exact:
+a substring of a stored string (the host part of a URL, say) hashes to something
+else and finds nothing. See the tradeoff discussion in the
 [README security model](../README.md#security-model-the-honest-version).
 
 **The allowlist is position- and value-aware, not just key-aware.** A string only
@@ -135,7 +137,7 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `client_name` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `identifier`) — see [above](#privacy-posture). |
 | `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `label` | `string?` | Operator-supplied label (`--identity`). |
-| `credential_fingerprints` | `CredentialFingerprint[]?` | Hashes of secret-looking env values passed to the wrapped server. |
+| `credential_fingerprints` | `CredentialFingerprint[]?` | Hashes of secret-looking env values passed to the wrapped server, plus the argv/target-URL pieces described below. **Never the recorder's own configuration** (`MCP_RECORDER_*`) — see *What is never fingerprinted*, below. |
 
 ### `ServerContext`
 
@@ -146,6 +148,23 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `command` | `string` | stdio transport: the wrapped command line (argv, scrubbed and re-joined with spaces). http transport: the target URL, scrubbed (see below). env values never included either way. |
 | `transport` | `'stdio' \| 'http'` | Transport the proxy bridged. |
 | `url` | `string?` | Additive, optional (schema stays v1); hook-sourced, on `tool_call` events only. Where the server named by `name` is, **as asserted by the MCP config file `mcp-recorder hook` found** (`MCP_RECORDER_MCP_CONFIG`, else `/tmp/mcp-config-*.json` in a cloud session) — not observed on the wire; that file is writable by the agent running under the hook, see [docs/hooks.md](hooks.md#cloud-sessions-uuid-server-names-and-serverurl). The value is the vendor endpoint behind an Anthropic-hosted connector's relay (the relay URL's decoded `mcp_url`, e.g. `https://mcp.clickup.com/mcp`), else the config entry's own URL. Scrubbed like the http transport's target URL below — userinfo stripped, query string and fragment dropped — but the stripped pieces are dropped **without** `credential_fingerprints` (the hook never sends them), and more strictly on the path: every segment that is secret-shaped, **an opaque identifier** (a UUID, a cloud session id such as `cse_...`) **or not a short vocabulary token** (`[A-Za-z0-9._-]{1,32}`) is replaced in place by its `sha256:<hex>` ref, so a relay URL never carries the session id and no free text from the file reaches the store. A scrubbed URL over 2048 characters is not recorded at all. Undefined when unresolved, on session-level hook events (`session_start`/`session_end`/the Stop notification, whose `name` is the client), and on every proxy-captured event (the http proxy records its target in `command`). See [Hook-sourced events](#hook-sourced-events-additive). |
+
+**What is never fingerprinted.** `identity.credential_fingerprints` answers one
+question — *which sessions saw this secret* — and it is only a useful question for
+secrets the agent and the wrapped server were exposed to. Environment variables in the
+recorder's own namespace (`MCP_RECORDER_*`, e.g. `MCP_RECORDER_SINK_TOKEN` and
+`MCP_RECORDER_SINK_TOKEN_FILE`) are therefore skipped by the collector
+(`collectEnvCredentialFingerprints`, `src/redact/redactor.ts`), and so is a
+`MCP_RECORDER_*=value` element inside a wrapped command (its value is still hashed out
+of `command`, it is simply not fingerprinted onto identity). The exclusion is the whole
+namespace, not a list of names, so a variable added later cannot escape it.
+
+This is not tidiness. Refs are unsalted by design (see [Privacy posture](#privacy-posture)),
+which means a *low-entropy* value's ref is recoverable by brute force — and the evidence
+sink ships every event to the receiver that the sink token authenticates to. Fingerprinting
+that token put a reversible copy of the receiver's own bearer credential on every event
+it received. Nothing in the recorder's configuration belongs in a blast-radius query, so
+none of it is collected in the first place.
 
 **`command` argv handling (stdio transport).** A raw `argv.join(' ')` would leak
 `--api-key sk-...`, `--token ...`, and connection strings like `postgres://user:pass@host`

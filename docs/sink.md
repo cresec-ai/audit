@@ -117,6 +117,18 @@ schema change:
   restart seq at 1 under the same key and fork. With `chain_id`, that is
   instead a visible "second chain for an enrolled key" at the receiver.
 
+**What never ships: this token.** The recorder fingerprints credential-shaped
+environment variables onto `identity.credential_fingerprints` so a blast-radius
+`query` can find which sessions saw a given secret. `MCP_RECORDER_SINK_TOKEN`
+(and `MCP_RECORDER_SINK_TOKEN_FILE`) are excluded from that, along with the rest
+of the `MCP_RECORDER_*` namespace: the agent never sees them, so no query needs
+them — and fingerprint refs are unsalted by design, so for a low-entropy token
+the ref is recoverable by brute force. Shipping one would mean handing the
+receiver a reversible copy of its own bearer credential, on every event it
+accepted. The exclusion lives in the collector
+(`collectEnvCredentialFingerprints`, `src/redact/redactor.ts`), not in a filter
+somewhere downstream. Found by local dogfood 6.
+
 ### Request
 
 ```
@@ -322,6 +334,7 @@ latency, no denial, no non-zero exit, no changed stdout byte.
 | 400 twice on the same range | untouched | rebuild the batch from the store once; if it 400s again, **stall** that chain, log once, keep heartbeating. Stalled, never discarded — the receiver then sees its cursor frozen while signed heads keep climbing, which is an explicit withholding condition rather than silence. |
 | 409 `chain_gap` | untouched | rewind to the receiver's `next_seq` and re-send. If the local store no longer holds it, **stall and surface**. Never jump a gap. |
 | 409 `chain_fork` | untouched | **terminal** for that chain. Stop shipping it, one loud diagnostic, keep recording locally and keep heartbeating. This is the tamper signal and is never auto-reconciled. |
+| The sender's OWN chain fails verification | untouched | **stall** before the batch reaches the wire, log once (pointing at `mcp-recorder verify`), keep heartbeating. See [The sender verifies its own chain](#the-sender-verifies-its-own-chain). |
 | 413 on a one-record batch | untouched | long backoff, stall, surface. Never skip. |
 | Process SIGKILLed with events "unsent" | untouched | there are no unsent events in the usual sense — everything `record()` sealed is already in the store. The shipper is crash-only by construction; the next start reads the receiver's cursor and ships the backlog. If the machine never comes back, the receiver holds everything up to the last 202 **plus a signed head proving how much more existed** — strictly better than the old branch-push, which on an unclean end shipped nothing at all. |
 | Disk full | the existing fail-open path | there is no separate spool, so the sink adds no new disk pressure. Disk-full lands on `store.appendEvents`: `Recorder.drainOnce` retries, then counts `dropped` and writes one stderr line. Those drops surface as `SessionEndEvent.events_dropped`, **and that event itself ships**. So a disk-full drop is a *counted* drop that reaches the receiver, never a forged continuity. |
@@ -353,6 +366,74 @@ turns on.
 3. **Heartbeat absence.** The only detector for "shipper killed" or "network
    blocked" — which is why absence alerting is a contract obligation on the
    receiver, not a feature.
+
+### The sender verifies its own chain
+
+Shipping forward from the receiver's cursor says nothing about the records
+*behind* it. Local dogfood 6 turned that into a working attack with `cp -a`
+and one edited field:
+
+1. copy a data dir, rewrite the event at seq 7 in place and leave every stored
+   `hash`/`prev_hash` alone, so the head hash the receiver knows still
+   matches;
+2. record a new session into the copy — its shipper delivered seq 12-22 and
+   the receiver accepted them, because they link to seq 11 exactly as the
+   honest ones would;
+3. when the honest store shipped its own seq 12, **it** got the `chain_fork`
+   409 and the receiver alerted "history was rewritten" against it.
+
+Fork detection worked. Attribution was decided by arrival order, and neither
+side ever said that the copy's own store fails `mcp-recorder verify`.
+
+So a batch is now gated on a recomputation of the sender's own chain, from
+seq 1 through the last record of that batch. A store that cannot verify that
+far **stalls** — the batch never reaches the wire, `ship --status` reads
+`stalled` with the offending seq in `last error`, and the heartbeat keeps
+running so the receiver sees the signed head climbing while the cursor stays
+frozen. That is the explicit withholding condition, which is what a rewritten
+history should look like from the outside.
+
+What it costs, measured on this repo's own code (Node 22, jsonl backend):
+hash recomputation runs at ~15 µs/record, while one ed25519 verification costs
+~2 ms — and a store signed on every flush, which is what the recorder does,
+holds roughly one signature per record. Verifying all of them would be
+~2 ms/record. It is unnecessary: the chain hash at seq *j* is a running
+commitment over every event at or below *j*, so recomputing the chain and then
+checking **one** signature per 2 000-record window pins the whole prefix.
+Measured first pass: 0.4 s over 20 000 records, 1.9 s over 100 000 — against
+4.1 s for `verifyStore` over the smaller of the two — once per shipper
+process, in a detached process that is on nobody's forwarding path. The
+verified frontier is then monotonic, so later batches pay only for their own
+records (3 ms in the same measurement), never an O(n) scan per batch. Nothing
+about this touches the proxy, the hook or a tool call; recording stays
+fail-open in every case.
+
+Deliberately not done: caching "verified through seq N" in a file beside the
+store. That file would be written by the same user the store is, so an
+attacker who rewrites history would rewrite the receipt too. The check is
+per process, and restarting the shipper is what re-runs it.
+
+That last sentence is a real limit, not a footnote: a shipper **already
+running** does not re-examine history at or below the frontier it has already
+verified. Measured on a live store — a shipper up since seq 17 shipped seq
+18-21 out of a store whose seq 3 had been rewritten under it and reported
+`idle`, while a shipper *started* on that same store stalled immediately with
+`hash_mismatch at seq 3`. The exposure is bounded by the process: every
+`record` / `http` / `hook` run starts a shipper afresh, and `--idle-exit`
+(15 minutes by default) retires an idle one. So a rewrite is caught on the
+next shipper start rather than on the next batch, and `mcp-recorder verify` —
+which reads from seq 1 every time — is what renders a verdict on a store at
+any given moment.
+
+| Rewrite | Caught by |
+|---|---|
+| Event edited in place, hashes untouched | `hash_mismatch` in the sender's own pass (the dogfood-6 attack) |
+| Event edited and hashes re-linked, no key | the window's newest head signature still attests the pre-rewrite chain hash: `signature_chain_mismatch`. In the delivered prefix the receiver's `head_hash` also disagrees, which the head-hash guard reports as a fork |
+| Record deleted, duplicated, or the tail truncated | `seq_gap` / `duplicate_seq` / `prev_hash_mismatch` |
+| Rewrite below the frontier of a shipper that is **already running** | nothing until that shipper is replaced — the frontier is monotonic per process. Caught on the next shipper start (measured above), and by `mcp-recorder verify` at any time |
+| Rewrite re-signed with `identity.key` | **nothing local.** The signing oracle is on the attacker's side of the boundary (see the threat model) |
+| A signature by a key other than this data dir's `identity.pub` | `signature_invalid`. The check pins the key exactly as `mcp-recorder verify` does, so a chain whose history was signed under an identity that has since been replaced stalls rather than ships |
+| A chain with no signatures at all | nothing: absence of a signature is not evidence of tampering, so it is a warning here and a verdict for `mcp-recorder verify`, not a reason to stall |
 
 ---
 
@@ -404,7 +485,11 @@ records, and a single-record batch up to 32 MiB, and must bound inflation.
    local store afterwards produces a `chain_fork` on the next ship, or a plain
    divergence the receiver's copy contradicts. The git-branch transport left
    the evidence local until a human remembered to export — a wide-open rewrite
-   window. This closes it to seconds.
+   window. This closes it to seconds. And the edited store stops shipping
+   altogether: the sender recomputes its own chain before extending the
+   receiver's, so a rewritten history can no longer quietly append to the
+   remote copy and leave an honest peer to be blamed for the fork (see
+   [The sender verifies its own chain](#the-sender-verifies-its-own-chain)).
 2. **Selective deletion.** Removing a record breaks `prev_hash`; re-sealing
    from that point yields different hashes at seqs the receiver already holds.
    There is no way to delete from the middle and have the tail accepted.
@@ -442,6 +527,13 @@ records, and a single-record batch up to 32 MiB, and must bound inflation.
    machine. The receiver's `received_at` is the only trustworthy clock.
 5. **A compromised receiver, or an operator who never looks.** The replica is
    only as good as the alerting on top of it.
+6. **A sender that is not this program.** The self-check binds the shipper in
+   this package; anyone who writes their own client can still POST a batch
+   from a rewritten store. What that buys them is bounded — the receiver
+   recomputes every hash and refuses anything that does not link — but if it
+   *does* link, the receiver still decides which branch is canonical by
+   arrival order. Deciding a fork by evidence rather than by arrival is the
+   receiver's problem, not the sender's, and it is not solved here.
 
 ### What a customer must do at the OS / fleet level
 

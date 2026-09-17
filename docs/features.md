@@ -67,8 +67,9 @@ $ node dist/cli.js record --data-dir dg1 --name gw-deny --policy policy.docs.yam
 ```
 
 Live-session evidence is cited from the dogfood branches
-(`evidence/cloud-dogfood-2` … `-5`), each of which carries a `REPORT.md` and a
-signed bundle. **Cloud dogfood 5** (2026-09-17, 46 events, `verify --bundle` and
+(`evidence/cloud-dogfood-2` … `-6`, and `evidence/local-dogfood-6` for the one
+run on a local machine), each of which carries a `REPORT.md` and, except for the
+local run, a signed bundle. **Cloud dogfood 5** (2026-09-17, 46 events, `verify --bundle` and
 the bundle's own `verify.cjs` both PASS) is the run most of the enforcement
 claims below rest on; it is the first run in which gateway mode ran inside a
 live agent session at all. `docs/connector-coverage.md` is the authority on
@@ -83,8 +84,9 @@ points at them.
 | Fail-open recording (a broken store never blocks traffic) | always on | **Tested** |
 | Streamable-HTTP proxy | `mcp-recorder http --target URL --port N` | **Verified** (once, one server) |
 | Claude Code hook tap (the only third-party view of Anthropic-hosted connectors) | `mcp-recorder hook`, `hook install` | **Verified** for recording |
-| Hook policy deny against a live hosted connector | `hook --policy FILE` | **Verified** (dogfood 5, two rule shapes, two calls each) |
-| Hook connector resolution by declared tool (the dogfood-4 mismatch) | automatic, inside `hook` | **Tested against the real binary**, not yet by a live mismatched session |
+| Hook policy deny against a live hosted connector | `hook --policy FILE` | **Verified** (cloud dogfood 5, two rule shapes, two calls each; local dogfood 6, tool-anchored rule, two calls, on one local machine) |
+| Hook connector resolution by declared tool (the dogfood-4 mismatch) | automatic, inside `hook` | **Verified** (cloud dogfood 6: fired live under a forced mismatch). **Cannot run at all in a local session** — no MCP config file exists there (local dogfood 6) |
+| Connector origin (`server.url`) and the host-alias deny rule, on a local machine | — | **Known gap** — never resolves locally; write tool-anchored rules (local dogfood 6) |
 | Kill switch (recording, and gateway enforcement — but not a hook deny) | `MCP_RECORDER_DISABLE=1` | **Verified** |
 | Edge redaction, allow-list model | default (`--redact allowlist`) | **Verified** |
 | `--redact off` (arguments and secrets still hashed, results are not) | `--redact off` | **Verified**, read the limit |
@@ -329,6 +331,17 @@ and is the shape `docs/hooks.md` tells operators to write; route A exists only
 when resolution succeeded, so its firing is also a statement about resolution —
 see the next section for exactly how much of one.
 
+**Locally, only route B's shape can work.** Local dogfood 6 ran a
+tool-anchored rule (`^mcp__.*__clickup_filter_tasks$`) in a fresh WSL2 CLI
+session on a laptop and **blocked both live attempts**: the model received
+`mcp-recorder policy: df6-local: tool-anchored deny` twice, Claude Code listed
+both calls under `permission_denials`, no workspace data came back, and the
+store verified PASS with both denies recorded as
+`error.type: "policy_denied"`. The recorded events carry
+`server.name: "claude_ai_ClickUp"` and **no `server.url`** — a route-A-style
+rule would have matched nothing in that session. See the next section for why
+that is structural on a local machine rather than a one-off.
+
 ### How does the hook know which connector a call went to?
 
 It resolves the `mcp__<server>__<tool>` name against the session's MCP config
@@ -345,13 +358,14 @@ underscore — so an alias can never collide with a raw server segment. An alias
 may only ever add a `deny`; `allow` rules are matched against the raw name only,
 because the config file is writable by the agent under policy.
 
-**Maturity: route 1 Verified live; route 2 Tested against the real binary, not
-yet by a live session that presents the mismatch.** That distinction is the
-whole point, so here it is in full.
+**Maturity: route 1 Verified live; route 2 Verified live in cloud dogfood 6,
+under a deliberately forced mismatch. Neither route resolves anything in a
+local session, where no MCP config file exists at all.** Those two
+qualifications are the whole point, so here they are in full.
 
 Route 2 is what PR #16 added, in response to dogfood 4, where the config was
 keyed by UUID while Claude Code presented the tools as `mcp__ClickUp__*` and
-nothing resolved. Across three live runs route 2 has run **zero** times:
+nothing resolved. Across dogfood 3, 4 and 5 route 2 ran **zero** times:
 dogfood 3's config key and tool-name segment agreed, so route 1 sufficed;
 dogfood 4's disagreed and route 2 did not exist yet; dogfood 5's agreed again
 (both UUID), so route 1 sufficed once more. Dogfood 5's denies firing therefore
@@ -405,12 +419,46 @@ $ echo $?
 0                                          (no output at all is what an allow looks like)
 ```
 
-**State it precisely, because the temptation runs both ways.** The declared-tool
-fallback is proven against the real binary in the exact shape that defeated
-dogfood 4, and it has not yet been exercised by a live session that naturally
-presents that mismatch. That is more than a unit test and less than a dogfood.
-The next run that lands on a friendly-tool-name session, or one that forces the
-mismatch deliberately, is what would move this row to Verified.
+**Then cloud dogfood 6 ran it live, which is what moved this row to Verified.**
+That run started a real cloud session whose MCP config was rewritten at session
+start so that **no key could equal any tool-name segment** (keys became
+`00000000-…` and `renamed_<8hex>` while every `tools[]` stayed intact), and gave
+it two deny rules: route A spelled as the host alias and nothing else
+(`^mcp__mcp\.clickup\.com__clickup_filter_tasks$`), route B tool-anchored as the
+control. **Route A fired and blocked both live attempts.** That spelling cannot
+come from a key lookup, since no key is or resembles `mcp.clickup.com`; the only
+way it can exist is route 2 matching `clickup_filter_tasks` against the renamed
+entry's `tools[]` and taking the origin from its `mcp_url`. The store confirms
+it independently: the denied `clickup_filter_tasks` events (seq 25, 26) and the
+denied `clickup_get_workspace_members` events (seq 24, 27) carry
+`server.name: "ClickUp"` and **`server.url: "https://mcp.clickup.com/mcp"`** —
+the correct connector identity, obtained from a config whose keys could not
+supply it by lookup. Route B fired both times too,
+as it must regardless of resolution. Evidence:
+`evidence/cloud-dogfood-6/REPORT.md`, Part 1, with a signed bundle.
+
+State what that is and is not: the fallback has executed inside a live agent
+session against a real hosted connector, with the mismatch **forced** rather
+than volunteered by the platform. No run has yet been handed the mismatch
+naturally — dogfood 3 and 5 both had agreeing conventions, and dogfood 4
+predates the fix.
+
+**And it is unreachable on a local machine, whichever route you hope for.**
+Local dogfood 6 (`evidence/local-dogfood-6/REPORT.md`, Part 1) found **no
+`/tmp/mcp-config-*.json` at all** on a Windows 11 + WSL2 machine — not before a
+CLI session, not while one ran (polled every 0.25 s), not after, and nothing in
+the Windows host's temp directories — and **no claude.ai connector in any
+`mcpServers` map anywhere on it**: hosted connectors live in
+`remoteMcpServersConfig` inside a Desktop session-metadata file with no
+`mcpServers` key, and the Desktop chat config's ClickUp entry is a stdio
+command with no `url`. Pointing `MCP_RECORDER_MCP_CONFIG` at each of those two
+files was tested directly and resolved nothing. So in a local session
+`server.url` is never recorded, no host alias is ever derived, a host-alias
+deny rule can never fire, and route 2 has nothing to fall back to. What still
+works locally is the tool-anchored rule: in that run
+`^mcp__.*__clickup_filter_tasks$` blocked both live ClickUp calls in a WSL CLI
+session. One machine, two surfaces — treat it as the only local measurement
+there is, not as a law about every laptop.
 
 Two things neither route changes, and they are why a deny is never a guarantee:
 the alias is derived from a file the agent under policy can rewrite (so it may
@@ -554,12 +602,24 @@ redaction off, the store becomes as sensitive as the traffic.
 
 ### Why are the hashes unsalted?
 
-So that blast-radius search works: hash a candidate value and look for it. The
+So that blast-radius search works: hash a candidate value and look for it. That
+also fixes its granularity — the *whole* value is hashed, so the search is
+exact and never a substring match (`attacker.example` does not find
+`https://attacker.example/collect`; see [Which sessions touched this
+value?](#which-sessions-touched-this-value)). The
 cost is stated plainly in the README's security model — someone who already
-holds a candidate value can confirm whether it was seen. In the default mode the
-store does not reveal a value to someone who does not already have it; under
-`--redact off` that no longer holds for results. Either way, if the trade is
-wrong for your threat model, treat the store itself as sensitive.
+holds a candidate value can confirm whether it was seen, and a value from a
+*small* space (a short or guessable secret) can simply be brute-forced back out
+of its ref. In the default mode the store does not reveal a value to someone who
+does not already have it; under `--redact off` that no longer holds for results.
+Either way, if the trade is wrong for your threat model, treat the store itself
+as sensitive.
+
+The one place the project acts on that rather than merely documenting it: the
+recorder never fingerprints its own configuration (`MCP_RECORDER_*`, notably the
+evidence sink's bearer token). The agent never sees those values, so no query
+needs them, and the sink would otherwise ship the receiver a reversible copy of
+the very token it authenticates with.
 
 **Maturity: Verified** — this is the mechanism `query` runs on, and the two
 `query` transcripts below (a hit and a miss) are it working. Dogfood 5 is the
@@ -783,6 +843,27 @@ $ node dist/cli.js query "never-passed-through-this-proxy-zzz" --data-dir d1
 ```
 
 Read that as "not found this way", not "never happened".
+
+**It matches EXACT values, not substrings — and that surprises people.** The
+needle is hashed whole and compared against stored refs, so a prefix, a
+suffix or the interesting part of a value finds nothing. Two misses from local
+dogfood 6, both of which cost time before they made sense:
+
+```
+$ node dist/cli.js query clickup_filter_tasks --data-dir /tmp/df6-local
+… 2 matches across 1 sessions            (matched on the recorded tool name)
+$ node dist/cli.js query mcp__claude_ai_ClickUp__clickup_filter_tasks --data-dir /tmp/df6-local
+0 matches across 0 sessions              (the name an operator actually sees
+                                          in Claude Code — the store holds the
+                                          server and the tool separately)
+$ node dist/cli.js query attacker.example --data-dir /tmp/df6-gw
+0 matches across 0 sessions              (a host is not a stored value)
+$ node dist/cli.js query https://attacker.example/collect --data-dir /tmp/df6-gw
+… 2 matches across 1 sessions            (the whole URL is)
+```
+
+So search the value as the agent passed it: the full URL, the full id, the
+full token, and the bare tool name rather than its `mcp__<server>__` spelling.
 
 ### Can I see the session as a timeline?
 
@@ -1368,10 +1449,17 @@ did not.
   two ClickUp calls, twice each, on two differently-written rules. See
   [Can a hook policy deny a live hosted-connector call?](#can-a-hook-policy-deny-a-live-hosted-connector-call)
 - **The declared-tool fallback that PR #16 added specifically to survive the
-  dogfood-4 mismatch: proven against the real binary, not by a live mismatched
-  session.** Dogfood 5's config key and tool-name segment agreed, so route 1
-  resolved everything and route 2 never executed. See
+  dogfood-4 mismatch: proven live in cloud dogfood 6**, under a mismatch forced
+  deliberately at session start. Dogfood 5's config key and tool-name segment
+  agreed, so route 1 resolved everything and route 2 never executed; dogfood 6
+  rewrote every config key so it could not, and the host-alias-only rule fired
+  with `server.url: "https://mcp.clickup.com/mcp"` on the denied events. See
   [How does the hook know which connector a call went to?](#how-does-the-hook-know-which-connector-a-call-went-to)
+- **None of this resolution happens on a local machine, so a local policy has
+  one working shape.** Local dogfood 6 found no MCP config file and no
+  connector in any `mcpServers` map on the machine it ran on: `server.url` is
+  never recorded there and a host-alias rule can never match. A tool-anchored
+  rule blocked both live calls in that run. Same section as above.
 
 The standing instruction from dogfood 4 has not been retired: anything that
 resolves a connector must be tested against both orderings, key-matches-segment

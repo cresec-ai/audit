@@ -1253,3 +1253,78 @@ describe('request_id can only ever be a string or a number (frozen schema)', () 
     expect(notes).toHaveLength(3);
   });
 });
+
+/* --- Finding 12 (local dogfood 6): with a sink configured, EVERY recorded
+ * event carried `{name: "MCP_RECORDER_SINK_TOKEN", ref: sha256(<token>)}` —
+ * the recorder's own transport credential, hashed unsalted, stamped on
+ * events the shipper then delivers to the receiver that accepts that very
+ * token. The agent never sees that token, so no blast-radius query needs it;
+ * the recorder's whole configuration namespace is now excluded inside the
+ * collector (src/redact/redactor.ts). */
+describe('the recorder own configuration credentials are never fingerprinted (finding 12)', () => {
+  const SINK_TOKEN = 'local-ingest';
+  const TOKEN_FILE = '/etc/mcp-recorder/sink-token';
+  const SERVER_TOKEN = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
+
+  /** One recorded session, with a sink configured exactly as docs/sink.md says. */
+  async function recordWithSink(): Promise<FakeStore> {
+    const store = new FakeStore();
+    const recorder = new Recorder({ store, signer: null });
+    const code = await runStdioProxy({
+      // Exits immediately: this test is about identity, not traffic.
+      command: [process.execPath, '-e', 'process.exit(0)'],
+      recorder,
+      redactor: fakeRedactor,
+      proxyVersion: '0.1.0-test',
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      // A minimal env, so ambient credential-shaped vars of the outer
+      // environment cannot decide these assertions either way.
+      env: {
+        PATH: process.env.PATH ?? '',
+        MCP_RECORDER_SINK: 'https://sink.example.com',
+        MCP_RECORDER_SINK_TOKEN: SINK_TOKEN,
+        MCP_RECORDER_SINK_TOKEN_FILE: TOKEN_FILE,
+        // The WRAPPED SERVER's own credential, the kind a blast-radius query
+        // exists for.
+        GITHUB_TOKEN: SERVER_TOKEN,
+      },
+    });
+    expect(code).toBe(0);
+    expect(store.events().length).toBeGreaterThan(0);
+    return store;
+  }
+
+  it('no event names the sink token or carries its ref', async () => {
+    const store = await recordWithSink();
+    for (const event of store.events()) {
+      const fps = event.identity.credential_fingerprints ?? [];
+      expect(fps.some((f) => f.name.startsWith('MCP_RECORDER_'))).toBe(false);
+      // By value too: the report verified the shipped ref was exactly
+      // sha256('local-ingest'), trivially reversible for a token this small.
+      expect(fps.map((f) => f.ref)).not.toContain(sha256Ref(SINK_TOKEN));
+      expect(fps.map((f) => f.ref)).not.toContain(sha256Ref(TOKEN_FILE));
+    }
+    // ...and nowhere else in the sealed records either.
+    const sealed = JSON.stringify(store.records);
+    expect(sealed).not.toContain(sha256Ref(SINK_TOKEN));
+    expect(sealed).not.toContain('MCP_RECORDER_SINK_TOKEN');
+    // A blast-radius query for the sink token finds nothing — there is
+    // nothing to find, which is the point.
+    expect(queryStore(store, SINK_TOKEN).matches).toEqual([]);
+  });
+
+  it('a genuine credential-shaped env var IS still fingerprinted (no over-correction)', async () => {
+    const store = await recordWithSink();
+    const start = store.events().find((e): e is SessionStartEvent => e.kind === 'session_start');
+    expect(start!.identity.credential_fingerprints).toContainEqual({
+      name: 'GITHUB_TOKEN',
+      ref: sha256Ref(SERVER_TOKEN),
+    });
+    const result = queryStore(store, SERVER_TOKEN);
+    expect(
+      result.matches.some((m) => m.path.startsWith('$.identity.credential_fingerprints')),
+    ).toBe(true);
+  });
+});

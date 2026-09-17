@@ -159,9 +159,9 @@ The short form first. "Stop a call" means block it **before** it executes.
 
 | Platform | What the install is | Fleet reach | Stop a call? | How we know |
 | --- | --- | --- | --- | --- |
-| Claude Code CLI | Hook entries in a settings file; optionally an MCP config rewrite | Managed settings pushed by MDM | **Yes** — `hook --policy` | **Live** for the tap (this repository's own 651-event chain), but every artifact we keep is from a cloud or remote session; managed settings **Inferred** |
-| Claude Code IDE extension | Same settings files | Same | **Yes** | **Inferred** |
-| Claude Code — Desktop "Code" tab | Same settings files | Same | **Yes** | **Inferred** |
+| Claude Code CLI | Hook entries in a settings file; optionally an MCP config rewrite | Managed settings pushed by MDM | **Yes** — `hook --policy`, but **on a local machine only with tool-anchored rules** (`^mcp__.*__<tool>$`); a host-alias rule cannot fire there | **Live** for the tap (this repository's own 651-event chain) and, in local dogfood 6, for a local deny: a tool-anchored rule blocked two live ClickUp calls in a WSL2 CLI session, with no `server.url` on any event. Every *signed bundle* we keep is still from a cloud or remote session; managed settings **Inferred** |
+| Claude Code IDE extension | Same settings files | Same | **Yes**, with the same local limit | **Inferred** — never run |
+| Claude Code — Desktop "Code" tab | Same settings files | Same | **Yes**, with the same local limit | **Inferred** for the tap. **Observed** (local dogfood 6) that it names the same connector by UUID (`mcp__47d587b8-…__clickup_*`) where the CLI on that same machine and account says `mcp__claude_ai_ClickUp__clickup_*` |
 | Claude Code cloud sessions | Hook entry committed in the repo's `.claude/settings.json`; env vars in the environment config | Every session started from that repo or branch | **Yes** — proven live | **Live** (dogfood 5: two rule shapes, four blocked ClickUp calls) |
 | Claude Code Agent SDK | Nothing ships today — no adapter exists | — | Would be, with a shim | **None** (SDK hook callbacks: **Inferred**) |
 | Claude Desktop chat | MCP config rewrite of local stdio servers; `--bridge` for a vendor with a public MCP endpoint | None we know of | **Yes**, wrapped servers only (gateway mode) | **Tested**; bridge **Experimental** |
@@ -221,16 +221,31 @@ artifact of one.
   connector resolution succeeds. With `--all-tools`, built-ins (`Bash`,
   `Edit`, `Read`) too. For servers wrapped with `record`, the full JSON-RPC in
   both directions.
+- **The local caveat, and it is not small: `server.url` never resolves on a
+  laptop.** Connector resolution reads an MCP config file, and local dogfood 6
+  found that a local machine has none — no `/tmp/mcp-config-*.json` before,
+  during or after a session, nothing equivalent on the Windows side, and no
+  claude.ai connector in any `mcpServers` map anywhere on it (they live in a
+  Desktop session-metadata file the hook cannot use). So every local event
+  records the platform's server segment and no vendor URL, and every
+  host-alias policy rule is dead on that surface. Evidence:
+  `evidence/local-dogfood-6/REPORT.md`, Part 1 — one machine, two surfaces
+  (WSL2 CLI and the Desktop "Code" tab), one account. See
+  [docs/hooks.md](hooks.md#local-sessions-no-config-file-so-no-serverurl).
 - **What it cannot see.** The Anthropic-to-vendor hop for hosted connectors —
   that call is made from Anthropic's infrastructure on every surface, and no
   proxy of ours is on it. What a `Bash` command does once it has started.
   Anything in a session that began before the hook was installed. Any tool call
   Claude Code does not route through a hook.
-- **Stop a call: yes.** `hook --policy` denies before the tool runs. Read
+- **Stop a call: yes — in one shape.** `hook --policy` denies before the tool
+  runs. Read
   [docs/hooks.md](hooks.md#write-deny-rules-against-the-tool-not-the-server-segment)
   first: in dogfood 4 two deny rules aimed at a platform-controlled name
   segment both silently missed and both live calls executed. Write
-  `^mcp__.*__<tool>$`, and smoke-test it.
+  `^mcp__.*__<tool>$`, and smoke-test it. On this surface that is not a style
+  preference: local dogfood 6 blocked two live ClickUp calls with exactly that
+  rule, and a host-alias rule in the same session would have matched nothing,
+  because no alias can be derived locally.
 - **What the customer holds.** The settings file, the data directory and its
   ed25519 key, and — with the sink — a bearer token. No repository, no CA, no
   account. `NODE_EXTRA_CA_CERTS` only if their egress proxy terminates TLS;
@@ -240,8 +255,18 @@ artifact of one.
   someone edits the hook out of the settings file; a session that started
   before the install; `MCP_RECORDER_DISABLE=1` in the environment (recording
   stops — a `hook --policy` deny still fires); the data directory deleted.
+  **And the quiet one: a policy written against a server segment silently
+  stops matching when the surface changes.** The segment is the platform's to
+  choose, and local dogfood 6 saw one ClickUp connector, one account, one
+  machine carry three spellings — `mcp__47d587b8-…__` in the Desktop "Code"
+  tab, `mcp__claude_ai_ClickUp__` in the WSL CLI, `mcp__ClickUp__` in a cloud
+  session. A rule that holds in the terminal can miss in the Desktop tab on
+  the same laptop, and a host-alias rule misses everywhere locally. Nothing
+  reports it: the evidence looks exactly like a session with nothing to block.
   Noticed through: a frozen head at the receiver while heartbeats continue,
-  `ship --status`, `verify`, and `sessions` gaining no new rows.
+  `ship --status`, `verify`, and `sessions` gaining no new rows — and, for the
+  policy specifically, by counting `policy_denied` events after a session
+  rather than assuming the rule fired.
 
 ### Claude Code — IDE extension and the Desktop "Code" tab
 
@@ -251,6 +276,19 @@ as the CLI, per Anthropic's documentation and
 Everything in the CLI section applies unchanged *if* that documentation is
 right. If a customer's assurance case rests on one of these two, test it before
 claiming it.
+
+**One thing about the Desktop "Code" tab is measured, and it matters for
+policy.** Local dogfood 6 inspected a live Desktop Code-tab session on the same
+machine and account as the WSL CLI and found the connectors named differently
+there: `mcp__47d587b8-3fb9-42e9-b596-f8b25371248c__clickup_filter_tasks` in the
+Desktop tab against `mcp__claude_ai_ClickUp__clickup_filter_tasks` in the CLI,
+with Desktop *extensions* named a third way again (`mcp__Desktop_Commander__*`,
+from the display name, not the manifest name). The local `server.url` gap
+applies here too — there is no config file on that machine for either surface.
+So a policy that is going to cover both surfaces must be tool-anchored; a
+segment-anchored rule covers whichever surface it was written on. The generated
+hook command is also platform-specific: `hook install` inside WSL writes
+absolute Linux paths, which a Windows-host Claude Code cannot run.
 
 ### Claude Code — cloud sessions (Claude Code on the web)
 
@@ -527,7 +565,9 @@ object key is replaced by `sha256:<hex>` plus a length before anything is
 written. A reader sees which tool was called, on which server, when, whether it
 failed, and how the calls chain together — never the arguments or the results.
 Someone who already holds a candidate value can confirm it was seen, with
-`query`. This is also why the sink can be a plain replica: **records ship
+`query` — and only if they hold it **exactly**, since the whole value is hashed
+and a substring matches nothing. This is also why the sink can be a plain
+replica: **records ship
 verbatim as sealed**, because altering anything inside `event` would break
 `record.hash` and fail verification at the receiver. There is no second
 redaction pass on the wire, and no opportunity for one.
@@ -702,7 +742,12 @@ printf '%s' '{"hook_event_name":"PreToolUse","session_id":"policy-smoke",
 ```
 
 A matching rule prints one `permissionDecision: "deny"` line; empty output
-means it does not match that name. Exit criterion: for each rule you intend to
+means it does not match that name. **Feed it the spelling your own surface
+uses** — local dogfood 6 saw one ClickUp connector arrive as
+`mcp__claude_ai_ClickUp__…` in the WSL CLI and `mcp__47d587b8-…__…` in the
+Desktop "Code" tab on the same laptop — and note that on a local surface a
+host-alias rule cannot be smoke-tested into working at all, because the alias
+is never derived there. Exit criterion: for each rule you intend to
 rely on, one deny observed in recorded evidence
 (`grep -c '"policy_denied"'` over an exported bundle), not merely a session
 that appeared to behave.

@@ -359,6 +359,24 @@ export interface RecorderConfig {
   disabled: boolean;
 }
 
+/**
+ * The namespace of every environment variable the recorder reads for its OWN
+ * configuration — every key in `ENV` below starts with it, and so must any
+ * future one.
+ *
+ * It exists because that namespace has to be excluded from credential
+ * fingerprinting. `identity.credential_fingerprints` answers "which sessions
+ * saw this secret", which is only meaningful for secrets the AGENT and the
+ * wrapped server were exposed to. Ours are not those: `MCP_RECORDER_SINK_TOKEN`
+ * is the recorder's own transport credential, the agent never sees it, and its
+ * ref would be shipped by the sink TO THE RECEIVER THAT ACCEPTS THAT VERY
+ * TOKEN — the worst possible destination for it, given refs are unsalted by
+ * design (see `sha256Ref`) and a low-entropy token is therefore recoverable
+ * from one. See `collectEnvCredentialFingerprints` in src/redact/redactor.ts,
+ * which is the one place this exclusion is applied.
+ */
+export const ENV_PREFIX = 'MCP_RECORDER_';
+
 export const ENV = {
   DATA_DIR: 'MCP_RECORDER_DATA_DIR',
   STORE: 'MCP_RECORDER_STORE',

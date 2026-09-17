@@ -11,14 +11,14 @@
  *   5. an idempotent replay does not fork or duplicate.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { GENESIS_HASH, sha256Ref } from '../src/chain/hash.js';
+import { GENESIS_HASH, computeHash, sha256Ref } from '../src/chain/hash.js';
 import { Signer } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
 import { verifyRecords } from '../src/verify/verify.js';
@@ -26,6 +26,7 @@ import { SCHEMA } from '../src/schema/events.js';
 import type { AnyEvent, ChainRecord } from '../src/schema/events.js';
 import { normalizeSinkUrl, resolveSinkConfig } from '../src/sink/config.js';
 import { SINK_HEADERS, chainIdFromGenesisRecord, sinkSignedPayload } from '../src/sink/protocol.js';
+import { advanceSelfCheck, newSelfCheck } from '../src/sink/selfcheck.js';
 import { runShipper } from '../src/sink/shipper.js';
 import { cliEntryPoint, ensureShipper } from '../src/sink/spawn.js';
 import {
@@ -665,6 +666,289 @@ describe('sink visibility', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* the shipper verifies its OWN chain before extending the receiver's  */
+/* ------------------------------------------------------------------ */
+
+/** Every record on disk, in seq order. */
+function readRecords(dataDir: string): ChainRecord[] {
+  return readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8')
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as ChainRecord);
+}
+
+function writeRecords(dataDir: string, records: ChainRecord[]): void {
+  writeFileSync(
+    join(dataDir, 'evidence.jsonl'),
+    records.map((r) => JSON.stringify(r)).join('\n') + '\n',
+  );
+}
+
+/**
+ * Local dogfood 6's attack, exactly: rewrite one sealed event and leave every
+ * stored `hash`/`prev_hash` alone, so the head hash the receiver knows still
+ * matches and the tampered store can keep extending the remote chain.
+ */
+function rewriteEventInPlace(dataDir: string, seq: number, tool: string): void {
+  writeRecords(
+    dataDir,
+    readRecords(dataDir).map((record) =>
+      record.seq === seq ? { ...record, event: { ...record.event, tool } as AnyEvent } : record,
+    ),
+  );
+}
+
+/**
+ * The careful version: rewrite an event AND re-link every hash after it, so
+ * the chain is internally consistent again. Only a head signature made before
+ * the rewrite can still tell.
+ */
+function rewriteAndRelink(dataDir: string, seq: number, tool: string): void {
+  const records = readRecords(dataDir);
+  let prevHash = records[0]!.prev_hash;
+  writeRecords(
+    dataDir,
+    records.map((record) => {
+      const event = record.seq === seq ? ({ ...record.event, tool } as AnyEvent) : record.event;
+      const rewritten: ChainRecord = {
+        ...record,
+        prev_hash: prevHash,
+        hash: computeHash(prevHash, event),
+        event,
+      };
+      prevHash = rewritten.hash;
+      return rewritten;
+    }),
+  );
+}
+
+/** A second handle on the same data dir — what the real shipper process has. */
+function reopen(dataDir: string): EvidenceStore {
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  cleanups.push(() => store.close());
+  return store;
+}
+
+/** Wraps a store so a test can see exactly which records were read back. */
+function countingStore(inner: EvidenceStore): { store: EvidenceStore; read: number[] } {
+  const read: number[] = [];
+  const store: EvidenceStore = {
+    get backend() {
+      return inner.backend;
+    },
+    get path() {
+      return inner.path;
+    },
+    head: () => inner.head(),
+    append: (records) => inner.append(records),
+    appendEvents: (events) => inner.appendEvents(events),
+    addSignature: (sig) => inner.addSignature(sig),
+    latestSignature: () => inner.latestSignature(),
+    signatures: () => inner.signatures(),
+    *iterate(opts) {
+      for (const record of inner.iterate(opts)) {
+        read.push(record.seq);
+        yield record;
+      }
+    },
+    count: () => inner.count(),
+    sessions: () => inner.sessions(),
+    close: () => inner.close(),
+  };
+  return { store, read };
+}
+
+describe('sink self-check', () => {
+  it('stops shipping when history the receiver ALREADY HOLDS was rewritten', async () => {
+    // Dogfood 6, step C: the tampered copy shipped seq 12-22 unchallenged and
+    // the honest store was the one blamed for the fork. Shipping forward from
+    // the receiver's cursor never looked behind it.
+    const f = await fixture('selfcheck-delivered', 6);
+    const sink = receiver(await startSinkReceiver());
+    const lines: string[] = [];
+    const opts = {
+      dataDir: f.dataDir,
+      sink: { url: sink.url },
+      signer: f.signer,
+      toolVersion: '0.0.0-test',
+      surface: 'ship' as const,
+      drain: true,
+      drainTimeoutMs: 5_000,
+      log: (m: string) => lines.push(m),
+      // Small windows so the real shipper walks several of them, as it would
+      // on a store far too big to verify in one.
+      selfCheckWindow: 4,
+      ...FAST,
+    };
+
+    const honest = await runShipper({ ...opts, store: f.store });
+    expect(honest.delivered).toBe(6);
+
+    // Three more sessions' worth of records, then the edit: seq 3 is already
+    // at the receiver, and its stored hashes are left untouched so the head
+    // the receiver knows still matches.
+    f.seal(3);
+    f.store.close();
+    rewriteEventInPlace(f.dataDir, 3, 'quietly_rewritten');
+
+    const tampered = await runShipper({ ...opts, store: reopen(f.dataDir) });
+
+    expect(tampered.state).toBe('stalled');
+    expect(tampered.delivered).toBe(0);
+    expect(tampered.lag).toBe(3);
+    // Not one of the new records reached the wire, let alone the receiver.
+    expect(sink.posts.filter((p) => p.body !== undefined && p.body.records.length > 0)).toHaveLength(1);
+    expect([...sink.chain(f.chainId)!.records.keys()].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6]);
+
+    // ...and the stall names the rewritten seq, in the file `ship --status`
+    // reads. A stall nobody can see is the failure mode being fixed here.
+    const status = readShipStatus(f.dataDir)!;
+    expect(status.state).toBe('stalled');
+    expect(status.last_error).toMatch(/local evidence does not verify/);
+    expect(status.last_error).toMatch(/hash_mismatch at seq 3/);
+    expect(status.lag).toBe(3);
+    expect(lines.join('\n')).toMatch(/sink stalled: local evidence does not verify/);
+    expect(lines.join('\n')).toMatch(/mcp-recorder verify/);
+  });
+
+  it('catches a rewrite that re-links the hashes, because the old signature still attests', async () => {
+    // Re-linking makes the chain self-consistent, so hash recomputation alone
+    // cannot see it and the receiver would happily store it. The head
+    // signature made before the rewrite is what still disagrees — which is
+    // why the self-check verifies one signature per window rather than none.
+    const f = await fixture('selfcheck-relink', 4);
+    const sink = receiver(await startSinkReceiver());
+    f.store.close();
+    rewriteAndRelink(f.dataDir, 2, 'quietly_rewritten');
+
+    const result = await runShipper({
+      dataDir: f.dataDir,
+      sink: { url: sink.url },
+      store: reopen(f.dataDir),
+      signer: f.signer,
+      toolVersion: '0.0.0-test',
+      surface: 'ship',
+      drain: true,
+      drainTimeoutMs: 5_000,
+      ...FAST,
+    });
+
+    expect(result.state).toBe('stalled');
+    expect(result.delivered).toBe(0);
+    expect(readShipStatus(f.dataDir)!.last_error).toMatch(/signature_chain_mismatch at seq 4/);
+    expect(sink.chain(f.chainId)).toBeUndefined();
+  });
+
+  it('leaves an honest store alone: a receiver far behind still gets everything', async () => {
+    // "Merely behind" is not "tampered": nothing has been delivered yet, the
+    // batches are capped so there are four of them, and the tail is unsigned
+    // (the recorder signs per flush, so a tail newer than the last flush is
+    // ordinary). None of that may stall the chain.
+    const f = await fixture('selfcheck-behind', 3);
+    f.seal(4);
+    const sink = receiver(await startSinkReceiver({ maxRecords: 2 }));
+
+    const result = await runShipper({
+      dataDir: f.dataDir,
+      sink: { url: sink.url },
+      store: f.store,
+      signer: f.signer,
+      toolVersion: '0.0.0-test',
+      surface: 'ship',
+      drain: true,
+      drainTimeoutMs: 5_000,
+      ...FAST,
+    });
+
+    expect(result.state).toBe('idle');
+    expect(result.delivered).toBe(7);
+    expect(result.lag).toBe(0);
+    expect([...sink.chain(f.chainId)!.records.keys()].sort((a, b) => a - b)).toEqual([
+      1, 2, 3, 4, 5, 6, 7,
+    ]);
+    expect(readShipStatus(f.dataDir)!.state).toBe('idle');
+  });
+
+  it('says nothing about a store that has never recorded anything', async () => {
+    const dataDir = tempDir('selfcheck-empty');
+    const store = openStore({ dataDir, backend: 'jsonl' });
+    cleanups.push(() => store.close());
+    const signer = await Signer.load(dataDir);
+    const sink = receiver(await startSinkReceiver());
+    const lines: string[] = [];
+
+    const result = await runShipper({
+      dataDir,
+      sink: { url: sink.url },
+      store,
+      signer,
+      toolVersion: '0.0.0-test',
+      surface: 'ship',
+      drain: true,
+      drainTimeoutMs: 5_000,
+      log: (m) => lines.push(m),
+      ...FAST,
+    });
+
+    expect(result.state).toBe('idle');
+    expect(result.localHeadSeq).toBe(0);
+    expect(lines).toEqual([]);
+    expect(readShipStatus(dataDir)!.state).toBe('idle');
+  });
+
+  it('recomputes the history once, then pays only for the records being shipped', async () => {
+    // The cost property: O(n) once per process, never O(n) per batch. If this
+    // ever regresses, a shipper on a large store re-reads the whole chain
+    // every poll interval.
+    const f = await fixture('selfcheck-incremental', 6);
+    const counted = countingStore(f.store);
+    const self = newSelfCheck();
+
+    const batch = [...f.store.iterate({ fromSeq: 5, toSeq: 6 })];
+    counted.read.length = 0;
+    expect(await advanceSelfCheck(counted.store, self, 6, batch)).toBeUndefined();
+    expect(self.through).toBe(6);
+    // Only the records BELOW the batch were read back; the batch itself was
+    // verified as the objects about to go on the wire.
+    expect(counted.read).toEqual([1, 2, 3, 4]);
+
+    f.seal(2);
+    const next = [...f.store.iterate({ fromSeq: 7, toSeq: 8 })];
+    counted.read.length = 0;
+    expect(await advanceSelfCheck(counted.store, self, 8, next)).toBeUndefined();
+    expect(self.through).toBe(8);
+    expect(counted.read).toEqual([]);
+
+    // A later window still anchors on the earlier one, so a rewrite anywhere
+    // below it is caught the next time the frontier has to move.
+    expect(self.hash).toBe(f.store.head().hash);
+  });
+
+  it('walks a long chain in windows, and a rewrite in a middle one still stops it', async () => {
+    // Windows bound the working set on a big store; each one anchors on the
+    // previous one's recomputed hash and checks the newest signature inside
+    // it, so a rewrite must not be able to hide between two of them.
+    const f = await fixture('selfcheck-windows', 7);
+    const pinned = { windowSize: 2, expectedPublicKeyHex: f.signer.publicKeyHex };
+
+    const clean = newSelfCheck();
+    expect(await advanceSelfCheck(f.store, clean, 7, [...f.store.iterate()], pinned)).toBeUndefined();
+    expect(clean.through).toBe(7);
+
+    f.store.close();
+    rewriteEventInPlace(f.dataDir, 5, 'quietly_rewritten');
+    const tampered = reopen(f.dataDir);
+    const self = newSelfCheck();
+    const problem = await advanceSelfCheck(tampered, self, 7, [...tampered.iterate()], pinned);
+    expect(problem).toMatch(/hash_mismatch at seq 5/);
+    // The frontier stopped at the last sound window instead of running on.
+    expect(self.through).toBe(4);
+    // And a failed chain stays failed without re-scanning it every poll.
+    expect(await advanceSelfCheck(tampered, self, 7, [], pinned)).toBe(problem);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* the shipper is a separate process, and one per data dir             */
 /* ------------------------------------------------------------------ */
 
@@ -850,6 +1134,50 @@ describe('ship CLI', () => {
       );
       expect(run.code ?? 0).toBe(0);
       expect(readShipStatus(f.dataDir)!.lag).toBe(2); // and the lag is on the record
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'a rewritten history stalls the real `ship` process, and `--status` says so',
+    async () => {
+      // The operator-visible half, end to end: dogfood 6's sequence run
+      // through the real `ship` process rather than an in-process shipper.
+      const f = await fixture('cli-selfcheck', 4);
+      const sink = receiver(await startSinkReceiver({ requireToken: 'tok' }));
+      const env = { [ENV.SINK]: sink.url, [ENV.SINK_TOKEN]: 'tok' };
+
+      const honest = await runCli(
+        ['ship', '--data-dir', f.dataDir, '--store', 'jsonl', '--drain', '--timeout', '10s'],
+        env,
+      );
+      expect(honest.stderr).toMatch(/delivered 4 record\(s\)/);
+
+      // Seal three more, then rewrite seq 2 — which the receiver already
+      // holds — leaving the stored hashes alone.
+      f.seal(3);
+      f.store.close();
+      rewriteEventInPlace(f.dataDir, 2, 'quietly_rewritten');
+
+      const drain = await runCli(
+        ['ship', '--data-dir', f.dataDir, '--store', 'jsonl', '--drain', '--timeout', '10s'],
+        env,
+      );
+      expect(drain.code ?? 0).toBe(0); // a stall is still fail-open for the build
+      expect(drain.stderr).toMatch(/delivered 0 record\(s\)/);
+      expect(drain.stderr).toMatch(/local evidence does not verify/);
+      // The receiver's copy is exactly what the honest run left it.
+      expect([...sink.chain(f.chainId)!.records.keys()].sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+
+      const status = await runCli(
+        ['ship', '--data-dir', f.dataDir, '--store', 'jsonl', '--status'],
+        env,
+      );
+      expect(status.code ?? 0).toBe(0);
+      expect(status.stdout).toMatch(/state: *stalled/);
+      expect(status.stdout).toMatch(/lag: *3 record\(s\) not yet at the receiver/);
+      expect(status.stdout).toMatch(/last error: *local evidence does not verify/);
+      expect(status.stdout).toMatch(/hash_mismatch at seq 2/);
     },
     60_000,
   );
@@ -1048,6 +1376,82 @@ describe('sink fail-open (end to end through `record`)', () => {
       for (const post of sink.posts) {
         expect(post.raw.toString('utf8')).not.toContain('HOOK-SINK-PROBE-4c8a');
       }
+    },
+    60_000,
+  );
+});
+
+/* ------------------------------------------------------------------ */
+/* the sink's own token is not evidence (finding 12, local dogfood 6)  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Local dogfood 6 found the recorder fingerprinting its OWN transport
+ * credential: with a sink configured, every event carried
+ * `{name: "MCP_RECORDER_SINK_TOKEN", ref: sha256(<token>)}` — and the
+ * shipper then delivered those events to the receiver that accepts that very
+ * token. Refs are unsalted by design (that is what makes `query` work), so
+ * for a low-entropy token the ref is recoverable by brute force: the sink was
+ * being handed a reversible copy of its own bearer token, on every event.
+ *
+ * This is checked on the WIRE — the octets the receiver actually got — with
+ * a positive control in the same bodies, so the negative cannot pass by the
+ * events simply carrying no fingerprints at all.
+ */
+describe('the sink is never shipped a copy of its own bearer token', () => {
+  it.skipIf(process.platform === 'win32')(
+    'no POST body names MCP_RECORDER_SINK_TOKEN or carries its ref, while a real credential still ships',
+    async () => {
+      // Deliberately low entropy, exactly as in the report: sha256 of this
+      // is reversible by anyone who can guess a short string.
+      const token = 'local-ingest';
+      const serverToken = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
+      const sink = receiver(await startSinkReceiver({ requireToken: token }));
+      const dataDir = tempDir('own-token');
+
+      const run = await runProxy(dataDir, {
+        [ENV.SINK]: sink.url,
+        [ENV.SINK_TOKEN]: token,
+        // The wrapped server's own credential — the kind credential
+        // fingerprints exist for, and this test's positive control.
+        GITHUB_TOKEN: serverToken,
+      });
+      expect(run.code).toBe(0);
+
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline && sink.chains.size === 0) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      cleanups.push(() => {
+        const status = readShipStatus(dataDir);
+        if (status?.pid !== undefined) {
+          try {
+            process.kill(status.pid, 'SIGTERM');
+          } catch {
+            /* already gone */
+          }
+        }
+      });
+
+      const bodies = sink.posts.map((p) => p.raw.toString('utf8'));
+      expect(bodies.length).toBeGreaterThan(0);
+
+      // Positive control: the wire IS carrying credential fingerprints, so
+      // the assertions below are about the sink token specifically.
+      expect(bodies.some((b) => b.includes(sha256Ref(serverToken)))).toBe(true);
+      expect(bodies.some((b) => b.includes('GITHUB_TOKEN'))).toBe(true);
+
+      for (const body of bodies) {
+        expect(body).not.toContain('MCP_RECORDER_SINK_TOKEN');
+        expect(body).not.toContain(sha256Ref(token));
+        expect(body).not.toContain(token); // the token itself, obviously
+      }
+
+      // And the same holds for the local store the wire is a copy of.
+      const onDisk = readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8');
+      expect(onDisk).not.toContain('MCP_RECORDER_SINK_TOKEN');
+      expect(onDisk).not.toContain(sha256Ref(token));
+      expect(onDisk).toContain(sha256Ref(serverToken));
     },
     60_000,
   );

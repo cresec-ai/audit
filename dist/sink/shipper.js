@@ -31,10 +31,20 @@
  * Every terminal condition here STALLS LOUDLY rather than degrading quietly.
  * The sender must NEVER skip a seq: a gap at the receiver makes everything
  * after it unverifiable forever, which is far worse than a visible stall.
+ *
+ * AND IT VERIFIES ITS OWN CHAIN BEFORE EXTENDING THE RECEIVER'S. Reading
+ * forward from the receiver's cursor says nothing about the records behind
+ * it: local dogfood 6 rewrote seq 7 of a copied data dir, shipped seq 12-22
+ * from it unchallenged, and the HONEST store was the one that then got the
+ * `chain_fork` 409 and the "history was rewritten" alert. So every batch is
+ * now gated on a recomputation of this store's own chain from seq 1 through
+ * the last record of that batch — once per process for the history, then
+ * incrementally. See src/sink/selfcheck.ts for the cost argument.
  */
 import { GENESIS_HASH } from '../chain/hash.js';
 import { SinkClient } from './client.js';
 import { AUTH_BACKOFF_BASE_MS, AUTH_BACKOFF_CAP_MS, HEARTBEAT_INTERVAL_S, SENDER_MAX_BYTES, SENDER_MAX_RECORDS, backoffMs, chainIdFromGenesisRecord, } from './protocol.js';
+import { advanceSelfCheck, newSelfCheck } from './selfcheck.js';
 import { readCursorCache, writeCursorCache, writeShipStatus } from './state.js';
 const DEFAULT_POLL_MS = 1_000;
 /** No local growth and no delivery for this long: exit, and let the next
@@ -144,6 +154,8 @@ export async function runShipper(opts) {
     let maxBytes = SENDER_MAX_BYTES;
     let heartbeatMs = opts.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_S * 1000;
     let badRequestRange;
+    /** How far this process has recomputed its OWN chain. Never persisted. */
+    const selfCheck = newSelfCheck();
     const writeStatus = (localHeadSeq) => {
         const status = {
             sink: opts.sink.url,
@@ -398,6 +410,27 @@ export async function runShipper(opts) {
         }
         const fromSeq = records[0].seq;
         const toSeq = records[records.length - 1].seq;
+        /* ---- self-check: never extend the receiver's chain from a local
+               history that no longer verifies. The first batch pays for the
+               records behind the cursor too (that is the whole point — dogfood 6
+               shipped seq 12-22 out of a store whose seq 7 had been rewritten);
+               later batches only pay for their own records. ---- */
+        const selfCheckFailure = await advanceSelfCheck(opts.store, selfCheck, toSeq, records, {
+            expectedPublicKeyHex: opts.signer.publicKeyHex,
+            onWindow: () => opts.touchLock?.(),
+            ...(opts.selfCheckWindow !== undefined ? { windowSize: opts.selfCheckWindow } : {}),
+        });
+        if (selfCheckFailure !== undefined) {
+            state = 'stalled';
+            noteError(`local evidence does not verify (${selfCheckFailure}); ` +
+                `refusing to ship seq ${String(fromSeq)}-${String(toSeq)} on top of it`);
+            logOnce('self-check', `[mcp-recorder] sink stalled: ${lastError ?? ''} — run 'mcp-recorder verify' on this data dir`);
+            writeStatus(localHead.seq);
+            if (opts.drain === true)
+                return result(localHead.seq);
+            await sleep(pollMs);
+            continue;
+        }
         const head = await signHead(localHead.seq, localHead.hash);
         if (head === undefined) {
             state = 'retrying';

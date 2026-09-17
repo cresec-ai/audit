@@ -57,6 +57,8 @@ export type { SinkClientOpts, SinkOutcome, SinkSigner } from './sink/client.js';
 export { agentFor as sinkAgentFor, noProxyMatches, proxyUrlFor, sinkFetch } from './sink/http.js';
 export { collectBatch, runShipper, signaturesInRange } from './sink/shipper.js';
 export type { ShipSigner, ShipperOpts, ShipperResult } from './sink/shipper.js';
+export { SELF_CHECK_MAX_SIGS_PER_WINDOW, SELF_CHECK_WINDOW, advanceSelfCheck, newSelfCheck, } from './sink/selfcheck.js';
+export type { ChainSelfCheck, SelfCheckOpts } from './sink/selfcheck.js';
 export { acquireShipLock, readCursorCache, readShipStatus, shipperLooksAlive, writeCursorCache, writeShipStatus, } from './sink/state.js';
 export type { CursorCache, ShipLock, ShipState, ShipStatus } from './sink/state.js';
 export { cliEntryPoint, ensureShipper } from './sink/spawn.js';

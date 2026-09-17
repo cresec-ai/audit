@@ -7,8 +7,10 @@ claude.ai web, Claude Desktop, Cowork and Claude Code, given that none of
 them is a local MCP server the recorder can wrap?
 
 Evidence tags used below: **[observed]** was verified directly inside a
-Claude Code cloud session on this repository (see `evidence/cloud-dogfood-*`
-and the session notes); **[docs]** comes from Anthropic or vendor
+Claude Code session on this repository — a cloud session (see
+`evidence/cloud-dogfood-*` and the session notes) or, where the text says so,
+the one local machine of `evidence/local-dogfood-6`; **[docs]** comes from
+Anthropic or vendor
 documentation read on 2026-09-15 by the research pass and was not
 independently re-verified (the refutation pass of that research did not
 complete). Where two sources disagree, the disagreement is recorded rather
@@ -39,8 +41,14 @@ than resolved.
   ClickUp calls, twice each, and the signed bundle carries the refusals. Read
   the caveat in [Dogfood 5](#dogfood-5-the-deny-fired-for-a-reason-worth-reading)
   before relying on it: that session's naming conventions agreed, so the fix's
-  own new code path did not run. [observed:
-  hooks run in cloud sessions, record, and deny; docs: managed settings reach]
+  own new code path did not run — cloud dogfood 6 then ran it live under a
+  deliberately forced mismatch. **On a local machine the control half is
+  narrower:** recording works and a tool-anchored deny blocks, but there is no
+  MCP config file to resolve a connector from, so `server.url` is never
+  recorded and a host-alias rule cannot fire at all — see [Local dogfood
+  6](#local-dogfood-6-the-same-tap-on-a-laptop-minus-the-connectors-identity).
+  [observed: hooks run in cloud sessions and on one local machine, record, and
+  deny; docs: managed settings reach]
 - **On claude.ai web, Desktop chat and Cowork, the only customer-side taps
   are Anthropic's own feeds, and they are Enterprise-gated.** Inference hooks
   (beta) deliver each turn's `tool_use`/`tool_result` blocks in real time and
@@ -73,7 +81,7 @@ than resolved.
 | Claude Desktop chat | Same as web. `claude_desktop_config.json` governs local stdio servers only; remote connectors are not in it. [observed: `setup` finds no connector entries] | Same as web. | Same as web. `setup --bridge` (PR #9) replaces a connector with a local `mcp-remote` bridge the recorder wraps, at the cost of the user re-authorising through the bridge. |
 | Cowork (Desktop, local or remote) | Anthropic-side for connectors; local MCP servers in-process | Compliance API transcripts, Cowork OpenTelemetry (Team+Enterprise), local `audit.jsonl` transcripts HMAC-chained by Anthropic. **Claude Code hooks are not known to fire here, and the evidence points against it** (see below). [docs] | Org per-tool policy. Our hook tap should be assumed NOT to apply until the probe says otherwise. |
 | Claude Code cloud session | Connectors are `type: http` MCP servers in `/tmp/mcp-config-<session>.json`, pointing at `api.anthropic.com/v2/ccr-sessions/<session>/mcp?mcp_url=<vendor>` with `X-MCP-Server-ID`, `X-MCP-Server-Origin` and `X-Session-UUID` headers; the relay forwards to the vendor. [observed] | PreToolUse/PostToolUse/PostToolUseFailure hooks from the repository's `.claude/settings.json` fire with full `tool_input` and `tool_response`, or the error string on PostToolUseFailure; the session transcript JSONL holds every `tool_use`/`tool_result`. [observed] | Hooks can deny or rewrite. `mcp-recorder hook` records every call; it enforces only when a deny rule matches the tool name Claude Code actually presents, which dogfood 4 showed is not a given (see below). |
-| Claude Code CLI, IDE, Desktop Code tab | Connector JSON-RPC leaves the machine for Anthropic's relay over HTTPS | Same hooks; Claude Code OpenTelemetry `tool_result` events with MCP server and tool names (and input when enabled). [docs] | Hooks; managed settings can lock them (`allowManagedHooksOnly`); `disableClaudeAiConnectors`, allowed/denied MCP server lists. [docs] |
+| Claude Code CLI, IDE, Desktop Code tab | Connector JSON-RPC leaves the machine for Anthropic's relay over HTTPS | Same hooks. **Recording proven locally** on one machine: the tap recorded two live ClickUp calls in a WSL2 CLI session and the chain verified PASS — but with **no `server.url` on any event**, because no local file maps a connector to its endpoint (see [Local dogfood 6](#local-dogfood-6-the-same-tap-on-a-laptop-minus-the-connectors-identity)). Claude Code OpenTelemetry `tool_result` events with MCP server and tool names (and input when enabled). [observed: WSL2 CLI and Desktop Code tab on one machine; docs: IDE extension, OTel] | Hooks — and locally **only in their tool-anchored form**: `^mcp__.*__clickup_filter_tasks$` blocked both live calls, while a host-alias rule (`^mcp__mcp\.clickup\.com__…$`) can never fire on that machine because the alias cannot be derived. Managed settings can lock hooks (`allowManagedHooksOnly`); `disableClaudeAiConnectors`, allowed/denied MCP server lists. [observed: the deny, on one machine; docs: managed settings] |
 | Agent SDK | Loads claude.ai connectors under claude.ai login | Hooks are callbacks with the same payloads; `canUseTool`. [docs] | Same. |
 | Managed Agents (beta) | Customer-visible event stream | `agent.mcp_tool_use` / `agent.mcp_tool_result` with full input and content; MCP tools default to `always_ask`. First-party connectors (Gmail, Drive) are not offered there. [docs] | Per-call confirmation. |
 
@@ -183,13 +191,70 @@ segment left open (`^mcp__.*__…$`). Evidence: `evidence/cloud-dogfood-5`.
   `tools[]` intact): the host-alias-only rule fired, `server.url` resolved
   through the fallback, and a control run with no config file correctly
   allowed the same call. So it is proven against the binary in the shape that
-  defeated dogfood 4, and not yet by a live session that naturally presents
-  that mismatch.
+  defeated dogfood 4.
+- **Cloud dogfood 6 closed the rest of that gap.** It ran a live cloud session
+  whose MCP config had been rewritten at session start so that no key could
+  equal any tool-name segment, and the host-alias-only deny rule — a spelling
+  route 1 cannot produce — fired and blocked both live ClickUp calls. The
+  denied events carry `server.url: "https://mcp.clickup.com/mcp"`, resolved
+  from the matching entry's `tools[]` alone. The fallback has now executed
+  inside a live agent session; the mismatch was forced deliberately rather
+  than handed over by the platform. Evidence: `evidence/cloud-dogfood-6`.
+
+### Local dogfood 6: the same tap on a laptop, minus the connector's identity
+
+Everything above was measured in Claude Code **cloud** sessions. Local dogfood
+6 (2026-09-17, `evidence/local-dogfood-6/REPORT.md`) is the first run on a
+local machine. Read its scope literally: **one machine** — a Windows 11 host
+with a WSL2 Ubuntu distro — **two Claude Code surfaces on it**, the WSL2 CLI
+(`claude` 2.1.272 inside WSL) and the Desktop "Code" tab (Claude Code 2.1.271
+launched by the Desktop app on the Windows host), **one claude.ai account and
+organisation** (the first 12 hex characters of the sha256 of each surface's
+account UUID and organisation UUID match).
+Two surfaces on one laptop is not "local Claude Code". It is the only local
+evidence that exists. [observed]
+
+- **Recording works.** In a fresh WSL2 CLI session the hook recorded both live
+  `clickup_filter_tasks` attempts, hashed their arguments, and the store
+  verified PASS (5 events, signed head). `sessions` and `query` behaved.
+- **A tool-anchored deny works.** The session ran with
+  `{"tool": "^mcp__.*__clickup_filter_tasks$"}` and **both calls were
+  blocked** before execution — the model got
+  `mcp-recorder policy: df6-local: tool-anchored deny` twice, Claude Code
+  listed both under `permission_denials`, and no workspace data came back.
+  The recorded denies carry `error.type: "policy_denied"` and
+  `server.name: "claude_ai_ClickUp"`.
+- **A host-alias deny cannot work.** There is no `/tmp/mcp-config-*.json` on
+  that machine at all: none before a CLI session, none while one ran (polled
+  every 0.25 s), none after, and none in the Windows host's temp directories.
+  No claude.ai connector appears in any `mcpServers` map anywhere on it —
+  hosted connectors live in `remoteMcpServersConfig` inside a Desktop
+  session-metadata file that has no `mcpServers` key, and the Desktop chat
+  config's ClickUp entry is a stdio command with no `url`. Pointing
+  `MCP_RECORDER_MCP_CONFIG` at either file was tested directly and resolved
+  nothing.
+- **So `server.url` is absent on every local event**, no host alias is ever
+  derived, and PR #16's declared-tool fallback cannot run in a local session
+  on that machine. Only rules anchored to the tool can fire.
+- **The connector's name is surface-specific, within one account.** ClickUp is
+  `mcp__47d587b8-…__clickup_*` in the Desktop "Code" tab and
+  `mcp__claude_ai_ClickUp__clickup_*` in the WSL CLI on the same laptop on the
+  same day; cloud dogfood 4 saw `mcp__ClickUp__…` for the same connector. Any
+  rule, permission entry or allowlist anchored to the server segment is
+  therefore specific to one surface, not just to one session.
+
+What this does **not** say: that every local machine behaves this way, that
+macOS or a non-WSL Windows install behaves this way, or that the IDE extension
+does. It says that on the only local machine anyone here has measured, the
+config file the cloud path depends on does not exist, and a local policy that
+relies on it is relying on nothing.
 
 So this memo now claims pre-execution *visibility* and pre-execution *control*
-on Claude Code, both demonstrated live — with the resolution caveat above, and
-with the standing warning that the platform controls the naming convention on
-both sides and has already changed it twice.
+on Claude Code, both demonstrated live — with the resolution caveat above, with
+the local limits just described (recording yes, tool-anchored deny yes,
+host-alias deny no, `server.url` no), and with the standing warning that the
+platform controls the naming convention on both sides and has already changed
+it twice.
 
 ## Anthropic-provided controls and feeds
 
@@ -249,7 +314,7 @@ can ingest them as evidence sources but cannot replace them. [docs]
 
 | Option | Covers | Pre-execution control | Effort | Status |
 |---|---|---|---|---|
-| A. `mcp-recorder hook` (Claude Code hooks) | Claude Code CLI, IDE, Desktop Code tab, cloud sessions, Agent SDK; every `mcp__*` tool including connectors | The mechanism allows deny or rewrite per call from a policy file; the first live test of a deny (dogfood 4) did not fire, the second (dogfood 5, after PR #16) blocked all four attempts — see above | Done | Merged in PR #10; `hook install` writes the settings entries; recording proven live in dogfood 3, 4 and 5; enforcement proven live in dogfood 5 |
+| A. `mcp-recorder hook` (Claude Code hooks) | Claude Code CLI, IDE, Desktop Code tab, cloud sessions, Agent SDK; every `mcp__*` tool including connectors | The mechanism allows deny or rewrite per call from a policy file; the first live test of a deny (dogfood 4) did not fire, the second (dogfood 5, after PR #16) blocked all four attempts — see above. Locally, tool-anchored rules only: no connector origin is resolvable, so a host-alias rule cannot fire | Done | Merged in PR #10; `hook install` writes the settings entries; recording proven live in cloud dogfood 3, 4, 5 and 6 and in a local WSL2 CLI session (local dogfood 6); enforcement proven live in cloud dogfood 5 and 6, and locally in the tool-anchored form only |
 | B. Local bridge (`setup --bridge`, `mcp-remote`) | Claude Desktop and Claude Code for vendors with public MCP endpoints, when the user replaces the directory connector | Yes, through the stdio proxy (gateway mode, merged in PR #8) | Done | Merged in PR #9; user re-authorises through the bridge |
 | C. Hosted recording gateway as a custom connector | claude.ai web, Desktop chat, Cowork, Claude Code, for vendors with public MCP endpoints (Google, Slack, ClickUp; not GitHub) | Yes, at our gateway | High: OAuth 2.1 authorisation server toward Claude (metadata, PKCE, claude.ai callback, sub-10-second token endpoint), OAuth client per vendor with an encrypted per-user token vault (the MCP spec forbids token passthrough), multi-tenant public HTTPS host reachable from Anthropic's egress range, plus the evidence sink | Not started. This is the product-shaped option: every incumbent gateway logs to a conventional store; the tamper-evident chain is the differentiator |
 | D. Ingest Anthropic feeds (inference-hook receiver, Compliance API puller, OTel collector) | Everything the feeds cover, including claude.ai web | Inference hooks: stop the next turn; others: none | Medium: an HTTPS receiver that seals each frame into the chain; a poller; an OTLP endpoint | Not started; Enterprise customers only |
@@ -259,11 +324,15 @@ can ingest them as evidence sources but cannot replace them. [docs]
 
 ## Recommendation
 
-1. **Ship A and prove it** (shipped; visibility proven in dogfood 3, 4 and
-   5; enforcement disproven in dogfood 4 and then proven in dogfood 5): every
-   Claude Code surface gets pre-execution visibility over connector calls
-   today, with nothing from Anthropic, and a deny rule written against the
-   tool rather than the server segment now blocks one.
+1. **Ship A and prove it** (shipped; visibility proven in cloud dogfood 3, 4,
+   5 and 6 and on one local machine in local dogfood 6; enforcement disproven
+   in dogfood 4 and then proven in dogfood 5, 6 and locally): every Claude
+   Code surface measured so far gets pre-execution visibility over connector
+   calls today, with nothing from Anthropic, and a deny rule written against
+   the tool rather than the server segment blocks one — cloud or local. A rule
+   written against a *host alias* blocks in a cloud session and cannot fire on
+   a local one, so write policies the tool-anchored way and treat the alias as
+   a cloud-only convenience.
 2. **Decide on C.** It is the only path to visibility and control on
    claude.ai web, Desktop chat and Cowork without an Enterprise contract, and
    it is a real product: a hosted gateway that is an OAuth 2.1 authorisation
@@ -295,6 +364,8 @@ and ClickUp audit-log and MCP documentation. MCP: authorization
 specification (token passthrough forbidden). Observations: this
 repository's cloud dogfood sessions (`evidence/cloud-dogfood-2`,
 `evidence/cloud-dogfood-3`, and `evidence/cloud-dogfood-4`, whose `REPORT.md`
-and 62-event signed bundle are the source for the dogfood 4 section above)
-and the connector wiring found in `/tmp/mcp-config-<session>.json` inside a
-Claude Code cloud session.
+and 62-event signed bundle are the source for the dogfood 4 section above;
+`evidence/cloud-dogfood-5` and `evidence/cloud-dogfood-6` for the later two),
+the connector wiring found in `/tmp/mcp-config-<session>.json` inside a
+Claude Code cloud session, and `evidence/local-dogfood-6/REPORT.md` — the one
+run on a local machine, and the source for every local claim above.

@@ -132,3 +132,43 @@ export interface ScrubbedArgv {
  * so a blast-radius `query` for the leaked value still finds it.
  */
 export declare function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv;
+/**
+ * Cap on fingerprints derived from the ENVIRONMENT alone. Deliberately
+ * separate from (and lower than) the caller's overall cap, so a wrapped
+ * server with dozens of credential-shaped env vars cannot crowd out an
+ * argv/URL-derived fingerprint (P2 fix; see `MAX_CREDENTIAL_FINGERPRINTS` in
+ * src/proxy/stdio.ts).
+ */
+export declare const ENV_CREDENTIAL_FINGERPRINT_CAP = 32;
+/**
+ * Is this environment variable part of the RECORDER's own configuration?
+ *
+ * Such a variable is never fingerprinted. `identity.credential_fingerprints`
+ * exists to answer "which sessions saw this secret" for secrets the AGENT and
+ * the wrapped server were exposed to; the recorder's own configuration is not
+ * that. `MCP_RECORDER_SINK_TOKEN` is the clearest case and the reason this
+ * function exists: it is the transport credential the shipper authenticates
+ * to the evidence sink with, the agent never sees it, a blast-radius query
+ * for it answers nothing anyone needs — and, before this exclusion, its ref
+ * was stamped on EVERY recorded event and then shipped to the receiver that
+ * accepts that very token. Refs are unsalted by design (see
+ * `Redactor.hashString` / `sha256Ref`), so for a low-entropy token that ref
+ * is recoverable by brute force: the sink was being handed a reversible copy
+ * of its own bearer token, on every event. `MCP_RECORDER_SINK_TOKEN_FILE` is
+ * the same family (its value is where the token lives), and so is anything
+ * else added to `ENV` later — which is why this matches the whole namespace
+ * rather than a list of names that a future variable would silently escape.
+ */
+export declare function isRecorderOwnEnvVar(name: string): boolean;
+/**
+ * THE one place environment variables become `CredentialFingerprint`s.
+ *
+ * Every recording surface that wants env-derived fingerprints calls this
+ * rather than walking `env` itself, so the exclusion above cannot be lost by
+ * a new call site: a later filter over the assembled list would be, since
+ * nothing forces a new caller through it.
+ *
+ * Never throws — it is on a fail-open path; a hashing failure degrades to
+ * "fewer fingerprints", never to a broken session.
+ */
+export declare function collectEnvCredentialFingerprints(env: NodeJS.ProcessEnv, redactor: RedactorLike, cap?: number): CredentialFingerprint[];

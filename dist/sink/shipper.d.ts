@@ -31,6 +31,15 @@
  * Every terminal condition here STALLS LOUDLY rather than degrading quietly.
  * The sender must NEVER skip a seq: a gap at the receiver makes everything
  * after it unverifiable forever, which is far worse than a visible stall.
+ *
+ * AND IT VERIFIES ITS OWN CHAIN BEFORE EXTENDING THE RECEIVER'S. Reading
+ * forward from the receiver's cursor says nothing about the records behind
+ * it: local dogfood 6 rewrote seq 7 of a copied data dir, shipped seq 12-22
+ * from it unchallenged, and the HONEST store was the one that then got the
+ * `chain_fork` 409 and the "history was rewritten" alert. So every batch is
+ * now gated on a recomputation of this store's own chain from seq 1 through
+ * the last record of that batch — once per process for the history, then
+ * incrementally. See src/sink/selfcheck.ts for the cost argument.
  */
 import type { ChainRecord, HeadSignature } from '../schema/events.js';
 import type { EvidenceStore, SignerLike } from '../types.js';
@@ -69,6 +78,8 @@ export interface ShipperOpts {
     gzipThresholdBytes?: number;
     /** Test seam: stop after this many POST attempts. */
     maxPosts?: number;
+    /** Records per self-check window; see SELF_CHECK_WINDOW. */
+    selfCheckWindow?: number;
 }
 export interface ShipperResult {
     state: ShipState;

@@ -132,7 +132,7 @@ import { setRegexGuardDiag, warmRegexGuard } from '../policy/regex-guard.js';
 import { normalizePolicy } from '../policy/types.js';
 import { planSpawn, spawnWrapped, terminateChild, withNodeDirOnPath } from './spawn.js';
 import { SCHEMA } from '../schema/events.js';
-import { STRUCTURAL_STRING_MAX_LEN, scrubArgv, scrubToolArguments, structuralString, } from '../redact/redactor.js';
+import { STRUCTURAL_STRING_MAX_LEN, collectEnvCredentialFingerprints, scrubArgv, scrubToolArguments, structuralString, } from '../redact/redactor.js';
 import { LineScanner } from './framing.js';
 const NL = 0x0a;
 /** Explicit rule ids (`ID_PATTERN`) and the auto-assigned `rule[<i>]` survive as-is. */
@@ -808,7 +808,6 @@ function boundedCanonicalJson(value, depth = 0, capped) {
     }
     throw new TypeError(`boundedCanonicalJson: unsupported type ${t}`);
 }
-const CREDENTIAL_NAME_RE = /(TOKEN|SECRET|PASSW|API[_-]?KEY|CREDENTIAL|AUTH)/i;
 const RUNNERS = new Set(['node', 'npx', 'tsx', 'bun', 'deno', 'bunx']);
 // Runner flags with no value (skipped outright) vs. flags that consume the
 // next argv token as their value (that token is skipped too).
@@ -964,13 +963,13 @@ function invalidRequestResponse(id, message) {
 // contended store delays session_end rather than losing it.
 const CLOSE_TIMEOUT_MS = 8_000;
 /**
- * Credential-fingerprint caps (P2 fix): env-derived fingerprints are capped
- * on their own so a wrapped server with many credential-shaped env vars
- * cannot fill the whole budget and silently crowd out argv/URL-derived
- * fingerprints pushed afterward — those must always have room to append, up
- * to the overall total below.
+ * Overall credential-fingerprint cap. Env-derived fingerprints are capped on
+ * their own, and lower (`ENV_CREDENTIAL_FINGERPRINT_CAP` in the redactor),
+ * so a wrapped server with many credential-shaped env vars cannot fill the
+ * whole budget and silently crowd out the argv/URL-derived fingerprints
+ * pushed afterward — those must always have room to append, up to this total
+ * (P2 fix).
  */
-const ENV_CREDENTIAL_FINGERPRINT_CAP = 32;
 const MAX_CREDENTIAL_FINGERPRINTS = 64;
 /** result_hash for a synthesized "unanswered" event: sha256 of canonical `null`. */
 const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
@@ -1065,22 +1064,17 @@ export async function runStdioProxy(opts) {
     }
     const initialServerName = opts.serverName || deriveServerName(opts.command);
     const fingerprint = sha256Ref(`${osUser}\0${host}\0${opts.identityLabel || ''}\0${initialServerName}`);
-    // P2 fix: env-derived fingerprints are capped at ENV_CREDENTIAL_FINGERPRINT_CAP
-    // on their own (not the shared total), reserving room below the overall
-    // MAX_CREDENTIAL_FINGERPRINTS cap for argv/URL-derived fingerprints so
-    // those are never silently dropped just because env filled the budget
-    // first.
+    // Env-derived fingerprints come from the redactor's single collector, which
+    // owns the whole policy: the credential-name shape, the value-length floor,
+    // its own cap (reserving room below MAX_CREDENTIAL_FINGERPRINTS for the
+    // argv/URL-derived fingerprints pushed afterward, P2 fix), and the
+    // exclusion of the recorder's OWN configuration variables —
+    // MCP_RECORDER_SINK_TOKEN and its family are never fingerprinted, because
+    // the agent never sees them and the sink would otherwise be shipped a
+    // reversible copy of its own bearer token on every event.
     const credentialFingerprints = [];
     try {
-        for (const [name, value] of Object.entries(env)) {
-            if (credentialFingerprints.length >= ENV_CREDENTIAL_FINGERPRINT_CAP)
-                break;
-            if (typeof value !== 'string' || value.length < 8)
-                continue;
-            if (!CREDENTIAL_NAME_RE.test(name))
-                continue;
-            credentialFingerprints.push({ name, ref: redactor.hashString(value) });
-        }
+        credentialFingerprints.push(...collectEnvCredentialFingerprints(env, redactor));
     }
     catch (err) {
         tapError(err);
