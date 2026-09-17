@@ -1,0 +1,23 @@
+# Gateway policy for cloud dogfood 5, applied to the LOCAL stdio servers in
+# .mcp.json (corp-notes, repo-filesystem) via scripts/dogfood-wrap.sh.
+#
+# Hosted connectors (ClickUp, Gmail, Drive, Calendar) cannot be wrapped this
+# way — Claude Code speaks to them over its own relay, which is why the hook
+# tap exists. Those are covered by .claude/dogfood5-policy.json instead.
+#
+# This is the first dogfood to run gateway mode in a live agent session at
+# all: every earlier gateway test drove a synthetic client.
+version: 1
+name: dogfood-5
+
+mcp:
+  default: allow
+  rules:
+    - id: no-exfil
+      match:
+        tool: [http_post, "send_*"]
+      action: deny
+      reason: dogfood-5 gateway deny — outbound HTTP from an agent is not allowed
+  boundary:
+    secrets: redact
+    injection: flag

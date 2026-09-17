@@ -1,0 +1,13 @@
+{
+  "deny": [
+    {
+      "tool": "^mcp__mcp\\.clickup\\.com__clickup_filter_tasks$",
+      "reason": "dogfood-5 route A: HOST-ALIAS ONLY. This spelling exists only if the hook resolved this connector's origin from the session's MCP config. In dogfood 4 it did not resolve (the config was UUID-keyed while the tool name was friendly) and this rule silently missed. If it fires now, the declared-tool fallback works against a live connector."
+    },
+    {
+      "tool": "^mcp__.*__clickup_get_workspace_members$",
+      "reason": "dogfood-5 route B: TOOL-ANCHORED, server segment left open. This is the shape docs/hooks.md now tells operators to write. It must fire regardless of how this session spells the server segment or keys its config."
+    }
+  ],
+  "default": "allow"
+}

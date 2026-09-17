@@ -4,18 +4,27 @@
       "command": "sh",
       "args": [
         "scripts/dogfood-wrap.sh",
-        "--name", "corp-notes",
+        "--name",
+        "corp-notes",
+        "--policy",
+        ".claude/dogfood5-gateway.yaml",
         "--",
-        "npx", "tsx", "demo/server.ts"
+        "npx",
+        "tsx",
+        "demo/server.ts"
       ]
     },
     "repo-filesystem": {
       "command": "sh",
       "args": [
         "scripts/dogfood-wrap.sh",
-        "--name", "repo-filesystem",
+        "--name",
+        "repo-filesystem",
         "--",
-        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
       ]
     }
   }
