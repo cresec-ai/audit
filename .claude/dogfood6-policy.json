@@ -1,0 +1,13 @@
+{
+  "deny": [
+    {
+      "tool": "^mcp__mcp\\.clickup\\.com__clickup_filter_tasks$",
+      "reason": "dogfood-6 route A: HOST-ALIAS ONLY. Under the FORCED MISMATCH config this alias can only exist if the declared-tool fallback (PR #16 route 2) resolved the connector. Route 1 cannot produce it. If this fires, route 2 has finally run live."
+    },
+    {
+      "tool": "^mcp__.*__clickup_get_workspace_members$",
+      "reason": "dogfood-6 route B: TOOL-ANCHORED control. Needs no resolution at all, so it must fire whatever happens to route 1 or 2. If B fires and A does not, resolution failed and the control still held."
+    }
+  ],
+  "default": "allow"
+}

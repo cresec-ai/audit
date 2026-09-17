@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node dist/cli.js hook --data-dir .mcp-recorder"
+            "command": "MCP_RECORDER_MCP_CONFIG=.mcp-recorder/forced-mismatch-config.json MCP_RECORDER_SINK=http://127.0.0.1:8787 MCP_RECORDER_SINK_TOKEN=dogfood6-ingest NO_PROXY=127.0.0.1 node dist/cli.js hook --data-dir .mcp-recorder --policy .claude/dogfood6-policy.json"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node dist/cli.js hook --data-dir .mcp-recorder"
+            "command": "MCP_RECORDER_MCP_CONFIG=.mcp-recorder/forced-mismatch-config.json MCP_RECORDER_SINK=http://127.0.0.1:8787 MCP_RECORDER_SINK_TOKEN=dogfood6-ingest NO_PROXY=127.0.0.1 node dist/cli.js hook --data-dir .mcp-recorder --policy .claude/dogfood6-policy.json"
           }
         ]
       }
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node dist/cli.js hook --data-dir .mcp-recorder"
+            "command": "MCP_RECORDER_MCP_CONFIG=.mcp-recorder/forced-mismatch-config.json MCP_RECORDER_SINK=http://127.0.0.1:8787 MCP_RECORDER_SINK_TOKEN=dogfood6-ingest NO_PROXY=127.0.0.1 node dist/cli.js hook --data-dir .mcp-recorder --policy .claude/dogfood6-policy.json"
           }
         ]
       }
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node dist/cli.js hook --data-dir .mcp-recorder"
+            "command": "MCP_RECORDER_MCP_CONFIG=.mcp-recorder/forced-mismatch-config.json MCP_RECORDER_SINK=http://127.0.0.1:8787 MCP_RECORDER_SINK_TOKEN=dogfood6-ingest NO_PROXY=127.0.0.1 node dist/cli.js hook --data-dir .mcp-recorder --policy .claude/dogfood6-policy.json"
           }
         ]
       }
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node dist/cli.js hook --data-dir .mcp-recorder"
+            "command": "MCP_RECORDER_MCP_CONFIG=.mcp-recorder/forced-mismatch-config.json MCP_RECORDER_SINK=http://127.0.0.1:8787 MCP_RECORDER_SINK_TOKEN=dogfood6-ingest NO_PROXY=127.0.0.1 node dist/cli.js hook --data-dir .mcp-recorder --policy .claude/dogfood6-policy.json"
           }
         ]
       }

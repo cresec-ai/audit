@@ -1,0 +1,13 @@
+version: 1
+name: dogfood-6
+mcp:
+  default: allow
+  rules:
+    - id: no-exfil
+      match:
+        tool: [http_post, "send_*"]
+      action: deny
+      reason: dogfood-6 gateway deny — outbound HTTP from an agent is not allowed
+  boundary:
+    secrets: redact
+    injection: flag

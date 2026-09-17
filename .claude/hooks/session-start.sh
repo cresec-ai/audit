@@ -8,4 +8,5 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
-exec sh "$CLAUDE_PROJECT_DIR/scripts/bootstrap.sh"
+sh "$CLAUDE_PROJECT_DIR/scripts/bootstrap.sh"
+exec sh "$CLAUDE_PROJECT_DIR/scripts/dogfood6-setup.sh"
