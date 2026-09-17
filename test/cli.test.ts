@@ -388,15 +388,6 @@ function seedHookSession(dataDir: string, sessionId: string): void {
 function seedGatewaySession(dataDir: string, sessionId: string): void {
   const at = (s: number): string => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
   const envelope = (timestamp: string) => ({
- * Seed a jsonl store with one session that recorded its session_end and then
- * KEPT RECORDING — the shape a Claude Code session resumed under the same
- * session_id leaves behind (cloud dogfood 4: session_end at 07:59:20, tool
- * calls until 12:41:08). `sessions` must not present this as simply ENDED.
- */
-function seedReopenedSession(dataDir: string, sessionId: string): void {
-  const at = (h: number, m: number, sec: number): string =>
-    new Date(Date.UTC(2026, 0, 1, h, m, sec)).toISOString();
-  const call = (timestamp: string, tool: string, requestId: number): ToolCallEvent => ({
     schema: SCHEMA,
     event_id: fixtureEventId(),
     session_id: sessionId,
@@ -459,6 +450,35 @@ function seedReopenedSession(dataDir: string, sessionId: string): void {
       approval_id: 'a1b2c3d4-0000-4000-8000-000000000000',
       waited_ms: 1500,
     }),
+  ];
+  const store = openStore({ dataDir, backend: 'jsonl' });
+  try {
+    let head: ChainHead = { seq: 0, hash: GENESIS_HASH };
+    const records = events.map((event) => {
+      const record = makeRecord(head, event);
+      head = { seq: record.seq, hash: record.hash };
+      return record;
+    });
+    store.append(records);
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * Seed a jsonl store with one session that recorded its session_end and then
+ * KEPT RECORDING — the shape a Claude Code session resumed under the same
+ * session_id leaves behind (cloud dogfood 4: session_end at 07:59:20, tool
+ * calls until 12:41:08). `sessions` must not present this as simply ENDED.
+ */
+function seedReopenedSession(dataDir: string, sessionId: string): void {
+  const at = (h: number, m: number, sec: number): string =>
+    new Date(Date.UTC(2026, 0, 1, h, m, sec)).toISOString();
+  const call = (timestamp: string, tool: string, requestId: number): ToolCallEvent => ({
+    schema: SCHEMA,
+    event_id: fixtureEventId(),
+    session_id: sessionId,
+    timestamp,
     kind: 'tool_call',
     identity: FIXTURE_IDENTITY,
     server: FIXTURE_SERVER,
@@ -669,10 +689,8 @@ describe('mcp-recorder CLI', () => {
     expect(human.code).toBe(0);
     const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
     const headers = headerLine!.trim().split(/\s+/);
-    // SERVERS and DECISIONS were appended, in that order: every column that
-    // existed before them keeps its position.
-    // New columns are appended LAST: every column that existed before them
-    // keeps its position.
+    // SERVERS, DECISIONS and LAST_EVENT were appended, in that order: every
+    // column that existed before them keeps its position.
     expect(headers).toEqual([
       'SESSION',
       'STARTED',
@@ -721,10 +739,6 @@ describe('mcp-recorder CLI', () => {
     const dataDir = tmpDir('mcp-rec-sessions-gateway-');
     const sessionId = 'dddddddd-0000-4000-8000-000000000000';
     seedGatewaySession(dataDir, sessionId);
-  it('sessions: a session whose events continue past its session_end reads (reopened), not ENDED', async () => {
-    const dataDir = tmpDir('mcp-rec-sessions-reopened-');
-    const sessionId = 'dddddddd-0000-4000-8000-000000000000';
-    seedReopenedSession(dataDir, sessionId);
 
     const human = await runCli(['sessions', '--data-dir', dataDir]);
     expect(human.code).toBe(0);
@@ -740,6 +754,35 @@ describe('mcp-recorder CLI', () => {
     expect(cell('TOOL_CALLS')).toBe('3'); // allowed + the denied call's synthetic response + approved
     expect(cell('ERRORS')).toBe('1'); // only the denied one
 
+    const json = await runCli(['sessions', '--data-dir', dataDir, '--json']);
+    expect(json.code).toBe(0);
+    const list = JSON.parse(json.stdout) as Array<{
+      session_id: string;
+      policy_decision_count: number;
+      tool_call_count: number;
+      error_count: number;
+    }>;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      session_id: sessionId,
+      policy_decision_count: 2,
+      tool_call_count: 3,
+      error_count: 1,
+    });
+  }, 60_000);
+
+  it('sessions: a session whose events continue past its session_end reads (reopened), not ENDED', async () => {
+    const dataDir = tmpDir('mcp-rec-sessions-reopened-');
+    const sessionId = 'dddddddd-0000-4000-8000-000000000000';
+    seedReopenedSession(dataDir, sessionId);
+
+    const human = await runCli(['sessions', '--data-dir', dataDir]);
+    expect(human.code).toBe(0);
+    const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
+    const headers = headerLine!.trim().split(/\s+/);
+    expect(rowLines).toHaveLength(1);
+    const cells = rowLines[0]!.trim().split(/\s+/);
+    const cell = (name: string): string => cells[headers.indexOf(name)]!;
     // The session_end at 07:59:20 was superseded by later events, so it is
     // NOT printed as an end time — printing it invites "ended at 07:59:20,
     // so the 5 events must be stale", which is exactly the misreading cloud
@@ -758,9 +801,6 @@ describe('mcp-recorder CLI', () => {
     expect(json.code).toBe(0);
     const list = JSON.parse(json.stdout) as Array<{
       session_id: string;
-      policy_decision_count: number;
-      tool_call_count: number;
-      error_count: number;
       started_at: string;
       ended_at?: string;
       last_event_at?: string;
@@ -769,9 +809,6 @@ describe('mcp-recorder CLI', () => {
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({
       session_id: sessionId,
-      policy_decision_count: 2,
-      tool_call_count: 3,
-      error_count: 1,
       started_at: '2026-01-01T07:00:00.000Z',
       ended_at: '2026-01-01T07:59:20.000Z',
       last_event_at: '2026-01-01T12:41:08.000Z',
