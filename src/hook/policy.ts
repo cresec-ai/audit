@@ -107,10 +107,27 @@ export function parsePolicy(text: string): CompiledPolicy {
 
 export interface LoadPolicyResult {
   policy: CompiledPolicy | null;
-  /** Set only when `path` was given but could not be read or parsed —
-   *  the caller should surface this to stderr; `policy: null` still means
-   *  "allow everything" either way. */
+  /** Set only when `path` was given but could not be read or parsed. */
   warning?: string;
+  /**
+   * `--policy` was given and could not be turned into a decision.
+   *
+   * This is the one case where `policy: null` does NOT mean "allow
+   * everything". Recording is fail-open; ENFORCEMENT is fail-closed, and an
+   * operator who passed `--policy` asked for enforcement. Allowing every call
+   * because the file has a typo is the failure mode where a security control
+   * is off and the only symptom is a line on stderr that nobody reads —
+   * measured on this project as exactly how a documented deny silently did
+   * nothing for two days (docs/roadmap.md, dogfood 4).
+   *
+   * `record --policy` already fails closed by exiting 2 before the server is
+   * spawned. The hook cannot exit non-zero without breaking the session, so
+   * it denies instead. That is recoverable: the default matcher is `mcp__.*`,
+   * so Bash and Edit keep working and the operator can fix the file. With
+   * `--all-tools` it is not, and `MCP_RECORDER_DISABLE=1` is the documented
+   * way out.
+   */
+  unusable?: boolean;
 }
 
 /** Load a policy file from disk. `path: undefined` means "no policy
@@ -122,13 +139,21 @@ export function loadPolicy(path: string | undefined): LoadPolicyResult {
     text = readFileSync(path, 'utf8');
   } catch (cause) {
     const msg = cause instanceof Error ? cause.message : String(cause);
-    return { policy: null, warning: `--policy ${path} could not be read (${msg}); allowing all tool calls` };
+    return {
+      policy: null,
+      unusable: true,
+      warning: `--policy ${path} could not be read (${msg}); DENYING every tool call it governs until it can be`,
+    };
   }
   try {
     return { policy: parsePolicy(text) };
   } catch (cause) {
     const msg = cause instanceof Error ? cause.message : String(cause);
-    return { policy: null, warning: `--policy ${path} is invalid (${msg}); allowing all tool calls` };
+    return {
+      policy: null,
+      unusable: true,
+      warning: `--policy ${path} is invalid (${msg}); DENYING every tool call it governs until it is fixed`,
+    };
   }
 }
 

@@ -267,10 +267,15 @@ export async function runHook(stdinText, opts) {
                     ? input.tool_use_id
                     : computeFallbackRequestId(sessionId, toolName, input.tool_input);
                 if (eventName === 'PreToolUse') {
-                    const { policy, warning } = loadPolicy(opts.policyPath);
+                    const { policy, warning, unusable } = loadPolicy(opts.policyPath);
                     if (warning !== undefined)
                         diagStderr(warning);
-                    const decision = evaluatePolicy(policy, toolName, policyAlias);
+                    // A policy that cannot be evaluated denies. See `unusable` in
+                    // ./policy.ts for why this is the one place the hook is not
+                    // fail-open, and why denying is recoverable.
+                    const decision = unusable === true
+                        ? { decision: 'deny', reason: 'the policy file could not be loaded, so nothing can be evaluated' }
+                        : evaluatePolicy(policy, toolName, policyAlias);
                     const isDenied = decision.decision === 'deny';
                     const attributes = {
                         'gen_ai.operation.name': 'execute_tool',

@@ -4,8 +4,9 @@
  *
  * Schema validation (`schema.ts` via `jsonschema.ts`) covers shapes, enums,
  * identifier patterns, numeric ranges (hold timeout, boundary scan size),
- * upper-case methods, non-empty glob strings/lists and the "at least one of
- * mcp / egress" rule (a root `anyOf`, whose error is reworded here).
+ * upper-case methods, non-empty glob strings/lists, the discriminated union a
+ * credential `source` / `host` / `path` is, and the "at least one of mcp /
+ * credentials / egress" rule (a root `anyOf`, whose error is reworded here).
  *
  * Semantic checks add what JSON Schema (in our keyword subset) cannot say:
  * - duplicate rule ids within a section;
@@ -29,7 +30,13 @@
  *   not;
  * - globs are not blank and use neither `[ ] { } \`, which OPA's glob library
  *   interprets and ours does not, nor `?`, which both interpret but not the
- *   same way (OPA's `?` is ASCII-only).
+ *   same way (OPA's `?` is ASCII-only);
+ * - `credentials` entries hold together: ids unique within the section and
+ *   site ids within their credential, dot-paths well-formed, every path a
+ *   source names absolute (a relative one resolves against the CLIENT's
+ *   working directory), a `github-app` with exactly one private-key
+ *   spelling, and a destination that is not read from the same argument the
+ *   credential is about to overwrite.
  *
  * Every error keeps an RFC 6901 pointer (`/mcp/rules/1/match/tool`).
  */

@@ -19,6 +19,11 @@ import {
   VALUE_TOO_LONG,
   SUPPORTED_KEYWORDS,
   autoRuleId,
+  autoUseId,
+  credentialTrustProblems,
+  credentialUseId,
+  fileTrustFrom,
+  policyFileTrust,
   checkCatastrophicShape,
   checkGlob,
   checkProvablyLinear,
@@ -50,7 +55,7 @@ import {
   validateAgainstSchema,
   validatePolicyObject,
 } from '../src/policy/index.js';
-import type { JsonSchema, Policy, PolicyError, PolicyInput } from '../src/policy/index.js';
+import type { Credential, JsonSchema, Policy, PolicyError, PolicyInput } from '../src/policy/index.js';
 
 const ROOT = join(__dirname, '..');
 const FIXTURES = join(ROOT, 'test', 'fixtures', 'policies');
@@ -142,7 +147,7 @@ describe('jsonschema: shipped schema', () => {
 
   it('collectKeywords does not mistake property names or enum values for keywords', () => {
     const used = collectKeywords(shipped);
-    for (const notKeyword of ['version', 'mcp', 'egress', 'tool', 'allow', 'hold', 'deny', 'mcpRule']) {
+    for (const notKeyword of ['version', 'mcp', 'credentials', 'egress', 'tool', 'allow', 'hold', 'deny', 'mcpRule']) {
       expect(used.has(notKeyword)).toBe(false);
     }
   });
@@ -156,7 +161,11 @@ describe('jsonschema: shipped schema', () => {
         expect(s.$ref.startsWith('#/$defs/'), `${where}: ${s.$ref}`).toBe(true);
         expect(defs[s.$ref.slice('#/$defs/'.length)], `${where}: ${s.$ref}`).toBeDefined();
       }
-      if (s.type === 'object' && s.$ref === undefined && where !== '$.$defs.mcpMatch.properties.args') {
+      // Two schemas are deliberately open: both are maps whose KEYS the
+      // author chooses (arg dot-path -> regex, permission name -> level), so
+      // there is no property list to close them against.
+      const openMaps = ['$.$defs.mcpMatch.properties.args', '$.$defs.credentialSource.oneOf[3].properties.permissions'];
+      if (s.type === 'object' && s.$ref === undefined && !openMaps.includes(where)) {
         expect(s.additionalProperties, `${where} lacks additionalProperties:false`).toBe(false);
       }
       for (const [k, v] of Object.entries(s)) {
@@ -372,13 +381,13 @@ describe('validatePolicyObject: error paths', () => {
     expectError(errorsFor((d) => (erule0(d).match.max_args_bytes = 1)), '/egress/rules/0/match/max_args_bytes', 'additionalProperties');
   });
 
-  it('at least one of mcp / egress is required (friendly message)', () => {
+  it('at least one of mcp / credentials / egress is required (friendly message)', () => {
     const errors = errorsFor((d) => {
       delete d.mcp;
       delete d.egress;
     });
-    expect(errors).toEqual([{ path: '', keyword: 'anyOf', message: 'at least one of "mcp" or "egress" is required' }]);
-    expect(formatPolicyErrors(errors)).toBe('/: at least one of "mcp" or "egress" is required');
+    expect(errors).toEqual([{ path: '', keyword: 'anyOf', message: 'at least one of "mcp", "credentials" or "egress" is required' }]);
+    expect(formatPolicyErrors(errors)).toBe('/: at least one of "mcp", "credentials" or "egress" is required');
   });
 
   it('mcp section shape', () => {
@@ -1153,6 +1162,329 @@ describe('loadPolicyFile', () => {
   it('parsePolicyText parses inline text for both sources', () => {
     expect(parsePolicyText('version: 1\n', 'yaml', 'x')).toEqual({ version: 1 });
     expect(parsePolicyText('{"version": 1}', 'json', 'x')).toEqual({ version: 1 });
+  });
+});
+
+/* ------------------------------ credentials ------------------------------- */
+
+type Mutable = Record<string, unknown>;
+
+/** The smallest credentials document that is actually safe: one credential, one destination-bound site. */
+function credentialsDoc(): Mutable {
+  return {
+    version: 1,
+    credentials: [
+      {
+        id: 'github-issues',
+        source: { type: 'env', var: 'GITHUB_TOKEN' },
+        use: [{ tool: 'http_post', arg: 'headers.Authorization', host: { from_arg: 'url', allow: ['api.github.com'] } }],
+      },
+    ],
+  };
+}
+
+/** `mutate` gets the first credential, its first use site and the whole document. */
+function credsMutated(mutate: (credential: Mutable, use: Mutable, doc: Mutable) => void): Mutable {
+  const doc = credentialsDoc();
+  const credential = (doc.credentials as Mutable[])[0] as Mutable;
+  const use = (credential.use as Mutable[])[0] as Mutable;
+  mutate(credential, use, doc);
+  return doc;
+}
+
+function credErrors(mutate: (credential: Mutable, use: Mutable, doc: Mutable) => void): PolicyError[] {
+  const doc = credsMutated(mutate);
+  const result = validatePolicyObject(doc);
+  expect(result.ok, `expected validation to fail for ${JSON.stringify(doc)}`).toBe(false);
+  return result.ok ? [] : result.errors;
+}
+
+function credPolicy(mutate: (credential: Mutable, use: Mutable, doc: Mutable) => void = () => {}): Policy {
+  const result = validatePolicyObject(credsMutated(mutate));
+  if (!result.ok) throw new Error(formatPolicyErrors(result.errors));
+  return result.policy;
+}
+
+function firstCredential(mutate: (credential: Mutable, use: Mutable, doc: Mutable) => void = () => {}): Credential {
+  return credPolicy(mutate).credentials![0]!;
+}
+
+describe('credentials: the section as a whole', () => {
+  it('stands on its own at the root, and the anyOf message names all three sections', () => {
+    expect(validatePolicyObject(credentialsDoc()).ok).toBe(true);
+    const bare = validatePolicyObject({ version: 1 });
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.errors[0]!.message).toBe('at least one of "mcp", "credentials" or "egress" is required');
+  });
+
+  it('rejects an empty list, and unknown keys at every level', () => {
+    expectError(credErrors((_c, _u, doc) => (doc.credentials = [])), '/credentials', 'minItems');
+    expectError(credErrors((c) => (c.provider_name = 'github')), '/credentials/0/provider_name', 'additionalProperties');
+    expectError(credErrors((_c, u) => (u.args = { x: 'y' })), '/credentials/0/use/0/args', 'additionalProperties');
+    // A typo in a SOURCE cannot be reported per-key: the source is a
+    // discriminated union, so an unknown key means no branch matched.
+    expectError(credErrors((c) => ((c.source as Mutable).file = '/tmp/x')), '/credentials/0/source', 'oneOf');
+  });
+
+  it('requires an id, a source and at least one use site', () => {
+    expectError(credErrors((c) => delete c.id), '/credentials/0', 'required');
+    expectError(credErrors((c) => delete c.source), '/credentials/0', 'required');
+    expectError(credErrors((c) => (c.use = [])), '/credentials/0/use', 'minItems');
+  });
+
+  it('holds is not a credential action in v1, and deny is the only on_unresolved', () => {
+    // Both refusals exist because the gateway has no code behind the value:
+    // a held credential would have to resolve AFTER the human answers, and
+    // "forward anyway" would forward the synthetic to the upstream.
+    expectError(credErrors((_c, u) => (u.action = 'hold')), '/credentials/0/use/0/action', 'enum');
+    expect(credPolicy((_c, u) => (u.action = 'deny')).credentials![0]!.use[0]!.action).toBe('deny');
+    expectError(credErrors((c) => (c.on_unresolved = 'allow')), '/credentials/0/on_unresolved', 'enum');
+  });
+});
+
+describe('credentials: the destination has to be constrained', () => {
+  it('a swap site with no host is a validation error, not a default-allow', () => {
+    // The whole point of destination binding: a policy that allows
+    // `http_post` with a credential in headers.Authorization and says nothing
+    // about where it goes authorises attacker.example exactly as happily as
+    // api.github.com, and the destination is the agent's to choose.
+    expectError(credErrors((_c, u) => delete u.host), '/credentials/0/use/0', 'required', /"host"/);
+  });
+
+  it('accepts exactly the three host forms and nothing in between', () => {
+    expect(firstCredential((_c, u) => (u.host = { fixed: 'api.github.com' })).use[0]!.host).toEqual({
+      from: 'declared',
+      host: 'api.github.com',
+    });
+    expect(firstCredential((_c, u) => (u.host = { from: 'server' })).use[0]!.host).toEqual({ from: 'server_name' });
+    // An argument-derived host without its allow-list is the unconstrained
+    // case wearing a different hat, so the schema does not admit it.
+    expectError(credErrors((_c, u) => (u.host = { from_arg: 'url' })), '/credentials/0/use/0/host', 'oneOf');
+    expectError(credErrors((_c, u) => (u.host = {})), '/credentials/0/use/0/host', 'oneOf');
+    expectError(credErrors((_c, u) => (u.host = { from_arg: 'url', allow: ['a.b'], fixed: 'a.b' })), '/credentials/0/use/0/host', 'oneOf');
+    expectError(credErrors((_c, u) => (u.host = { from: 'tool' })), '/credentials/0/use/0/host', 'oneOf');
+    expectError(credErrors((_c, u) => (u.host = { fixed: 'https://api.github.com/x' })), '/credentials/0/use/0/host', 'oneOf');
+  });
+
+  it('will not read the destination out of the argument it is about to overwrite', () => {
+    expectError(
+      credErrors((_c, u) => ((u.host as Mutable).from_arg = u.arg)),
+      '/credentials/0/use/0/host/from_arg',
+      'credentialSite',
+      /same argument the credential is spliced into/,
+    );
+  });
+
+  it('runs host, path, server and tool through the SAME glob and dot-path checks as mcp', () => {
+    expectError(credErrors((_c, u) => ((u.host as Mutable).allow = ['api.?ithub.com'])), '/credentials/0/use/0/host/allow/0', 'glob', /\? wildcard/);
+    expectError(credErrors((_c, u) => (u.tool = ['ok', ' '])), '/credentials/0/use/0/tool/1', 'glob', /empty or blank/);
+    expectError(credErrors((_c, u) => (u.server = '{a,b}')), '/credentials/0/use/0/server', 'glob', /reserved/);
+    expectError(credErrors((_c, u) => (u.arg = 'headers..Authorization')), '/credentials/0/use/0/arg', 'dotPath');
+    expectError(credErrors((_c, u) => ((u.host as Mutable).from_arg = 'a..b')), '/credentials/0/use/0/host/from_arg', 'dotPath');
+    expectError(credErrors((_c, u) => (u.path = { from_arg: '.x', allow: ['/**'] })), '/credentials/0/use/0/path/from_arg', 'dotPath');
+    expectError(credErrors((_c, u) => (u.path = { from_arg: 'list_id', allow: ['9?1'] })), '/credentials/0/use/0/path/allow/0', 'glob');
+  });
+});
+
+describe('credentials: sources', () => {
+  const sources: Record<string, Mutable> = {
+    env: { type: 'env', var: 'GITHUB_TOKEN' },
+    file: { type: 'file', path: '/etc/mcp-recorder/stripe.json', field: 'keys.restricted' },
+    exec: { type: 'exec', command: '/usr/bin/op', args: ['read', 'op://dev/npm/token'] },
+    'github-app': { type: 'github-app', app_id: '12345', installation_id: '67890', private_key_env: 'GH_APP_KEY', permissions: { issues: 'write' } },
+    'aws-sts': { type: 'aws-sts', role_arn: 'arn:aws:iam::123456789012:role/mcp-reader', region: 'eu-west-1', duration_seconds: 900 },
+    vault: { type: 'vault', path: 'secret/data/db', addr: 'https://openbao.internal:8200', token_env: 'VAULT_TOKEN' },
+    clickup: { type: 'clickup', team_id: '9012345678' },
+  };
+
+  it('accepts all seven in their minimal valid form', () => {
+    for (const [name, source] of Object.entries(sources)) {
+      const result = validatePolicyObject(credsMutated((c) => (c.source = source)));
+      expect(result.ok, `${name}: ${result.ok ? '' : formatPolicyErrors(result.errors)}`).toBe(true);
+    }
+    expectError(credErrors((c) => (c.source = { type: 'keychain', account: 'x' })), '/credentials/0/source', 'oneOf');
+  });
+
+  it('every path a source names must be absolute', () => {
+    // A relative path resolves against the recorder's working directory,
+    // which in a stdio deployment is wherever the CLIENT happened to launch.
+    expectError(credErrors((c) => (c.source = { type: 'file', path: 'stripe.json' })), '/credentials/0/source/path', 'absolutePath');
+    // And a bare command name resolves through PATH, which the agent writes.
+    expectError(credErrors((c) => (c.source = { type: 'exec', command: 'op', args: ['read'] })), '/credentials/0/source/command', 'absolutePath');
+    expectError(
+      credErrors((c) => (c.source = { type: 'github-app', app_id: '1', installation_id: '2', private_key_file: 'key.pem' })),
+      '/credentials/0/source/private_key_file',
+      'absolutePath',
+    );
+    for (const absolute of ['/etc/x.json', 'C:\\ProgramData\\x.json', '\\\\host\\share\\x.json']) {
+      expect(validatePolicyObject(credsMutated((c) => (c.source = { type: 'file', path: absolute }))).ok, absolute).toBe(true);
+    }
+  });
+
+  it('checks the per-source fields the schema cannot express', () => {
+    expectError(credErrors((c) => (c.source = { type: 'github-app', app_id: '1', installation_id: '2' })), '/credentials/0/source', 'source', /exactly one/);
+    expectError(
+      credErrors((c) => (c.source = { type: 'github-app', app_id: '1', installation_id: '2', private_key_env: 'K', private_key_file: '/k.pem' })),
+      '/credentials/0/source',
+      'source',
+      /not both/,
+    );
+    expectError(
+      credErrors((c) => (c.source = { type: 'github-app', app_id: '1', installation_id: '2', private_key_env: 'K', permissions: { issues: 'delete' } })),
+      '/credentials/0/source/permissions/issues',
+      'enum',
+    );
+    expectError(credErrors((c) => (c.source = { type: 'vault', path: 'p', addr: 'openbao.internal' })), '/credentials/0/source/addr', 'url');
+    expectError(credErrors((c) => (c.source = { type: 'vault', path: 'p', addr: 'file:///etc/passwd' })), '/credentials/0/source/addr', 'url');
+    expectError(credErrors((c) => (c.source = { type: 'env', var: 'GITHUB-TOKEN' })), '/credentials/0/source', 'oneOf');
+    expectError(credErrors((c) => (c.source = { type: 'aws-sts', role_arn: 'mcp-reader' })), '/credentials/0/source', 'oneOf');
+    // STS below its own 15-minute floor is a typo, not a shorter token.
+    expectError(credErrors((c) => (c.source = { type: 'aws-sts', role_arn: sources['aws-sts']!.role_arn, duration_seconds: 60 })), '/credentials/0/source', 'oneOf');
+  });
+});
+
+describe('credentials: normalization', () => {
+  it('fills the defaults the broker depends on, and quotes where each number comes from', () => {
+    const credential = firstCredential();
+    expect(credential.ttl_seconds).toBe(30); // NHI's BROKER_DEFAULT_TTL_SECONDS
+    expect(credential.timeout_ms).toBe(5000); // NHI's brokerclient HTTP timeout
+    expect(credential.on_unresolved).toBe('deny');
+    expect(credential.use[0]!.action).toBe('allow');
+    expect(credential.use[0]!.server).toEqual(['*']);
+    expect(credential.use[0]!.path).toEqual({ from: 'tool_name' });
+    expect(DEFAULTS.credential.ttl_seconds).toBe(30);
+    expect(DEFAULTS.credential.timeout_ms).toBe(5000);
+    // Per-source defaults: the vault key the control plane reads, the
+    // shortest session STS will mint, and ClickUp's usual variable.
+    expect(firstCredential((c) => (c.source = { type: 'vault', path: 'secret/data/db' })).source).toEqual({
+      type: 'vault',
+      path: 'secret/data/db',
+      field: 'token',
+    });
+    expect(firstCredential((c) => (c.source = { type: 'aws-sts', role_arn: 'arn:aws:iam::123456789012:role/r' })).source).toEqual({
+      type: 'aws-sts',
+      role_arn: 'arn:aws:iam::123456789012:role/r',
+      duration_seconds: 900,
+    });
+    expect(firstCredential((c) => (c.source = { type: 'clickup' })).source).toEqual({ type: 'clickup', token_env: 'CLICKUP_API_TOKEN' });
+    expect(firstCredential((c) => (c.source = { type: 'exec', command: '/usr/bin/op' })).source).toEqual({ type: 'exec', command: '/usr/bin/op', args: [] });
+  });
+
+  it('composes the recorded site id from the credential and the site', () => {
+    expect(firstCredential().use[0]!.id).toBe('github-issues/use[0]');
+    expect(autoUseId(3)).toBe('use[3]');
+    expect(credentialUseId('a', 'b')).toBe('a/b');
+    expect(firstCredential((_c, u) => (u.id = 'create-issue')).use[0]!.id).toBe('github-issues/create-issue');
+  });
+
+  it('scopes id uniqueness the way the composition does: per credential, per section', () => {
+    // Two credentials may both call a site `write` — the composed ids differ.
+    const twoCredentials = credPolicy((c, _u, doc) => {
+      const second = JSON.parse(JSON.stringify(c)) as Mutable;
+      second.id = 'clickup-api';
+      ((c.use as Mutable[])[0] as Mutable).id = 'write';
+      ((second.use as Mutable[])[0] as Mutable).id = 'write';
+      (doc.credentials as Mutable[]).push(second);
+    });
+    expect(twoCredentials.credentials!.map((c) => c.use[0]!.id)).toEqual(['github-issues/write', 'clickup-api/write']);
+    // Within one credential, and within the section, they may not.
+    expectError(
+      credErrors((c) => {
+        const site = JSON.parse(JSON.stringify((c.use as Mutable[])[0])) as Mutable;
+        site.id = 'write';
+        ((c.use as Mutable[])[0] as Mutable).id = 'write';
+        (c.use as Mutable[]).push(site);
+      }),
+      '/credentials/0/use/1/id',
+      'duplicateId',
+      /duplicate use site id/,
+    );
+    expectError(
+      credErrors((c, _u, doc) => (doc.credentials as Mutable[]).push(JSON.parse(JSON.stringify(c)) as Mutable)),
+      '/credentials/1/id',
+      'duplicateId',
+      /duplicate credential id/,
+    );
+    // The mcp/egress pointers did not move when the helper grew a base path.
+    const mcpDup = validatePolicyObject({
+      version: 1,
+      mcp: { rules: [{ id: 'r', match: { tool: 'a' }, action: 'allow' }, { id: 'r', match: { tool: 'b' }, action: 'deny' }] },
+    });
+    expect(mcpDup.ok).toBe(false);
+    if (!mcpDup.ok) expect(mcpDup.errors[0]!.path).toBe('/mcp/rules/1/id');
+  });
+
+  it('is pure and JSON-plain, like the rest of the normalized policy', () => {
+    const input: PolicyInput = {
+      version: 1,
+      credentials: [
+        {
+          id: 'c',
+          scopes: ['a'],
+          source: { type: 'exec', command: '/bin/true', args: ['x'] },
+          use: [{ tool: 't', arg: 'a', host: { from_arg: 'u', allow: ['h'] } }],
+        },
+      ],
+    };
+    const snapshot = JSON.stringify(input);
+    const policy = normalizePolicy(input);
+    input.credentials![0]!.scopes!.push('b');
+    (input.credentials![0]!.source as { args: string[] }).args.push('y');
+    expect(JSON.stringify(normalizePolicy(JSON.parse(snapshot) as PolicyInput))).toBe(JSON.stringify(policy));
+    expect(policy.credentials![0]!.scopes).toEqual(['a']);
+    expect((policy.credentials![0]!.source as { args: string[] }).args).toEqual(['x']);
+    expect(JSON.parse(JSON.stringify(policy))).toEqual(policy);
+  });
+
+  it('loads the credentials fixture end to end', () => {
+    const loaded = loadPolicyFile(join(FIXTURES, 'credentials.yaml'));
+    expect(loaded.policy.credentials!.map((c) => c.id)).toEqual(['github-issues', 'clickup-api', 'db-readonly', 'npm-publish', 'stripe-readonly']);
+    expect(loaded.policy.credentials![0]!.use.map((u) => u.id)).toEqual(['github-issues/no-deletes', 'github-issues/create-issue']);
+    expect(loaded.policy.credentials![2]!.ttl_seconds).toBe(0); // 0 means "do not cache the decision"
+  });
+});
+
+describe('credentials: who may write the policy file', () => {
+  const me = { uid: 501, gid: 20, groups: [20, 80] };
+
+  it('reads writability off the mode bits, and fails closed when it cannot read them', () => {
+    // Owner-writable and owned by us is the ordinary laptop case, and it is
+    // the one that matters: the recorder's uid is the agent's uid.
+    expect(fileTrustFrom({ uid: 501, gid: 20, mode: 0o100644 }, me).writableByThisUid).toBe(true);
+    expect(fileTrustFrom({ uid: 0, gid: 0, mode: 0o100644 }, me).writableByThisUid).toBe(false);
+    expect(fileTrustFrom({ uid: 0, gid: 0, mode: 0o100666 }, me).writableByThisUid).toBe(true);
+    expect(fileTrustFrom({ uid: 0, gid: 80, mode: 0o100664 }, me).writableByThisUid).toBe(true); // a group we are in
+    expect(fileTrustFrom({ uid: 0, gid: 99, mode: 0o100664 }, me).writableByThisUid).toBe(false);
+    expect(fileTrustFrom({ uid: 0, gid: 0, mode: 0o100444 }, { ...me, uid: 0 }).writableByThisUid).toBe(true); // root ignores the bits
+    // Unknown is treated as writable on purpose: guessing "safe" on a
+    // platform with no mode bits turns a control into a decoration.
+    expect(fileTrustFrom({ uid: 501, gid: 20, mode: 0o100444 }, undefined)).toMatchObject({ writableByThisUid: true });
+    expect(fileTrustFrom(undefined, me)).toMatchObject({ writableByThisUid: true });
+    for (const trust of [fileTrustFrom({ uid: 501, gid: 20, mode: 0o100644 }, me), fileTrustFrom({ uid: 0, gid: 0, mode: 0o100444 }, me)]) {
+      expect(trust.detail.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('names the exec credentials a writable policy must not be trusted to resolve', () => {
+    const writable = { writableByThisUid: true, detail: 'the policy file is world-writable (mode 0666)' };
+    const sealed = { writableByThisUid: false, detail: 'not writable' };
+    const withExec = credPolicy((c) => (c.source = { type: 'exec', command: '/usr/bin/op', args: ['read'] }));
+    expect(credentialTrustProblems(withExec, writable)).toHaveLength(1);
+    expect(credentialTrustProblems(withExec, writable)[0]).toMatch(/"github-issues".*exec.*world-writable/);
+    expect(credentialTrustProblems(withExec, sealed)).toEqual([]);
+    // `env` and `file` are not refused: a writable policy can repoint them
+    // either way, but only `exec` lets it choose the COMMAND as well.
+    expect(credentialTrustProblems(credPolicy(), writable)).toEqual([]);
+    expect(credentialTrustProblems({ version: 1 }, writable)).toEqual([]);
+  });
+
+  it('loadPolicyFile attaches the trust facts, and validation does not depend on them', () => {
+    const loaded = loadPolicyFile(join(FIXTURES, 'credentials.yaml'));
+    expect(typeof loaded.trust!.writableByThisUid).toBe('boolean');
+    expect(loaded.trust!.detail.length).toBeGreaterThan(0);
+    expect(policyFileTrust(join(FIXTURES, 'credentials.yaml'))).toEqual(loaded.trust);
+    // A file that is not there at all still answers, fail-closed.
+    expect(policyFileTrust(join(FIXTURES, 'no-such-policy.yaml')).writableByThisUid).toBe(true);
   });
 });
 

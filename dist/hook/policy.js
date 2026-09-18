@@ -87,14 +87,22 @@ export function loadPolicy(path) {
     }
     catch (cause) {
         const msg = cause instanceof Error ? cause.message : String(cause);
-        return { policy: null, warning: `--policy ${path} could not be read (${msg}); allowing all tool calls` };
+        return {
+            policy: null,
+            unusable: true,
+            warning: `--policy ${path} could not be read (${msg}); DENYING every tool call it governs until it can be`,
+        };
     }
     try {
         return { policy: parsePolicy(text) };
     }
     catch (cause) {
         const msg = cause instanceof Error ? cause.message : String(cause);
-        return { policy: null, warning: `--policy ${path} is invalid (${msg}); allowing all tool calls` };
+        return {
+            policy: null,
+            unusable: true,
+            warning: `--policy ${path} is invalid (${msg}); DENYING every tool call it governs until it is fixed`,
+        };
     }
 }
 /** Evaluate a policy against a hook's full `tool_name`, and — when given —

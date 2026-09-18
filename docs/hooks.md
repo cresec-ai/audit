@@ -540,12 +540,25 @@ the block itself is part of the evidence chain, not just Claude Code's own
 transcript.
 
 **A missing `--policy` is not an error** — no policy configured means allow
-everything, exactly as if `hook` had no `--policy` flag at all. **A present
-but malformed policy file is fail-open too**: `hook` warns once on stderr
-and behaves exactly as if no policy were configured, rather than failing the
-tool call over a typo in a config file. Recording, and this policy engine,
-must never be the reason a tool call breaks — only a genuinely configured
-`deny` rule ever blocks anything.
+everything, exactly as if `hook` had no `--policy` flag at all.
+
+**A present but unusable policy file DENIES.** If `--policy` was given and
+the file cannot be read or cannot be parsed, every tool call the hook governs
+is denied until it is fixed, with the reason on stderr and in the evidence.
+Recording is fail-open; *enforcement* is fail-closed, and passing `--policy`
+is asking for enforcement. `record --policy` already does this by exiting 2
+before the server is spawned; the hook cannot exit non-zero without breaking
+the session, so it denies instead.
+
+This changed deliberately. It used to warn and allow, which meant a typo
+silently disarmed the control and the only symptom was one line on stderr —
+the failure mode that left dogfood 4's deny rules doing nothing for two days
+while the run looked healthy.
+
+It is recoverable: the default matcher is `mcp__.*`, so Bash, Edit and Read
+keep working and you can fix the file from the same session. With
+`--all-tools` it is not, and `MCP_RECORDER_DISABLE=1` is the documented way
+out. The hook still never exits non-zero and never crashes the session.
 
 ### Write deny rules against the tool, not the server segment
 

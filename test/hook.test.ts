@@ -272,6 +272,61 @@ describe('mcp-recorder hook', () => {
     expect(toolCall.error?.type).toBe('policy_denied');
   });
 
+  it('a policy that cannot be READ denies, because enforcement is fail-closed', async () => {
+    // The asymmetry this pins: `record --policy` fails closed by exiting 2
+    // before the server is spawned, but the hook used to print a warning and
+    // ALLOW every call — and the hook is the vantage point an install
+    // actually registers. A security control that turns itself off when its
+    // config has a typo, leaving one line on stderr, is the failure mode
+    // dogfood 4 already produced once.
+    const dataDir = tmpDir('mcp-hook-policy-missing-');
+    const sessionId = freshSessionId();
+
+    const result = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl', '--policy', join(dataDir, 'does-not-exist.json')],
+      preToolUseInput({
+        sessionId,
+        toolName: 'mcp__ClickUp__clickup_delete_task',
+        toolInput: { task_id: 'to-delete' },
+        toolUseId: 'toolu_unreadable_1',
+      }),
+    );
+
+    // Exit code stays 0: denying is a decision, not a crash, and a hook that
+    // exits non-zero breaks the session it is supposed to be observing.
+    expect(result.code).toBe(0);
+    const payload = JSON.parse(result.stdout) as {
+      hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+    };
+    expect(payload.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(payload.hookSpecificOutput.permissionDecisionReason).toContain('could not be loaded');
+    expect(result.stderr).toContain('DENYING');
+
+    const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
+    expect(toolCall.is_error).toBe(true);
+    expect(toolCall.error?.type).toBe('policy_denied');
+  });
+
+  it('a policy that cannot be PARSED denies too', async () => {
+    const dataDir = tmpDir('mcp-hook-policy-unparseable-');
+    const policyPath = join(dataDir, 'broken.json');
+    writeFileSync(policyPath, '{"deny": [ this is not json');
+
+    const result = await runHook(
+      ['--data-dir', dataDir, '--store', 'jsonl', '--policy', policyPath],
+      preToolUseInput({
+        sessionId: freshSessionId(),
+        toolName: 'mcp__ClickUp__clickup_create_task',
+        toolInput: {},
+        toolUseId: 'toolu_invalid_1',
+      }),
+    );
+
+    expect(result.code).toBe(0);
+    const payload = JSON.parse(result.stdout) as { hookSpecificOutput: { permissionDecision: string } };
+    expect(payload.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
   it('a non-matching (allow-listed) policy does not deny', async () => {
     const dataDir = tmpDir('mcp-hook-policy-allow-');
     const policyPath = join(dataDir, 'policy.json');
@@ -294,7 +349,13 @@ describe('mcp-recorder hook', () => {
     expect(toolCall.is_error).toBe(false);
   });
 
-  it('a broken policy file is fail-open (allows, warns on stderr, never crashes the hook)', async () => {
+  it('a broken policy file denies without crashing the hook (it used to allow)', async () => {
+    // CHANGED DELIBERATELY. This test previously asserted `stdout === ''` —
+    // a broken policy allowed every call. RECORDING is fail-open and stays
+    // that way; ENFORCEMENT is fail-closed, and passing --policy is asking
+    // for enforcement. The old behaviour meant a typo silently disarmed the
+    // control with one stderr line as the only symptom, which is precisely
+    // how dogfood 4's deny rules did nothing for two days.
     const dataDir = tmpDir('mcp-hook-policy-broken-');
     const policyPath = join(dataDir, 'policy.json');
     writeFileSync(policyPath, '{ not valid json');
@@ -307,11 +368,13 @@ describe('mcp-recorder hook', () => {
         toolUseId: 'toolu_broken_policy',
       }),
     );
+    // Still never crashes: the hook exits 0 and the session continues.
     expect(result.code).toBe(0);
-    expect(result.stdout).toBe(''); // no deny — a broken policy fails open to allow
     expect(result.stderr).toContain('--policy');
+    const payload = JSON.parse(result.stdout) as { hookSpecificOutput: { permissionDecision: string } };
+    expect(payload.hookSpecificOutput.permissionDecision).toBe('deny');
     const toolCall = readEvents(dataDir).find((e) => e.kind === 'tool_call') as ToolCallEvent;
-    expect(toolCall.is_error).toBe(false);
+    expect(toolCall.is_error).toBe(true);
   });
 
   it('PostToolUse: redacts the result, measures duration, and shares request_id with the PreToolUse event', async () => {

@@ -4,10 +4,13 @@
  * object rule each; distinct basenames because the Helm ConfigMap flattens
  * by basename):
  *
- *   .manifest                {"revision": "<policy sha256 hex>", "roots": ["cresec/mcp", "cresec/egress"]}
- *   cresec/mcp/tool.rego     package cresec.mcp     (always)
- *   cresec/egress/http.rego  package cresec.egress  (only when `egress` is present; then and only then
- *                                                    "cresec/egress" is listed in the manifest roots)
+ *   .manifest                        {"revision": "<policy sha256 hex>", "roots": ["cresec/mcp", ...]}
+ *   cresec/mcp/tool.rego             package cresec.mcp          (always)
+ *   cresec/credentials/broker.rego   package cresec.credentials  (only when `credentials` is present)
+ *   cresec/egress/http.rego          package cresec.egress       (only when `egress` is present)
+ *
+ * An optional section's root is listed in the manifest when, and only when,
+ * its module is emitted.
  *
  * Output is deterministic (same policy + options => identical bytes), uses
  * tabs like `opa fmt`, `import rego.v1`, and emits every string literal via
@@ -52,12 +55,15 @@ export interface RegoBundle {
 }
 export declare const MANIFEST_PATH = ".manifest";
 export declare const MCP_REGO_PATH = "cresec/mcp/tool.rego";
+export declare const CREDENTIALS_REGO_PATH = "cresec/credentials/broker.rego";
 export declare const EGRESS_REGO_PATH = "cresec/egress/http.rego";
 /** Manifest root of the MCP module (always present). */
 export declare const MCP_ROOT = "cresec/mcp";
+/** Manifest root of the credentials module (listed only when `cresec/credentials/broker.rego` is emitted). */
+export declare const CREDENTIALS_ROOT = "cresec/credentials";
 /** Manifest root of the egress module (listed only when `cresec/egress/http.rego` is emitted). */
 export declare const EGRESS_ROOT = "cresec/egress";
-/** The `.manifest` roots for a policy: `["cresec/mcp"]`, plus `"cresec/egress"` when it has an egress section. */
+/** The `.manifest` roots for a policy: `["cresec/mcp"]`, plus the roots of whichever optional sections it has. */
 export declare function bundleRoots(policy: Policy): string[];
 /** Canonical write order for bundle files. */
 export declare const BUNDLE_FILE_ORDER: readonly string[];
@@ -71,6 +77,21 @@ export declare function toRe2Source(pattern: string): string;
 export declare const DECISION_SHAPE = "{\"allow\": bool, \"action\": \"allow\"|\"hold\"|\"deny\", \"rule_id\": \"...\", \"reason\": \"...\", \"matched\": bool, \"deny_reason\": \"...\"}";
 /** Render `cresec/mcp/tool.rego`. A policy without `mcp` compiles to the documented default (allow, no rules). */
 export declare function renderMcpModule(policy: Policy, opts: CompileOptions): string;
+/**
+ * Render `cresec/credentials/broker.rego`; throws when the policy has no
+ * `credentials` section.
+ *
+ * Unlike `egress`, which is compiled for the sidecar and NOT enforced here,
+ * the credentials section IS enforced locally: the gateway's broker checks
+ * the same site list on every `tools/call` before it swaps anything, and this
+ * module is the control plane's copy of that decision for the day the swap is
+ * pointed at `/broker/exchange` instead. Both sides therefore have to agree,
+ * which is why every predicate below has a counterpart in the local matcher
+ * and why the default is `deny` and not author-settable: a credentials
+ * section whose default were `allow` would hand the credential to every tool
+ * the author forgot to think about.
+ */
+export declare function renderCredentialsModule(policy: Policy, opts: CompileOptions): string;
 /** Render `cresec/egress/http.rego`; throws when the policy has no `egress` section. */
 export declare function renderEgressModule(policy: Policy, opts: CompileOptions): string;
 /** Compile a normalized policy into an OPA bundle (in-memory file map). */

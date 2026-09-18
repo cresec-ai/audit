@@ -445,6 +445,16 @@ export class Redactor implements RedactorLike {
 
   private refOf(original: string): RedactedRef {
     const ref = this.hashString(original);
+    // A brokered real credential is the one value whose REF is as dangerous
+    // as the value (see `registerBrokeredSecret`): substitute the constant
+    // `BROKERED_REF` instead. The exact test is free — `ref` is already
+    // computed and the set is keyed by it — and the containment test that
+    // follows catches `Bearer <token>`, whose hash is just as recoverable
+    // because the prefix is known. `len` stays honest: a length is a hint
+    // about the provider's token format, not a copy of the token.
+    if (isBrokeredRef(ref) || containsBrokeredSecret(original)) {
+      return { redacted: true, ref: BROKERED_REF, len: original.length };
+    }
     const out: RedactedRef = { redacted: true, ref, len: original.length };
     const secretRefs = this.extractSecretRefs(original, ref);
     if (secretRefs !== undefined) out.secret_refs = secretRefs;
@@ -471,6 +481,15 @@ export class Redactor implements RedactorLike {
         const token = m[0];
         if (token.length > 0) {
           const tref = this.hashString(token);
+          // Same exclusion one level down: a brokered token found INSIDE a
+          // larger leaf (an `Authorization: Bearer <real>` header echoed back
+          // in a tool result) must not be fingerprinted either. Dropped
+          // silently rather than replaced — `secret_refs` is a list of refs,
+          // so there is nothing to substitute, and the decision's own
+          // credential id is where that use is recorded. The containment arm
+          // is the one that matters here: the `Bearer\s+…` pattern matches
+          // the prefix WITH the token, so the exact test alone would miss it.
+          if (isBrokeredRef(tref) || containsBrokeredSecret(token)) continue;
           if (!seen.has(tref)) {
             seen.add(tref);
             found.push(tref);
@@ -655,6 +674,12 @@ export function scrubArgv(argv: string[], redactor: RedactorLike): ScrubbedArgv 
 
   const fingerprint = (name: string, value: string): Sha256Ref => {
     const ref = redactor.hashString(value);
+    // A brokered real credential on the wrapped server's command line: the
+    // element is still replaced (nothing readable lands in
+    // `ServerContext.command`), but neither its ref nor a fingerprint of it
+    // is emitted — the ref IS the token for anything that can brute-force it.
+    // See `registerBrokeredSecret`.
+    if (isBrokeredRef(ref) || containsBrokeredSecret(value)) return BROKERED_REF;
     fingerprints.push({ name, ref });
     return ref;
   };
@@ -847,7 +872,156 @@ export function collectEnvCredentialFingerprints(
     if (typeof value !== 'string' || value.length < MIN_CREDENTIAL_VALUE_LEN) continue;
     if (!CREDENTIAL_NAME_RE.test(name)) continue;
     if (isRecorderOwnEnvVar(name)) continue;
+    // The other family never fingerprinted. `env: GITHUB_TOKEN` as a broker
+    // source is matched by CREDENTIAL_NAME_RE above, so without this line the
+    // recorder would hash the real brokered token into every event's
+    // `identity.credential_fingerprints` — the exact leak the broker exists
+    // to prevent. See `registerBrokeredSecret`.
+    if (isBrokeredSecret(value) || containsBrokeredSecret(value)) continue;
     fingerprints.push({ name, ref: redactor.hashString(value) });
   }
   return fingerprints;
+}
+
+/* -------------------------------------------------------------------- */
+/* brokered secrets — the other family never fingerprinted               */
+/* -------------------------------------------------------------------- */
+
+/**
+ * What a brokered value is replaced by, and the ref that stands in for it.
+ *
+ * A constant, so it is greppable in a store and identical across sessions,
+ * and a genuine `sha256:<hex>` so every consumer of `RedactedRef.ref` — the
+ * `query` matcher, the replay renderer, the bundle exporter — keeps working
+ * on a shape it already understands. It is the hash of a literal, so it
+ * discloses nothing: anyone can compute it, which is the point.
+ */
+export const BROKERED_PLACEHOLDER = '[brokered-credential]';
+export const BROKERED_REF: Sha256Ref = sha256Ref(BROKERED_PLACEHOLDER);
+
+/**
+ * Cap on distinct brokered values held in the exclusion set. One entry per
+ * distinct resolved credential per process; a session that legitimately mints
+ * more than this many distinct tokens does not exist, and the cap is what
+ * makes the set's memory bounded by configuration rather than by traffic.
+ * Registration FAILS at the cap rather than evicting: evicting would silently
+ * un-protect a credential that is still live, and the broker turns a failed
+ * registration into a denial (`exclusion_capacity`).
+ */
+export const MAX_BROKERED_SECRETS = 1024;
+
+/**
+ * Shortest value that takes part in the CONTAINMENT test below. A four-
+ * character "credential" would be a substring of half the tool output in the
+ * world and would blank the store; nothing a broker hands out is that short.
+ * Values under the floor still get the exact-ref exclusion, which cannot
+ * misfire.
+ */
+const MIN_BROKERED_CONTAINS_LEN = 12;
+
+/** sha256 refs of real credentials this process has brokered. */
+const brokeredRefs = new Set<Sha256Ref>();
+
+/**
+ * The same credentials as values, for the containment test.
+ *
+ * WHY A SECOND COPY, AND WHY IT COSTS NOTHING WHEN UNUSED. The exact test
+ * catches a leaf that IS the token. It does not catch `"Bearer <token>"`,
+ * which is what an `Authorization` header looks like and what the
+ * `Bearer\s+...` alwaysPattern matches — and sha256("Bearer " + token) is
+ * every bit as brute-forceable as sha256(token), because the prefix is
+ * known. So a leaf is also scanned for a brokered value inside it. When no
+ * credential has been brokered — every session that does not use the broker,
+ * which is all of them today — the set is empty and the test is one
+ * `size === 0` check: 8.5 ns for a 4 KiB leaf, measured on this repo's
+ * CI-class hardware (Node 22). With one credential registered the same leaf
+ * costs 54 ns, against ~12 us to SHA-256 it, which is the work this sits
+ * next to. So it is ~0.4% of the hashing it guards, and free when unused.
+ *
+ * It is not a second exposure: the value is already in this process's heap
+ * (the broker's cache holds it, the outbound buffer held it), and a JS
+ * string cannot be reliably zeroed anyway — "short residency" is the claim,
+ * not "erased".
+ */
+const brokeredValues = new Set<string>();
+
+/**
+ * Remember that `value` is a REAL credential the broker resolved, so that no
+ * surface in the recorder ever fingerprints it.
+ *
+ * WHY THIS EXISTS, and why it is the same shape as `isRecorderOwnEnvVar`.
+ * Refs here are unsalted sha256 by design (`Redactor.hashString` / `sha256Ref`),
+ * because a blast-radius `query` has to be able to match a known probe value
+ * by hashing it the same way. That trade is right for a credential the AGENT
+ * already saw. It is exactly wrong for a brokered one: the whole claim of the
+ * broker is that the real token is absent from the model's context and from
+ * the transcript, so hashing it into the evidence chain would hand anybody
+ * holding the chain a brute-forceable copy — and a confirmable one for
+ * anybody who already has a candidate. There are at least six surfaces that
+ * would do it by default: `scrubToolArguments` on a post-swap message,
+ * `RedactedRef.ref`, `RedactedRef.secret_refs` when the token is embedded in
+ * a bigger leaf, `collectEnvCredentialFingerprints` on `GITHUB_TOKEN`,
+ * `scrubArgv` on a server command line, and the boundary filter's own
+ * `secret_refs` when a tool reflects the token back. One test, called from
+ * every one of them, is the only shape that survives a new call site being
+ * added — a filter applied afterwards to an assembled list would not be.
+ *
+ * WHAT IT DELIBERATELY FORFEITS. `query <the real token>` will not find the
+ * sessions that used it, so blast radius for a brokered credential cannot be
+ * answered from a hash. That is the correct trade and it costs less than it
+ * looks: the agent never saw the value, and the question is answered better
+ * anyway by the credential id and `decision_id` that the broker records for
+ * every use — which name the credential, the policy that allowed it and the
+ * destination it was allowed to, instead of proving that some hash appeared.
+ *
+ * Process-local and in memory only: a file of "secrets not to fingerprint"
+ * beside the store would be written by the same uid the store is, and would
+ * be a list of hashes of live credentials, which is the thing we just refused
+ * to write down.
+ *
+ * Returns false when the set is full; the caller must treat that as a
+ * resolution failure and DENY, never as permission to hand the value on.
+ */
+export function registerBrokeredSecret(value: string): boolean {
+  if (value === '') return true;
+  const ref = sha256Ref(value);
+  if (brokeredRefs.has(ref)) return true;
+  if (brokeredRefs.size >= MAX_BROKERED_SECRETS) return false;
+  brokeredRefs.add(ref);
+  if (value.length >= MIN_BROKERED_CONTAINS_LEN) brokeredValues.add(value);
+  return true;
+}
+
+/** THE exclusion test, by value. */
+export function isBrokeredSecret(value: string): boolean {
+  return value !== '' && brokeredRefs.has(sha256Ref(value));
+}
+
+/** THE exclusion test, for a caller that has already hashed the value. */
+export function isBrokeredRef(ref: Sha256Ref): boolean {
+  return brokeredRefs.has(ref);
+}
+
+/**
+ * THE exclusion test for a string that may merely CONTAIN a brokered
+ * credential — `Bearer <token>`, `token=<token>`, a JSON blob quoting it.
+ * See `brokeredValues` for why this exists and what it costs.
+ */
+export function containsBrokeredSecret(value: string): boolean {
+  if (brokeredValues.size === 0) return false;
+  for (const secret of brokeredValues) {
+    if (value.length >= secret.length && value.includes(secret)) return true;
+  }
+  return false;
+}
+
+/** Size of the exclusion set (tests, and the broker's own capacity check). */
+export function brokeredSecretCount(): number {
+  return brokeredRefs.size;
+}
+
+/** Drop every registered brokered secret — tests only. */
+export function forgetBrokeredSecrets(): void {
+  brokeredRefs.clear();
+  brokeredValues.clear();
 }
