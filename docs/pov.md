@@ -221,10 +221,24 @@ denied and nothing is forwarded; and a positive control confirms that a secret
 nothing excludes *is* fingerprinted, so the absence assertions cannot pass
 vacuously.
 
-What is still missing before this belongs in the same evidence class as the
-deny claims: **one dogfood run swapping a real credential in a live agent
-session**, with the bundle committed. Every other load-bearing claim in this
-arc has a named live run behind it. Until this one does, say so.
+**Proven live in dogfood 7** (`evidence/dogfood-7`): a real Claude Code agent
+called the tool, the byte journal shows `Authorization: Bearer df7-real-…`
+reaching the server, the chain holds only the synthetic's ref, and a second
+call to an undeclared tool carried the synthetic out as written — destination
+binding doing its job.
+
+It took three attempts, and the first two are the reason this stage is worth
+telling honestly. Claude Code sent the declared argument's parent as a JSON
+**string** rather than a nested object, so the dot-path resolved to nothing
+and the gateway **silently forwarded the synthetic** — no swap, no deny, no
+log line. The cause was the tool's own `inputSchema` leaving the property
+untyped; typing it fixed it on the first try, while saying so in the prompt
+did not. The gateway now refuses that case (`site_arg_unresolved`) instead of
+forwarding, and [docs/policy.md](policy.md) documents the trap.
+
+Tell that story in the room. A control that silently does nothing is the
+failure mode this product exists to make impossible, and we found it in our
+own feature by running it for real.
 
 The honest claim, and say it before the demo rather than after:
 
@@ -274,7 +288,7 @@ resolver, or the hosted control plane.
 | `credentials` policy section + Rego emitter | 4 | shipped | recorder |
 | Gateway synthetic→real swap + result scrub | 4 | shipped | recorder |
 | Broker end-to-end suite (4 tests, real binary) | 4 | shipped | recorder |
-| Live dogfood run swapping a real credential | 4 | needs-build | recorder |
+| Live dogfood run swapping a real credential | 4 | shipped (dogfood 7) | recorder |
 | `decision_id` on decision events | 4 | needs-build | recorder |
 | Gateway for HTTP MCP servers (`http --policy`) | — | needs-build | recorder |
 | SIEM export | — | needs-build | recorder |
@@ -321,9 +335,9 @@ Each line was checked by running the thing, not by reading about it.
 
 **Enforcement**
 - *"`ui --out` just writes an empty page if you forget `--data-dir`."* — it used
-  to render `~/.mcp-recorder` silently. It now names the store it opened on
-  stderr, but the page itself still carries no provenance, so pass
-  `--data-dir` in a customer room regardless.
+  to render `~/.mcp-recorder` silently. It now names the store on stderr, and
+  the page header already carried `store: jsonl · /path/to/evidence.jsonl`, so
+  a page handed to someone else does say where it came from.
 - *"It stops prompt injection."* — `boundary.injection: flag` is the default and
   does **not** block. What prevents harm is a deny rule on the vector.
 - *"`DECISIONS` shows how much we blocked."* — it reads 0 for every hook session
@@ -392,10 +406,11 @@ The shortest ordered list that makes the week-one POV deliverable end to end.
 3. ~~Land the broker core, the `credentials` policy section and the gateway
    swap, and write the end-to-end suite.~~ **Done** — landed together, wired
    into the binary, 4 end-to-end tests against the real CLI, 1,643 tests green.
-4. **One dogfood run swapping a real credential** in a live agent session,
-   bundle committed — so the credential claim sits in the same evidence class
-   as the deny claims. This is the only thing between Half B and a demo.
+4. ~~One dogfood run swapping a real credential in a live agent session.~~
+   **Done** — dogfood 7, bundle and byte journal committed to
+   `evidence/dogfood-7`. It also found and closed a silent no-op.
 5. **`decision_id` on decision events** — the join key to the control plane.
+   Now the only item left on this path.
 
 Deliberately **not** on the path: everything in NHI. A one-week POV as scoped
 here runs end to end with zero NHI infrastructure, because the broker resolves

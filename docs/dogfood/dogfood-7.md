@@ -79,7 +79,7 @@ Then check, in this order:
 | The chain is intact | `verify --data-dir /tmp/dogfood7/data` | PASS |
 | Undeclared site | ask the agent to call another tool with the synthetic | journal shows the **synthetic** |
 | Policy fail-closed | point `--policy` at a missing file, make one MCP call | `permissionDecision: deny` |
-| Store provenance | `ui --out /tmp/x.html --no-open` with no `--data-dir` | stderr names the default store |
+| Store provenance | `ui --out /tmp/x.html --no-open` with no `--data-dir` | stderr names the default store, and the page header names it too |
 
 ## Recording the result
 
