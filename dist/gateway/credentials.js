@@ -122,6 +122,20 @@ export const SWAP_DENY = {
     pathNotAllowed: 'path_not_allowed',
     /** Two placeholders in one argument: no issuance produces that, so it is refused rather than guessed at. */
     multiplePlaceholders: 'multiple_placeholders',
+    /**
+     * A declared site matched the call, its argument did not resolve to a
+     * string, and a synthetic is sitting somewhere else in the arguments.
+     *
+     * Dogfood 7 found this the hard way. Claude Code sent `headers` as a JSON
+     * STRING rather than a nested object (the fixture's schema left the
+     * property untyped), so `headers.Authorization` resolved to nothing, the
+     * site was not engaged, and the call was forwarded AS WRITTEN — synthetic
+     * and all — with no swap, no deny and no log line. The operator believed
+     * brokering was on; the placeholder went to the upstream. That is dogfood
+     * 4's failure shape (a control that does nothing, with no symptom) inside
+     * the broker, and it is why this code exists.
+     */
+    siteArgUnresolved: 'site_arg_unresolved',
     /** A declared site was hit by a batch element; a batch has no place to park the async exchange. */
     inBatch: 'swap_in_batch',
     /** A declared site was hit by a `tools/call` NOTIFICATION; nothing can be answered on it. */
@@ -145,6 +159,7 @@ const RESOLUTION_FAILURE_CODES = new Set([
     SWAP_DENY.unavailable,
     SWAP_DENY.noToken,
     SWAP_DENY.multiplePlaceholders,
+    SWAP_DENY.siteArgUnresolved,
     SWAP_DENY.inBatch,
     SWAP_DENY.onNotification,
     SWAP_DENY.tooMany,
@@ -293,6 +308,28 @@ function siteMatches(site, input) {
     return site.tool.some((g) => globMatch(g, '/', input.tool));
 }
 /**
+ * Is there a synthetic ANYWHERE in these arguments?
+ *
+ * Only ever asked about a call whose declared site failed to resolve, to tell
+ * two very different things apart: a call that simply carries no credential
+ * (ordinary traffic; forward it) and a call that carries one the gateway
+ * could not reach (the silent no-op; refuse it). Serialising the arguments is
+ * acceptable here because it happens on a path that is already about to
+ * refuse or forward a single call, never on every call.
+ */
+function argsCarryASynthetic(args) {
+    if (args === undefined || args === null)
+        return false;
+    try {
+        return JSON.stringify(args)?.includes(SYNTHETIC_PREFIX) === true;
+    }
+    catch {
+        // Circular or otherwise unserialisable: assume the worst, because the
+        // question is only asked when a declared site already failed to resolve.
+        return true;
+    }
+}
+/**
  * The swaps a call asks for: one per declared site whose argument actually
  * carries a synthetic. A site that matches the tool but whose argument holds
  * something else is simply not engaged — the call is ordinary traffic and is
@@ -310,8 +347,27 @@ export function planSwaps(config, input) {
         if (!siteMatches(site, input))
             continue;
         const leaf = getPath(input.args, site.arg);
-        if (typeof leaf !== 'string')
+        if (typeof leaf !== 'string') {
+            // The site matched this tool, so the operator declared that this call
+            // carries a credential at this path — and it does not. If a synthetic
+            // is elsewhere in the arguments, the placeholder is about to be
+            // forwarded to the upstream while the operator believes it was
+            // swapped. Refuse instead: the call would have failed at the upstream
+            // anyway, and a refusal is the only version of that with a symptom.
+            if (argsCarryASynthetic(input.args)) {
+                out.push({
+                    site,
+                    path: ['params', 'arguments', ...site.argSegments],
+                    leaf: '',
+                    synthetic: '',
+                    host: '',
+                    hostSource: site.hostFrom === 'server' ? 'server_name' : site.hostFrom === 'fixed' ? 'declared' : 'argument',
+                    pathTemplate: '',
+                    refusal: SWAP_DENY.siteArgUnresolved,
+                });
+            }
             continue;
+        }
         const found = leaf.match(syntheticPattern());
         if (found === null || found.length === 0)
             continue;

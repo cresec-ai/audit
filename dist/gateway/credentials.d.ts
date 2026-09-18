@@ -117,6 +117,20 @@ export declare const SWAP_DENY: {
     readonly pathNotAllowed: "path_not_allowed";
     /** Two placeholders in one argument: no issuance produces that, so it is refused rather than guessed at. */
     readonly multiplePlaceholders: "multiple_placeholders";
+    /**
+     * A declared site matched the call, its argument did not resolve to a
+     * string, and a synthetic is sitting somewhere else in the arguments.
+     *
+     * Dogfood 7 found this the hard way. Claude Code sent `headers` as a JSON
+     * STRING rather than a nested object (the fixture's schema left the
+     * property untyped), so `headers.Authorization` resolved to nothing, the
+     * site was not engaged, and the call was forwarded AS WRITTEN — synthetic
+     * and all — with no swap, no deny and no log line. The operator believed
+     * brokering was on; the placeholder went to the upstream. That is dogfood
+     * 4's failure shape (a control that does nothing, with no symptom) inside
+     * the broker, and it is why this code exists.
+     */
+    readonly siteArgUnresolved: "site_arg_unresolved";
     /** A declared site was hit by a batch element; a batch has no place to park the async exchange. */
     readonly inBatch: "swap_in_batch";
     /** A declared site was hit by a `tools/call` NOTIFICATION; nothing can be answered on it. */

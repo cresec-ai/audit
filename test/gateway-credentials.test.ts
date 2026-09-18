@@ -509,13 +509,40 @@ describe('planning (destination-bound, never value-bound)', () => {
     expect(plan[0]?.refusal).toBeUndefined();
   });
 
-  it('does not fire for the same placeholder in an UNDECLARED argument — the echo attack', () => {
+  it('never swaps into an UNDECLARED argument — the echo attack gets nothing', () => {
     // `http_post(body=<synthetic>)` is the reflection attack: a value-bound
     // swap would rewrite it and the tool would hand the real token straight
-    // back. The body is not a declared site, so nothing happens here and the
-    // upstream receives the placeholder.
-    expect(planSwaps(cfg, { server: 'corp-notes', tool: 'http_post', args: { url: 'https://api.github.com/repos/o/r', body: SYNTHETIC } })).toEqual([]);
+    // back. Destination binding is what prevents that, and it holds in both
+    // branches below — no plan ever targets `body`.
+    const reflected = planSwaps(cfg, {
+      server: 'corp-notes',
+      tool: 'http_post',
+      args: { url: 'https://api.github.com/repos/o/r', body: SYNTHETIC },
+    });
+    // NARROWED AFTER DOGFOOD 7. This used to be `[]` — forward the
+    // placeholder and let the upstream reject it. It is now a refusal,
+    // because the gateway cannot tell that case apart from the one dogfood 7
+    // hit: Claude Code sent `headers` as a JSON string, `headers.Authorization`
+    // resolved to nothing, and the call was forwarded with the synthetic in
+    // it, with no swap, no deny and no log. Refusing is better in BOTH
+    // readings — a louder answer to a reflection attempt, and a symptom for a
+    // shape mismatch that otherwise silently disarms the whole feature.
+    expect(reflected).toHaveLength(1);
+    expect(reflected[0]?.refusal).toBe(SWAP_DENY.siteArgUnresolved);
+    expect(reflected[0]?.synthetic).toBe(''); // nothing was located to swap
+    expect(reflected[0]?.path).not.toContain('body');
+
+    // An undeclared TOOL is different and is unchanged: no site matches at
+    // all, so the call is ordinary traffic and the placeholder goes out as
+    // written, exactly as the threat model says it should.
     expect(planSwaps(cfg, { server: 'corp-notes', tool: 'echo', args: { anything: SYNTHETIC } })).toEqual([]);
+
+    // And a declared tool carrying no credential at all stays ordinary too:
+    // the refusal above is triggered by a synthetic the gateway could not
+    // reach, never by the argument merely being absent.
+    expect(
+      planSwaps(cfg, { server: 'corp-notes', tool: 'http_post', args: { url: 'https://api.github.com/x', body: 'plain' } }),
+    ).toEqual([]);
   });
 
   it('refuses a destination the site does not allow, before any exchange', () => {
@@ -701,11 +728,34 @@ describe('gateway: credential swap', () => {
     assertCanaryAbsent(s);
   });
 
-  it('leaves a placeholder in an UNDECLARED argument alone — the upstream gets the synthetic and rejects it', async () => {
+  it('refuses a declared tool carrying the placeholder somewhere it cannot reach', async () => {
+    // The dogfood 7 shape, end to end: the site declares
+    // http_post/headers.Authorization, the call carries the synthetic
+    // somewhere else, so the gateway cannot evaluate the swap it was
+    // configured to make. Before this was narrowed the call went through
+    // untouched and nothing said so.
     const s = startProxy();
     await handshake(s);
-    // The reflection attack: ask the tool to hand the argument back.
     s.send(toolsCall(2, 'http_post', { url: 'https://api.github.com/repos/o/r', body: SYNTHETIC }));
+    await waitFor(s.responded(2), 'refusal response');
+    s.stdin.end();
+    await s.done;
+
+    // The broker is never consulted — there was nothing to exchange.
+    expect(s.broker.calls).toEqual([]);
+    // NOTHING reached the server: not the real token, and not the synthetic
+    // either. That second half is the change.
+    expect(JSON.stringify(witnessed(s.witness))).not.toContain(SYNTHETIC);
+    expect(JSON.stringify(witnessed(s.witness))).not.toContain(CANARY);
+    assertCanaryAbsent(s);
+  });
+
+  it('a placeholder in an UNDECLARED TOOL still goes out as written', async () => {
+    // Unchanged by the dogfood 7 narrowing, and the control that proves the
+    // narrowing did not become "refuse anything with a synthetic in it".
+    const s = startProxy();
+    await handshake(s);
+    s.send(toolsCall(2, 'echo', { anything: SYNTHETIC }));
     await waitFor(s.responded(2), 'unswapped call response');
     s.stdin.end();
     await s.done;

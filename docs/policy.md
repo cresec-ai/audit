@@ -261,6 +261,36 @@ occur. That is what stops the reflection attack — ask an `echo`-shaped tool to
 return its input and it is simply not a declared site, so it receives the
 synthetic and the upstream rejects it.
 
+#### Type the argument in your server's schema
+
+`arg` is a dot-path into `params.arguments`, so the client has to send that
+structure. If the tool's `inputSchema` leaves the property untyped, a client
+may send a **JSON string** where you expect an object, and
+`headers.Authorization` then resolves to nothing.
+
+This is not hypothetical. In dogfood 7 the fixture declared
+`inputSchema: { type: 'object', additionalProperties: true }` with no
+`properties`, and Claude Code sent:
+
+```json
+"headers": "{\"Authorization\": \"Bearer cresec_synth_v1_…\"}"
+```
+
+twice in a row — a string, not an object — and it did so again when the prompt
+explicitly said to send a nested object. Adding `properties.headers.type =
+"object"` to the tool's schema fixed it on the first try. **The schema, not
+the prompt, is what decides this.**
+
+When the shape does not match, the gateway now **refuses** the call with
+`site_arg_unresolved` rather than forwarding it. It used to forward it
+untouched, which meant the synthetic went to the upstream while the operator
+believed the credential had been swapped — a control doing nothing, with no
+symptom. A refusal is the version of that with a symptom.
+
+The refusal fires only when a synthetic is actually present somewhere in the
+arguments. A declared tool called without any credential is ordinary traffic
+and is forwarded as written.
+
 ### `credentials[].use[].host` — the destination
 
 Required. A swap site with no host constraint is a full-privilege credential
