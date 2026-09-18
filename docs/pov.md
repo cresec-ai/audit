@@ -320,9 +320,10 @@ Each line was checked by running the thing, not by reading about it.
   A miss means "not found this way", not "never happened".
 
 **Enforcement**
-- *"Enforcement is fail-closed."* — true of `record --policy`, which exits 2 on
-  an unreadable policy. The **hook is fail-open** on a bad policy, and the hook
-  is what Stage 1 installs.
+- *"`ui --out` just writes an empty page if you forget `--data-dir`."* — it used
+  to render `~/.mcp-recorder` silently. It now names the store it opened on
+  stderr, but the page itself still carries no provenance, so pass
+  `--data-dir` in a customer room regardless.
 - *"It stops prompt injection."* — `boundary.injection: flag` is the default and
   does **not** block. What prevents harm is a deny rule on the vector.
 - *"`DECISIONS` shows how much we blocked."* — it reads 0 for every hook session
@@ -374,10 +375,6 @@ Each line was checked by running the thing, not by reading about it.
   agentless product with named displacements; do not imply parity.
 - *"It rolls up across your fleet."* — no fleet view, no aggregation, no
   retention, no pruning, no external anchoring.
-- *"`ui --out` just writes an empty page if you forget `--data-dir`."* —
-  reproduced: in an empty directory it exits 0 and writes a 183,503-byte page
-  containing **54 events read from `~/.mcp-recorder`**. In a customer room that
-  is unrelated traffic presented as theirs. Always pass `--data-dir`.
 - *"`setup` will rewrite your configs safely."* — rated **Tested, not Verified**:
   no real client has ever launched what it wrote. Use `--dry-run` in the room.
 

@@ -171,10 +171,11 @@ Usage:
       tool_call/session_* event, and (PreToolUse only) prints a policy deny decision when
       --policy says to. This is the ONLY place a third party gets visibility
       into Anthropic-hosted connectors (mcp__ClickUp__*, mcp__Gmail__*, ...)
-      that no local MCP proxy can see. Fail-open: never blocks a tool call,
-      never exits non-zero, except a deliberate --policy deny. Only
-      mcp__-prefixed (MCP) tools are recorded by default; --all-tools also
-      records built-ins (Bash, Edit, ...). See docs/hooks.md.
+      that no local MCP proxy can see. Recording is fail-open: it never blocks
+      a tool call and never exits non-zero. Enforcement is fail-closed: a
+      --policy that cannot be read or parsed denies what it governs until it
+      is fixed. Only mcp__-prefixed (MCP) tools are recorded by default;
+      --all-tools also records built-ins (Bash, Edit, ...). See docs/hooks.md.
   mcp-recorder hook install [--settings PATH] [--all-tools] [--policy FILE]
                         [--data-dir D] [--client NAME] [--command CMD]
                         [--dry-run] [--undo] [--json]
@@ -1084,6 +1085,27 @@ async function resolveStoreVerify(
   return { result, pinned };
 }
 
+/**
+ * Say which store an inspection command opened, when nobody named one.
+ *
+ * `--data-dir` and MCP_RECORDER_DATA_DIR both being absent resolves to
+ * ~/.mcp-recorder, which is right for a laptop with one store and wrong in
+ * every way that matters when it is not what the operator meant. Measured:
+ * `ui --out page.html` run in an empty directory exits 0 and writes a
+ * 183 KB page holding 54 events from the home store — in a customer room,
+ * somebody else's traffic rendered as if it were theirs. The page carries no
+ * hint of where it came from, so nothing downstream can catch it either.
+ *
+ * Refusing would break the laptop case this default exists for, so the
+ * command says what it did instead, on stderr, where it cannot be mistaken
+ * for output. Silence still means "you told me which store".
+ */
+function announceDefaultDataDir(flags: Flags, config: { dataDir: string }): void {
+  if (flags['data-dir'] !== undefined) return;
+  if (process.env[ENV.DATA_DIR] !== undefined && process.env[ENV.DATA_DIR] !== '') return;
+  diag(`reading the default store at ${config.dataDir} (no --data-dir given)`);
+}
+
 async function cmdVerify(flags: Flags): Promise<void> {
   const allowUnsigned = flags['allow-unsigned'] === true;
   const publicKeyFlag = asStr(flags['public-key']);
@@ -1115,6 +1137,7 @@ async function cmdVerify(flags: Flags): Promise<void> {
     };
   } else {
     const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
     const store = openConfiguredStore(config, { readOnly: true });
     try {
       const resolved = await resolveStoreVerify(store, config, { explicitPublicKeyHex, allowUnsigned });
@@ -1148,6 +1171,7 @@ async function cmdQuery(flags: Flags, positionals: string[]): Promise<void> {
   guardStdoutEpipe();
   const needle = positionals[0] ?? err('query: missing <needle> argument');
   const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
   const store = openConfiguredStore(config, { readOnly: true });
   try {
     const sessionId = resolveSessionId(store, asStr(flags.session));
@@ -1200,6 +1224,7 @@ function endedCell(s: SessionSummary): string {
 async function cmdSessions(flags: Flags): Promise<void> {
   guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
   const store = openConfiguredStore(config, { readOnly: true });
   try {
     const sessions = store.sessions();
@@ -1260,6 +1285,7 @@ async function cmdSessions(flags: Flags): Promise<void> {
 async function cmdUi(flags: Flags): Promise<void> {
   guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
   const store = openConfiguredStore(config, { readOnly: true });
   try {
     const sessionId = resolveSessionId(store, asStr(flags.session));
@@ -1312,6 +1338,7 @@ function exportTimestamp(now: Date): string {
 async function cmdExport(flags: Flags): Promise<void> {
   guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
   const store = openConfiguredStore(config, { readOnly: true });
   try {
     if (store.count() === 0) {

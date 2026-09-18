@@ -1385,3 +1385,28 @@ describe('ui: best-effort browser open', () => {
     30_000,
   );
 });
+
+describe('inspection commands say which store they opened', () => {
+  it('announces the default store when nobody named one, and stays quiet when they did', async () => {
+    // Measured before this existed: `ui --out page.html` in an empty
+    // directory exited 0 and wrote a 183 KB page holding 54 events read from
+    // ~/.mcp-recorder. In a customer room that is somebody else's traffic
+    // rendered as if it were theirs, and nothing on the page says otherwise.
+    const dataDir = tmpDir('mcp-rec-announce-');
+    const home = tmpDir('mcp-rec-home-');
+
+    // No --data-dir and no env: the default is used, so it must be named.
+    const implicitRun = await runCli(['sessions'], { HOME: home, USERPROFILE: home });
+    expect(implicitRun.stderr).toContain('no --data-dir given');
+    expect(implicitRun.stderr).toContain('.mcp-recorder');
+
+    // Named explicitly: silence. An operator who said where to look does not
+    // need to be told where we looked.
+    const explicitRun = await runCli(['sessions', '--data-dir', dataDir], { HOME: home, USERPROFILE: home });
+    expect(explicitRun.stderr).not.toContain('no --data-dir given');
+
+    // Named through the environment: also silence.
+    const envRun = await runCli(['sessions'], { HOME: home, USERPROFILE: home, MCP_RECORDER_DATA_DIR: dataDir });
+    expect(envRun.stderr).not.toContain('no --data-dir given');
+  });
+});
