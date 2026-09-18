@@ -208,14 +208,36 @@ The closing moment: **their** auditor, who has never met us, runs one command on
 bare Node against a key handed over through a different channel, and gets `PASS`
 over a week of their own agents' behaviour.
 
-**Half B — the credential swap. In flight, and described as such.** The agent
-holds a synthetic; the gateway swaps it for the real token per call and scrubs
-the real value out of both the result and the evidence. The broker core with
-seven credential sources, the `credentials` policy section and the gateway wiring
-are written. They are not yet integrated, the end-to-end suite is not written,
-and no live run has swapped a real credential.
+**Half B — the credential swap. Working against the built binary; not yet
+watched in a live agent session.** The agent holds a synthetic; the gateway
+swaps it for the real token at a declared site, and the real value reaches
+neither the client nor the evidence chain.
 
-Show the wire contract, the code, and a date. Do not show a mock.
+Four end-to-end tests run the real binary and assert on what crossed the wire:
+the server receives the real credential while the client and the chain see only
+the synthetic; a tool that hands its input back gets the **synthetic**, because
+an echo is not a declared site; a declared site aimed at an undeclared host is
+denied and nothing is forwarded; and a positive control confirms that a secret
+nothing excludes *is* fingerprinted, so the absence assertions cannot pass
+vacuously.
+
+What is still missing before this belongs in the same evidence class as the
+deny claims: **one dogfood run swapping a real credential in a live agent
+session**, with the bundle committed. Every other load-bearing claim in this
+arc has a named live run behind it. Until this one does, say so.
+
+The honest claim, and say it before the demo rather than after:
+
+> Credential brokering keeps the real credential out of the model's context,
+> out of the transcript and out of the evidence chain, and turns every use of
+> it into a policy-checked decision recorded under a decision id. It does not
+> hide the credential from anything that can run code as the same OS user —
+> which includes the agent's own shell.
+
+On a single-uid developer laptop this is a **context and audit** control, not a
+confidentiality one. It becomes a confidentiality control only when the
+resolver runs as a principal the agent is not: a root-owned config and
+resolver, or the hosted control plane.
 
 ---
 
@@ -248,10 +270,11 @@ Show the wire contract, the code, and a date. Do not show a mock.
 | `sessions --tools` census | 2 | needs-build | recorder |
 | `DECISIONS` counting both deny shapes | 2 | needs-build | recorder |
 | npm publication | 1 | needs-build | recorder |
-| Broker core + 7 credential sources | 4 | in-flight | recorder |
-| `credentials` policy section + Rego emitter | 4 | in-flight | recorder |
-| Gateway synthetic→real swap + result scrub | 4 | in-flight | recorder |
-| Broker end-to-end suite | 4 | needs-build | recorder |
+| Broker core + 7 credential sources | 4 | shipped | recorder |
+| `credentials` policy section + Rego emitter | 4 | shipped | recorder |
+| Gateway synthetic→real swap + result scrub | 4 | shipped | recorder |
+| Broker end-to-end suite (4 tests, real binary) | 4 | shipped | recorder |
+| Live dogfood run swapping a real credential | 4 | needs-build | recorder |
 | `decision_id` on decision events | 4 | needs-build | recorder |
 | Gateway for HTTP MCP servers (`http --policy`) | — | needs-build | recorder |
 | SIEM export | — | needs-build | recorder |
@@ -309,11 +332,29 @@ Each line was checked by running the thing, not by reading about it.
   and nothing consumes it.
 
 **Credentials**
-- *"The credential broker is on `feat/credential-broker`."* — the work is real but
-  was uncommitted across separate worktrees when this was written. Check before
-  saying it.
-- *"We can show the swap next week."* — not until the units are landed together,
-  the suite is green and one dogfood run has swapped a real credential.
+- *"The agent never has access to your credentials."* — it does. It can read the
+  environment variable, file or command the broker reads, and the policy that
+  names them. What it does not have is a credential in its context or its
+  transcript, and it cannot use one without leaving a decision record.
+- *"Prompt injection cannot use your credentials."* — it cannot **steal** them,
+  given destination-bound swapping. It can absolutely cause an authorised,
+  policy-permitted use of one. The gain is that the use is bounded and on the
+  record; narrow it with `hold` on high-impact sites.
+- *"The real token never leaves the vault."* — true of the hosted control plane,
+  false of the local broker, where the token is resolved on the same machine as
+  the agent.
+- *"Synthetic credentials are useless if stolen."* — useless off the machine;
+  on the machine they are redeemable, and on the machine is where the attacker
+  already is.
+- *"Least privilege"* / *"scoped credentials"* — only where the policy constrains
+  the destination as well as the tool. A `use` site with an unconstrained host
+  is a full-privilege credential with extra steps, which is why the schema makes
+  it an error rather than a default-allow.
+- *"Revocation is instant."* — a cached decision is live for its TTL, and
+  revoking does not recall a call already in flight. Quote the number.
+- *"We have demonstrated the credential swap."* — it is proven against the built
+  binary by four end-to-end tests. No live agent session has swapped a real
+  credential yet. That run is the next item.
 - *"Point it at Cresec and your synthetics keep working."* — a locally-minted
   synthetic cannot resolve against a real NHI: the per-tenant pepper lives in
   OpenBao and the HMAC is computed there.
@@ -351,13 +392,13 @@ The shortest ordered list that makes the week-one POV deliverable end to end.
    render the default store; the demo cleans up and fails on the doubling retry.
 2. **`DECISIONS` counts both deny shapes** — otherwise Stage 4 under-reports the
    customer's own controls to zero.
-3. **Land the broker core and its seven sources.**
-4. **Land the `credentials` policy section.**
-5. **Land the gateway swap**, deleting its temporary scaffold for the real module.
-6. **Write the end-to-end suite**, plus the first tests for the gateway swap.
-7. **One dogfood run swapping a real credential**, bundle committed — so the
-   credential claim sits in the same evidence class as the deny claims.
-8. **`decision_id` on decision events** — the join key to the control plane.
+3. ~~Land the broker core, the `credentials` policy section and the gateway
+   swap, and write the end-to-end suite.~~ **Done** — landed together, wired
+   into the binary, 4 end-to-end tests against the real CLI, 1,643 tests green.
+4. **One dogfood run swapping a real credential** in a live agent session,
+   bundle committed — so the credential claim sits in the same evidence class
+   as the deny claims. This is the only thing between Half B and a demo.
+5. **`decision_id` on decision events** — the join key to the control plane.
 
 Deliberately **not** on the path: everything in NHI. A one-week POV as scoped
 here runs end to end with zero NHI infrastructure, because the broker resolves
