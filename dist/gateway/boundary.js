@@ -53,6 +53,7 @@
  * Also home of the exact human-readable strings a denied/held call gets
  * back (pinned by tests — keep them short and stable).
  */
+import { SYNTHETIC_PREFIX } from '../broker/protocol.js';
 import { DEFAULT_POLICY } from '../redact/redactor.js';
 import { findInjectionSpans, matchSpans, mergeSpans } from './injection.js';
 /** Cap on `secret_refs`, matching the redactor's `MAX_SECRET_REFS`. */
@@ -568,6 +569,26 @@ function unionRegions(secrets, injections) {
     }
     return out;
 }
+/**
+ * Where synthetic placeholders sit in a string. Used to keep the secret
+ * scanner off them; see the call site for why that is the right behaviour.
+ */
+function syntheticOccurrences(text) {
+    const out = [];
+    const prefix = SYNTHETIC_PREFIX;
+    let from = 0;
+    for (;;) {
+        const at = text.indexOf(prefix, from);
+        if (at === -1)
+            break;
+        let end = at + prefix.length;
+        while (end < text.length && /[A-Za-z0-9_-]/.test(text[end]))
+            end++;
+        out.push({ start: at, end, id: 'synthetic' });
+        from = end;
+    }
+    return out;
+}
 /** `[redacted:sha256:<16 hex>]` for one secret token. */
 function secretMarker(token, hashString) {
     const ref = hashString(token);
@@ -669,7 +690,15 @@ function applyBoundaryUnsafe(message, config, deps, opts, base) {
     let secretsFound = 0;
     let injectionFound = 0;
     for (const slot of slots) {
-        const raw = scanSecrets ? rawSecretSpans(slot.text, deps.secretPatterns) : [];
+        // A synthetic is not a secret — it is the placeholder that exists so a real
+        // one never gets here, and off this machine it is inert. Redacting it
+        // would hide the single most useful thing a reader can check: that what
+        // came back is the synthetic and NOT the credential. Synthetics are
+        // high-entropy, so the generic patterns match them (and often match only
+        // PART of one, which is why this works on overlap rather than on the
+        // span's own text).
+        const syntheticSpans = syntheticOccurrences(slot.text);
+        const raw = (scanSecrets ? rawSecretSpans(slot.text, deps.secretPatterns) : []).filter((span) => !syntheticSpans.some((syn) => span.start < syn.end && syn.start < span.end));
         const secrets = mergeSpans(raw);
         // The operator's budget, not a second hidden one: `max_scan_bytes` has
         // already been enforced on the whole line above, so this never truncates

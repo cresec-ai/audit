@@ -255,6 +255,8 @@ function normalizeCredential(credential) {
         timeout_ms: credential.timeout_ms ?? DEFAULTS.credential.timeout_ms,
         on_unresolved: credential.on_unresolved ?? DEFAULTS.credential.on_unresolved,
     };
+    if (credential.synthetic_env !== undefined)
+        out.synthetic_env = credential.synthetic_env;
     if (credential.provider !== undefined)
         out.provider = credential.provider;
     if (credential.scopes !== undefined)

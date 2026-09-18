@@ -27,6 +27,7 @@ import { readZipEntries } from './export/unzip.js';
 import { HoldError, HoldStore } from './gateway/holds.js';
 import type { HoldDecision, HoldRecord } from './gateway/holds.js';
 import type { GatewayOptions } from './gateway/options.js';
+import { credentialSwapFromPolicy } from './broker/wire.js';
 import { PolicyLoadError, parsePolicyText, sourceForPath } from './policy/load.js';
 import type { LoadedPolicy } from './policy/load.js';
 import { bundleFileOrder, compileToRego } from './policy/rego.js';
@@ -636,6 +637,19 @@ async function cmdRecord(flags: Flags, serverCommand: string[]): Promise<void> {
       // hold, independent of the evidence store: a store that fails to open
       // degrades recording to passthrough but never enforcement.
       gateway = { policy, holdStore: new HoldStore(config.dataDir) };
+      // A `credentials:` section turns the gateway into a broker as well as a
+      // gate. Building it here, beside the policy, keeps the one deliberate
+      // exception to fail-open in one place: a credentials section that
+      // cannot be turned into a broker exits 2 rather than running with a
+      // swap the operator believes is on. Absent section, absent env
+      // binding, or a broker that refuses its own config are three different
+      // outcomes and the operator hears which one.
+      try {
+        const wiring = credentialSwapFromPolicy({ policy: policy.policy, env: process.env, warn: diag });
+        if (wiring !== undefined) gateway.credentials = wiring.swap;
+      } catch (e) {
+        err(`policy ${policyPath}: ${(e as Error).message}`);
+      }
     }
   }
 

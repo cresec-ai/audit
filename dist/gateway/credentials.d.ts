@@ -129,7 +129,15 @@ export declare const SWAP_DENY: {
 /** A glob or a non-empty list of globs, as the policy author writes it. */
 export type GlobOrList = string | string[];
 /** Where a site's destination comes from. `server` = the MCP server's own name. */
-export type HostFrom = 'arg' | 'server';
+/**
+ * Where the destination comes from. `fixed` exists because a policy may
+ * declare the host outright (`host: { fixed: api.stripe.com }`) for a server
+ * whose upstream is not named in any argument — without it such a site has no
+ * expressible destination, and a site with no destination constraint is the
+ * failure the red team named: authorising a tool without authorising where it
+ * points.
+ */
+export type HostFrom = 'arg' | 'server' | 'fixed';
 /** One declared swap site, as authored. */
 export interface CredentialSiteInput {
     id?: string;
@@ -147,6 +155,8 @@ export interface CredentialSiteInput {
     host_from?: HostFrom;
     /** Dot-path of the argument the host (and by default the path) is derived from. */
     host_arg?: string;
+    /** The destination itself, when `host_from` is "fixed". */
+    host_fixed?: string;
     /** Dot-path of the argument the path template is derived from, when it is not `host_arg`. */
     path_arg?: string;
     /** REQUIRED. Globs on the derived host, `.` delimiter — the destination constraint. */
@@ -173,6 +183,8 @@ export interface CredentialSite {
     arg: string;
     argSegments: (string | number)[];
     hostFrom: HostFrom;
+    /** Set only when `hostFrom` is "fixed". */
+    hostFixed?: string;
     hostArg?: string;
     pathArg?: string;
     allowHost: string[];
@@ -209,7 +221,7 @@ export interface PlannedSwap {
     /** The synthetic token inside that leaf. */
     synthetic: string;
     host: string;
-    hostSource: 'argument' | 'server_name';
+    hostSource: 'argument' | 'server_name' | 'declared';
     pathTemplate: string;
     /** Set when the destination already fails the site's own constraint: a deny decided before any exchange. */
     refusal?: string;
@@ -313,7 +325,7 @@ export interface SwapDecision {
     credential: string;
     decisionId: string;
     host: string;
-    hostSource: 'argument' | 'server_name';
+    hostSource: 'argument' | 'server_name' | 'declared';
     pathTemplate: string;
     ttlSeconds: number;
     denyCode?: string;

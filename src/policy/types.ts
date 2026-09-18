@@ -210,6 +210,8 @@ export interface CredentialUseInput {
 
 export interface CredentialInput {
   id: string;
+  /** Environment variable holding this credential's synthetic. Default `MCP_RECORDER_SYNTHETIC_<ID>`. */
+  synthetic_env?: string;
   provider?: string;
   scopes?: string[];
   source: CredentialSourceInput;
@@ -305,6 +307,8 @@ export interface CredentialUse {
 
 export interface Credential {
   id: string;
+  /** Environment variable holding this credential's synthetic, when the policy names one. */
+  synthetic_env?: string;
   /** Informational: which provider the real credential belongs to. Recorded on the decision. */
   provider?: string;
   /** Informational: what the real credential can do. Recorded on the decision, so blast radius is answerable from the chain instead of reconstructed. */
@@ -635,6 +639,7 @@ function normalizeCredential(credential: CredentialInput): Credential {
     timeout_ms: credential.timeout_ms ?? DEFAULTS.credential.timeout_ms,
     on_unresolved: credential.on_unresolved ?? DEFAULTS.credential.on_unresolved,
   };
+  if (credential.synthetic_env !== undefined) out.synthetic_env = credential.synthetic_env;
   if (credential.provider !== undefined) out.provider = credential.provider;
   if (credential.scopes !== undefined) out.scopes = [...credential.scopes];
   return out;

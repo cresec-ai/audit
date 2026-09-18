@@ -152,6 +152,14 @@ export const POLICY_SCHEMA: JsonSchema = {
           maximum: LIMITS.credential_timeout_ms.max,
           description: 'Deadline for resolving the source. Overrunning it denies this call. Default 5000.',
         },
+        synthetic_env: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          pattern: '^[A-Za-z_][A-Za-z0-9_]*$',
+          description:
+            'Environment variable holding the synthetic bound to this credential. Defaults to MCP_RECORDER_SYNTHETIC_<ID>. The synthetic is deliberately not in the policy: a policy file is shareable evidence of the rules, and a file of raw synthetics is a file of values redeemable on this machine.',
+        },
         on_unresolved: {
           type: 'string',
           enum: ['deny'],

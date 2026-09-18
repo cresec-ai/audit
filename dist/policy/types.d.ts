@@ -181,6 +181,8 @@ export interface CredentialUseInput {
 }
 export interface CredentialInput {
     id: string;
+    /** Environment variable holding this credential's synthetic. Default `MCP_RECORDER_SYNTHETIC_<ID>`. */
+    synthetic_env?: string;
     provider?: string;
     scopes?: string[];
     source: CredentialSourceInput;
@@ -267,6 +269,8 @@ export interface CredentialUse {
 }
 export interface Credential {
     id: string;
+    /** Environment variable holding this credential's synthetic, when the policy names one. */
+    synthetic_env?: string;
     /** Informational: which provider the real credential belongs to. Recorded on the decision. */
     provider?: string;
     /** Informational: what the real credential can do. Recorded on the decision, so blast radius is answerable from the chain instead of reconstructed. */

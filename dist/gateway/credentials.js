@@ -206,8 +206,11 @@ export function normalizeCredentialsConfig(input) {
             throw new CredentialsConfigError(`credentials site "${id}": arg (the dot-path holding the synthetic) is required`);
         }
         const hostFrom = raw.host_from ?? 'arg';
-        if (hostFrom !== 'arg' && hostFrom !== 'server') {
-            throw new CredentialsConfigError(`credentials site "${id}": host_from must be "arg" or "server"`);
+        if (hostFrom !== 'arg' && hostFrom !== 'server' && hostFrom !== 'fixed') {
+            throw new CredentialsConfigError(`credentials site "${id}": host_from must be "arg", "server" or "fixed"`);
+        }
+        if (hostFrom === 'fixed' && (typeof raw.host_fixed !== 'string' || raw.host_fixed === '')) {
+            throw new CredentialsConfigError(`credentials site "${id}": host_fixed is required when host_from is "fixed"`);
         }
         if (hostFrom === 'arg' && (typeof raw.host_arg !== 'string' || raw.host_arg === '')) {
             throw new CredentialsConfigError(`credentials site "${id}": host_arg is required unless host_from is "server"` +
@@ -225,6 +228,8 @@ export function normalizeCredentialsConfig(input) {
         };
         if (raw.host_arg !== undefined)
             site.hostArg = raw.host_arg;
+        if (raw.host_fixed !== undefined)
+            site.hostFixed = raw.host_fixed;
         if (raw.path_arg !== undefined)
             site.pathArg = raw.path_arg;
         if (raw.allow_path !== undefined)
@@ -320,7 +325,7 @@ export function planSwaps(config, input) {
             leaf,
             synthetic,
             host: '',
-            hostSource: site.hostFrom === 'server' ? 'server_name' : 'argument',
+            hostSource: site.hostFrom === 'server' ? 'server_name' : site.hostFrom === 'fixed' ? 'declared' : 'argument',
             pathTemplate: '',
         };
         if (found.length > 1) {
@@ -329,6 +334,17 @@ export function planSwaps(config, input) {
         if (site.hostFrom === 'server') {
             planned.host = input.server.toLowerCase();
             planned.pathTemplate = input.tool;
+        }
+        else if (site.hostFrom === 'fixed') {
+            // Declared by the operator, so nothing about the call can move it. The
+            // allow_host check below still runs: it is the same list, so it passes,
+            // and leaving it in means there is exactly one place a destination is
+            // approved rather than two code paths to keep in agreement.
+            planned.host = site.hostFixed.toLowerCase();
+            planned.pathTemplate = site.pathArg === undefined ? input.tool : '';
+            if (site.pathArg !== undefined) {
+                planned.pathTemplate = deriveDestination(getPath(input.args, site.pathArg))?.pathTemplate ?? '';
+            }
         }
         else {
             const derived = deriveDestination(getPath(input.args, site.hostArg));
