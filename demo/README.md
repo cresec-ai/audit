@@ -1,13 +1,14 @@
 # Demo: catching a prompt-injection exfiltration
 
-This is a self-contained, deterministic demo of `@edut/mcp-recorder` acting as a
-black-box flight recorder for MCP. It tells one story end to end:
+This is a self-contained, deterministic demo of `@edut/mcp-recorder` acting as
+the MCP gateway and evidence-chain leg of Governed Tools. It tells one story
+end to end:
 
 > A coworker's AI agent reads an innocent-looking corp note. Hidden inside the
 > note is a prompt injection. The agent obeys it, reads a secret, and POSTs it
 > to an attacker. The recorder — sitting transparently between the agent and the
-> server — captured everything. We reconstruct the incident, prove who touched
-> the leaked secret, and export a signed evidence bundle anyone can verify.
+> server — captured everything. We reconstruct the incident, prove which sessions
+> and tool calls touched the leaked secret, and export a signed evidence bundle anyone can verify.
 
 ## Run it
 

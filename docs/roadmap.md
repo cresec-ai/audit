@@ -1,36 +1,47 @@
 # Roadmap: where this project actually is
 
-`@edut/mcp-recorder` is one npm-shaped package in this repository. The plan
-around it is larger than the package, and most of that plan is not code that
-lives here. This page separates the three, so that nobody installs the
-recorder expecting a hosted control plane.
+`@edut/mcp-recorder` is the MCP gateway and evidence-chain leg of Cresec
+Governed Tools, and it is one npm-shaped package in this repository. The
+product around it is larger than the package, and most of that product is
+not code that lives here: the identity gate, the per-user credential vault,
+the HTTPS egress gateway, the policy engine and the views are the control
+plane in [`cresec-ai/nhi`](https://github.com/cresec-ai/nhi). This page
+separates what is shipped here from what is planned where, so that nobody
+installs the recorder expecting a hosted control plane.
 
-It also reconciles this repository with `cresec-ai/nhi`, the control plane that
-holds credentials. [docs/pov.md](pov.md) is the companion page: it tells the
-proof-of-value story these items serve, stage by stage, and carries the list of
-things we must not claim in a room. Read that first if you want the *why*; this
-page is the *what and in what order*.
+[docs/pov.md](pov.md) is the companion page: it tells the Governed Tools
+story and the four-week proof of value week by week, says what this package
+contributes to each week, and carries the list of things we must not claim in
+a room. Read that first if you want the *why*; this page is the *what and in
+what order*.
 
 The source of truth for planning is the ClickUp list
 [🛠️ MVP — MCP Black Box](https://app.clickup.com/90182720801/v/l/li/901818701787),
-75 items when this page was written. This page is the engineering reading of
-it, checked against the repository.
+121 items when read from ClickUp on 2026-09-20 (107 before the fourteen
+subtasks filed that day), whose `[Roadmap v2]` Phase 0–6 tasks are the frame
+this page uses. The product story and the invariants are
+in the ClickUp doc
+[NHI Platform — Product Thesis & Strategic Analysis](https://app.clickup.com/90182720801/docs/2kzmy791-558):
+the [Governed Tools story page](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-618)
+and the [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638).
+This page is the engineering reading of them, checked against the repository.
 
-**Snapshot:** `origin/main` at `6307cc3`, version `0.1.0`, Node `v22.22.2` on
-Linux, checked 2026-09-17. This page will drift; the commit is how you tell
-how far. Everything below described as verified was run against that code
-while writing this page, and the commands are in
-[What did we verify, and how?](#what-did-we-verify-and-how). Anything we
-could not run is labelled as unverified rather than left to read as fact.
+**Snapshot:** `origin/main` at `74dce0e`, version `0.1.0`, Node `v22.22.2` on
+Linux, checked 2026-09-20. This page will drift; the commit is how you tell
+how far. The command transcripts in
+[What did we verify, and how?](#what-did-we-verify-and-how) were run at
+`6307cc3` on 2026-09-17 and have not been re-run at `74dce0e`; the three
+merges below landed between the two. Anything we could not run is labelled
+as unverified rather than left to read as fact.
 
-Three merges landed since the previous revision of this page, and all three
-are on `origin/main`:
+Three merges landed since those transcripts were taken, and all three are on
+`origin/main`:
 
 | Commit | PR | What it added |
 |---|---|---|
-| `b322dea` | #8 | Gateway mode: `record --policy`, per-tool allow/hold/deny, `holds`/`approve`/`deny`, the tool-result boundary filter, `policy.yaml` v1 and the Rego compiler |
-| `6f5725b` | #16 | Hook connector resolution falls back to the entry that declares the tool, when no config key matches the server segment |
-| `6307cc3` | #17 | `npm run typecheck` now runs two tsconfigs, so `test/`, `bench/` and `demo/` are typechecked too |
+| `6dc4399` | #18 | Docs: overview, feature reference and roadmap, plus connector-coverage after dogfood 5 |
+| `ebeaa9b` | #19 | The live evidence sink: `ship`, `MCP_RECORDER_SINK`, the reference receiver under `receiver/`, shipper self-check |
+| `74dce0e` | #20 | The credential broker: seven sources, the `credentials` policy section, the gateway synthetic→real swap with result scrub, the four-test end-to-end suite, and dogfood 7 |
 
 ## Which bucket does a thing belong in?
 
@@ -38,13 +49,22 @@ are on `origin/main`:
 |---|---|---|
 | **Shipped** | this repository, `origin/main` | all of it |
 | **In progress** | this repository, open work on top of main | some of it, unevenly — see below |
-| **v2, planned** | a Go monorepo that does not exist in this repository | **none of it** |
+| **Roadmap v2, control-plane half** | [`cresec-ai/nhi`](https://github.com/cresec-ai/nhi), an existing pnpm + Turborepo + Go monorepo | **none of it** |
 
-The v2 plan (agentctl CLI, edge daemon, hosted control plane, approvals
-inbox, Slack approvals, multi-tenant Helm deploy) targets a different
-codebase. `git ls-files '*.go'` on `origin/main` returns zero files. No
-amount of installing `@edut/mcp-recorder` produces a hosted gateway or an
-approvals UI.
+Roadmap v2 (Phase 0–6, Sept 21 – Dec 11, 2026, in the ClickUp list above)
+puts the identity gate, the per-user credential vault, the HTTPS egress
+gateway, the policy engine, the record stream and the views in the control
+plane, and the MCP gateway and the evidence chain here. `git ls-files '*.go'`
+on `origin/main` returns zero files. No amount of installing
+`@edut/mcp-recorder` produces a hosted gateway, a manager view or per-user
+identity.
+
+The earlier intermediate plan (an `agentctl` CLI, an edge daemon, a sidecar,
+an approvals inbox, Slack approvals) is superseded. The edge daemon is on the
+[retirement list](https://app.clickup.com/t/z8n6b5z509), and the sidecar's
+job — enforcing the compiled `egress` rules — now belongs to the re-targeted
+data-plane proxy, Phase 3's
+[HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h).
 
 ## What can I install and use today?
 
@@ -88,10 +108,10 @@ Each row states the limit next to the capability, not below it.
 | Claude Code hook (`hook`) | a PreToolUse deny returned `permissionDecision: "deny"`; the denied call is in the chain as `error.type: "policy_denied"`, `is_error: true`, `phase: "pre"`. Both deny routes also fired against **live** ClickUp calls in cloud dogfood 5, twice each | Claude Code surfaces only. Not claude.ai web, not Claude Desktop chat. Cowork should be assumed **not** covered — see [docs/connector-coverage.md](connector-coverage.md) |
 | Connector resolution, declared-tool fallback | driven against the real binary in dogfood 4's exact failing config shape — see [What did we verify, and how?](#what-did-we-verify-and-how) | Proven against the real binary in that shape. **Not yet exercised by a live session that naturally presents the mismatch** — see [lesson three](#a-live-run-can-pass-for-a-reason-unrelated-to-the-fix-under-test) |
 | Gateway mode (`record --policy`) | the gateway table below, plus a live agent session in cloud dogfood 5 | Stdio only, and the only place the proxy may block or rewrite traffic. See the gateway table for each behaviour's own limit |
-| `policy.yaml` v1 + Rego compiler | `policy validate` and `policy compile` outputs below | This package enforces the **MCP half only**. Egress rules compile and are then the v2 sidecar's job |
+| `policy.yaml` v1 + Rego compiler | `policy validate` and `policy compile` outputs below | This package enforces the **MCP half only**. Egress rules compile and are then the job of Phase 3's [HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h), the re-targeted data-plane proxy in the control plane, which does not exist yet |
 | HTTP MCP proxy (`http`) | `npm test`: `test/http-proxy.test.ts`, 17 tests pass | Records only. `http --policy` exits 2: gateway mode is stdio-only |
 | Typechecked tests | `npm run typecheck` exits 0, running `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json` | Two configs, because `tsconfig.json` emits the committed `dist/`. A new top-level TypeScript directory is unchecked until it is added to `tsconfig.test.json`'s `include` |
-| Test suite | `npm test`: 1317 passed, 3 skipped, 32 files, 67.87 s | The suite spawns real child processes and is timing-sensitive. Of the 3 skipped, one is the OPA parity test, skipped here because no `opa` binary is on PATH — see the gateway table |
+| Test suite | `npm test` at `6307cc3`: 1317 passed, 3 skipped, 32 files, 67.87 s. Not re-run at `74dce0e`; [docs/pov.md](pov.md) records 1,643 after the broker landed | The suite spawns real child processes and is timing-sensitive. Of the 3 skipped, one is the OPA parity test, skipped here because no `opa` binary is on PATH — see the gateway table |
 
 The ClickUp items behind these are all complete:
 [stdio MCP passthrough proxy (forward unchanged)](https://app.clickup.com/t/86exx61yr),
@@ -130,7 +150,7 @@ of the connector research and shipped in PR #10 and PR #9.
 | Boundary filter, injection markers, `flag` (the default) | the same result reached the client **verbatim**; the evidence event carries `{"boundary":{"action":"flag","injection_found":1,"scanned":true,"secrets_found":0},"decision":"allow"}` and the gateway prints nothing on stderr | **`flag` does not block.** The agent still receives the injected text. The default is `flag`, not `block`, because false positives on security documentation are expected — see [Known gaps](#known-gaps-dogfood-5-raised) |
 | Transport scope | `http --target … --policy …` exits 2: `http: gateway mode is available for the stdio transport only (drop --policy)` | Gateway mode is stdio-only. The `hook` policy is a separate, simpler allow/deny engine |
 | `policy.yaml` v1 validation | `policy validate docs/examples/policy.laptop.yaml` → `valid (3 mcp rules, 0 egress rules)`, exit 0 | A schema check. It says nothing about whether the rules you wrote match the tool names your client actually sends |
-| Rego compilation | `policy compile` emitted `package cresec.mcp` with a provenance comment naming the policy and its sha256; `--out` wrote `.manifest`, `cresec/mcp/tool.rego`, `cresec/egress/http.rego` | The TypeScript engine and the emitted Rego must stay semantically identical, and an OPA parity test enforces that — **but it is skipped without an `opa` binary**, and it was skipped in our run (`no opa binary found … skipping OPA parity tests`) |
+| Rego compilation | `policy compile` emitted `package cresec.mcp` with a provenance comment naming the policy and its sha256; `--out` wrote `.manifest`, `cresec/mcp/tool.rego`, `cresec/egress/http.rego` | The TypeScript engine and the emitted Rego must stay semantically identical, and an OPA parity test enforces that — **but it is skipped without an `opa` binary**, and it was skipped in our run (`no opa binary found … skipping OPA parity tests`). At `74dce0e` a policy with a `credentials` section also emits `cresec/credentials/broker.rego`; the transcript predates that |
 
 See [docs/gateway.md](gateway.md) for the walk-through and
 [docs/policy.md](policy.md) for the rule semantics. `docs/gateway.md` carries
@@ -273,8 +293,9 @@ import rego.v1
 
 A policy may carry `mcp` rules and `egress` rules; the compiler emits a
 module for each. **This package enforces only the MCP half.** Egress rules
-compile and are then the v2 sidecar's job, and the sidecar does not exist
-yet. The tool says so rather than pretending otherwise:
+compile and are then the HTTPS egress gateway's job
+([Phase 3](https://app.clickup.com/t/z8n6b5z50h)), and that gateway does not
+exist yet. The tool says so rather than pretending otherwise:
 
 ```
 $ mcp-recorder policy validate test/fixtures/policies/egress-only.yaml
@@ -341,14 +362,18 @@ section; both are shipped and both are now closed in ClickUp too.
 
 ### What ClickUp says, and what the repository contains
 
-Checked directly against ClickUp on 2026-09-17. Where the two disagree, both
-readings are given rather than one being picked.
+Checked directly against ClickUp on 2026-09-17, and the statuses re-read from
+ClickUp on 2026-09-20 (one had changed: P1-12). Where the two disagree, both
+readings are given rather than one being picked. The `P` items belong to the intermediate `agentctl` / sidecar
+plan that Roadmap v2 supersedes; they are listed because they were closed on
+the strength of what this repository shipped, and the scope gap between the
+item and the code is worth knowing.
 
 | Item | ClickUp status | What `origin/main` contains | Divergence |
 |---|---|---|---|
 | [P2-7 MCP gateway mode: JSON-RPC proxy, per-tool allow/hold/deny, tool-result boundary filter (folds Edut M0)](https://app.clickup.com/t/z8n6b5yta4) | complete, closed 2026-09-17 | `record --policy`, allow/hold/deny, `holds`/`approve`/`deny`, the boundary filter — all verified above | **Scope.** The item describes the v2 Go binary with per-tenant upstream registration and an audience token in `Authorization`. None of that exists. What shipped is the laptop-scale TypeScript subset, stdio only, one machine, no tenants. The item was closed on the strength of that subset |
-| [P1-5 policy.yaml schema v1 + JSON Schema validation + compiler to Rego (existing OPA bundle endpoint)](https://app.clickup.com/t/z8n6b5yt9p) | complete, closed 2026-09-17 | `policy validate`, `policy compile`, `docs/policy.md`, `docs/policy-schema.json` | **Scope.** The item lists `agents`, `credentials` and `egress` sections alongside `rules`. v1 as shipped covers `mcp` and `egress`; only the `mcp` half is enforced by anything that exists today, and there is no credentials brokering here at all |
-| [P1-12 Docs: 10-minute quickstart for laptop and CI](https://app.clickup.com/t/z8n6b5yt9x) | in progress | `README.md`, [docs/install.md](install.md), [docs/gateway.md](gateway.md), [docs/hooks.md](hooks.md), [docs/policy.md](policy.md), [docs/connector-coverage.md](connector-coverage.md), [docs/red-team.md](red-team.md), [docs/agent-guidance.md](agent-guidance.md) | **None on status.** There is no single 10-minute quickstart page, and no CI-specific one at all; what exists is a per-client install guide plus topic pages |
+| [P1-5 policy.yaml schema v1 + JSON Schema validation + compiler to Rego (existing OPA bundle endpoint)](https://app.clickup.com/t/z8n6b5yt9p) | complete, closed 2026-09-17 | `policy validate`, `policy compile`, `docs/policy.md`, `docs/policy-schema.json` | **Scope.** The item lists `agents`, `credentials` and `egress` sections alongside `rules`. v1 as shipped covers `mcp`, `egress` and, since PR #20 (`74dce0e`), `credentials`; the `mcp` and `credentials` halves are enforced by this package (gateway mode and the local broker), `egress` compiles and nothing consumes it, and there is no `agents` section |
+| [P1-12 Docs: 10-minute quickstart for laptop and CI](https://app.clickup.com/t/z8n6b5yt9x) | complete (read "in progress" on 2026-09-17; read complete, closed 2026-09-17, from ClickUp on 2026-09-20) | `README.md`, [docs/install.md](install.md), [docs/gateway.md](gateway.md), [docs/hooks.md](hooks.md), [docs/policy.md](policy.md), [docs/connector-coverage.md](connector-coverage.md), [docs/red-team.md](red-team.md), [docs/agent-guidance.md](agent-guidance.md) | **None on status.** There is no single 10-minute quickstart page, and no CI-specific one at all; what exists is a per-client install guide plus topic pages |
 | [OSS packaging: README, license, landing](https://app.clickup.com/t/86exx6206) | in progress | GPL-3.0 `LICENSE`, a README, `docs/landing/` | **None on status.** The package is not on npm, so the `npx` form in the docs does not resolve yet |
 | [P3-6 Agent-facing guidance snippet (CLAUDE.md / AGENTS.md / Cursor rules) so agents don't fight holds](https://app.clickup.com/t/z8n6b5ytad) | complete | [docs/agent-guidance.md](agent-guidance.md) | **Bucket.** ClickUp does not say which artefact closed it; our reading is that this page did — a v2-phase item delivered in this TypeScript package rather than in the Go codebase its phase describes |
 
@@ -420,86 +445,158 @@ store *does* hold events, the same mistake produces a page about the wrong
 session with no warning at all — which is how it behaved when we reran it
 here.
 
-## The consolidated backlog (both repositories, one order)
+## The consolidated backlog, keyed to Roadmap v2
 
-This replaces the two separate roadmaps. Ordering is by **which proof-of-value
-stage an item unblocks**, not by which repository it lives in — see
-[docs/pov.md](pov.md) for the stages and for what we may and may not claim about
-each capability.
+This replaces the two separate roadmaps, and the earlier ordering of this
+section by proof-of-value stage. The frame is Roadmap v2 Phase 0–6 and the
+`[A]` / `[B]` / `[C]` build tickets in ClickUp; this repository's own open
+items sit under the phase they serve. Owner is `recorder` (this repository)
+or `control plane` (`cresec-ai/nhi`). Every ticket id links to ClickUp; an
+item with no ticket is one this page names and nobody has filed yet.
 
-Owner is `recorder` (this repository), `nhi` (`cresec-ai/nhi`, the control
-plane), or `v2` (a Go monorepo that exists in neither).
+Five items the previous revision of this section listed as open P0 work are
+done on `origin/main` and are dropped: the broker core, the `credentials`
+policy section, the gateway swap, the end-to-end broker suite and the live
+dogfood run — `acb3f9c`, `5f59c70`, `5d3dace`, merged as PR #20 (`74dce0e`).
+[docs/pov.md](pov.md) tells what dogfood 7 found.
 
-### P0 — the week-one POV does not work without these
+### Phase 0 — Decisions & specs (wk 1–2)
 
-| Item | Unblocks | Size | Owner | Why |
-|---|---|---|---|---|
-| Pre-flight hardening: `hook install` creates `.claude/`; `--undo` byte-exact; backups gitignored; `ui --out` refuses to silently render the default store; demo cleans up and fails on the doubling retry | Stage 1 | S | recorder | Each has already made a live operator look incompetent. `ui --out` is the worst: without `--data-dir` it renders `~/.mcp-recorder`, so in a customer room it can display somebody else's traffic |
-| Publish `@edut/mcp-recorder` to npm | Stage 1 | S | recorder | `npm view` returns E404, so every `npx -y` line in our docs is a future form, and a GitHub-URL install is rejected outright by some security teams |
-| `sessions` DECISIONS counts both deny shapes; replay badges them consistently | Stage 2 | S | recorder | It reads 0 for hook sessions however many calls they denied. Any "how much did we block?" answer is wrong today, and the buyer finds it unaided |
-| Land the broker core + protocol + seven resolver sources | Stage 4B | M | recorder | Until it lands, the branch name is a claim nothing backs and nothing else in the credential story can integrate |
-| Land the `credentials` policy section + Rego emitter | Stage 4B | M | recorder | The policy surface the broker needs. `main`'s schema is still exactly `version`/`name`/`mcp`/`egress` |
-| Land the gateway swap + result scrub, deleting its temporary scaffold | Stage 4B | M | recorder | Integration is the risk here, not authorship: three units written in three isolated trees that have never run together |
-| End-to-end broker suite, plus the first tests for the gateway swap | Stage 4B | M | recorder | The unit that proves the three pieces work together rather than three pieces each working alone |
-| One dogfood run swapping a real credential, bundle committed | Stage 4B | S | recorder | Every other load-bearing claim has a named live run behind it. The credential claim needs the same or it is not in the same class |
+[Phase 0](https://app.clickup.com/t/z8n6b5z4zf). Exit: hour-1 artifact spec
+signed off; actor-claim schema for (user, tool, tool-version, host) agreed;
+v1 mediation scope fixed (HTTPS SaaS APIs + MCP; databases v1.5); retirement
+list executed; Sludge0 decision recorded.
 
-### P1 — makes the story hold together
+| Item | Ticket | Owner | What it means for this repository |
+|---|---|---|---|
+| Actor-claim schema for (user, tool, tool-version, host) | [z8n6b5z507](https://app.clickup.com/t/z8n6b5z507) | both | The one decision this repository is blocked on. Until it is taken no event carries a user, and the identity block stays `os_user` + `hostname`. When it lands: additive optional fields, because `edut.mcp-recorder.event.v1` is frozen |
+| Hour-1 artifact spec | [z8n6b5z504](https://app.clickup.com/t/z8n6b5z504) | control plane | Nothing here |
+| Retire v1 components: Go edge daemon, Chrome MV3 extension, Gmail watch/Pub-Sub, mobile network extensions | [z8n6b5z509](https://app.clickup.com/t/z8n6b5z509) | control plane | Closes the "edge daemon / sidecar" thread earlier revisions of this page pointed at |
+| [A1] Demo environment: Okta dev tenant, Salesforce dev org, Workspace test domain, a Vercel project | [z8n6b5z8cf](https://app.clickup.com/t/z8n6b5z8cf) | control plane | Nothing here |
+| Both repositories' docs re-pointed at the Governed Tools story | [z8n6b5z9fh](https://app.clickup.com/t/z8n6b5z9fh) | both | This revision of this page, `docs/pov.md`, `README.md`, `AGENTS.md`, the landing page and the package description; in `cresec-ai/nhi`: `README.md`, `docs/governed-tools.md`, `AGENTS.md`, superseded banners |
 
-| Item | Unblocks | Size | Owner | Why |
-|---|---|---|---|---|
-| `decision_id` as an additive optional field on decision events | Stage 4B, every later NHI join | S | recorder | The only identifier joining the agent-side signed chain to the control-plane ledger. Cheap, and permitted by the frozen v1 schema |
-| Promote the deny-rule smoke test to `policy test --tool <name>` | Stage 3 | S | recorder | The thirty seconds where a rule prints nothing is the most persuasive moment in the second meeting. Today it is a `printf` someone has to remember — and forgetting it is exactly how dogfood 4 failed |
-| `sessions --tools` census | Stage 2 | S | recorder | Turns Stage 2 from an engineer improvising SQL into a product surface, and it is what makes the discovery claim defensible |
-| Ship `receiver/` in package `files`; add an HTTP export route for signed replica bundles | Stage 3, 4 | M | recorder | Today a receiver needs a repo clone, and a remote auditor cannot pull a signed replica without filesystem access to the receiver host — which undercuts "evidence you do not have to be handed" |
+### Phase 1 — Pull layer & hour-1 artifact (wk 1–4)
 
-### P2 — proves what we already shipped, and makes NHI serve one real exchange
+[Phase 1](https://app.clickup.com/t/z8n6b5z4zj). No SDK, no proxy, no code
+change at the customer. Nothing in this repository; listed so nobody looks
+for it here. Tickets:
+[Okta ingest](https://app.clickup.com/t/z8n6b5z50b),
+[connector-side audit ingest](https://app.clickup.com/t/z8n6b5z50c),
+[identity join + attribution report](https://app.clickup.com/t/z8n6b5z50e),
+[[B1] tenant onboarding, read-only](https://app.clickup.com/t/z8n6b5z8cj),
+[[B2] hour-1 artifact renderer](https://app.clickup.com/t/z8n6b5z8ck). All
+control plane.
 
-| Item | Unblocks | Size | Owner | Why |
-|---|---|---|---|---|
-| Exercise gateway `hold` in a live session; boundary secret filter against a real agent-driven secret | Stage 3 | S | recorder | Both shipped but marked Tested-not-Verified. One dogfood run each moves two beats from "we tested it" to "we watched it" |
-| One real client launching what `setup` wrote | Stage 1 | M | recorder | Removes the only awkward moment in the first meeting, where we recommend hand-editing the config we shipped a command to write |
-| NHI: fix preseed — insert the `data_plane_instance` row, store a real HMAC instead of the literal `fakeHash`, write the token to the vault | beyond Stage 4 | S | nhi | Three independent denies mean NHI cannot serve a single successful exchange from a clean checkout. This one fix makes the core swap real on the control-plane side |
-| NHI: synthetic issuance endpoint, called from handover completion | beyond Stage 4 | S | nhi | `issueSynthetic` has zero call sites, so nothing in the running system can hand out a working synthetic |
-| NHI: generic revoke endpoint, and point the console at it | beyond Stage 4 | M | nhi | Turns the designated "wow moment" from a client-side animation into a 403 on the wire. Their own `it.fails` test being green is a machine-checked assertion that it 404s today |
-| NHI: call `startCronJobs` | beyond Stage 4 | XS | nhi | The cron runner is built, tested and never started, so nothing changes on a timer: no posture snapshot is ever written and Gmail watches expire silently |
-| A Rego deny rule that can actually fire, with an OPA input document unified with the recorder's | Stage 3 handover becoming real enforcement | M | both | The sole deny rule keys on a field the broker never sends, so OPA returns allow unconditionally; the passing tests supply it by hand and mask the gap |
-| Add `cresec/broker/allow.rego` as a third compile target; generate NHI's hand-written bundle in CI from a `policy.yaml` in git | Stage 3, week 2+ | M | both | Removes the second authoring surface. Two places a rule can be wrong, neither smoke-tested, is precisely how dogfood 4 failed |
+### Phase 2 — Identity gate & propagation (wk 2–6)
 
-### P3 — fleet, and the hard gate
+[Phase 2](https://app.clickup.com/t/z8n6b5z4zn). Exit: a Vercel and a Lambda
+tool sign in via Okta and reach the gateway with a valid per-user token; no
+secrets in tool env.
 
-| Item | Unblocks | Size | Owner | Why |
-|---|---|---|---|---|
-| NHI: implement the three evidence-sink routes over the existing audit tables, using `receiver/` as the reference | fleet | L | nhi | The cleanest single piece of integration in the whole join: signed agent-side evidence lands in the control plane's append-only storage |
-| NHI: control-plane authentication, tenant middleware, RLS per transaction | any production use | XL | nhi | Zero auth hooks across 21 route plugins; tenant-scoped endpoints trust a caller-supplied `tenant_id`. This is the hard gate on everything after it |
-| Sub-second revocation reaching the agent gateway (NATS) | beyond Stage 4 | M | both | Answers "revoke it and show me the 403" at fleet speed rather than "delete it from the resolver and the next call fails" |
-| SIEM export (Splunk / Sentinel / Datadog / Elastic) | post-POV | M | recorder | The SOC wants the inventory in the tool they already watch; the frozen OTel-aligned schema makes it cheap on our side |
-| Fleet aggregation, retention and pruning, external anchoring of chain heads, MDM-pushed managed settings | beyond the POV | L | both | The store grows until deleted. The sink is the first half of anchoring, not the whole of it |
-| Gateway enforcement for HTTP MCP servers; egress enforcement of the compiled rules | not in this POV | L / XL | recorder, v2 | Two holes a technical buyer will find: `http --policy` exits 2, and the compiler emits egress rules nothing enforces |
+| Item | Ticket | Owner | What it means for this repository |
+|---|---|---|---|
+| Okta Cross App Access and Entra OBO on top of `/v1/tokens/exchange`; hosted OIDC front issuing the identity JWT | [z8n6b5z50f](https://app.clickup.com/t/z8n6b5z50f), [z8n6b5z9fc](https://app.clickup.com/t/z8n6b5z9fc) | control plane | The RFC 8693 endpoint and the EdDSA JWT issuer exist in the control plane (needs-nhi); the Okta/Entra front does not. The JWT this issues is what the MCP gateway will read for the actor claim |
+| Middleware packages (Next.js/Vercel, Lambda authorizer, Express, FastAPI) | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) | control plane | Nothing here |
+| [A2] Reference tool, both states (`service-account` and `governed` branches) | [z8n6b5z8cg](https://app.clickup.com/t/z8n6b5z8cg) | undecided (nhi supplies the JWT and gateway URLs) | `npm run demo` is not this: it is a fixed script against a corp-notes fixture |
+| [C1] Per-user OAuth connect flows for Salesforce and Gmail; tokens in OpenBao keyed by (user, connector); refresh, revoke, fail closed within a minute of Okta deactivation | [z8n6b5z8cm](https://app.clickup.com/t/z8n6b5z8cm) | control plane | Replaces the synthetic-issuance story earlier revisions carried (fix preseed, an issuance endpoint, a generic revoke endpoint). Per-tenant synthetic issuance is not on Roadmap v2. This is the per-user token path `RemoteBroker` will fetch from once wired; whether that is a `/broker/exchange` re-keyed by (user, connector) or a new endpoint is undecided in nhi |
+| Control-plane authentication and tenancy | — (no ticket; nhi says it precedes every phase) | control plane | No authentication hook across 21 route plugins; every console-facing plugin trusts a caller-supplied `tenant_id`; the two exceptions, `/v1/tokens/exchange` and the Tailscale webhook, authenticate by payload. Nothing on Roadmap v2 names this work, and it is the hard gate on any production use of the control plane |
 
-### P4 — not scheduled
+### Phase 3 — Egress gateway: HTTPS + MCP mediation (wk 4–9)
 
-Approvals inbox, Slack approve/deny, hosted multi-tenant gateway, fleet console,
-mobile agents. Listed so nobody mistakes the local `holds` / `approve` / `deny`
-commands for them, and so nobody promises them in a room.
+[Phase 3](https://app.clickup.com/t/z8n6b5z4zr). Exit: partner's tool runs
+with zero stored secrets; p95 overhead < 50 ms; every call carries (user,
+tool, version, target).
 
-### The v2 plan these fold into
+| Item | Ticket | Owner | What it means for this repository |
+|---|---|---|---|
+| HTTPS egress gateway: `gateway/<connector>/…` base-URL override, per-user token injection, redacted recording | [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h) | control plane | The data-plane proxy re-targeted: needs-build on a needs-nhi base (the Go proxy exists; the JWT validation, per-user fetch and redacted recording do not). Where compiled `egress` rules would finally be enforced; today `policy compile` emits them and nothing consumes them |
+| [A3] Gateway walking skeleton: validate the identity JWT, fetch the per-user token from OpenBao, forward to Salesforce and Gmail, one record per call to NATS, p95 measured | [z8n6b5z8ch](https://app.clickup.com/t/z8n6b5z8ch) | control plane | A Fastify service per the build brief; whether it replaces the re-targeted Go proxy or is absorbed into it is undecided. The p95 < 50 ms criterion is measured there, not by `npm run bench` (0.792 ms p50, stdio, local fixture) |
+| MCP gateway: forward to vendor remote MCPs with per-user tokens; skill/tool identity attached to the session | [z8n6b5z50j](https://app.clickup.com/t/z8n6b5z50j) | recorder | `http --policy` exits 2 today. `RemoteBroker` (`src/broker/remote.ts`) is the fail-closed client for a control plane's `/broker/exchange`, tested and exported; `src/broker/wire.ts` constructs `LocalBroker` only. Wire it in, key by (user, connector) instead of (data-plane instance, synthetic credential) — against whichever endpoint nhi settles on, a re-keyed `/broker/exchange` or a new one — and carry the actor claim |
+| Policy engine: (user × tool version) → (connector × tool × scope); action classes read / draft / send / write; draft-only default | [z8n6b5z50k](https://app.clickup.com/t/z8n6b5z50k) | control plane, recorder | `policy.yaml` v1 is the authoring surface here and compiles to Rego; the control plane's bundle is hand-written, and its sole deny rule keys on a field the exchange never sends. `policy compile` already emits `cresec/credentials/broker.rego` (package `cresec.credentials`) from the `credentials` section; the control plane evaluates package `cresec.broker` with a different input document, so the two do not meet. Removing the second authoring surface — a `cresec/broker/allow.rego` compile target, the bundle generated in CI from a `policy.yaml` in git, one OPA input document — lives under this ticket. Two places a rule can be wrong, neither smoke-tested, is how dogfood 4 failed |
+| Degrade mode: read-only when the gateway is unreachable | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | recorder, MCP leg only (the customer's HTTPS tool falling back is the control plane's, in its middleware [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) and gateway [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h)) | `MCP_RECORDER_DISABLE=1` removes recording and enforcement together; there is no read-only fallback for the MCP gateway. Invariant 8 |
+| SDK compatibility list: which vendor SDKs honour base-URL override, which need the MCP route | [z8n6b5z9fe](https://app.clickup.com/t/z8n6b5z9fe) | control plane | Decides per connector whether a tool takes the HTTPS gateway or this package's MCP route |
+| Promote the deny-rule smoke test to `policy test --tool <name>` | — | recorder | The thirty seconds where a rule prints nothing. Today it is a `printf` someone has to remember, and forgetting it is exactly how dogfood 4 failed |
+| Exercise gateway `hold` in a live session; boundary secret filter against a real agent-driven secret | — | recorder | Both shipped, both Tested-not-Verified. One dogfood run each |
+| One real client launching what `setup` wrote | — | recorder | `setup` is Tested-not-Verified: no real client has launched what it wrote |
+| Cross-tool verification matrix: Codex, Cursor, Copilot coding agent | [z8n6b5z1zv](https://app.clickup.com/t/z8n6b5z1zv) | recorder | Configuration is wired for each; none has had the dogfood runs Claude Code has |
+| Dogfood 6: the declared-tool fallback in a live session that naturally mismatches | [z8n6b5z1zu](https://app.clickup.com/t/z8n6b5z1zu) | recorder | The forced form ran; the natural one has not |
+| Pre-flight hardening: `hook install --undo` byte-exact and its backups gitignored; `ui --out` refuses to silently render the default store; the demo fails on the doubling retry | [z8n6b5z30j](https://app.clickup.com/t/z8n6b5z30j), [z8n6b5z1zx](https://app.clickup.com/t/z8n6b5z1zx) | recorder | Each has already made a live operator look incompetent |
+| Publish `@edut/mcp-recorder` to npm | [OSS packaging](https://app.clickup.com/t/86exx6206) | recorder | `npm view` returned E404 on 2026-09-20, so every `npx -y` line in our docs is a future form |
 
-The ClickUp v2 phases remain the longer-range frame, and much of the backlog
-above is their laptop-scale ancestor rather than a replacement.
+### Phase 4 — Evidence chain & views (wk 5–10)
 
-| Phase | What it is | Relationship |
-|---|---|---|
-| [v2 · P0 — Harness Audit CLI](https://app.clickup.com/t/z8n6b5yt92) | `agentctl scan` over CI workflows, agent configs, secret reachability, egress and MCP inventory | New code. Reads configuration; records nothing. `sessions --tools` is the observed-traffic answer to the same question |
-| [v2 · P1 — Tier 1 Sidecar: secrets brokering + egress](https://app.clickup.com/t/z8n6b5yt93) | forward proxy with a per-install CA, network-namespace launcher, synthetic credentials, vendor policy packs | Where compiled `egress` rules would finally be enforced. Its P1-5 child (the policy schema) shipped here; the `credentials` section closes the half that was descoped |
-| [v2 · P2 — Tier 2 Hosted Gateway](https://app.clickup.com/t/z8n6b5yt94) | multi-tenant ingress, vendor compile targets, drift detection, sessions UI | The hosted version of what `record --policy` does locally |
-| [v2 · P3 — Approval gates + evidence](https://app.clickup.com/t/z8n6b5yt95) | hold state machine, Slack approvals, one-shot tokens, inbox | The local `holds` / `approve` / `deny` commands are the ancestor. No inbox, no Slack, no token here |
-| [v2 · P4 — Pilot instrumentation](https://app.clickup.com/t/z8n6b5yt96) | pilot metrics, partner reporting, per-tenant bypass | Nothing in this package |
+[Phase 4](https://app.clickup.com/t/z8n6b5z4zv). "The record is the
+product." Exit: partner's CISO receives a bundle that verifies independently;
+manager view shows attribution ≥ 90% on the converted tool.
+
+| Item | Ticket | Owner | What it means for this repository |
+|---|---|---|---|
+| Hash-chained evidence stream (user, tool, version, connector, target, action class, time, request hash, redacted payload); signed bundles + verifier CLI; regulator-mapped export pack (EU AI Act Art. 12; SOC 2 CC6/CC7); PII policy for payloads before the first bundle leaves | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m), [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff), [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | recorder, control plane | The chain, `export` and the dependency-free `verify.cjs` are shipped here and verify offline. Missing: the actor-claim fields (after Phase 0), the NATS stream (the sink's reference receiver is a file-backed HTTPS service), the export-pack mapping (nothing in `src/` maps the bundle to Art. 12 or SOC 2 controls), and the PII decision |
+| `decision_id` on `policy_decision` events | — | recorder | Already recorded as `cresec.broker.decision_id` on swapped `tool_call` events; the decision event lacks the field. Additive optional field |
+| One event shape for "this call was denied"; `DECISIONS` counts both; replay badges consistently | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | recorder | Reads 0 for hook sessions however many calls they denied. A hook deny has no usable JSON-RPC request id, so it is not simply "emit a `policy_decision`" |
+| `sessions --tools` per-server, per-tool census | — | recorder | Turns a census from an engineer improvising SQL into a product surface |
+| Ship `receiver/` in package `files`; add an HTTP export route for signed replica bundles | — | recorder | Today a receiver needs a repo clone, and a remote auditor cannot pull a signed replica without filesystem access to the receiver host |
+| Where this package's sink lands: an ingest endpoint in the control plane speaking the sink's wire contract (`docs/sink.md`, `receiver/` as the reference), or two evidence stores kept apart; NATS revocation reaching the gateway | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m) | undecided (control plane, if it ingests) | Undecided, and nhi's page records it the same way. If the control plane ingests, signed agent-side evidence lands in its append-only storage, which would be the cleanest single piece of integration in the join. The control plane's own chain is a different claim to an auditor and stays separate either way |
+| Manager view; security view (attribution % per tool/connector, before/after, policy violations, break-glass); ownership-decay alerts | [z8n6b5z50n](https://app.clickup.com/t/z8n6b5z50n) | control plane | Nothing here. `ui` is a replay page over one store |
+| SIEM export (Splunk / Sentinel / Datadog / Elastic); fleet aggregation, retention and pruning, external anchoring of chain heads | — | recorder | Not on Roadmap v2. Listed so nobody promises them; the store grows until deleted |
+
+### Phase 5 — Builder integrations & templates (wk 7–11)
+
+[Phase 5](https://app.clickup.com/t/z8n6b5z4zx). Exit: a rep's Claude
+routine, published through the skill, runs for a second rep as that rep,
+with zero manual setup beyond connecting their own accounts once.
+
+| Item | Ticket | Owner | What it means for this repository |
+|---|---|---|---|
+| "Publish as governed tool" skill for Claude Code / Cursor; credential-less templates (Next.js/Vercel, Lambda, Express, FastAPI); skill registry; conversion runbook | [z8n6b5z50p](https://app.clickup.com/t/z8n6b5z50p) | control plane | `setup` and `hook install` rewrite client configs to route through the recorder; `docs/agent-guidance.md` tells an agent how to behave at a hold. Neither is this |
+| Routine → team tool split: shared steps vs per-rep settings (voice, exclusions, accounts); plumbing as code, model only at judgment steps | [z8n6b5z9f4](https://app.clickup.com/t/z8n6b5z9f4) | control plane | The idea the story turns on: Ori's routine becomes shared steps plus per-rep settings, with the model called only at judgment steps. Nothing here |
+| Tool registry + ownership: signed tool/skill versions, approver, allowed connectors and scopes, owner; ownership-decay reassignment | [z8n6b5z9f5](https://app.clickup.com/t/z8n6b5z9f5) | control plane | Binds `tool` and `tool-version` in the actor claim to a signed registry entry; the MCP gateway will read those claims |
+| Conversion runbook for existing tools: Path A (already OIDC), Path B (own auth → OIDC proxy), Path C (built through template) | [z8n6b5z9f6](https://app.clickup.com/t/z8n6b5z9f6) | control plane | Nothing here |
+| Lovable / v0 prompt template + Retool resource configuration pointing at the gateway | [z8n6b5z9f7](https://app.clickup.com/t/z8n6b5z9f7) | control plane | Nothing here |
+
+### Phase 6 — POV execution & seed readiness (wk 8–12)
+
+[Phase 6](https://app.clickup.com/t/z8n6b5z501):
+[sign one design partner](https://app.clickup.com/t/z8n6b5z50r) with Okta +
+Salesforce + Gmail and a rep-built routine, on a 30-day clock;
+[POV runbook](https://app.clickup.com/t/z8n6b5z9f8);
+[success-metric dashboard](https://app.clickup.com/t/z8n6b5z9f9);
+[pricing instrumentation](https://app.clickup.com/t/z8n6b5z9fa); seed deck
+([z8n6b5z9fb](https://app.clickup.com/t/z8n6b5z9fb)). Refuse during the POV: an
+inline proxy in front of production APIs, a capture SDK, building UI for the
+tool. Nothing here except the bundle format and verifier the week-3 bundle
+reuses — [docs/pov.md](pov.md) says what that is and what `export` does not
+cover.
+
+### Not scheduled
+
+Approvals inbox and Slack approve/deny. Listed so nobody mistakes the local
+`holds` / `approve` / `deny` commands for them, and so nobody promises them
+in a room. The hosted gateway is Phase 3 and mobile agents are retired, so
+neither belongs on this line any longer.
+
+### Where the earlier plans went
+
+The intermediate `v2 · P0–P4` items and the Edut `M0–M4` milestones are still
+in the ClickUp list. This is where each landed under Roadmap v2.
+
+| Earlier item | Where it went |
+|---|---|
+| [v2 · P0 — Harness Audit CLI](https://app.clickup.com/t/z8n6b5yt92) (`agentctl scan`) | Superseded. The read-only inventory question is Phase 1's pull layer, answered from vendor audit APIs rather than local configuration |
+| [v2 · P1 — Tier 1 Sidecar: secrets brokering + egress](https://app.clickup.com/t/z8n6b5yt93) | Superseded. Egress enforcement is Phase 3's [HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h); its P1-5 child (the policy schema) shipped here, and the `credentials` section closed the half that was descoped |
+| [v2 · P2 — Tier 2 Hosted Gateway](https://app.clickup.com/t/z8n6b5yt94) | Is [Phase 3](https://app.clickup.com/t/z8n6b5z4zr) |
+| [v2 · P3 — Approval gates + evidence](https://app.clickup.com/t/z8n6b5yt95) | Evidence is [Phase 4](https://app.clickup.com/t/z8n6b5z50m). The hold state machine, Slack approvals and the inbox are unscheduled; the local `holds` / `approve` / `deny` commands are their ancestor |
+| [v2 · P4 — Pilot instrumentation](https://app.clickup.com/t/z8n6b5yt96) | Is [Phase 6](https://app.clickup.com/t/z8n6b5z501) |
+| Edut `M0`–`M3` | Complete; the code is on `origin/main` |
+| [M4 — Demo & design-partner launch](https://app.clickup.com/t/86exx61xv) | Open. Its design-partner half is now Phase 6's [signed partner](https://app.clickup.com/t/z8n6b5z50r) |
 
 ## How should I read the ClickUp week numbers?
 
-As sequence, not as promises. "Wk 1–2" means the phase comes first, and "Wk
-6–11" means that phase overlaps the one before it. No week number on this
-page maps to a calendar date, and none of them is a commitment.
+Roadmap v2's week numbers are calendar weeks: wk 1–12 runs Sept 21 – Dec 11,
+2026, and the build brief dates the sprints (A: 22 Sep – 3 Oct; B: 6 – 17
+Oct; C: 20 Oct – 14 Nov). Overlapping windows mean overlapping phases. They
+are the plan's dates, not this repository's commitments, and nothing on this
+page restates a date per item.
 
 ## What have we learned that changed the plan?
 
@@ -672,8 +769,13 @@ instant the counts run through, and a named test covers it.
 
 ## Where to read next
 
-- [docs/pov.md](pov.md) — the proof-of-value story, the reconciliation with the
-  NHI control plane, the feature map, and what we do not claim.
+- [docs/pov.md](pov.md) — the Governed Tools story, the four-week proof of
+  value week by week, the feature map keyed to Roadmap v2, and what we do not
+  claim.
+- ClickUp: the [story page](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-618),
+  the [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638),
+  the [thesis reconciliation](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-598),
+  and the list [🛠️ MVP — MCP Black Box](https://app.clickup.com/90182720801/v/l/li/901818701787).
 - [README.md](../README.md) — what the tool promises, and the honest security
   model.
 - [docs/install.md](install.md) — install per client, Windows and WSL,

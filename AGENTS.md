@@ -1,9 +1,58 @@
 # Working in this repository
 
-`@edut/mcp-recorder` is a fail-open MCP recording proxy: it wraps a stdio MCP
-server and records every tool call, redacted at the edge, into a
-tamper-evident local evidence store. Read `README.md` for the promises and
-`docs/event-schema.md` for the frozen event format.
+`@edut/mcp-recorder` is the MCP gateway and evidence-chain leg of Cresec
+Governed Tools: a fail-open MCP recording proxy that wraps a stdio MCP server
+and records every tool call, redacted at the edge, into a tamper-evident local
+evidence store, and — with a policy file — an enforcing gateway over those
+calls. Read `README.md` for the promises and `docs/event-schema.md` for the
+frozen event format.
+
+## The product this package serves
+
+Governed Tools makes an internal tool hold no credentials: people sign in
+through the company's Okta or Entra, every outbound call goes through a
+gateway that resolves who the person is, checks policy for that person and
+that tool version, injects that person's own credential, and writes a signed
+record. Two repositories build it. The control plane — identity gate,
+per-user credential vault, HTTPS egress gateway, policy, views — is
+[cresec-ai/nhi](https://github.com/cresec-ai/nhi)'s job (its share of
+Roadmap v2 runs through Phases 1–4 and 6; none of it is runnable from a clean
+checkout today). This package is the
+MCP gateway and the evidence chain. `docs/pov.md` says what this package
+contributes to the four-week proof of value, with a status on every
+capability, and what it must not be claimed to do (no per-user identity, no
+actor claims on events, no per-user token injection, no views, no degrade
+mode).
+
+The build brief's invariants that bind this repository, numbered as in the
+brief ([ClickUp](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638)):
+
+1. The tool holds no secret. Enforcement is credential absence, not policy
+   text.
+3. Every mediated call produces exactly one record, chained to the previous
+   one, signed, verifiable offline by the customer with no network access to
+   us.
+4. No payload warehousing. Hash the full request, store a redacted form.
+   Decide redaction before the first record exists.
+8. Degrade, don't die. Gateway unreachable means the tool falls back to
+   read-only, not to broken.
+
+Invariant 3's chain, signature and offline-verifier clauses hold for the MCP
+leg (the rules below are how); its exactly-one-record clause does not yet — a
+gateway refusal writes a `policy_decision` and a `tool_call`, a hook call is a
+`pre` + `post` pair, and fail-open recording can drop an event (see the
+one-deny-event-shape ticket in `docs/pov.md`). Invariant 4 holds for the
+stored form (redacted tree, hashed leaves, `result_hash` over the complete
+result); a hash of the complete raw request is not recorded on `tool_call`
+events. Invariant 1 is not met by this package alone: the local broker keeps
+the real credential out of the model's context, the transcript and the chain
+at declared swap sites, but the secret is resolvable on the agent's own
+machine, so it is a context and audit control, not credential absence.
+Credential absence is the control plane's per-user injection (`RemoteBroker`,
+unwired). Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
+removes enforcement entirely and there is no read-only fallback. A PR that
+touches one of these says which. Package name, binary name, commands and the
+event schema do not change with the positioning.
 
 ## Setup
 
