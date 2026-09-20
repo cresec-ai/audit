@@ -772,6 +772,11 @@ instant the counts run through, and a named test covers it.
 - [docs/pov.md](pov.md) — the Governed Tools story, the four-week proof of
   value week by week, the feature map keyed to Roadmap v2, and what we do not
   claim.
+- `docs/e2e-testing.md` in [`cresec-ai/nhi`](https://github.com/cresec-ai/nhi/blob/main/docs/e2e-testing.md)
+  — how both repositories are tested end to end against a production-shaped
+  staging: the layers, the scenario suite, and the `staging.yml` workflow this
+  repository gains (the hosted evidence receiver, the injection demo, and
+  `http --policy` against a vendor remote MCP once it exists).
 - ClickUp: the [story page](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-618),
   the [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638),
   the [thesis reconciliation](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-598),
