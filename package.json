@@ -1,7 +1,7 @@
 {
   "name": "@edut/mcp-recorder",
   "version": "0.1.0",
-  "description": "Black-box flight recorder for MCP: wrap any MCP server in one config line and record every tool call into a tamper-evident, replayable, exportable local evidence store.",
+  "description": "The MCP gateway and evidence-chain leg of Cresec Governed Tools: wrap any MCP server in one config line, record every tool call into a tamper-evident, replayable, exportable local evidence store, and allow, hold or deny calls with a policy file.",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -10,7 +10,11 @@
     "ai-security",
     "evidence",
     "tamper-evident",
-    "proxy"
+    "proxy",
+    "gateway",
+    "policy",
+    "governed-tools",
+    "cresec"
   ],
   "license": "GPL-3.0",
   "type": "module",

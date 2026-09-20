@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mcp-recorder — a black-box flight recorder for MCP</title>
-<meta name="description" content="Wrap any MCP server in one config line. Every agent tool call recorded, redacted at the edge, sealed in a signed hash chain. Local-first, tamper-evident, GPL-3.0.">
+<title>mcp-recorder — the MCP gateway and signed evidence chain of Governed Tools</title>
+<meta name="description" content="The MCP gateway and evidence-chain leg of Cresec Governed Tools. Wrap any MCP server in one config line: every agent tool call recorded, redacted at the edge, sealed in a signed hash chain, and allowed, held or denied by policy. Local-first, tamper-evident, GPL-3.0.">
 <style>
   :root {
     --bg: #0b0e14;
@@ -94,11 +94,13 @@
 
 <header class="wrap">
   <div class="badge">@edut/mcp-recorder</div>
-  <h1>A black-box flight recorder<br><span class="dim">for MCP.</span></h1>
+  <h1>Every mediated MCP call,<br><span class="dim">one signed record.</span></h1>
   <p class="sub">
-    Wrap any MCP server in one config line. Every agent tool call is recorded,
-    redacted at the edge, and sealed into a signed hash chain &mdash; on your machine.
-    Nothing to trust, nothing to break.
+    The MCP gateway and evidence-chain leg of Cresec Governed Tools. Wrap any MCP
+    server in one config line: every agent tool call is recorded, redacted at the
+    edge, sealed into a signed hash chain on your machine &mdash; and, with a policy,
+    allowed, held or denied before it runs. With credential brokering, the real
+    credential stays out of the model's context, the transcript and the evidence chain.
   </p>
   <div class="install"><span class="dollar">$</span> mcp-recorder setup --client claude-desktop</div>
   <p class="hero-links">
@@ -182,13 +184,15 @@ signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.8
 
 <section class="wrap">
   <div class="cta">
-    <h2>Built in the open. Design partners wanted.</h2>
+    <h2>Built in the open. One design partner wanted.</h2>
     <p>
-      If you run agents with MCP in production and care about what they did &mdash; incident
-      response, compliance, or plain peace of mind &mdash; we want your hardest questions.
+      A four-week proof of value of Governed Tools: you bring an Okta admin, a Salesforce
+      admin, a Google Workspace admin, one rep with a working Claude routine, and a named
+      tool owner. Three admin actions, zero production traffic rerouted, no capture SDK.
+      Week 3 ends with a signed evidence bundle your security team verifies offline.
     </p>
     <a class="btn solid" href="https://github.com/cresec-ai/audit">GitHub</a>
-    <a class="btn" href="mailto:hello@example.com?subject=mcp-recorder%20design%20partner">Become a design partner</a>
+    <a class="btn" href="https://github.com/cresec-ai/audit/issues">Become the design partner</a>
   </div>
 </section>
 

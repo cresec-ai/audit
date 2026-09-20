@@ -5,6 +5,12 @@ local, tamper-evident log, and — with a policy file — can allow, hold or den
 those calls before they run. This page is for deciding whether to run it, and
 for knowing what changed once you have.
 
+It is the MCP gateway and evidence-chain leg of Cresec Governed Tools: the part that sits on the
+agent's MCP tool-call path and produces the signed record. What it lacks today
+— which named person is acting, through which tool version, with which
+per-user credential — is the control plane's job, and
+[docs/pov.md](pov.md) says which Roadmap v2 phase supplies each piece.
+
 It does not repeat [docs/install.md](install.md), which is the installation
 walkthrough for each client, or the 60-second quickstart in
 [README.md](../README.md). Read those for the how; read this for the what and
@@ -13,6 +19,9 @@ the cost.
 **How the claims on this page were checked.** Every command below was run on
 2026-09-17 against this checkout — `main` at `6307cc3`, `@edut/mcp-recorder`
 v0.1.0, Node v22.22.2, Linux — and every output block is pasted from that run.
+That snapshot predates three merges now on `main` (#18 docs, #19 the evidence
+sink, #20 the credential broker); where one of them changes a statement below,
+the text says so in place.
 Gateway mode (`record --policy`, `holds`/`approve`/`deny`, the boundary
 filter, `policy validate`/`compile`) merged in PR #8 (`b322dea`) and is in this
 checkout; it was run here like everything else. Commands are written as
@@ -34,6 +43,13 @@ are usually gone, and what remains is a chat transcript nobody can attest to.
 This records each of those calls as it happens, into a hash-chained local log
 with payloads hashed rather than stored, so afterwards you can reconstruct
 what the agent saw and did, and demonstrate that the log was not edited.
+
+In Governed Tools' words: the record is the product. What this log does not
+yet say is which named person was behind the call and through which tool
+version — the audit line still reads as an OS user on a hostname, not as
+`maya.s@company.com via outreach-tool v3`. That half is what the control
+plane's identity gate and per-user credentials add on top of this log; see
+[docs/pov.md](pov.md).
 
 ## What is running once it is installed?
 
@@ -67,9 +83,9 @@ a bare CRLF, non-JSON noise, a JSON-RPC integer past 2^53, an unterminated
 trailing line, and, in each direction, a single line larger than the proxy's
 own 32 MiB tap cap. Every byte matches.
 
-Nothing is sent anywhere. Searching `src/` for the ways a Node program opens
-a socket finds two files, and both are servers this tool runs locally on your
-behalf:
+Nothing is sent anywhere unless you opt in. At `6307cc3`, searching `src/`
+for the ways a Node program opens a socket found two files, and both are
+servers this tool runs locally on your behalf:
 
 ```
 $ grep -rnE "from 'node:(http|https|net|tls|dgram)'|\bfetch\(|new WebSocket" src/
@@ -83,9 +99,22 @@ src/proxy/http.ts:17:import type { AddressInfo } from 'node:net';
 
 `src/replay/serve.ts` is the local replay UI (`ui` without `--out`);
 `src/proxy/http.ts` is the `http` subcommand, forwarding to the target you
-name on the command line. There is no `fetch`, no WebSocket, and no other
-outbound client anywhere in `src/`. Evidence leaves the machine only when you
-run `export`.
+name on the command line. At that commit there was no `fetch`, no WebSocket,
+and no other outbound client anywhere in `src/`, and evidence left the
+machine only when you ran `export`.
+
+Two merges since then added outbound clients, both opt-in and both absent
+from the transparent path (this paragraph is by reading, not by running): `src/sink/http.ts` (PR #19) imports `node:https`
+and `node:tls` to replicate sealed records to an evidence sink, and only when
+`MCP_RECORDER_SINK` is set — with it unset there is no shipper and no
+connection ([docs/sink.md](sink.md)); and `src/broker/remote.ts` (PR #20)
+is a client for a control plane's `/broker/exchange`, exported and tested but
+not constructed by the CLI, which wires the local broker only. PR #20 also
+added four credential sources (`github-app`, `aws-sts`, `vault`, `clickup`)
+in `src/broker/sources.ts` that reach their provider through the same
+`sinkFetch` transport, and only when a policy's `credentials` section
+declares one; they carry no evidence. Evidence still leaves the machine only
+when you run `export` or set the sink variable.
 
 ### Where the evidence lands
 
@@ -316,11 +345,13 @@ connectors is the next section, and it is the part worth reading closely.
 
 ## What has been proven against live connectors
 
-Five cloud dogfood runs have driven this from inside a real Claude Code cloud
-session; the last three (3, 4 and 5) exercised Anthropic-hosted connectors
-through the hook. Each left a `REPORT.md` and a signed evidence bundle on an
-`evidence/cloud-dogfood-*` branch. The latest is `evidence/cloud-dogfood-5`,
-and you can check it without trusting this page:
+Six cloud dogfood runs have driven this from inside a real Claude Code cloud
+session; runs 3 to 6 exercised Anthropic-hosted connectors through the hook.
+Each left an `evidence/cloud-dogfood-*` branch. The bundle walked through
+below is `evidence/cloud-dogfood-5`, with its `REPORT.md` on the same branch;
+cloud dogfood 6, the forced-mismatch run, is covered under
+[The caveat, and how it was closed](#the-caveat-and-how-it-was-closed).
+You can check the dogfood 5 bundle without trusting this page:
 
 ```
 $ git show origin/evidence/cloud-dogfood-5:evidence/cloud-dogfood-5/incident.zip > incident.zip
@@ -479,8 +510,8 @@ between them is the whole design: a store that cannot be written never turns
 into a deny, but a decision that cannot be *reached* — a hold nobody can
 record, so nobody can approve — does.
 
-The reasoning is that a flight recorder that can ground the aircraft is worse
-than no flight recorder — people turn it off. An enforcement point that
+The reasoning is that a recorder that can ground the aircraft is worse than
+no recorder — people turn it off. An enforcement point that
 silently permits what it could not evaluate is worse than no enforcement point
 — people believe it. So recording drops events rather than blocking traffic,
 and enforcement refuses calls rather than waving them through.
@@ -807,18 +838,36 @@ is no retention, rotation or pruning yet: the store grows until you delete it.
 
 It fits if:
 
+- you are converting a rep's or a team's tool whose MCP calls need a chained,
+  signed record now, and per-tool allow / hold / deny over those calls is the
+  control you want today — the MCP leg of Governed Tools, on its own;
 - you run agents against local stdio MCP servers and want a record you can
-  hand to someone else;
+  hand to someone else, verifiable with bare Node and no network access to
+  anyone;
 - you need to answer "did this credential ever pass through an agent, and
   where did it go" after the fact;
 - you use Claude Code and want per-call visibility into Anthropic-hosted
   connectors, with deny rules that have now blocked real connector calls in a
-  live session — subject to the resolution caveat above;
-- you would rather the enforcement point sat on your machine than in a
-  vendor's console, and per-tool allow / hold / deny over a local stdio
-  server is the shape of control you want.
+  live session — subject to the resolution caveat above.
 
-It does not fit if:
+It does not fit if you expect any of the following from this package alone,
+because each is the control plane's job in Roadmap v2 Phases 2–4, or
+nobody's ([docs/pov.md](pov.md) says which):
+
+- per-user attribution — events carry an OS username and a hostname, not a
+  named person, and no tool version;
+- per-user credential injection — the local broker resolves credentials on
+  the agent's own machine from env, file or command sources; there is no
+  control plane behind it;
+- a credential swap on Anthropic-hosted connectors — architecturally
+  impossible from the customer side; the hook can deny those calls and
+  nothing can swap their credential;
+- a manager or security view — `ui` is a replay page over one store;
+- a degrade-to-read-only mode — `MCP_RECORDER_DISABLE=1` removes recording
+  and enforcement together; the MCP gateway's read-only fallback is this
+  package's to build, and the HTTPS tool's is the control plane's.
+
+It also does not fit if:
 
 - your agents run on claude.ai web, Desktop chat or Cowork and you want
   per-call visibility — the tap does not exist, and
@@ -836,6 +885,8 @@ It does not fit if:
 
 ## Where to go next
 
+- [docs/pov.md](pov.md) — where this package sits in Governed Tools, the
+  four-week proof of value week by week, and what we do not claim.
 - [docs/install.md](install.md) — installation, per-client config, Windows and
   WSL, uninstall, troubleshooting.
 - [docs/deployment.md](deployment.md) — what deploying this in a customer looks

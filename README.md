@@ -1,8 +1,8 @@
 # @edut/mcp-recorder
 
-**A black-box flight recorder for MCP.** Wrap any MCP server in one config line and every tool call your agent makes is recorded into a tamper-evident, replayable, exportable evidence store — on your machine, with the payloads redacted at the edge.
+**The MCP gateway and evidence-chain leg of Cresec Governed Tools.** Wrap any MCP server in one config line and every tool call your agent makes through that server is recorded into a tamper-evident, replayable, exportable evidence store — on your machine, with the payloads redacted at the edge — and, with a policy file, allowed, held or denied before it runs.
 
-**The bet:** record every agent tool call; make the record tamper-evident; keep it local-first. Nothing to trust, nothing to break. When an agent does something surprising — or someone claims it did — you can reconstruct exactly what happened, prove the record wasn't altered, and hand a stranger a bundle they can verify with bare Node and no dependencies.
+**The bet:** every mediated tool call produces exactly one record, chained to the previous one, signed, and verifiable offline by the customer with no network access to us — starting with the MCP leg. When an agent does something surprising — or someone claims it did — you can reconstruct exactly what happened, prove the record wasn't altered, and hand a stranger a bundle they can verify with bare Node and no dependencies.
 
 ```
 BEFORE  {"command": "npx", "args": ["-y", "@some/mcp-server"]}
@@ -12,6 +12,8 @@ AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--", "npx", "-y
 That's the whole integration. The proxy forwards bytes unchanged, fails open (recording failure never breaks traffic), and adds <5ms p50 latency.
 
 - **License:** GPL-3.0 · **Node:** >= 20 (macOS, Linux, Windows; WSL supported via wsl.exe wrapper) · **Binary:** `mcp-recorder`
+
+**Where this fits.** Governed Tools is four pieces: Okta-brokered identity on the way in, credential-less tools in the middle, mediated egress on the way out, and one signed record across all three. This package is the MCP half of the egress leg and the signed record: the recording proxy, the policy gateway for MCP tool calls, the hash chain, the bundle and the verifier. The identity gate, the per-user credential vault, the HTTPS egress gateway and the manager and security views are the Cresec control plane's job in [cresec-ai/nhi](https://github.com/cresec-ai/nhi) (its share of Roadmap v2 runs through Phases 1–4 and 6; none of it is runnable from a clean checkout today), and this package does not contain them: events here carry an OS username and a hostname, not a named person, and the local credential broker resolves credentials on the agent's own machine rather than injecting a per-user token from a control plane. What this package contributes to the four-week proof of value, week by week and with a status on every capability, is in **[docs/pov.md](docs/pov.md)**; the backlog keyed to Roadmap v2 is in **[docs/roadmap.md](docs/roadmap.md)**.
 
 ---
 
@@ -273,8 +275,8 @@ Events follow the frozen schema `edut.mcp-recorder.event.v1`, with field names a
 ## What we explicitly do NOT do
 
 - **No payload storage.** Strings are hashed at the edge — leaf values, object keys, and the wrapped command's argv alike; original values never land in the store. A tool call's `arguments` are hashed unconditionally, regardless of key.
-- **No cloud.** Local-first, no telemetry, no phone-home. Evidence leaves your machine only when you run `export`.
-- **No enforcement unless you ask for it.** In record mode the recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a flight recorder, not a firewall. Enforcement exists only in [gateway mode](#gateway-mode-opt-in-enforcement), only with an explicit `--policy`, and only over `tools/call` requests and their results — every other message is still forwarded untouched.
+- **No cloud.** Local-first, no telemetry, no phone-home. Evidence leaves your machine only when you run `export`, or when you opt in to an evidence sink by setting `MCP_RECORDER_SINK` (see [docs/sink.md](docs/sink.md)); with that variable unset the recorder opens no connection of its own — the exceptions are the target you name on `http`, and the `github-app`, `aws-sts`, `vault` and `clickup` credential sources, which call out only when your policy's `credentials` section declares them.
+- **No enforcement unless you ask for it.** In record mode the recorder observes; it never blocks, rewrites, or rate-limits traffic. It is a recorder, not a firewall. Enforcement exists only in [gateway mode](#gateway-mode-opt-in-enforcement), only with an explicit `--policy`, and only over `tools/call` requests and their results — every other message is still forwarded untouched.
 
 ## Development
 
@@ -284,6 +286,6 @@ Events follow the frozen schema `edut.mcp-recorder.event.v1`, with field names a
 
 GPL-3.0. The recorder sits in your trust path, so you should be able to read every line of it — and so should everyone downstream of any fork.
 
-## Built in the open — design partners wanted
+## Built in the open — one design partner wanted
 
-This project is being built in public and shaped by real incident-response and compliance workflows. If you run agents with MCP in anger and want a say in where this goes — verification workflows, retention, external anchoring, fleet aggregation — open an issue or reach out. Early design partners get their problems prioritized.
+This project is being built in public. We are looking for one design partner for a four-week proof of value of Governed Tools: an Okta admin, a Salesforce admin to approve one connected app, a Google Workspace admin to allowlist one OAuth app, one rep with a working Claude routine and two hours, and a named tool owner. Three admin actions from you, zero production traffic rerouted, no capture SDK, no UI built by us. Week 1 is a read-only before-number from your Okta and Salesforce (or Google Workspace) audit logs; week 3 ends with one signed evidence bundle your security team verifies with bare Node and no network access to us. What happens each week, what this package contributes, and what we do not claim is in [docs/pov.md](docs/pov.md); the scope is on the [Governed Tools story page](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-618). Open an issue on this repository to start the conversation.
