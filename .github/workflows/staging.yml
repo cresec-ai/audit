@@ -1,0 +1,218 @@
+# Staging jobs for the MCP gateway and evidence-chain leg (S17a/S18 of
+# cresec-ai/nhi docs/e2e-testing.md). Scheduled and manual ONLY: never on a
+# pull request or a push, so a fork PR can never reach these variables.
+#
+# Nothing here is a secret in the repository. The receiver URL, the tenant
+# and the recorder's public key are repository VARIABLES the founder typed
+# (`vars.*`); the ingest token and the recorder's identity key come from
+# Secret Manager through Workload Identity Federation (`ci-sa`, bound to
+# `cresec-ai/audit:refs/heads/main` only) and are referenced by NAME. Every
+# job fails loudly when a variable is absent — a staging run that quietly
+# skipped would read as green in the nightly summary.
+#
+# These jobs block nothing and follow the `staging-red` rule through the nhi
+# issue tracker. They are not runnable until staging exists (the Terraform
+# and deploy workflows in cresec-ai/nhi are written, not applied).
+name: staging
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The receiver's ingest endpoint on `stateful-1`, e.g. https://evidence.staging.cresec.ai
+  STAGING_RECEIVER_URL: ${{ vars.STAGING_RECEIVER_URL }}
+  # Read-only routes of the same receiver (GET /v1/chains, /v1/rejections, /v1/alerts).
+  STAGING_RECEIVER_OPERATOR_URL: ${{ vars.STAGING_RECEIVER_OPERATOR_URL }}
+  # The CI recorder's ed25519 public key, 64 hex, typed by a human (S18).
+  CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX: ${{ vars.CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX }}
+  # WIF provider and the harness service account (docs/e2e-testing.md, "How CI gets them").
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  GCP_CI_SERVICE_ACCOUNT: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+
+jobs:
+  ship-staging:
+    name: ship-staging (S18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require the staging variables
+        # No silent skip: a missing variable is a failed job with a message naming it.
+        run: |
+          missing=0
+          for name in STAGING_RECEIVER_URL STAGING_RECEIVER_OPERATOR_URL CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX GCP_WORKLOAD_IDENTITY_PROVIDER GCP_CI_SERVICE_ACCOUNT GCP_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::repository variable $name is not set; staging is not configured for this repository"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run compile
+      - name: Authenticate to Google Cloud (WIF, no keys)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_CI_SERVICE_ACCOUNT }}
+      - name: Read the ingest token and the recorder identity from Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          # Referenced by NAME; the values land in masked step outputs only.
+          secrets: |-
+            ingest_token:${{ env.GCP_PROJECT_ID }}/receiver-ingest-token
+            operator_token:${{ env.GCP_PROJECT_ID }}/receiver-operator-token
+            identity_key:${{ env.GCP_PROJECT_ID }}/e2e-recorder-identity-key
+      - name: Materialise the pinned recorder identity into the data dir
+        # The receiver pins ONE key (`enrolment: pinned`); a fresh per-run key
+        # would never be attested. `identity.key` is the 64-hex ed25519 seed
+        # (src/chain/keys.ts), written 0600 into the run's data dir, alive
+        # only for this job; the recorder derives `identity.pub` from it on
+        # its first run and the next step checks that against the pinned key.
+        env:
+          IDENTITY_KEY: ${{ steps.secrets.outputs.identity_key }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/data"
+          umask 077
+          printf '%s\n' "$IDENTITY_KEY" > "$RUNNER_TEMP/data/identity.key"
+      - name: Record a short session and ship it to the staging receiver
+        env:
+          MCP_RECORDER_DATA_DIR: ${{ runner.temp }}/data
+          MCP_RECORDER_STORE: jsonl
+          MCP_RECORDER_SINK: ${{ env.STAGING_RECEIVER_URL }}
+          MCP_RECORDER_SINK_TOKEN: ${{ steps.secrets.outputs.ingest_token }}
+        run: |
+          set -eu
+          # `record` auto-starts the shipper; `ship --drain` waits for the backlog.
+          # The first thing it does is derive identity.pub from the materialised key.
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"staging-nightly","version":"0"},"capabilities":{}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"note":"staging-nightly-s18"}}}' \
+            | node dist/cli.js record --name staging-echo -- node test/fixtures/echo-server.cjs
+          if [ "$(tr -d '[:space:]' < "$MCP_RECORDER_DATA_DIR/identity.pub")" != "$CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX" ]; then
+            echo "::error::the recorder identity in Secret Manager does not match CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX"
+            exit 1
+          fi
+          node dist/cli.js ship --drain --timeout 5m
+          node dist/cli.js ship --status --json | tee "$RUNNER_TEMP/ship-status.json"
+          node -e '
+            const s = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (s.state !== "ok" && s.state !== "idle") { console.error("shipper state " + s.state + ": " + (s.last_error || "")); process.exit(1); }
+            if (s.lag !== 0) { console.error("receiver lags the local head by " + s.lag); process.exit(1); }
+          ' "$RUNNER_TEMP/ship-status.json"
+      - name: Download the receiver's export of this chain and verify it offline against the pinned key
+        env:
+          MCP_RECORDER_DATA_DIR: ${{ runner.temp }}/data
+          MCP_RECORDER_STORE: jsonl
+          MCP_RECORDER_SINK: ${{ env.STAGING_RECEIVER_URL }}
+          RECEIVER_OPERATOR_TOKEN: ${{ steps.secrets.outputs.operator_token }}
+        run: |
+          set -eu
+          chain_id="$(node dist/cli.js ship --status --json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).chain_id))')"
+          echo "chain $chain_id"
+          # The receiver's operator export route (receiver/README.md); the
+          # bundle it returns is the product's own layout, verify.cjs included.
+          # The OPERATOR token, not the ingest one: an install that can write
+          # cannot read the fleet.
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $RECEIVER_OPERATOR_TOKEN" \
+            -o "$RUNNER_TEMP/replica.zip" \
+            "$STAGING_RECEIVER_OPERATOR_URL/v1/chains/$chain_id/export"
+          mkdir -p "$RUNNER_TEMP/replica" && cd "$RUNNER_TEMP/replica" && unzip -q ../replica.zip
+          # Plain node, network isolation as far as a runner allows: the proxy variables are unset.
+          env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+            node verify.cjs --public-key "$CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX"
+          # The replica is byte-identical to the local chain up to attested_seq.
+          node -e '
+            const fs = require("node:fs");
+            const local = fs.readFileSync(process.env.MCP_RECORDER_DATA_DIR + "/evidence.jsonl", "utf8").trim().split("\n");
+            const replica = fs.readFileSync("events.jsonl", "utf8").trim().split("\n");
+            if (replica.length === 0 || replica.length > local.length) { console.error("replica/local length mismatch"); process.exit(1); }
+            for (let i = 0; i < replica.length; i++) if (replica[i] !== local[i]) { console.error("replica differs from local at line " + (i + 1)); process.exit(1); }
+            console.log("replica byte-identical to local chain through seq " + replica.length);
+          '
+      - name: The rewritten-history negative control stalls the next shipper
+        env:
+          MCP_RECORDER_DATA_DIR: ${{ runner.temp }}/data
+          MCP_RECORDER_STORE: jsonl
+          MCP_RECORDER_SINK: ${{ env.STAGING_RECEIVER_URL }}
+          MCP_RECORDER_SINK_TOKEN: ${{ steps.secrets.outputs.ingest_token }}
+        run: |
+          set -eu
+          # Edit one delivered event in place (same length: every stored hash still links).
+          sed -i 's/"tool":"echo"/"tool":"ech0"/' "$MCP_RECORDER_DATA_DIR/evidence.jsonl"
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"staging-nightly","version":"0"},"capabilities":{}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"note":"after-the-rewrite"}}}' \
+            | MCP_RECORDER_SINK= node dist/cli.js record --name staging-echo -- node test/fixtures/echo-server.cjs
+          node dist/cli.js ship --drain --timeout 2m 2> "$RUNNER_TEMP/stall.log" || true
+          grep -q 'sink stalled' "$RUNNER_TEMP/stall.log"
+          grep -q 'hash_mismatch' "$RUNNER_TEMP/stall.log"
+
+  demo-injection:
+    name: demo-injection (the scripted incident, gateway mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require the staging variables
+        run: |
+          if [ -z "$STAGING_RECEIVER_URL" ] || [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] || [ -z "$GCP_CI_SERVICE_ACCOUNT" ] || [ -z "$GCP_PROJECT_ID" ]; then
+            echo "::error::STAGING_RECEIVER_URL / GCP_* repository variables are not set; staging is not configured"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run compile
+      - name: Authenticate to Google Cloud (WIF, no keys)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_CI_SERVICE_ACCOUNT }}
+      - name: Read the ingest token from Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            ingest_token:${{ env.GCP_PROJECT_ID }}/receiver-ingest-token
+      - name: Run the demo in gateway mode against staging
+        env:
+          MCP_RECORDER_DATA_DIR: ${{ runner.temp }}/demo-data
+          MCP_RECORDER_SINK: ${{ env.STAGING_RECEIVER_URL }}
+          MCP_RECORDER_SINK_TOKEN: ${{ steps.secrets.outputs.ingest_token }}
+        # The demo exits with "--policy needs a file argument" without one (demo/run.ts).
+        run: npm run demo -- --policy docs/examples/policy.demo.yaml
+      - name: Assert the deny events in the exported bundle, never the exit code
+        env:
+          MCP_RECORDER_DATA_DIR: ${{ runner.temp }}/demo-data
+        run: |
+          set -eu
+          node dist/cli.js export --dir "$RUNNER_TEMP/demo-bundle"
+          cd "$RUNNER_TEMP/demo-bundle" && node verify.cjs
+          node -e '
+            const lines = require("node:fs").readFileSync("events.jsonl", "utf8").trim().split("\n").map((l) => JSON.parse(l).event);
+            const denies = lines.filter((e) => e.kind === "policy_decision" && e.decision === "deny");
+            if (denies.length === 0) { console.error("the demo produced no policy_decision deny event"); process.exit(1); }
+            if (!denies.every((d) => typeof d.decision_id === "string")) { console.error("a policy_decision has no decision_id"); process.exit(1); }
+            console.log(denies.length + " deny event(s) in the bundle, each with a decision_id");
+          '

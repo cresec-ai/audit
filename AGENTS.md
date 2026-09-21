@@ -48,8 +48,10 @@ events. Invariant 1 is not met by this package alone: the local broker keeps
 the real credential out of the model's context, the transcript and the chain
 at declared swap sites, but the secret is resolvable on the agent's own
 machine, so it is a context and audit control, not credential absence.
-Credential absence is the control plane's per-user injection (`RemoteBroker`,
-unwired). Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
+Credential absence is the control plane's per-user injection; `RemoteBroker`
+is its client, wired behind `credentials[].broker: { kind: remote }` against
+`POST /v1/broker/user-token`, tested against a fake control plane and not yet
+run against a real one. Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
 removes enforcement entirely and there is no read-only fallback. A PR that
 touches one of these says which. Package name, binary name, commands and the
 event schema do not change with the positioning.

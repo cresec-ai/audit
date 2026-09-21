@@ -3,7 +3,9 @@
 `policy.yaml` is the single policy file for agent harnesses in the Cresec
 line of tools. Two consumers read it:
 
-- **`mcp-recorder` gateway mode** (`mcp-recorder record --policy policy.yaml -- <server>`)
+- **`mcp-recorder` gateway mode** (`mcp-recorder record --policy policy.yaml -- <server>`
+  for a stdio server, `mcp-recorder http --target URL --policy policy.yaml` for a
+  streamable-HTTP one)
   enforces the `mcp` section on every MCP `tools/call` that crosses the proxy:
   per-tool **allow / hold / deny**, plus a **tool-result boundary filter** that
   redacts secret-shaped values and flags prompt-injection markers in tool
@@ -210,9 +212,10 @@ credentials:
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `id` | identifier | required | Unique within the section. Recorded on every decision — the credential's **name**, never its value. |
-| `provider` | identifier | — | Informational (`github`, `clickup`, …). Recorded on the decision. |
+| `provider` | identifier | — | Informational for a `source` credential (`github`, `clickup`, …). Recorded on the decision. For a `broker` credential it is the control plane's **connector** and must be one of `salesforce`, `gmail`, `workspace`, `slack`, `outlook` (`policy validate` refuses anything else). |
 | `scopes` | string[] | — | Informational: what the **real** credential can do. Recorded on the decision, so blast radius is answerable from the chain instead of reconstructed later. |
-| `source` | object | required | Where the real credential is resolved from. See below. |
+| `source` | object | one of `source` / `broker` | Where the real credential is resolved from **on this machine**. See below. |
+| `broker` | object | one of `source` / `broker` | Resolve this credential through the **Cresec control plane's per-user token endpoint** instead. See [`credentials[].broker`](#credentialsbroker--resolved-by-the-control-plane). |
 | `use[]` | array | required, ≥ 1 | Declared swap sites, in order; first match wins. |
 | `ttl_seconds` | integer 0–300 | `30` | How long a positive decision may be cached. |
 | `timeout_ms` | integer 100–30000 | `5000` | Deadline for resolving the source. Overrunning it **denies this call**. |
@@ -253,6 +256,8 @@ same uid mints its own token rather than stealing the brokered one.
 | `path` | object | `{ from: tool }` | What `request.path_template` is. |
 | `action` | `allow` \| `deny` | `allow` | `hold` is not available in v1 (see Limitations). |
 | `reason` | string ≤ 512 | — | Shown to the model on a deny. |
+| `action_class` | `read` \| `draft` \| `send` \| `write` | `write` | The control plane's action class for this site (`read` and `draft` need no grant there; `send` and `write` do). Sent as `action_class` on the per-user token request of a `broker` credential; informational for a local `source`. The default is the class that always needs a grant. |
+| `method` | `^[A-Za-z]{1,16}$` | `POST` | The HTTP method this site's request maps onto (`target.method` on the per-user token request). Upper-cased. |
 
 The swap is **destination-bound, never value-bound**: the real token replaces
 the synthetic inside the string at `arg`, at a site whose `server`, `tool`,
@@ -312,6 +317,96 @@ host was the server name" without anyone having to reconstruct which it was.
 `path` takes the same two argument-derived / default forms:
 `{ from_arg: <dot-path>, allow: <glob|glob[]> }` (delimiter `/`) or the
 default `{ from: tool }`, which says `request.path_template` is the tool name.
+
+### `credentials[].broker` — resolved by the control plane
+
+```yaml
+credentials:
+  - id: gmail-drafts
+    provider: gmail                       # the control plane's connector name — REQUIRED here
+    broker:
+      kind: remote
+      url: https://api.staging.cresec.ai  # https://; http:// on loopback only
+      token_env: CRESEC_INTERNAL_TOKEN    # the internal bearer, named, never its value
+      tenant: e2e                         # slug or uuid; optional with an identity JWT
+      identity_jwt_env: CRESEC_IDENTITY_JWT   # or start the recorder with --identity-jwt PATH
+      # user_env: CRESEC_USER_ID            # the user id when no identity JWT is given
+      # tool_id / tool_version              # the tool claim when no identity JWT is given
+      # timeout_ms: 5000
+    use:
+      - id: draft
+        tool: gmail_create_draft
+        arg: headers.Authorization
+        host: { from_arg: url, allow: [gmail.googleapis.com] }
+        action_class: draft
+        method: POST
+```
+
+A credential with `broker: { kind: remote }` has no local `source`: the
+gateway resolves it by calling the control plane's per-user token endpoint,
+`POST <url>/v1/broker/user-token`, exactly as
+[`docs/internal/contracts/user-token.md`](https://github.com/cresec-ai/nhi/blob/main/docs/internal/contracts/user-token.md)
+in cresec-ai/nhi specifies (the contract page spells the block
+`credentials.broker`; here `credentials` is a list, so the block sits on the
+credential it brokers). One call per mediated call, at the declared site and
+only there:
+
+| On the wire | From |
+| --- | --- |
+| `Authorization: Bearer $<token_env>` | the environment variable `token_env` names (registered as a brokered secret before the recorder opens, so it is never fingerprinted) |
+| `X-Cresec-Tenant` | the identity JWT's `tenant_id`, else `broker.tenant` |
+| `user_id` | the identity JWT's `sub`, else `$<user_env>` |
+| `connector` | `credentials[].provider` |
+| `tool` | the identity JWT's `tool` claim, else `broker.tool_id` / `tool_version` |
+| `action_class` | the site's `action_class` (default `write`) |
+| `target` | `{ host, path_template, method }`: the site's derived host (lowercase); its path template — the tool name for a `host: { fixed }` / `{ from: server }` site, the URL argument's path for a `host: { from_arg }` site, in both cases with **identifier segments replaced by `{id}`** (uuids, digit runs, long hex, long opaque tokens — ADR 015's rule, so a message or record id in a URL never reaches the control plane's `policy_decision` row; `cresec.credential.path_template` on the local event keeps the untemplated value); the site's `method` (upper-case) |
+| `run_as` | the identity JWT's `run_as`, else `user` |
+| `job_token` | `null` for a human session. For a **job token** (an identity JWT with `kind: job`, `run_as: owner` — `POST /v1/jobs/token`), the JWT itself, exactly as identity-jwt.md defines the job token; a job JWT whose raw form the recorder cannot send is a startup error (exit 2), never a `400` on every call |
+| `run_id` | `null` (v1 of this leg sends none) |
+
+The synthetic **never leaves this process** — it is what is swapped, not what
+is sent — and is checked against the credential the site named, so a
+placeholder issued for one credential cannot buy another credential's token.
+The response is mapped the way the contract's "audit `RemoteBroker` mapping"
+table says: a `200` swaps `token.access_token` at the site exactly as a local
+source's value would be (the value is registered as a brokered secret first,
+so no fingerprinting surface can hash it, and the reverse scrub replaces it
+with the synthetic if the upstream reflects it); the response's `decision_id`
+lands on the `tool_call` event as `cresec.broker.decision_id` and on the
+`policy_decision` event's `decision_id` field when the call is refused. A
+`403` is a **deny of the tool call with the control plane's `reason`**
+(`grant_required`, `user_deactivated`, `no_connection`, …). A `503` whose
+body says `vault_unavailable` or `connector_unavailable` is a deny with that
+reason. Any other `5xx`, a timeout (`timeout_ms`, default 5 000 ms) or a
+connection failure is a deny with reason **`control_plane_unavailable`** —
+never a crash, never a hang, never a forward: the credential is absent
+([ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md):
+invariant 1 wins over invariant 8; there is no read-only fallback in this
+leg).
+
+Every remote credential in one policy names the same control plane (same
+`url` and `token_env`). Local and remote credentials mix freely: the swap
+routes each declared site to the broker its credential named. The Rego
+emitter (`policy compile`) ignores the `broker` block, `action_class` and
+`method`: a remote credential compiles to exactly the module a local one
+does, and the OPA parity test pins that.
+
+Refusals at start, not at first call (exit 2): `token_env` unset; no user
+(neither an identity JWT nor `user_env`); no tenant; no tool claim; a
+`provider` that is not one of the control plane's connectors; a job JWT with
+no raw token to send as `job_token`; two remote credentials naming different
+control planes. The variables `token_env` and `identity_jwt_env` name are
+registered as brokered secrets before the recorder opens, so neither the
+internal token nor the identity JWT is ever fingerprinted.
+
+**Which invariants this touches.** Invariant 1 (the tool holds no secret):
+with a remote broker the per-user token is fetched per call and lives in this
+process only for the reverse-scrub window; the agent's context, the transcript
+and the chain hold the synthetic. It is still a context and audit control on
+the agent's own machine — the process that fetches the token can read it —
+so credential *absence* is the control plane's per-user injection, and this
+leg is its client. Invariant 3: the control plane's `decision_id` is on the
+record, and the record verifies offline as before.
 
 ### What the gateway does with all this
 
@@ -848,18 +943,26 @@ Gateway decisions are part of the tamper-evident chain, under the frozen
 - `session_start.policy` — `{ hash, name }` of the policy in force.
 - `tool_call.gateway` — `{ decision, rule_id, outcome, approval_id, boundary }` on every tool call.
 - `policy_decision` events — one per deny and one per hold outcome, with
-  `policy_hash`, `args_hash`, `approval_id`, `waited_ms`, `approver`.
+  `policy_hash`, `args_hash`, `approval_id`, `waited_ms`, `approver` and
+  `decision_id` (the local engine's uuid, or the control plane's when a
+  remote broker decided).
 
 See [docs/event-schema.md](event-schema.md) for the exact fields.
 
 ## Limitations (v1)
 
-- Gateway mode is available for the stdio transport. `mcp-recorder http
-  --policy` is rejected with a clear error (exit 2) for now. `mcp-recorder
-  http` **ignores** an exported `MCP_RECORDER_POLICY` instead of refusing to
-  start, printing `http: MCP_RECORDER_POLICY ignored — gateway mode is
-  available for the stdio transport only` on stderr and recording as usual,
-  so the variable can stay exported in a shell that also runs stdio servers.
+- Gateway mode is available for both transports: `record --policy` (stdio)
+  and `http --policy` (streamable HTTP; `MCP_RECORDER_POLICY` applies to both
+  when the flag is absent). Over HTTP a `tools/call` request body and its
+  result are **buffered** — a JSON body whole, an SSE stream one event at a
+  time — so they can be evaluated and filtered; that is the gateway-mode
+  exception AGENTS.md allows, and without `--policy` the HTTP proxy streams
+  every byte as before. A JSON-RPC batch carrying a refused `tools/call` is
+  answered locally as a whole (each refused call gets its deny result, every
+  other element a `-32600` asking to be resent on its own). A compressed
+  upstream response is refused (`502`) because the boundary filter cannot
+  read it; the gateway sends `accept-encoding: identity` so a compliant
+  upstream never compresses.
 - A policy without an `mcp` section is valid, and `policy validate` exits 0
   (with a warning), but `record --policy` and `setup --policy` refuse it with
   exit 2 — the gateway would have nothing to enforce. That applies to a

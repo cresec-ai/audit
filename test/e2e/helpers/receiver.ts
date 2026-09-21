@@ -41,7 +41,16 @@ export interface RunningReceiver {
   stop(): void;
 }
 
-export async function startReceiver(dataDir: string, token: string): Promise<RunningReceiver> {
+export interface ReceiverOptions {
+  /**
+   * `pinned` enrolment with exactly these 64-hex keys (receiver/auth.ts):
+   * a sender whose key is not listed is refused with 403 and stores
+   * nothing. Default: `tofu`, the posture a one-shot test deployment has.
+   */
+  pinnedKeys?: string[];
+}
+
+export async function startReceiver(dataDir: string, token: string, opts: ReceiverOptions = {}): Promise<RunningReceiver> {
   const loader = tsxLoader();
   if (loader === undefined) throw new Error('e2e: tsx is not installed; cannot run the receiver');
 
@@ -68,8 +77,11 @@ export async function startReceiver(dataDir: string, token: string): Promise<Run
         // The install's key is minted by the recorder at first run, so the
         // receiver cannot have been told about it in advance. 'tofu' binds
         // the first key it sees and flags it `new_identity` — the posture a
-        // one-shot test deployment actually has.
-        MCPR_RECEIVER_ENROLMENT: 'tofu',
+        // one-shot test deployment actually has. `pinned` is the fleet
+        // posture (S18): the operator registered the key out of band.
+        ...(opts.pinnedKeys === undefined
+          ? { MCPR_RECEIVER_ENROLMENT: 'tofu' }
+          : { MCPR_RECEIVER_ENROLMENT: 'pinned', MCPR_RECEIVER_KEYS: opts.pinnedKeys.join(',') }),
       }),
       stdio: ['ignore', 'pipe', 'pipe'],
     },

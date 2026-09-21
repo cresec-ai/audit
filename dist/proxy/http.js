@@ -6,6 +6,48 @@
  * response is streamed back verbatim — status, headers, body chunks as they
  * arrive, so SSE flows untouched. The tap keeps a bounded COPY of bodies and
  * scans them for JSON-RPC traffic; every tap failure is swallowed (fail-open).
+ *
+ * GATEWAY MODE (`opts.gateway` present, i.e. `http --policy`) is the ONE
+ * place the above is set aside, and only for `tools/call` requests and
+ * their results — the same rule the stdio gateway follows (./stdio.ts):
+ *
+ *  - EVERY POST — whatever its content-type header says, or none — is
+ *    BUFFERED (up to MAX_GATEWAY_BODY) and parsed as JSON before anything
+ *    reaches the upstream; a `tools/call` in it is
+ *    evaluated against the policy and allowed (forwarded as written, or
+ *    with a brokered credential spliced in at a declared site), denied (a
+ *    tool-error result the model can read, written by the proxy itself, the
+ *    upstream never sees the call) or held (the exchange is parked until
+ *    `mcp-recorder approve|deny`, the timeout, a `notifications/cancelled`
+ *    from the client, or the client going away). A body the gateway cannot
+ *    evaluate — too large to buffer, not JSON — is refused with a JSON-RPC
+ *    error and never forwarded (enforcement fails closed);
+ *  - a JSON response body is buffered and every tools/call result in it
+ *    goes through the boundary filter; an SSE response (on the POST, or on
+ *    the standalone GET stream) is split into EVENTS, each held only until
+ *    the blank line that ends it, and a tools/call result carried by a
+ *    `data:` line is filtered before the event is re-emitted. Nothing else
+ *    about the response is touched; an event the filter did not change goes
+ *    out from its original bytes;
+ *  - `accept-encoding: identity` is forced on the upstream request, and a
+ *    response that arrives compressed anyway is refused (502): a result the
+ *    filter cannot read must not reach the client unread;
+ *  - a JSON-RPC batch is all or nothing: forwarded when every tools/call in
+ *    it is allowed and needs no credential, answered locally otherwise
+ *    (each refused call gets its deny result, every other element a
+ *    -32600 asking for it to be resent on its own). MCP dropped batching
+ *    in 2025-06-18; this keeps the gate closed for a client that still
+ *    sends one.
+ *
+ * Every other exchange — GET, DELETE — streams exactly as it does without a
+ * policy. A POST body that is not JSON does not: it is refused (400), never
+ * forwarded, because the gate cannot know it carries no tools/call. The
+ * correlation is per exchange, so a JSON-RPC id reused by another client
+ * cannot take over a held call's slot; the
+ * stdio gateway's duplicate-id gate has no HTTP counterpart and needs none.
+ * Recording stays fail-open inside gateway mode (a store failure never
+ * becomes a deny); enforcement fails closed (an unevaluable policy or an
+ * unwritable hold is a deny).
  */
 import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -15,6 +57,12 @@ import { randomUUID } from 'node:crypto';
 import { canonicalJson, sha256Hex, sha256Ref } from '../chain/hash.js';
 import { looksSecret, scrubToolArguments, structuralString } from '../redact/redactor.js';
 import { SCHEMA } from '../schema/events.js';
+import { FAIL_CLOSED_REFUSAL_GUIDANCE, applyBoundary, boundarySecretPatterns, deniedText, synthesizeDeniedResult, } from '../gateway/boundary.js';
+import { MAX_INFLIGHT_SWAPS, SWAP_DENY, swapDenyReason, unplannableSwap, } from '../gateway/credentials.js';
+import { evaluateMcp } from '../policy/engine.js';
+import { stampActor } from '../identity/stamp.js';
+import { INVALID_ID_TOOLS_CALL_MESSAGE, MAX_HOLDS, NESTED_BATCH_MESSAGE, NULL_ID_TOOLS_CALL_MESSAGE, OVERSIZED_LINE_MESSAGE, UNPARSEABLE_LINE_MESSAGE, spliceRewrittenText, } from './stdio.js';
+import { MAX_GATEWAY_BODY, SseEventSplitter, invalidRequestResponse, isInvalidIdToolsCall, isRpcId, isRpcResponse, isToolsCallNotification, isToolsCallRequest, looksLikeToolResult, rewriteSseEvent, toolsCallParts, } from './http-gateway.js';
 const MAX_TAP_BODY = 32 * 1024 * 1024; // 32 MiB cap on tapped body copies
 const MAX_PENDING = 10_000;
 /** Hop-by-hop headers that must not be forwarded in either direction. */
@@ -225,6 +273,8 @@ export async function runHttpProxy(opts) {
         if (credentialFingerprints.length > 0) {
             id.credential_fingerprints = credentialFingerprints.map((c) => ({ ...c }));
         }
+        if (opts.actor !== undefined)
+            stampActor(id, opts.actor);
         return id;
     };
     const currentServer = () => {
@@ -361,6 +411,16 @@ export async function runHttpProxy(opts) {
             };
             if (rawError !== undefined)
                 attributes['error.type'] = 'jsonrpc_error';
+            // Gateway mode: the request-time decision and the boundary report the
+            // response filter attached to the entry. Same merge as the stdio
+            // gateway's handleResponse.
+            if (entry.gateway !== undefined) {
+                attributes['cresec.policy.decision'] = entry.gateway.decision;
+                if (entry.gateway.rule_id !== undefined)
+                    attributes['cresec.policy.rule_id'] = entry.gateway.rule_id;
+            }
+            if (entry.attributes !== undefined)
+                Object.assign(attributes, entry.attributes);
             const ev = {
                 ...base('tool_call', attributes),
                 kind: 'tool_call',
@@ -374,6 +434,8 @@ export async function runHttpProxy(opts) {
             };
             if (rawError !== undefined)
                 ev.error = errorInfo(rawError);
+            if (entry.gateway !== undefined)
+                ev.gateway = { ...entry.gateway };
             record(ev);
             return;
         }
@@ -581,29 +643,736 @@ export async function runHttpProxy(opts) {
         }
         return out;
     };
-    const handleRequest = (req, res) => {
-        // Resolve the upstream URL: '/' means "the configured endpoint"; any
-        // other path is grafted onto the target origin (sub-endpoints).
-        let upstreamUrl;
+    /* ------------------------------ gateway ---------------------------------- */
+    const gateway = opts.gateway;
+    const swap = gateway?.credentials;
+    /** Set by close(): nothing new may be held or forwarded. */
+    let sessionClosing = false;
+    /** Gateway mode: resolve every parked hold as `session_end`; a no-op otherwise. */
+    let resolveAllHolds = () => undefined;
+    const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
+    const RULE_ID_SHAPE = /^(?:[A-Za-z0-9_.:/-]{1,64}|rule\[[0-9]+\])$/;
+    const cappedRuleId = (id) => (RULE_ID_SHAPE.test(id) ? id : structuralString(id, 'identifier'));
+    /** One JSON body, written whole: content-length set, nothing else about the response touched. */
+    const respondJson = (res, status, payload) => {
+        const body = Buffer.from(JSON.stringify(payload), 'utf8');
         try {
-            upstreamUrl =
-                req.url === undefined || req.url === '/' ? target : new URL(req.url, target);
+            res.writeHead(status, { 'content-type': 'application/json', 'content-length': body.length });
+            res.end(body);
         }
         catch {
-            upstreamUrl = target;
+            /* client already gone */
         }
-        const sessionHeader = req.headers['mcp-session-id'];
-        const sessionKey = typeof sessionHeader === 'string'
-            ? sessionHeader
-            : Array.isArray(sessionHeader) && sessionHeader.length > 0
-                ? sessionHeader[0]
-                : '';
-        const scope = { local: new Map(), sessionKey, exchangeId: randomUUID() };
-        const upReq = requester(upstreamUrl, { method: req.method, headers: forwardHeaders(req.headers, 'host') }, (upRes) => {
+    };
+    /**
+     * Everything below exists only in gateway mode; `gw` is undefined otherwise
+     * and `handleRequest` never reaches it.
+     */
+    const gw = gateway === undefined
+        ? undefined
+        : (() => {
+            const loaded = gateway.policy;
+            const mcp = loaded.policy.mcp;
+            if (mcp === undefined)
+                throw new Error('mcp-recorder: http gateway needs a policy with an `mcp` section');
+            const holdStore = gateway.holdStore;
+            const boundaryDeps = {
+                secretPatterns: boundarySecretPatterns(),
+                hashString: (v) => redactor.hashString(v),
+            };
+            const holds = new Map();
+            const swapping = new Set();
+            const guarded = (fn) => {
+                try {
+                    fn();
+                }
+                catch (err) {
+                    tapError(err); // recording is fail-open even inside gateway mode
+                }
+            };
+            /* ---- evaluation ---- */
+            const evaluationFailed = (err) => ({
+                action: 'deny',
+                matched: false,
+                reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
+                failClosed: true,
+            });
+            const evaluate = (rawTool, args) => {
+                let canonical;
+                let argsHash;
+                try {
+                    canonical = canonicalJson(args);
+                    argsHash = sha256Ref(canonical);
+                }
+                catch (err) {
+                    return { decision: evaluationFailed(err), argsHash: NULL_RESULT_HASH };
+                }
+                if (rawTool.length > 128) {
+                    // Fail closed WITHOUT consulting the policy: the glob engine is a
+                    // backtracking regex, so an uncapped name is a denial of service.
+                    return {
+                        decision: {
+                            action: 'deny',
+                            matched: false,
+                            reason: `tools/call params.name is ${rawTool.length} characters; the gateway evaluates at most 128 (the name is refused, never truncated)`,
+                            failClosed: true,
+                        },
+                        argsHash,
+                    };
+                }
+                try {
+                    return {
+                        decision: evaluateMcp(loaded.policy, {
+                            server: currentServer().name,
+                            tool: rawTool,
+                            args,
+                            argsBytes: Buffer.byteLength(canonical),
+                        }),
+                        argsHash,
+                    };
+                }
+                catch (err) {
+                    return { decision: evaluationFailed(err), argsHash };
+                }
+            };
+            const buildCall = (msg) => {
+                const { params, name } = toolsCallParts(msg);
+                const args = params['arguments'] ?? {};
+                const { decision, argsHash } = evaluate(name, args);
+                const tool = name === '' ? '' : structuralString(name, 'identifier');
+                const call = { id: msg.id, params, rawTool: name.length > 128 ? tool : name, tool, args, argsHash };
+                if (decision.ruleId !== undefined) {
+                    call.rawRuleId = decision.ruleId;
+                    call.ruleId = cappedRuleId(decision.ruleId);
+                }
+                if (decision.reason !== undefined)
+                    call.reason = decision.reason;
+                if (decision.failClosed === true)
+                    call.failClosed = true;
+                return { call, action: decision.action };
+            };
+            /* ---- events ---- */
+            const policyAttributes = (call, decision) => {
+                const attributes = {
+                    'gen_ai.tool.name': call.tool,
+                    'gen_ai.tool.call.id': String(call.id),
+                    'mcp.method.name': 'tools/call',
+                    'rpc.system': 'jsonrpc',
+                    'cresec.policy.decision': decision,
+                };
+                if (call.ruleId !== undefined)
+                    attributes['cresec.policy.rule_id'] = call.ruleId;
+                if (call.swapAttributes !== undefined)
+                    Object.assign(attributes, call.swapAttributes);
+                if (call.decisionId !== undefined)
+                    attributes['cresec.policy.decision_id'] = call.decisionId;
+                return attributes;
+            };
+            const recordPolicyDecision = (call, hold) => {
+                const decision = hold === undefined ? 'deny' : 'hold';
+                if (call.decisionId === undefined)
+                    call.decisionId = randomUUID();
+                const ev = {
+                    ...base('policy_decision', policyAttributes(call, decision)),
+                    kind: 'policy_decision',
+                    decision,
+                    tool: call.tool,
+                    request_id: call.id,
+                    policy_hash: loaded.hash,
+                    args_hash: call.argsHash,
+                    decision_id: call.decisionId,
+                };
+                if (call.ruleId !== undefined)
+                    ev.rule_id = call.ruleId;
+                if (hold !== undefined) {
+                    ev.outcome = hold.outcome;
+                    if (hold.approvalId !== undefined)
+                        ev.approval_id = hold.approvalId;
+                    ev.waited_ms = hold.waitedMs;
+                    if (hold.approver !== undefined)
+                        ev.approver = hold.approver;
+                }
+                record(ev);
+            };
+            const gatewayOutcomeFor = (call, hold) => {
+                const out = { decision: hold === undefined ? 'allow' : 'hold' };
+                if (call.ruleId !== undefined)
+                    out.rule_id = call.ruleId;
+                if (hold !== undefined) {
+                    out.outcome = hold.outcome;
+                    if (hold.approvalId !== undefined)
+                        out.approval_id = hold.approvalId;
+                    out.waited_ms = hold.waitedMs;
+                }
+                return out;
+            };
+            const recordSyntheticToolCall = (call, result, hold, errorType = 'policy_denied', refusal) => {
+                const gatewayOutcome = gatewayOutcomeFor(call, hold);
+                if (hold === undefined)
+                    gatewayOutcome.decision = 'deny';
+                if (refusal !== undefined)
+                    gatewayOutcome.refusal = refusal;
+                const attributes = {
+                    'gen_ai.operation.name': 'execute_tool',
+                    ...policyAttributes(call, gatewayOutcome.decision === 'deny' ? 'deny' : 'hold'),
+                    'error.type': errorType,
+                };
+                const ev = {
+                    ...base('tool_call', attributes),
+                    kind: 'tool_call',
+                    tool: call.tool,
+                    request_id: call.id,
+                    args: scrubToolArguments(redactor, call.args),
+                    result_hash: sha256Ref(canonicalJson(result)),
+                    result: redactor.scrub(result),
+                    is_error: true,
+                    duration_ms: 0,
+                    error: { type: errorType },
+                    gateway: gatewayOutcome,
+                };
+                record(ev);
+            };
+            /** The deny result for one call: events first (policy_decision, then the synthetic tool_call), then the response. */
+            const synthesizeDeny = (call, hold) => {
+                const input = { tool: call.rawTool };
+                if (call.rawRuleId !== undefined)
+                    input.ruleId = call.rawRuleId;
+                if (call.reason !== undefined)
+                    input.reason = call.reason;
+                if (call.failClosed === true)
+                    input.failClosed = true;
+                if (hold !== undefined && hold.approvalId !== undefined) {
+                    input.approvalId = hold.approvalId;
+                    input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
+                }
+                const response = synthesizeDeniedResult(call.id, deniedText(input));
+                guarded(() => {
+                    recordPolicyDecision(call, hold);
+                    recordSyntheticToolCall(call, response.result, hold);
+                });
+                return response;
+            };
+            const denyCall = (res, call, hold, diagLine) => {
+                const response = synthesizeDeny(call, hold);
+                respondJson(res, 200, response);
+                if (diagLine !== undefined)
+                    diag(diagLine);
+                else if (hold === undefined)
+                    diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
+            };
+            /** Register a forwarded tools/call so its response becomes the tool_call event. */
+            const registerCall = (scope, call, gatewayOutcome, attributes) => {
+                const key = idKeyOf(call.id);
+                const entry = {
+                    method: 'tools/call',
+                    // PRE-swap params: the event's `args` are scrubbed from these,
+                    // so the chain records the synthetic, never the brokered value.
+                    params: call.params,
+                    t0: performance.now(),
+                    toolName: call.tool,
+                    id: call.id,
+                    allKey: scope.exchangeId + '|' + key,
+                    gateway: gatewayOutcome,
+                };
+                if (attributes !== undefined)
+                    entry.attributes = attributes;
+                scope.local.set(key, entry);
+                entry.sessionFallbackKey = scope.sessionKey + 'c2s' + key;
+                evictOldest(sessionPending);
+                sessionPending.set(entry.sessionFallbackKey, entry);
+                evictOldest(allPending);
+                allPending.set(entry.allKey, entry);
+            };
+            /* ---- the swap ---- */
+            const planSwap = (tool, args) => {
+                if (swap === undefined || !swap.hasSites)
+                    return [];
+                try {
+                    return swap.plan({ server: currentServer().name, tool, args });
+                }
+                catch (err) {
+                    tapError(err);
+                    return [unplannableSwap(SWAP_DENY.unavailable)];
+                }
+            };
+            const clientUserAgent = () => {
+                if (clientName === undefined)
+                    return undefined;
+                return clientVersion === undefined ? clientName : `${clientName}/${clientVersion}`;
+            };
+            /**
+             * Exchange the planned synthetics, then either forward the rewritten
+             * message or refuse. `forward(message)` receives the message to put
+             * on the wire — the original object when nothing was swapped.
+             */
+            const withSwap = (res, call, msg, plan, forward, hold) => {
+                if (plan.length === 0 || swap === undefined) {
+                    forward(msg);
+                    return;
+                }
+                if (swapping.size >= MAX_INFLIGHT_SWAPS) {
+                    denyCall(res, { ...call, reason: swapDenyReason(SWAP_DENY.tooMany), failClosed: true }, undefined, `gateway: ${MAX_INFLIGHT_SWAPS} credential swaps already in flight; denying tools/call "${call.tool}"`);
+                    return;
+                }
+                const key = randomUUID();
+                swapping.add(key);
+                const ctx = { server: currentServer().name, tool: call.rawTool };
+                const ua = clientUserAgent();
+                if (ua !== undefined)
+                    ctx.userAgent = ua;
+                const settle = (outcome) => {
+                    const refuse = (code, failClosed) => {
+                        const decided = [...outcome.decisions].reverse().find((d) => d.decisionId !== '');
+                        denyCall(res, {
+                            ...call,
+                            reason: swapDenyReason(code),
+                            swapAttributes: outcome.attributes,
+                            ...(decided !== undefined ? { decisionId: decided.decisionId } : {}),
+                            ...(failClosed ? { failClosed: true } : {}),
+                        }, hold, `gateway: credential swap refused tools/call "${call.tool}" (${code})`);
+                    };
+                    if (outcome.kind === 'deny') {
+                        refuse(outcome.code, outcome.failClosed);
+                        return;
+                    }
+                    if (outcome.message === msg) {
+                        // An allow that changed nothing would forward the SYNTHETIC.
+                        refuse(SWAP_DENY.noToken, true);
+                        return;
+                    }
+                    if (sessionClosing) {
+                        refuse(SWAP_DENY.sessionEnd, true);
+                        return;
+                    }
+                    for (const d of outcome.decisions) {
+                        diag(`gateway: swapped credential "${structuralString(d.credential, 'identifier')}" into tools/call` +
+                            ` "${call.tool}" for ${structuralString(d.host, 'identifier')}` +
+                            `${d.hostSource === 'server_name' ? ' (host is the server name, not a checked destination)' : ''}` +
+                            ` (decision ${structuralString(d.decisionId, 'identifier')}, ttl ${d.ttlSeconds}s)`);
+                    }
+                    forward(outcome.message, outcome.attributes);
+                };
+                swap.exchange(msg, plan, ctx).then((outcome) => {
+                    swapping.delete(key);
+                    settle(outcome);
+                }, (err) => {
+                    swapping.delete(key);
+                    tapError(err);
+                    denyCall(res, { ...call, reason: swapDenyReason(SWAP_DENY.unavailable), failClosed: true }, hold);
+                });
+            };
+            /* ---- holds ---- */
+            const settleHold = (entry, status, decided) => {
+                if (entry.settled)
+                    return;
+                entry.settled = true;
+                if (holds.get(entry.key) === entry)
+                    holds.delete(entry.key);
+                entry.abort.abort();
+                const resolution = {
+                    outcome: status,
+                    approvalId: entry.approvalId,
+                    waitedMs: round2(performance.now() - entry.t0),
+                };
+                const decidedBy = decided?.decided_by;
+                if (typeof decidedBy === 'string')
+                    resolution.approver = structuralString(decidedBy, 'identifier');
+                if (status === 'timeout' || status === 'cancelled' || status === 'session_end') {
+                    holdStore.finalize(entry.approvalId, status);
+                }
+                const forward = status === 'approved' || (status === 'timeout' && mcp.hold.on_timeout === 'allow');
+                if (forward && !sessionClosing) {
+                    guarded(() => recordPolicyDecision(entry, resolution));
+                    diag(`gateway: hold ${entry.approvalId} ${status}; forwarding tools/call "${entry.tool}" after ${resolution.waitedMs} ms`);
+                    entry.forward();
+                    return;
+                }
+                if (forward)
+                    resolution.outcome = 'session_end';
+                const failedClosed = resolution.outcome === 'session_end';
+                entry.refuse(failedClosed ? { ...entry, failClosed: true } : entry, resolution);
+                diag(`gateway: hold ${entry.approvalId} ${resolution.outcome} after ${resolution.waitedMs} ms; tools/call "${entry.tool}" not forwarded`);
+            };
+            const startHold = (res, scope, call, forward) => {
+                if (holds.size >= MAX_HOLDS) {
+                    denyCall(res, { ...call, reason: 'too many pending holds', failClosed: true }, undefined, `gateway: ${MAX_HOLDS} holds already pending; denying tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
+                    return;
+                }
+                const timeoutMs = mcp.hold.timeout_ms;
+                let created;
+                try {
+                    const input = {
+                        session_id: sessionId,
+                        server: currentServer().name,
+                        tool: call.tool,
+                        args: scrubToolArguments(redactor, call.args),
+                        args_hash: call.argsHash,
+                        timeout_at: new Date(Date.now() + timeoutMs).toISOString(),
+                    };
+                    if (call.rawRuleId !== undefined)
+                        input.rule_id = call.rawRuleId;
+                    if (call.reason !== undefined)
+                        input.reason = call.reason;
+                    created = holdStore.create(input);
+                }
+                catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    diag(`gateway: cannot write hold for tools/call "${call.tool}" (${message}); denying`);
+                    denyCall(res, { ...call, reason: 'hold unavailable', failClosed: true });
+                    return;
+                }
+                const key = scope.sessionKey + '|' + idKeyOf(call.id);
+                const entry = {
+                    ...call,
+                    approvalId: created.approval_id,
+                    key,
+                    t0: performance.now(),
+                    abort: new AbortController(),
+                    settled: false,
+                    // Replaced with the real resolution when the decision arrives
+                    // (below), before settleHold is asked to forward.
+                    forward: () => undefined,
+                    refuse: (refused, hold) => denyCall(res, refused, hold, `gateway: hold ${created.approval_id} ${hold.outcome}; tools/call "${call.tool}" refused`),
+                };
+                holds.set(key, entry);
+                diag(`gateway: holding tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'}) as ${created.approval_id}` +
+                    ` — mcp-recorder approve|deny ${created.approval_id}`);
+                // The client going away is a cancellation: nobody is waiting for
+                // the answer any more, and the hold file says so.
+                res.on('close', () => {
+                    if (!entry.settled && !res.writableEnded)
+                        settleHold(entry, 'cancelled');
+                });
+                const waitOpts = { timeoutMs, signal: entry.abort.signal };
+                if (gateway.pollMs !== undefined)
+                    waitOpts.pollMs = gateway.pollMs;
+                holdStore.waitForDecision(created.approval_id, waitOpts).then((result) => {
+                    if (entry.settled)
+                        return;
+                    const status = result.status;
+                    if (status === 'approved' || (status === 'timeout' && mcp.hold.on_timeout === 'allow')) {
+                        const resolution = {
+                            outcome: status,
+                            approvalId: created.approval_id,
+                            waitedMs: round2(performance.now() - entry.t0),
+                        };
+                        const decidedBy = result.record?.decided_by;
+                        if (typeof decidedBy === 'string')
+                            resolution.approver = structuralString(decidedBy, 'identifier');
+                        entry.forward = () => forward(resolution);
+                    }
+                    settleHold(entry, status, result.record);
+                }, (err) => {
+                    tapError(err);
+                    if (!entry.settled) {
+                        entry.failClosed = true;
+                        settleHold(entry, 'denied');
+                    }
+                });
+            };
+            const cancelHold = (scope, msg) => {
+                const params = isPlainObject(msg['params']) ? msg['params'] : {};
+                const requestId = params['requestId'];
+                if (!isRpcId(requestId))
+                    return;
+                const entry = holds.get(scope.sessionKey + '|' + idKeyOf(requestId));
+                if (entry !== undefined)
+                    settleHold(entry, 'cancelled');
+            };
+            resolveAllHolds = () => {
+                for (const entry of [...holds.values()])
+                    settleHold(entry, 'session_end');
+            };
+            /* ---- server -> client: the boundary filter ---- */
+            /** Look up the pending entry a response answers, WITHOUT removing it (handleResponse does that). */
+            const pendingFor = (id, scope) => {
+                const key = idKeyOf(id);
+                return scope.local.get(key) ?? sessionPending.get(scope.sessionKey + 'c2s' + key);
+            };
+            /**
+             * Filter ONE parsed server->client message: the brokered-token scrub
+             * first (so nothing below sees the real value), then the boundary
+             * filter over a tools/call result. Returns the message the client
+             * gets and the message the chain sees (scrubbed, boundary NOT
+             * applied: `result`/`result_hash` describe the raw server result).
+             */
+            const filterServerMessage = (msg, rawBytes, scope) => {
+                let recorded = msg;
+                let changed = false;
+                if (swap !== undefined) {
+                    try {
+                        const text = JSON.stringify(msg);
+                        if (typeof text === 'string' && swap.scrubber.mightContain(text)) {
+                            const scrubbed = swap.scrubber.scrubMessage(msg);
+                            if (scrubbed.changed) {
+                                recorded = scrubbed.message;
+                                changed = true;
+                                diag('gateway: a brokered credential came back in a server message; replaced with its placeholder');
+                            }
+                        }
+                    }
+                    catch (err) {
+                        tapError(err);
+                    }
+                }
+                if (!isPlainObject(recorded) || !isRpcResponse(recorded))
+                    return { delivered: recorded, recorded, changed };
+                const entry = pendingFor(recorded.id, scope);
+                const isToolResult = entry !== undefined ? entry.method === 'tools/call' : looksLikeToolResult(recorded);
+                if (!isToolResult)
+                    return { delivered: recorded, recorded, changed };
+                const outcome = applyBoundary(recorded, mcp.boundary, boundaryDeps, { rawBytes });
+                const report = { ...outcome.report };
+                if (outcome.changed) {
+                    try {
+                        const delivered = isPlainObject(outcome.message) ? outcome.message['result'] : null;
+                        report.delivered_result_hash = sha256Ref(canonicalJson(delivered ?? null));
+                    }
+                    catch (err) {
+                        tapError(err);
+                    }
+                    diag(`gateway: ${report.action === 'block' ? 'blocked' : 'redacted'} tool result of tools/call` +
+                        ` "${entry?.toolName ?? ''}" (${report.secrets_found} secret-shaped, ${report.injection_found} injection marker(s))`);
+                }
+                if (entry !== undefined) {
+                    entry.gateway = { ...(entry.gateway ?? { decision: 'allow' }), boundary: report };
+                }
+                else {
+                    diag('gateway: boundary-filtered a tool result with no pending request');
+                }
+                return { delivered: outcome.changed ? outcome.message : recorded, recorded, changed: changed || outcome.changed };
+            };
+            /**
+             * A whole JSON response body: filtered element by element, spliced
+             * back into the original text when anything changed, then tapped.
+             */
+            const filterJsonBody = (text, scope) => {
+                let msg;
+                try {
+                    msg = JSON.parse(text);
+                }
+                catch {
+                    guarded(() => protocolError('server_to_client', 'unparseable', Buffer.byteLength(text), text));
+                    return Buffer.from(text, 'utf8');
+                }
+                const rawBytes = Buffer.byteLength(text);
+                if (Array.isArray(msg)) {
+                    const delivered = [...msg];
+                    const recorded = [...msg];
+                    let changed = false;
+                    msg.forEach((el, i) => {
+                        const f = filterServerMessage(el, rawBytes, scope);
+                        delivered[i] = f.delivered;
+                        recorded[i] = f.recorded;
+                        if (f.changed)
+                            changed = true;
+                    });
+                    guarded(() => handleMessage(recorded, 'server_to_client', text, scope));
+                    return Buffer.from(changed ? (spliceRewrittenText(text, msg, delivered) ?? JSON.stringify(delivered)) : text, 'utf8');
+                }
+                const f = filterServerMessage(msg, rawBytes, scope);
+                guarded(() => handleMessage(f.recorded, 'server_to_client', text, scope));
+                return Buffer.from(f.changed ? (spliceRewrittenText(text, msg, f.delivered) ?? JSON.stringify(f.delivered)) : text, 'utf8');
+            };
+            /** One complete SSE event: its `data:` payload filtered when it is a JSON-RPC message. */
+            const filterSseEvent = (raw, data, scope) => {
+                if (data === undefined)
+                    return raw;
+                let msg;
+                try {
+                    msg = JSON.parse(data);
+                }
+                catch {
+                    return raw; // non-JSON SSE data (pings etc.) — forwarded as is
+                }
+                const f = filterServerMessage(msg, raw.length, scope);
+                guarded(() => handleMessage(f.recorded, 'server_to_client', data, scope));
+                if (!f.changed)
+                    return raw;
+                return rewriteSseEvent(raw, spliceRewrittenText(data, msg, f.delivered) ?? JSON.stringify(f.delivered));
+            };
+            /**
+             * What goes out in place of an SSE event whose filtering THREW.
+             * A JSON-RPC response (or a batch of them) becomes a blocked
+             * tool result for each id, so the client is answered and the
+             * secret-shaped bytes are not; any other JSON is dropped (an
+             * empty buffer) with a `protocol_error` on the chain; a `data:`
+             * payload that is not JSON was never scanned and is re-emitted
+             * from its original bytes. Never throws.
+             */
+            const failClosedSseEvent = (raw, data) => {
+                if (data === undefined)
+                    return raw;
+                let msg;
+                try {
+                    msg = JSON.parse(data);
+                }
+                catch {
+                    return raw;
+                }
+                const responses = (Array.isArray(msg) ? msg : [msg]).filter((m) => isRpcResponse(m));
+                const blocked = responses.map((m) => synthesizeDeniedResult(m.id, 'mcp-recorder gateway: the boundary filter failed on this tool result, so the gateway withheld it rather than deliver it unscanned\n' +
+                    FAIL_CLOSED_REFUSAL_GUIDANCE));
+                guarded(() => protocolError('server_to_client', 'unparseable', raw.length, raw.toString('utf8')));
+                diag(`gateway: boundary filter failed on an SSE event; ${blocked.length > 0 ? `answered ${String(blocked.length)} response(s) with a blocked result` : 'dropped the event'} (fail closed)`);
+                if (blocked.length === 0)
+                    return Buffer.alloc(0);
+                try {
+                    return rewriteSseEvent(raw, JSON.stringify(Array.isArray(msg) ? blocked : blocked[0]));
+                }
+                catch (err) {
+                    tapError(err);
+                    return Buffer.alloc(0); // still nothing unscanned crosses
+                }
+            };
+            return {
+                mcp,
+                buildCall,
+                denyCall,
+                registerCall,
+                planSwap,
+                withSwap,
+                startHold,
+                cancelHold,
+                recordPolicyDecision,
+                recordSyntheticToolCall,
+                gatewayOutcomeFor,
+                filterJsonBody,
+                filterSseEvent,
+                failClosedSseEvent,
+                scrubBytes: (bytes) => (swap === undefined ? bytes : swap.scrubber.scrubBytes(bytes)),
+            };
+        })();
+    const abortable = (req, res, upReq) => {
+        // The upstream connection must not outlive the client's interest in the
+        // response: if the client goes away mid-exchange (aborted fetch, closed
+        // socket), tear down the upstream request/response too instead of
+        // leaking it. Safe to call after a normal completion — destroy() on an
+        // already-finished request is a no-op.
+        let upstreamAborted = false;
+        const abortUpstream = () => {
+            if (upstreamAborted)
+                return;
+            upstreamAborted = true;
+            try {
+                if (!upReq.destroyed)
+                    upReq.destroy();
+            }
+            catch {
+                /* already gone */
+            }
+        };
+        // `req`'s 'close' fires once its body has been fully read too, not only
+        // on a premature disconnect — `req.complete` tells them apart. `res`'s
+        // 'close' can likewise fire after a normal `res.end()`, so only treat it
+        // as an abort signal when the response never actually finished.
+        req.on('close', () => {
+            if (!req.complete)
+                abortUpstream();
+        });
+        res.on('close', () => {
+            if (!res.writableEnded)
+                abortUpstream();
+        });
+    };
+    /** Forward one exchange to the upstream and relay its response. */
+    const forwardExchange = (req, res, upstreamUrl, scope, fwd = {}) => {
+        const headers = forwardHeaders(req.headers, 'host');
+        if (gw !== undefined) {
+            // A compressed response cannot be scanned; the upstream is told not to.
+            delete headers['accept-encoding'];
+            delete headers['Accept-Encoding'];
+            headers['accept-encoding'] = 'identity';
+        }
+        if (fwd.body !== undefined) {
+            // The body is sent whole: its length is known and any chunked framing
+            // the client used no longer applies.
+            delete headers['content-length'];
+            delete headers['Content-Length'];
+            headers['content-length'] = fwd.body.length;
+        }
+        const upReq = requester(upstreamUrl, { method: req.method, headers }, (upRes) => {
             // Headers are in: any header-wait timeout no longer applies. A
             // streaming (or merely slow) response must never be torn down for
             // inactivity once the exchange is under way.
             upReq.setTimeout(0);
+            const ct = upRes.headers['content-type'];
+            const encoding = upRes.headers['content-encoding'];
+            const compressed = typeof encoding === 'string' && encoding !== '' && encoding.toLowerCase() !== 'identity';
+            if (gw !== undefined && compressed) {
+                // Fail closed: a result the boundary filter cannot read must not
+                // reach the client unread. The upstream was told `identity`.
+                upRes.resume();
+                diag(`gateway: upstream answered with content-encoding ${encoding}; refused (the boundary filter cannot scan a compressed result)`);
+                respondJson(res, 502, invalidRequestResponse(null, 'mcp-recorder gateway: the upstream answered with a compressed body, which the gateway cannot scan; refused'));
+                return;
+            }
+            const sseGateway = gw !== undefined && isSseContentType(ct);
+            const jsonGateway = gw !== undefined && !sseGateway && isJsonContentType(ct) && fwd.filterResponse === true;
+            if (jsonGateway) {
+                // Buffered, filtered, then written whole with its true length.
+                const chunks = [];
+                let len = 0;
+                let over = false;
+                upRes.on('data', (chunk) => {
+                    if (over)
+                        return;
+                    len += chunk.length;
+                    if (len > MAX_GATEWAY_BODY) {
+                        // Past the cap the body cannot be parsed or filtered: it is
+                        // forwarded as it stands and the chain says so (`oversized`),
+                        // exactly as the stdio gateway treats a line past its cap.
+                        over = true;
+                        try {
+                            res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, forwardHeaders(upRes.headers));
+                            for (const c of chunks)
+                                res.write(gw.scrubBytes(c));
+                            res.write(gw.scrubBytes(chunk));
+                        }
+                        catch (err) {
+                            tapError(err);
+                        }
+                        chunks.length = 0;
+                        upRes.on('data', (c) => res.write(gw.scrubBytes(c)));
+                        guarded(() => protocolError('server_to_client', 'oversized', len, ''));
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
+                upRes.on('end', () => {
+                    try {
+                        if (over) {
+                            res.end();
+                            return;
+                        }
+                        const body = gw.filterJsonBody(Buffer.concat(chunks).toString('utf8'), scope);
+                        const outHeaders = forwardHeaders(upRes.headers);
+                        delete outHeaders['content-length'];
+                        delete outHeaders['Content-Length'];
+                        outHeaders['content-length'] = body.length;
+                        res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, outHeaders);
+                        res.end(body);
+                    }
+                    catch (err) {
+                        tapError(err);
+                        try {
+                            res.destroy();
+                        }
+                        catch {
+                            /* already gone */
+                        }
+                    }
+                });
+                upRes.on('error', () => {
+                    try {
+                        res.destroy();
+                    }
+                    catch {
+                        /* already gone */
+                    }
+                });
+                return;
+            }
             try {
                 res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, forwardHeaders(upRes.headers));
                 res.flushHeaders();
@@ -619,8 +1388,71 @@ export async function runHttpProxy(opts) {
                 upRes.destroy();
                 return;
             }
+            if (sseGateway) {
+                // Event by event: each is held only until the blank line that ends
+                // it, filtered if it carries a tools/call result, and re-emitted
+                // from its original bytes when the filter changed nothing.
+                const splitter = new SseEventSplitter();
+                const emit = (ev) => {
+                    if (ev.oversized === true) {
+                        res.write(gw.scrubBytes(ev.raw));
+                        guarded(() => protocolError('server_to_client', 'oversized', ev.raw.length, ''));
+                        return;
+                    }
+                    let out;
+                    try {
+                        out = gw.filterSseEvent(ev.raw, ev.data, scope);
+                    }
+                    catch (err) {
+                        // Enforcement fails CLOSED here as it does on the JSON path: a
+                        // tools/call result the filter blew up on must not reach the
+                        // client unscanned. What replaces it depends on what the event
+                        // carried — a JSON-RPC response gets a blocked result the model
+                        // can read (so the client is not left waiting on the id), any
+                        // other JSON payload is dropped and the chain says so, and an
+                        // event that is not JSON at all (a ping, a comment) was never
+                        // the filter's to touch and crosses as written.
+                        tapError(err);
+                        out = gw.failClosedSseEvent(ev.raw, ev.data);
+                    }
+                    res.write(gw.scrubBytes(out));
+                };
+                upRes.on('data', (chunk) => {
+                    try {
+                        for (const ev of splitter.push(chunk))
+                            emit(ev);
+                    }
+                    catch (err) {
+                        tapError(err);
+                    }
+                });
+                upRes.on('end', () => {
+                    try {
+                        const tail = splitter.end();
+                        if (tail !== undefined)
+                            emit(tail);
+                    }
+                    catch (err) {
+                        tapError(err);
+                    }
+                    try {
+                        res.end();
+                    }
+                    catch {
+                        /* client already gone */
+                    }
+                });
+                upRes.on('error', () => {
+                    try {
+                        res.destroy();
+                    }
+                    catch {
+                        /* already gone */
+                    }
+                });
+                return;
+            }
             // Per-response tap state, chosen by content-type.
-            const ct = upRes.headers['content-type'];
             const sse = isSseContentType(ct) ? new SseScanner() : null;
             const tapJson = sse === null && isJsonContentType(ct);
             const jsonChunks = [];
@@ -628,7 +1460,7 @@ export async function runHttpProxy(opts) {
             let jsonOver = false;
             upRes.on('data', (chunk) => {
                 // Forward first — the tap must never delay or reorder bytes.
-                res.write(chunk);
+                res.write(gw === undefined ? chunk : gw.scrubBytes(chunk));
                 try {
                     if (sse !== null) {
                         for (const data of sse.push(chunk)) {
@@ -728,36 +1560,11 @@ export async function runHttpProxy(opts) {
                 /* response already unusable */
             }
         });
-        // The upstream connection must not outlive the client's interest in the
-        // response: if the client goes away mid-exchange (aborted fetch, closed
-        // socket), tear down the upstream request/response too instead of
-        // leaking it. Safe to call after a normal completion — destroy() on an
-        // already-finished request is a no-op.
-        let upstreamAborted = false;
-        const abortUpstream = () => {
-            if (upstreamAborted)
-                return;
-            upstreamAborted = true;
-            try {
-                if (!upReq.destroyed)
-                    upReq.destroy();
-            }
-            catch {
-                /* already gone */
-            }
-        };
-        // `req`'s 'close' fires once its body has been fully read too, not only
-        // on a premature disconnect — `req.complete` tells them apart. `res`'s
-        // 'close' can likewise fire after a normal `res.end()`, so only treat it
-        // as an abort signal when the response never actually finished.
-        req.on('close', () => {
-            if (!req.complete)
-                abortUpstream();
-        });
-        res.on('close', () => {
-            if (!res.writableEnded)
-                abortUpstream();
-        });
+        abortable(req, res, upReq);
+        if (fwd.body !== undefined) {
+            upReq.end(fwd.body);
+            return;
+        }
         // Request body: stream straight through; keep a bounded COPY for the tap.
         const reqIsJson = isJsonContentType(req.headers['content-type']);
         const reqChunks = [];
@@ -795,6 +1602,299 @@ export async function runHttpProxy(opts) {
         });
         req.pipe(upReq);
     };
+    /* ----------------------- gateway: the request side ----------------------- */
+    /** Read a whole request body, bounded. Resolves `undefined` when it grew past the cap. */
+    const readBody = (req, cap) => new Promise((resolveBody, rejectBody) => {
+        const chunks = [];
+        let len = 0;
+        let over = false;
+        req.on('data', (chunk) => {
+            if (over)
+                return;
+            len += chunk.length;
+            if (len > cap) {
+                over = true;
+                chunks.length = 0;
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('end', () => resolveBody(over ? undefined : Buffer.concat(chunks)));
+        req.on('error', rejectBody);
+    });
+    /**
+     * One tools/call over HTTP: evaluate, then forward (with the swap when a
+     * declared site is engaged), deny, or hold. `text` is the body as the
+     * client wrote it; a rewritten body is spliced so untouched bytes cross
+     * as written.
+     */
+    const gatewayToolsCall = (g, req, res, upstreamUrl, scope, text, msg) => {
+        const { call, action } = g.buildCall(msg);
+        const forward = (hold) => {
+            const plan = g.planSwap(call.rawTool, call.args);
+            g.withSwap(res, call, msg, plan, (message, attributes) => {
+                const body = message === msg ? Buffer.from(text, 'utf8') : Buffer.from(spliceRewrittenText(text, msg, message) ?? JSON.stringify(message), 'utf8');
+                try {
+                    g.registerCall(scope, call, g.gatewayOutcomeFor(call, hold), attributes);
+                }
+                catch (err) {
+                    tapError(err);
+                }
+                forwardExchange(req, res, upstreamUrl, scope, { body, filterResponse: true });
+            }, hold);
+        };
+        if (action === 'allow') {
+            forward();
+            return;
+        }
+        if (action === 'deny') {
+            g.denyCall(res, call);
+            return;
+        }
+        if (sessionClosing) {
+            g.denyCall(res, { ...call, reason: 'session_end (hold not started)', failClosed: true }, { outcome: 'session_end', waitedMs: 0 }, `gateway: session ending; tools/call "${call.tool}" refused instead of held (rule ${call.ruleId ?? 'default'})`);
+            return;
+        }
+        g.startHold(res, scope, call, (hold) => forward(hold));
+    };
+    /**
+     * A JSON-RPC batch: all or nothing (module header). Every element is
+     * evaluated; when each tools/call is allowed and needs no credential the
+     * batch crosses as written, otherwise it is answered here.
+     */
+    const gatewayBatch = (g, req, res, upstreamUrl, scope, text, batch) => {
+        const calls = new Map();
+        let clean = true;
+        batch.forEach((el, i) => {
+            if (Array.isArray(el)) {
+                clean = false;
+                return;
+            }
+            if (isInvalidIdToolsCall(el) || isToolsCallNotification(el)) {
+                clean = false;
+                return;
+            }
+            if (!isToolsCallRequest(el))
+                return;
+            const built = g.buildCall(el);
+            calls.set(i, built);
+            if (built.action !== 'allow' || g.planSwap(built.call.rawTool, built.call.args).length > 0)
+                clean = false;
+        });
+        if (clean) {
+            for (const [, built] of calls) {
+                try {
+                    g.registerCall(scope, built.call, g.gatewayOutcomeFor(built.call));
+                }
+                catch (err) {
+                    tapError(err);
+                }
+            }
+            // The other elements register through the ordinary tap.
+            guarded(() => {
+                batch.forEach((el, i) => {
+                    if (!calls.has(i))
+                        handleMessage(el, 'client_to_server', text, scope);
+                });
+            });
+            forwardExchange(req, res, upstreamUrl, scope, { body: Buffer.from(text, 'utf8'), filterResponse: true });
+            return;
+        }
+        const responses = [];
+        batch.forEach((el, i) => {
+            if (Array.isArray(el)) {
+                responses.push(invalidRequestResponse(null, NESTED_BATCH_MESSAGE));
+                return;
+            }
+            if (isInvalidIdToolsCall(el)) {
+                responses.push(invalidRequestResponse(null, el['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
+                return;
+            }
+            const built = calls.get(i);
+            if (built !== undefined) {
+                const { call, action } = built;
+                let refused;
+                let refusal;
+                if (action === 'deny')
+                    refused = call;
+                else if (action === 'hold') {
+                    refused = { ...call, reason: 'hold is not available inside a JSON-RPC batch; send the call on its own', failClosed: true };
+                }
+                else {
+                    refused = { ...call, reason: 'batched with a call the policy refused; send it on its own', failClosed: true };
+                    refusal = 'batch_refused';
+                }
+                const input = { tool: refused.rawTool };
+                if (refused.rawRuleId !== undefined)
+                    input.ruleId = refused.rawRuleId;
+                if (refused.reason !== undefined)
+                    input.reason = refused.reason;
+                if (refused.failClosed === true)
+                    input.failClosed = true;
+                const response = synthesizeDeniedResult(refused.id, deniedText(input));
+                guarded(() => {
+                    g.recordPolicyDecision(refused);
+                    g.recordSyntheticToolCall(refused, response.result, undefined, refusal ?? 'policy_denied', refusal);
+                });
+                responses.push(response);
+                return;
+            }
+            if (isPlainObject(el) && isRpcId(el['id'])) {
+                responses.push(invalidRequestResponse(el['id'], 'mcp-recorder gateway: this request was batched with a tools/call the policy refused and was not forwarded; send it on its own'));
+            }
+            // A notification in a refused batch gets no response, like any notification.
+        });
+        diag(`gateway: refused a JSON-RPC batch of ${batch.length} (a tools/call in it was denied, held or needed a credential)`);
+        respondJson(res, 200, responses);
+    };
+    /** Gateway mode: a POST with a JSON body. Buffered, parsed, gated. */
+    const gatewayPost = async (g, req, res, upstreamUrl, scope) => {
+        let body;
+        try {
+            body = await readBody(req, MAX_GATEWAY_BODY);
+        }
+        catch {
+            return; // the client went away mid-body; nothing to answer
+        }
+        if (body === undefined) {
+            diag('gateway: refused a request body larger than the gateway can buffer');
+            respondJson(res, 413, invalidRequestResponse(null, OVERSIZED_LINE_MESSAGE));
+            return;
+        }
+        const text = body.toString('utf8');
+        let msg;
+        try {
+            msg = JSON.parse(text);
+        }
+        catch {
+            guarded(() => protocolError('client_to_server', 'unparseable', body.length, text));
+            diag('gateway: refused a request body that is not JSON');
+            respondJson(res, 400, invalidRequestResponse(null, UNPARSEABLE_LINE_MESSAGE));
+            return;
+        }
+        if (Array.isArray(msg)) {
+            gatewayBatch(g, req, res, upstreamUrl, scope, text, msg);
+            return;
+        }
+        if (isToolsCallRequest(msg)) {
+            gatewayToolsCall(g, req, res, upstreamUrl, scope, text, msg);
+            return;
+        }
+        if (isInvalidIdToolsCall(msg)) {
+            // Refused whatever the policy says (a response could not be
+            // correlated); recorded on a notification event, like the stdio gateway.
+            const { params, name } = toolsCallParts(msg);
+            const tool = name === '' ? '' : structuralString(name, 'identifier');
+            guarded(() => {
+                const ev = {
+                    ...base('notification', { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' }),
+                    kind: 'notification',
+                    method: 'tools/call',
+                    direction: 'client_to_server',
+                    params: redactor.scrub(params),
+                    gateway: { decision: 'deny', refusal: 'invalid_request_id' },
+                };
+                record(ev);
+            });
+            diag(`gateway: refused tools/call "${tool}" with an unusable id`);
+            respondJson(res, 400, invalidRequestResponse(null, msg['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
+            return;
+        }
+        if (isToolsCallNotification(msg)) {
+            // Evaluated like a request; a refusal has no response to carry it
+            // (202, per the streamable-HTTP transport) so it rides the
+            // notification event's `gateway` field.
+            const { params, name } = toolsCallParts(msg);
+            const args = params['arguments'] ?? {};
+            const { call, action } = g.buildCall({ ...msg, id: '' });
+            const tool = name === '' ? '' : structuralString(name, 'identifier');
+            if (action === 'allow' && g.planSwap(call.rawTool, args).length === 0) {
+                guarded(() => handleMessage(msg, 'client_to_server', text, scope));
+                forwardExchange(req, res, upstreamUrl, scope, { body, filterResponse: true });
+                return;
+            }
+            const outcome = { decision: 'deny' };
+            if (call.ruleId !== undefined)
+                outcome.rule_id = call.ruleId;
+            guarded(() => {
+                const attributes = { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' };
+                if (call.ruleId !== undefined)
+                    attributes['cresec.policy.rule_id'] = call.ruleId;
+                const ev = {
+                    ...base('notification', attributes),
+                    kind: 'notification',
+                    method: 'tools/call',
+                    direction: 'client_to_server',
+                    params: redactor.scrub(params),
+                    gateway: outcome,
+                };
+                record(ev);
+            });
+            diag(`gateway: refused tools/call notification "${tool}" (rule ${call.ruleId ?? 'default'}; a notification cannot be held or answered)`);
+            try {
+                res.writeHead(202);
+                res.end();
+            }
+            catch {
+                /* client gone */
+            }
+            return;
+        }
+        if (isPlainObject(msg) && msg['method'] === 'notifications/cancelled') {
+            try {
+                g.cancelHold(scope, msg);
+            }
+            catch (err) {
+                tapError(err);
+            }
+        }
+        // Everything else — initialize, tools/list, notifications, client
+        // responses — crosses as written and is recorded by the ordinary tap.
+        guarded(() => handleMessage(msg, 'client_to_server', text, scope));
+        forwardExchange(req, res, upstreamUrl, scope, { body, filterResponse: true });
+    };
+    const guarded = (fn) => {
+        try {
+            fn();
+        }
+        catch (err) {
+            tapError(err);
+        }
+    };
+    const handleRequest = (req, res) => {
+        // Resolve the upstream URL: '/' means "the configured endpoint"; any
+        // other path is grafted onto the target origin (sub-endpoints).
+        let upstreamUrl;
+        try {
+            upstreamUrl =
+                req.url === undefined || req.url === '/' ? target : new URL(req.url, target);
+        }
+        catch {
+            upstreamUrl = target;
+        }
+        const sessionHeader = req.headers['mcp-session-id'];
+        const sessionKey = typeof sessionHeader === 'string'
+            ? sessionHeader
+            : Array.isArray(sessionHeader) && sessionHeader.length > 0
+                ? sessionHeader[0]
+                : '';
+        const scope = { local: new Map(), sessionKey, exchangeId: randomUUID() };
+        // EVERY POST is gated, whatever its content-type says. The gate parses
+        // the body itself (a body that is not JSON is refused there), so a
+        // tools/call sent as text/plain, or with no content-type at all, is
+        // evaluated exactly like one sent as application/json — keying the gate
+        // on the header would let a client name its way past the policy.
+        if (gw !== undefined && req.method === 'POST') {
+            gatewayPost(gw, req, res, upstreamUrl, scope).catch((err) => {
+                // Enforcement fails closed: an exchange the gateway could not
+                // evaluate is refused, never forwarded.
+                tapError(err);
+                respondJson(res, 500, invalidRequestResponse(null, 'mcp-recorder gateway: internal error while evaluating the request; refused'));
+            });
+            return;
+        }
+        forwardExchange(req, res, upstreamUrl, scope);
+    };
     /* ------------------------------ lifecycle -------------------------------- */
     const server = createServer(handleRequest);
     server.on('clientError', (_err, socket) => {
@@ -822,6 +1922,12 @@ export async function runHttpProxy(opts) {
             cwd: process.cwd(),
             redaction_mode: redactor.mode,
         };
+        if (opts.gateway !== undefined) {
+            sessionStart.policy = { hash: opts.gateway.policy.hash };
+            if (opts.gateway.policy.name !== undefined) {
+                sessionStart.policy.name = structuralString(opts.gateway.policy.name, 'identifier');
+            }
+        }
         record(sessionStart);
     }
     catch (err) {
@@ -832,6 +1938,15 @@ export async function runHttpProxy(opts) {
         if (closed)
             return;
         closed = true;
+        sessionClosing = true;
+        try {
+            // Gateway mode: a hold nobody answered is recorded as `session_end`
+            // and the client, if still waiting, gets the refusal.
+            resolveAllHolds();
+        }
+        catch (err) {
+            tapError(err);
+        }
         try {
             // Requests still in flight when the proxy closes get no response —
             // record that explicitly rather than silently dropping them.

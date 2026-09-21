@@ -168,6 +168,13 @@ export type CredentialPathInput = {
 } | {
     from: 'tool';
 };
+/**
+ * The control plane's action classes (cresec-ai/nhi
+ * docs/internal/contracts/user-token.md). `read` and `draft` need no grant
+ * there; `send` and `write` do. Carried on the per-user token request when a
+ * credential is brokered remotely; informational for a local source.
+ */
+export type ActionClass = 'read' | 'draft' | 'send' | 'write';
 export interface CredentialUseInput {
     id?: string;
     server?: GlobOrList;
@@ -178,6 +185,35 @@ export interface CredentialUseInput {
     path?: CredentialPathInput;
     action?: CredentialAction;
     reason?: string;
+    /** What the call does at the destination. Default `write` — the class that always needs a grant. */
+    action_class?: ActionClass;
+    /** The HTTP method the site's request maps onto (`target.method`). Default `POST`. */
+    method?: string;
+}
+/**
+ * `credentials[].broker` — resolve THIS credential through the Cresec
+ * control plane's per-user token endpoint (`POST <url>/v1/broker/user-token`)
+ * instead of a local `source`. The contract page spells it
+ * `credentials.broker`; in this file `credentials` is a list, so the block
+ * sits on the credential it brokers. Exactly one of `source` / `broker`.
+ */
+export interface RemoteBrokerInput {
+    kind: 'remote';
+    /** Control plane base URL, `https://` (loopback `http://` allowed for tests). */
+    url: string;
+    /** Env var holding the internal bearer token (`CRESEC_INTERNAL_TOKEN`). Never the value. */
+    token_env: string;
+    /** Tenant slug or uuid for `X-Cresec-Tenant`; optional when the identity JWT carries `tenant_id`. */
+    tenant?: string;
+    /** Env var holding the user id; optional when `--identity-jwt` supplies `sub`. */
+    user_env?: string;
+    /** Env var holding the identity JWT itself (an alternative to `--identity-jwt PATH`). */
+    identity_jwt_env?: string;
+    /** Tool registry id / version when no identity JWT supplies the `tool` claim. */
+    tool_id?: string;
+    tool_version?: string;
+    /** Round-trip budget for the control plane. Default 5000 ms; overrunning it denies. */
+    timeout_ms?: number;
 }
 export interface CredentialInput {
     id: string;
@@ -185,7 +221,10 @@ export interface CredentialInput {
     synthetic_env?: string;
     provider?: string;
     scopes?: string[];
-    source: CredentialSourceInput;
+    /** Where the real credential is resolved from locally. Exactly one of `source` / `broker`. */
+    source?: CredentialSourceInput;
+    /** Resolve through the control plane instead. Exactly one of `source` / `broker`. */
+    broker?: RemoteBrokerInput;
     use: CredentialUseInput[];
     ttl_seconds?: number;
     timeout_ms?: number;
@@ -266,16 +305,35 @@ export interface CredentialUse {
     path: CredentialPath;
     action: CredentialAction;
     reason?: string;
+    /** The control plane's action class for this site. Default `write`. */
+    action_class: ActionClass;
+    /** `target.method` on the per-user token request. Default `POST`, always uppercase. */
+    method: string;
+}
+/** Normalized `credentials[].broker`. */
+export interface RemoteBrokerSetting {
+    kind: 'remote';
+    url: string;
+    token_env: string;
+    tenant?: string;
+    user_env?: string;
+    identity_jwt_env?: string;
+    tool_id?: string;
+    tool_version?: string;
+    timeout_ms: number;
 }
 export interface Credential {
     id: string;
     /** Environment variable holding this credential's synthetic, when the policy names one. */
     synthetic_env?: string;
-    /** Informational: which provider the real credential belongs to. Recorded on the decision. */
+    /** Informational: which provider the real credential belongs to. Recorded on the decision. For a remote broker it is the `connector` sent to the control plane. */
     provider?: string;
     /** Informational: what the real credential can do. Recorded on the decision, so blast radius is answerable from the chain instead of reconstructed. */
     scopes?: string[];
-    source: CredentialSource;
+    /** Local resolution. Absent exactly when `broker` is present. */
+    source?: CredentialSource;
+    /** Remote resolution through the control plane. Absent exactly when `source` is present. */
+    broker?: RemoteBrokerSetting;
     /** Declared swap sites, in order; the first match decides. */
     use: CredentialUse[];
     /** How long a positive decision may be cached, in seconds. */
@@ -395,6 +453,12 @@ export declare const DEFAULTS: {
         readonly timeout_ms: 5000;
         readonly on_unresolved: OnUnresolved;
         readonly action: CredentialAction;
+        /** The class that always needs a grant at the control plane: the safe default for a site whose author said nothing. */
+        readonly action_class: ActionClass;
+        /** `target.method` when the site does not say: what a swap site of an MCP tool almost always is. */
+        readonly method: "POST";
+        /** `credentials[].broker.timeout_ms`: the same 5 s the local resolver and NHI's client carry. */
+        readonly broker_timeout_ms: 5000;
         /** NHI's broker reads `{"token": ...}` out of the vault blob; same key here. */
         readonly vault_field: "token";
         /** AWS's minimum session length: the shortest-lived token STS will mint. */

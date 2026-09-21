@@ -57,6 +57,57 @@ export interface CredentialFingerprint {
   ref: Sha256Ref;
 }
 
+/* ------------------------------------------------------------------ */
+/* Actor claim (additive, v1) — ADR 012 in cresec-ai/nhi.               */
+/* ------------------------------------------------------------------ */
+
+/** The person the identity JWT names (`sub`, `email`, `idp`, `idp_sub`). */
+export interface ActorUser {
+  /** The control plane's `user.id` (uuid). */
+  id: string;
+  email: string;
+  idp: 'okta' | 'entra' | 'google' | 'test';
+  /** The IdP's subject for the user; `""` when `idp` is `test` and none was seeded. */
+  idp_sub: string;
+}
+
+/** The tool version the person signed in through. */
+export interface ActorTool {
+  /** The tool registry's `tool.id` (uuid). */
+  id: string;
+  name: string;
+  version: string;
+}
+
+/** Where that tool runs, as registered — never observed on the wire. */
+export interface ActorHost {
+  origin: string;
+  kind: 'vercel' | 'lambda' | 'other' | 'local';
+}
+
+/**
+ * Additive optional field on {@link IdentityContext} (schema stays v1): who
+ * acted, through which tool version, from which host, on whose behalf —
+ * ADR 012's actor claim, copied field for field from the identity JWT the
+ * recorder was started with (`--identity-jwt`, or the env var a policy's
+ * `credentials[].broker.identity_jwt_env` names). A pure function of the
+ * JWT's claims; nothing is looked up.
+ *
+ * Exactly the control plane's shape (`packages/contracts/src/actor.ts` in
+ * cresec-ai/nhi: `user`, `tool`, `host`, `run_as` and nothing else), so an
+ * audit record's `actor` and a control-plane record's `actor` compare equal
+ * byte for byte. Whether this leg checked the JWT's signature is NOT part
+ * of the claim: it rides beside it as {@link IdentityContext.actor_verified}.
+ * An event with no JWT has no `actor` at all and reads as unattributed,
+ * which is the honest state.
+ */
+export interface ActorClaim {
+  user: ActorUser;
+  tool: ActorTool;
+  host: ActorHost;
+  run_as: 'user' | 'owner';
+}
+
 /** Identity context stamped on every event ("identity-stamp everything"). */
 export interface IdentityContext {
   /**
@@ -76,6 +127,20 @@ export interface IdentityContext {
   label?: string;
   /** Hashes of secret-looking env values passed to the wrapped server. */
   credential_fingerprints?: CredentialFingerprint[];
+  /**
+   * Additive optional field (schema stays v1). The ADR 012 actor claim, when
+   * the recorder was started with an identity JWT. See {@link ActorClaim}.
+   */
+  actor?: ActorClaim;
+  /**
+   * Additive optional field (schema stays v1); present exactly when `actor`
+   * is. Whether the identity JWT's EdDSA signature was checked against a
+   * JWKS (`--identity-jwks`). `false` means the claims were DECODED, not
+   * verified: the record says what the token said, and an auditor who
+   * needs more must verify the token out of band. Beside `actor` rather
+   * than inside it so `actor` stays the control plane's shape byte for byte.
+   */
+  actor_verified?: boolean;
 }
 
 export interface ServerContext {
@@ -298,6 +363,16 @@ export interface PolicyDecisionEvent extends EventBase {
   waited_ms?: number;
   /** OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one. */
   approver?: string;
+  /**
+   * Additive optional field (schema stays v1). The id of THIS decision, a
+   * uuid: minted by the local policy engine for a decision it took itself,
+   * or the control plane's `decision_id` when the remote credential broker
+   * (`credentials[].broker: { kind: remote }`) made the decision — the same
+   * value a swapped `tool_call` carries as `cresec.broker.decision_id`, so
+   * the two events join on it. Absent only on events written before the
+   * field existed.
+   */
+  decision_id?: string;
 }
 
 /** Any other correlated JSON-RPC request/response (tools/list, resources/read, ...). */

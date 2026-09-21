@@ -142,13 +142,18 @@ interface SessionRow {
  * response was seen, which gateway mode makes ordinary because a deny is
  * answered by the proxy itself without waiting for the server. See
  * SessionSummary.server_count for the full account.
- * policy_decision_count is gateway mode's enforcement: one per deny and one
- * per resolved hold, an approved hold included. It comes off the kind, plus
- * the one decision that CANNOT be a `policy_decision` event — a refused
- * `tools/call` NOTIFICATION, which has no request id to write one with and
- * carries its outcome on the `notification` event instead. The synthetic
- * tool_call that carries a refusal back to the client is a tool_call,
- * counted there and in error_count, never here.
+ * policy_decision_count is enforcement, whichever surface did it: gateway
+ * mode's one per deny and one per resolved hold (an approved hold
+ * included), off the kind; the one gateway decision that CANNOT be a
+ * `policy_decision` event — a refused `tools/call` NOTIFICATION, which has
+ * no request id to write one with and carries its outcome on the
+ * `notification` event instead; and a HOOK deny, which `mcp-recorder hook`
+ * records as the call's own `pre` tool_call with `error.type:
+ * 'policy_denied'` (a hook deny has no JSON-RPC id either, and it IS the
+ * call). The gateway's synthetic tool_call that carries a refusal back to
+ * the client has no `phase`, so it is a tool_call counted there and in
+ * error_count, never here — the two shapes of "this call was denied" each
+ * count exactly once.
  *
  * Non-conforming records are read the same way jsonl.ts reads them: an
  * explicit `phase: null` counts as a call like an absent phase, a
@@ -176,6 +181,9 @@ SELECT
   SUM(CASE WHEN r.kind = 'policy_decision'
             OR (r.kind = 'notification'
                 AND json_type(r.event, '$.gateway.decision') = 'text')
+            OR (r.kind = 'tool_call'
+                AND json_extract(r.event, '$.phase') = 'pre'
+                AND json_extract(r.event, '$.error.type') = 'policy_denied')
            THEN 1 ELSE 0 END)                           AS policy_decision_count,
   (SELECT json_extract(f.event, '$.server.name')
      FROM records f WHERE f.session_id = r.session_id ORDER BY f.seq LIMIT 1) AS server_name,

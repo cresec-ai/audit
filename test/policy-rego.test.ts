@@ -337,6 +337,55 @@ describe('compileToRego: cresec/credentials/broker.rego', () => {
     );
   });
 
+  it('ignores credentials[].broker, action_class and method: a remote credential compiles to exactly the Rego a local one does', () => {
+    // The emitted module names the credential by id and the site by its
+    // globs, host and path; WHERE the credential is resolved (a local
+    // source, or the control plane's per-user token endpoint) and the
+    // control plane's own inputs (action class, method) are not the Rego's
+    // business. So the two spellings must produce one bundle, or the OPA
+    // parity gate would be comparing the local engine against a policy
+    // that changes shape when brokering moves to the control plane.
+    const opts = { policyHash: goldenHash('remote'), toolVersion: TOOL_VERSION };
+    const local = validatePolicyObject({
+      version: 1,
+      mcp: { default: 'allow' },
+      credentials: [
+        {
+          id: 'gmail-drafts',
+          provider: 'gmail',
+          source: { type: 'env', var: 'GMAIL_TOKEN' },
+          use: [{ id: 'draft', tool: 'gmail_create_draft', arg: 'headers.Authorization', host: { fixed: 'gmail.googleapis.com' } }],
+        },
+      ],
+    });
+    const remote = validatePolicyObject({
+      version: 1,
+      mcp: { default: 'allow' },
+      credentials: [
+        {
+          id: 'gmail-drafts',
+          provider: 'gmail',
+          broker: { kind: 'remote', url: 'https://api.cresec.test', token_env: 'CRESEC_INTERNAL_TOKEN', tenant: 'e2e', user_env: 'CRESEC_USER_ID' },
+          use: [
+            {
+              id: 'draft',
+              tool: 'gmail_create_draft',
+              arg: 'headers.Authorization',
+              host: { fixed: 'gmail.googleapis.com' },
+              action_class: 'draft',
+              method: 'POST',
+            },
+          ],
+        },
+      ],
+    });
+    if (!local.ok || !remote.ok) throw new Error('fixture invalid');
+    expect(remote.policy.credentials![0]!.broker?.kind).toBe('remote');
+    expect(compileToRego(remote.policy, opts)).toEqual(compileToRego(local.policy, opts));
+    // NEGATIVE CONTROL: the bundle is not vacuous — the site is in it.
+    expect(compileToRego(remote.policy, opts).files[CREDENTIALS_REGO_PATH]).toContain('gmail-drafts/draft');
+  });
+
   it('defaults to deny, and says in the module that it is the one section enforced on BOTH sides', () => {
     expect(credentials.startsWith('package cresec.credentials\n\nimport rego.v1\n\n')).toBe(true);
     expect(credentials).toContain(

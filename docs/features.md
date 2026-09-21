@@ -110,9 +110,10 @@ points at them.
 | Policy validation | `policy validate FILE` | **Tested** |
 | Rego compiler and OPA parity | `policy compile FILE` | **Tested** (parity runs in CI only) |
 | Typechecking for `test`/`bench`/`demo` | `npm run typecheck` | **Verified** (build-time control; run here and in CI) |
-| `sessions` DECISIONS does not count hook denies | — | **Known gap** |
-| Two different event shapes for "this call was denied" | — | **Known gap** |
-| Replay page badges the two deny paths differently | — | **Known gap** |
+| `sessions` DECISIONS counts hook denies too | `sessions` | **Tested** (`test/store.test.ts`, both backends) — closed after this transcript |
+| Two different event shapes for "this call was denied" | — | **Known gap**, narrowed: both shapes count once and badge alike; the shapes themselves stay two (invariant 3's exactly-one-record clause) |
+| Replay page badges the two deny paths alike | `ui` | **Tested** (`test/replay.test.ts`: `hook deny` / `gateway deny`, same `gw-deny` badge) — closed after this transcript |
+| Gateway mode over HTTP (`http --policy`), control-plane token injection (`credentials[].broker`), actor claim (`--identity-jwt`) | `http --policy`, `record --policy` | **Tested** against fakes (`test/http-gateway.test.ts`, `test/e2e/http-gateway.e2e.test.ts`); not yet a live vendor remote MCP |
 | `boundary.injection: flag` flags but does not block | — | **Known gap** |
 | `ui --out` against a missing store renders an empty page silently | — | **Known gap** |
 | Anything on claude.ai web, Desktop chat or Cowork | — | **Known gap** |
@@ -232,18 +233,16 @@ f6e83a5f  2026-09-17T05:32:46.290Z  2026-09-17T05:32:47.344Z  http-demo  3      
 (`TOOL_CALLS 0` because this reproduction sent only `initialize`.)
 
 **Limits, stated here rather than in a footnote:** one public server is the
-whole of our live evidence for this transport; SSE responses are covered by the
-test suite only; and `http` has no gateway mode at all. Both refusals are real:
-
-```
-$ node dist/cli.js http --target http://127.0.0.1:8791/mcp --policy policy.docs.yaml
-[mcp-recorder] error: http: gateway mode is available for the stdio transport only (drop --policy)
-$ echo $?
-2
-
-$ MCP_RECORDER_POLICY=policy.docs.yaml node dist/cli.js http --target http://127.0.0.1:8791/mcp --port 8799
-[mcp-recorder] http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio transport only
-```
+whole of our live evidence for this transport, and SSE responses are covered
+by the test suite only. `http --policy` — gateway mode over HTTP, with the
+same policy, holds, boundary filter and `credentials` swap as `record
+--policy` — is **Tested**, not Verified: `test/http-gateway.test.ts` and
+`test/e2e/http-gateway.e2e.test.ts` (S17a: a journaling fake vendor MCP and a
+fake control plane serving `POST /v1/broker/user-token`) drive the built
+binary; no live vendor remote MCP has been gated yet (S17b). The earlier
+refusal is gone: an exported `MCP_RECORDER_POLICY` is enforced by `http`
+exactly as by `record`, and the proxy says so at start
+(`gateway: policy <name> (<n> rules) enforced over HTTP`).
 
 ### Can it see Claude's built-in connectors?
 
@@ -777,8 +776,9 @@ mcp-recorder sessions [--data-dir D] [--store B] [--json]
 **Maturity: Verified.** The table is for reading; `--json` is the stable
 interface. `SERVERS` counts distinct servers the session's tool calls went to,
 and a hook-captured call (a pre + post pair) counts once. `DECISIONS` counts
-`policy_decision` events — read the known gap below before using that column as
-an enforcement signal.
+`policy_decision` events **and**, since the gap below was closed, the hook's
+deny shape (a `pre` `tool_call` with `error.type: "policy_denied"`), so it is
+an enforcement signal for both surfaces.
 
 A `session_end` is not necessarily a session's last event: a Claude Code session
 resumed under the same id keeps recording after it. Rather than print a
@@ -1413,7 +1413,8 @@ to give you a number, which is the behaviour to want from it.
 
 - Denied tools are still listed by `tools/list` in v1.
 - `egress` rules are not enforced here; that is the sidecar's job.
-- Gateway mode is stdio only.
+- Gateway mode over HTTP buffers `tools/call` bodies and results (the
+  gateway-mode exception); everything else streams.
 
 ---
 
@@ -1466,13 +1467,24 @@ resolves a connector must be tested against both orderings, key-matches-segment
 and key-does-not, and an expectation like "it blocked" is checked against the
 recorded evidence, never inferred from the session finishing.
 
-### `sessions` DECISIONS reads 0 for a session whose hook denied calls
+### `sessions` DECISIONS read 0 for a session whose hook denied calls (closed)
 
-`DECISIONS` counts `policy_decision` events. A hook deny is not one: it is
+**Closed after this transcript** ([z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr)):
+both store backends now count the hook's deny shape — a `pre` `tool_call`
+with `error.type: "policy_denied"` — as one decision, so the hook session
+below reads `DECISIONS 1` and `--json`'s `policy_decision_count` agrees
+(`test/store.test.ts`, `test/cli.test.ts`). The replay page gives that
+event the same red `gw-deny` badge a gateway deny gets, labelled `hook deny`.
+What stays true: the two SHAPES remain two (a gateway deny is a
+`policy_decision` plus a synthetic `tool_call`; a hook deny is the call's own
+`pre` event), which is invariant 3's exactly-one-record clause still not
+holding. The transcript that found the gap is kept as it was:
+
+`DECISIONS` counted `policy_decision` events. A hook deny is not one: it is
 recorded as a `tool_call` with `error.type: "policy_denied"`. So a session in
-which every deny fired correctly still shows `DECISIONS 0`, and anyone reading
+which every deny fired correctly still showed `DECISIONS 0`, and anyone reading
 that column as their at-a-glance enforcement signal would conclude the opposite
-of what happened. Dogfood 5's hosted-connector session shows `ERRORS 5,
+of what happened. Dogfood 5's hosted-connector session showed `ERRORS 5,
 DECISIONS 0` with four live denies in it.
 
 Reproduced here, the two enforcement paths side by side — one session in which
@@ -1488,9 +1500,9 @@ $ node dist/cli.js sessions --data-dir dg1          # gateway deny (header row t
 579d565e  2026-09-17T05:27:10.396Z  2026-09-17T05:27:10.428Z  gw-deny      6       1           1       1        1          2026-09-17T05:27:10.428Z
 ```
 
-**Until this is unified, count both:** `policy_decision` events *and* `tool_call`
+The column now counts both: `policy_decision` events *and* `pre` `tool_call`
 events carrying `error.type: "policy_denied"`. The `--json` field is
-`policy_decision_count`, and it has the same limitation.
+`policy_decision_count`, and it agrees.
 
 ### Two different event shapes for "this call was denied"
 

@@ -44,8 +44,26 @@
  */
 import type { Credential, Policy } from '../policy/types.js';
 import { CredentialSwap } from '../gateway/credentials.js';
+import type { IdentityJwtClaims } from '../identity/actor.js';
+import type { Broker, BrokerExchangeHint, BrokerExchangeRequest, BrokerExchangeResponse } from './protocol.js';
+import { type RemoteBrokerOptions } from './remote.js';
 /** Raised when a policy expresses something the local broker cannot resolve. */
 export declare class CredentialWiringError extends Error {
+}
+/**
+ * One `Broker` over two: a credential whose policy entry carries `broker:
+ * { kind: remote }` is answered by the control plane, every other one by
+ * the local resolver. Routing is by the SITE's credential id (the hint the
+ * swap engine passes), never by the synthetic — the remote path is keyed on
+ * (user, connector, tool, action class, target), which are properties of
+ * the declared site, and a request that arrives with no hint at all cannot
+ * name a remote credential and falls to the local broker, which knows
+ * nothing about it and denies `unknown_synthetic`.
+ */
+export declare class CompositeBroker implements Broker {
+    #private;
+    constructor(local: Broker | undefined, remote: Broker | undefined, remoteCredentialIds: Iterable<string>);
+    exchange(req: BrokerExchangeRequest, hint?: BrokerExchangeHint): Promise<BrokerExchangeResponse>;
 }
 /**
  * Register the real credentials a policy points at, so that nothing hashes
@@ -66,9 +84,33 @@ export interface WireOptions {
     env: NodeJS.ProcessEnv;
     /** Identity the broker knows this proxy by. Ephemeral unless supplied. */
     dataPlaneInstanceId?: string;
+    /**
+     * The identity JWT's claims (`--identity-jwt`, or the env var a remote
+     * credential's `identity_jwt_env` names — see `identityJwtFromPolicy`).
+     * Supplies `user_id`, the tenant and the tool claim of every per-user
+     * token request; without it those come from `user_env`, `tenant` and
+     * `tool_id`/`tool_version` on the `broker` block, and a remote credential
+     * that has neither is a wiring error (exit 2), not a silent deny.
+     */
+    identity?: IdentityJwtClaims;
+    /**
+     * The compact JWS the claims came from. Needed only for a JOB token
+     * (`kind: job`, `run_as: owner`): user-token.md requires `job_token` when
+     * `run_as = owner`, and identity-jwt.md says the job token IS the identity
+     * JWT with `kind: job` — so it is sent as given. Never recorded.
+     */
+    identityJwt?: string;
+    /** Transport seam for the remote broker (tests inject; production gets `sinkFetch`). */
+    remoteFetch?: RemoteBrokerOptions['fetch'];
     /** Operator diagnostics; the caller routes these to stderr. */
     warn?: (line: string) => void;
 }
+/**
+ * The env var, if any, a policy says holds the identity JWT: the first
+ * remote credential's `identity_jwt_env`. Read by the CLI BEFORE wiring, so
+ * the same claims stamp the actor on every event and key the token requests.
+ */
+export declare function identityJwtEnvFromPolicy(policy: Policy): string | undefined;
 /**
  * Build the swap for a policy, or `undefined` when there is nothing to build.
  *

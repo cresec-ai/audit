@@ -30,6 +30,8 @@
   },
   "files": [
     "dist",
+    "receiver",
+    "src",
     "docs/agent-guidance.md",
     "docs/event-schema.md",
     "docs/gateway.md",

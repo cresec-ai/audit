@@ -32,5 +32,6 @@
 export { SYNTHETIC_PREFIX, BROKER_DEFAULT_TTL_SECONDS, mintSynthetic, mintPepper, isSyntheticShaped, hashSynthetic, syntheticHashesEqual, denyResponse, newDecisionId, } from './protocol.js';
 export { CredentialSourceError, FILE_MODE_CHECK_APPLIES, MAX_CREDENTIAL_BYTES, SOURCE_DEADLINE_MS, assessConfigTrust, defaultSeams, makeSource, sigv4Headers, sourceKinds, xmlTag, } from './sources.js';
 export { LocalBroker, MAX_DECISION_CACHE, SOURCE_UNHEALTHY_MS, credentialsConfigHash, matchRules, validateCredentialEntry, validateCredentials, } from './local.js';
-export { RemoteBroker, REMOTE_TIMEOUT_MS } from './remote.js';
+export { RemoteBroker, REMOTE_TIMEOUT_MS, USER_TOKEN_PATH, templatePath } from './remote.js';
+export { CompositeBroker, CredentialWiringError, credentialSwapFromPolicy, registerPolicyEnvSecrets, syntheticEnvVar } from './wire.js';
 //# sourceMappingURL=index.js.map

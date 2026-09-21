@@ -59,8 +59,23 @@ export interface BrokerExchangeResponse {
     denied?: boolean;
     deny_reason?: string;
 }
+/**
+ * Which declared site asked for the exchange. Additive and OPTIONAL: the
+ * wire request above is keyed on the synthetic alone, exactly as NHI's is,
+ * and a broker that resolves by synthetic (the local one, the `/broker/
+ * exchange` remote) ignores this. The per-user token path needs it because
+ * the control plane's request is keyed on (user, connector, tool, action
+ * class, target) and the connector, action class and method are properties
+ * of the SITE the policy declared, not of the synthetic.
+ */
+export interface BrokerExchangeHint {
+    /** `credentials[].id` of the site's credential. */
+    credential: string;
+    /** `credentials[].use[].id` (`<credential>/<site>`). */
+    site: string;
+}
 export interface Broker {
-    exchange(req: BrokerExchangeRequest): Promise<BrokerExchangeResponse>;
+    exchange(req: BrokerExchangeRequest, hint?: BrokerExchangeHint): Promise<BrokerExchangeResponse>;
 }
 /**
  * TTL a positive decision may be cached for, in seconds.
@@ -87,7 +102,11 @@ export declare const BROKER_DEFAULT_TTL_SECONDS = 30;
  * back to the model. Diagnostics go to the operator through the `warn` seam,
  * never into a response the agent reads.
  */
-export type DenyReason = 'unknown_synthetic' | 'synthetic_revoked' | 'synthetic_disabled' | 'unknown_cred' | 'cred_revoked' | 'cred_disabled' | 'denied_by_policy' | 'vault_missing_token' | 'method_not_permitted' | 'host_not_permitted' | 'path_not_permitted' | 'no_host_constraint' | 'source_timeout' | 'source_unhealthy' | 'source_unavailable' | 'source_empty' | 'source_file_mode_too_open' | 'source_exec_failed' | 'source_untrusted_config' | 'github_app_rejected' | 'aws_sts_rejected' | 'vault_unreachable' | 'clickup_token_rejected' | 'exclusion_capacity' | 'broker_unreachable' | 'broker_error';
+export type DenyReason = 'unknown_synthetic' | 'synthetic_revoked' | 'synthetic_disabled' | 'unknown_cred' | 'cred_revoked' | 'cred_disabled' | 'denied_by_policy' | 'vault_missing_token' | 'method_not_permitted' | 'host_not_permitted' | 'path_not_permitted' | 'no_host_constraint' | 'source_timeout' | 'source_unhealthy' | 'source_unavailable' | 'source_empty' | 'source_file_mode_too_open' | 'source_exec_failed' | 'source_untrusted_config' | 'github_app_rejected' | 'aws_sts_rejected' | 'vault_unreachable' | 'clickup_token_rejected' | 'exclusion_capacity' | 'broker_unreachable' | 'broker_error'
+/** A 5xx other than the two below, a timeout or a connection failure: the control plane could not decide. */
+ | 'control_plane_unavailable'
+/** The decision was allow but the token could not be produced (503 bodies). */
+ | 'vault_unavailable' | 'connector_unavailable';
 /** Mint a fresh synthetic. 32 random bytes, base64url, prefixed — NHI's `mintSyntheticValue`. */
 export declare function mintSynthetic(): string;
 /**

@@ -30,10 +30,12 @@
  *   and bounded, not prevented.
  */
 export { SYNTHETIC_PREFIX, BROKER_DEFAULT_TTL_SECONDS, mintSynthetic, mintPepper, isSyntheticShaped, hashSynthetic, syntheticHashesEqual, denyResponse, newDecisionId, } from './protocol.js';
-export type { Broker, BrokerExchangeRequest, BrokerExchangeResponse, DenyReason, } from './protocol.js';
+export type { Broker, BrokerExchangeHint, BrokerExchangeRequest, BrokerExchangeResponse, DenyReason, } from './protocol.js';
 export { CredentialSourceError, FILE_MODE_CHECK_APPLIES, MAX_CREDENTIAL_BYTES, SOURCE_DEADLINE_MS, assessConfigTrust, defaultSeams, makeSource, sigv4Headers, sourceKinds, xmlTag, } from './sources.js';
 export type { AwsStsSourceSpec, ClickupSourceSpec, ConfigTrustReport, CredentialSource, CredentialSourceKind, CredentialSourceSpec, EnvSourceSpec, ExecSeamResult, ExecSourceSpec, FileSourceSpec, GithubAppSourceSpec, HttpSeamRequest, HttpSeamResponse, ResolvedCredential, SecretFile, SourceSeams, VaultSourceSpec, } from './sources.js';
 export { LocalBroker, MAX_DECISION_CACHE, SOURCE_UNHEALTHY_MS, credentialsConfigHash, matchRules, validateCredentialEntry, validateCredentials, } from './local.js';
 export type { BrokerDecisionRecord, ConfigTrust, CredentialEntry, CredentialRule, CredentialSwapSite, ExchangeContext, FieldBinding, LocalBrokerOptions, } from './local.js';
-export { RemoteBroker, REMOTE_TIMEOUT_MS } from './remote.js';
-export type { RemoteBrokerOptions } from './remote.js';
+export { RemoteBroker, REMOTE_TIMEOUT_MS, USER_TOKEN_PATH, templatePath } from './remote.js';
+export type { RemoteBrokerOptions, UserTokenConfig, UserTokenCredential, UserTokenSite } from './remote.js';
+export { CompositeBroker, CredentialWiringError, credentialSwapFromPolicy, registerPolicyEnvSecrets, syntheticEnvVar } from './wire.js';
+export type { CredentialSwapWiring, WireOptions } from './wire.js';

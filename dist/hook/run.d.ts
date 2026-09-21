@@ -38,6 +38,7 @@
  * rule is a deliberate, operator-configured decision, not a failure.
  */
 import type { RecorderConfig } from '../types.js';
+import { type ActorStamp } from '../identity/stamp.js';
 export interface HookOpts {
     config: RecorderConfig;
     /** Absolute path to a policy file, or undefined for "no policy" (allow all). */
@@ -47,6 +48,8 @@ export interface HookOpts {
     /** Record built-in (non-mcp__) tool calls too, not just MCP ones. */
     allTools: boolean;
     proxyVersion: string;
+    /** Additive: the ADR 012 actor claim (`--identity-jwt`), stamped on every event's identity block. */
+    actor?: ActorStamp;
 }
 export interface HookResult {
     /** Always 0 — see the file-level fail-open note. */

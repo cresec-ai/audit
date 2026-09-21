@@ -61,6 +61,7 @@ import { resolveServerOrigin } from './mcp-config.js';
 import { hostAliasToolName, parseToolName } from './names.js';
 import { evaluatePolicy, loadPolicy } from './policy.js';
 import { claimSessionStart, markPending, sweepStalePending, takePending } from './state.js';
+import { stampActor, type ActorStamp } from '../identity/stamp.js';
 
 /** sha256:<hex> of canonical `null` — result_hash for a PreToolUse marker
  *  (no result exists yet). */
@@ -75,6 +76,8 @@ export interface HookOpts {
   /** Record built-in (non-mcp__) tool calls too, not just MCP ones. */
   allTools: boolean;
   proxyVersion: string;
+  /** Additive: the ADR 012 actor claim (`--identity-jwt`), stamped on every event's identity block. */
+  actor?: ActorStamp;
 }
 
 export interface HookResult {
@@ -247,6 +250,7 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
     if (osUser) identity.os_user = osUser;
     if (host) identity.hostname = host;
     if (opts.config.identityLabel) identity.label = opts.config.identityLabel;
+    if (opts.actor !== undefined) stampActor(identity, opts.actor);
 
     // Scrubbed like argv (AGENTS.md: no readable payload strings reach the
     // store) even though this particular string is a local constant, never

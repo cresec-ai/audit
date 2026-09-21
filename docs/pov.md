@@ -221,18 +221,20 @@ evidence behind it:
 | Capability | Status | The limit, in the same breath |
 |---|---|---|
 | `record` transparent stdio proxy, fail-open, byte-for-byte | shipped | the gateway's recording path. The byte-for-byte test drives CRLF framing, non-JSON noise and a line past the 32 MiB tap cap in both directions |
-| `http` recording proxy for a remote MCP server | shipped, record-only | `http --policy` exits 2. This is the "forwards to vendor remote MCPs with per-user tokens" gap named in [the MCP gateway ticket](https://app.clickup.com/t/z8n6b5z50j) |
-| Gateway mode `record --policy`: allow / hold / deny, tool-result boundary filter | shipped, stdio only | rules key on (server, tool, args), not (user × tool version); no read / draft / send / write action classes; draft-only is a policy the operator writes today, not a default the engine applies |
-| Per-user token injection from the control plane | needs-build | `RemoteBroker` (`src/broker/remote.ts`) is a fail-closed client for a control plane's `/broker/exchange`, exported and tested, and not wired into the CLI — `src/broker/wire.ts` constructs `LocalBroker` only. It is keyed by (data-plane instance, synthetic credential), not (user, connector) |
+| `http` recording proxy for a remote MCP server | shipped | byte-for-byte without `--policy`; one live public server is the whole of the live evidence for the transport |
+| `http --policy`: the gateway over the streamable-HTTP transport | in-flight (this branch; tested, not verified live) | the same evaluation, holds, boundary filter, `credentials` swap and events as `record --policy`, over the HTTP exchange (`src/proxy/http.ts`). The one difference: a `tools/call` body and its result are buffered long enough to evaluate and filter them (a JSON body whole, an SSE stream one event at a time) — the gateway-mode exception AGENTS.md allows. Proven against a journaling fake vendor MCP and a fake control plane (S17a, `test/e2e/http-gateway.e2e.test.ts`); S17b, a live vendor remote MCP, has not run. Touches invariants 1 and 3 as the rows below say |
+| Gateway mode `record --policy`: allow / hold / deny, tool-result boundary filter | shipped (stdio, verified live); in-flight over HTTP | rules key on (server, tool, args), not (user × tool version); the read / draft / send / write action class is a per-site declaration a remote credential sends to the control plane, not something this engine applies; draft-only is a policy the operator writes today, not a default the engine applies |
+| Per-user token injection from the control plane | in-flight (this branch; tested against a fake control plane) | `credentials[].broker: { kind: remote }` wires `RemoteBroker` (`src/broker/wire.ts`) to `POST /v1/broker/user-token` exactly as nhi's `docs/internal/contracts/user-token.md` specifies, keyed by (user, connector, tool, action class, target) from the identity JWT or the policy; the returned access token is swapped at the declared site as a local source's would be, never logged, never recorded; the control plane's `decision_id` lands on the `tool_call` and the `policy_decision`; a 403 is a deny with the control plane's reason, a 5xx / timeout / connection failure is a deny with `control_plane_unavailable` (fail closed, bounded at 5 s). **Invariant 1** is touched, not met by this leg alone: the token is fetched per call and absent from the agent's context, transcript and chain, but the fetching process can read it, so this is the client of credential absence, not credential absence. **Invariant 3**: the decision id is on the record. Nothing here degrades: an unreachable control plane denies (ADR 013), there is no read-only fallback (invariant 8 still unimplemented) |
 | Local credential broker + `credentials` policy section + synthetic-for-real swap at declared sites, with result scrub | shipped | the ancestor of Phase 3 token injection, proven live in dogfood 7 ([below](#the-credential-swap-what-dogfood-7-proved-and-what-it-did-not)). On one machine a context and audit control, not a confidentiality one |
 | Added latency | shipped, measured 2026-09-17 | 0.792 ms p50 added, stdio, against a local echo fixture, gate < 5 ms (`npm run bench`). Nothing here measures the HTTP transport or a remote hop, which is what the week's p95 < 50 ms criterion is about |
-| Actor claim (user, tool, tool-version, host) on every record | needs-build | a [Phase 0 decision](https://app.clickup.com/t/z8n6b5z507) comes first. Events carry `os_user`, `hostname`, an operator `--identity` label and the MCP client's name today, and no named person or tool version |
+| Actor claim (user, tool, tool-version, host) on every record | in-flight (this branch) | ADR 012's shape, as an additive optional `identity.actor` on every event (`docs/event-schema.md`), decoded from the identity JWT given with `--identity-jwt` (or a policy's `identity_jwt_env`); verified against a JWKS only with `--identity-jwks`, and every event says which (`identity.actor_verified`, beside the claim so `actor` stays the control plane's shape byte for byte; `exp`/`iat` are checked in both modes). **Invariant 3**: the record now carries who acted; the chain and `verify.cjs` are unchanged (they hash whatever is there). What still does not hold: the claim is stamped from a token the operator supplies at start, so one proxy process is one actor and a session with no token is unattributed; nothing here checks the person is still active (that is the control plane's status check) |
 
 The attribution number the week is scored on comes from the control plane's
 identity join, not from anything this package counts. `sessions`
-(**shipped**) lists one row per recorded session with tool calls, errors and
-servers; it is a census of MCP traffic, not an attribution report, and the
-per-server, per-tool form (`sessions --tools`) is **needs-build**.
+(**shipped**) lists one row per recorded session with tool calls, errors,
+servers and decisions; it is a census of MCP traffic, not an attribution
+report, and the per-server, per-tool form (`sessions --tools`) is
+**needs-build**.
 
 **What the control plane must supply.** The identity gate and the per-user
 token in OpenBao —
@@ -278,8 +280,9 @@ a vendor through MCP, `export` holds that leg today. The tool volunteers its own
 unprompted: `key check : NOT independently verified - the key came from this
 bundle itself… Re-run with --public-key <hex|path> using a key you obtained
 out of band`. Lean on that line; it buys more credibility than the `PASS`
-does. What the bundle does not carry today: the actor claim (**needs-build**,
-after [z8n6b5z507](https://app.clickup.com/t/z8n6b5z507)), and a
+does. The bundle carries the actor claim when the recorder was started with
+an identity JWT (`identity.actor`, **in-flight** on this branch; without one
+the record is honestly unattributed). What it does not carry: a
 regulator-mapped export pack (EU AI Act Art. 12; SOC 2 CC6/CC7) — nothing
 in `src/` maps the bundle to either, and no page describes such a mapping
 ([z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff), **needs-build**).
@@ -309,11 +312,12 @@ engine evaluates the rule:
 The manager view is
 [Phase 4's views ticket](https://app.clickup.com/t/z8n6b5z50n) and belongs to
 the control plane (**needs-build**). This package has a replay timeline (`ui`,
-**shipped**) over one store, and a `DECISIONS` column in `sessions` that reads
-0 for every hook session however many calls it denied
-([one deny event shape](https://app.clickup.com/t/z8n6b5z1zr),
-**needs-build**). Neither is a manager view, and nobody should show them as
-one.
+**shipped**) over one store, and a `DECISIONS` column in `sessions` that
+counts both deny shapes — gateway `policy_decision` events and the hook's
+denied `pre` call — with the replay page badging both alike
+([one deny event shape](https://app.clickup.com/t/z8n6b5z1zr), counting and
+badging **in-flight** on this branch; the shapes themselves stay two).
+Neither is a manager view, and nobody should show them as one.
 
 **What the control plane must supply.** Per-user OAuth for four more reps
 ([C1]), the send action class for two of them, the manager view, and the NATS
@@ -418,7 +422,7 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | Feature | Phase | Ticket | Status | Owner |
 |---|---|---|---|---|
 | Transparent stdio proxy (`record`), fail-open, `MCP_RECORDER_DISABLE=1` kill switch | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
-| Gateway allow / hold / deny (`record --policy`), `holds`/`approve`/`deny` | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped, stdio only | recorder |
+| Gateway allow / hold / deny (`record --policy`), `holds`/`approve`/`deny` | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped (stdio, verified live); in-flight over HTTP (`http --policy`, tested against fakes) | recorder |
 | Tool-result boundary filter (secrets rewritten to `[redacted:sha256:…]`) | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
 | Tool-result injection markers (**flag, does not block**) | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
 | Claude Code hook tap (`hook`), hook policy deny | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
@@ -427,8 +431,8 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | `policy validate` + Rego compiler (OPA parity test) | 3 | [Policy engine](https://app.clickup.com/t/z8n6b5z50k) | shipped; egress rules compile and nothing enforces them | recorder |
 | Policy per (user × tool version); read / draft / send / write classes; draft-only default | 3 | [Policy engine](https://app.clickup.com/t/z8n6b5z50k) | needs-build | control plane, recorder |
 | Deny-rule smoke test as a command (`policy test`) | 3 | — | needs-build | recorder |
-| `http` recording proxy for remote MCP servers | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped, record-only | recorder |
-| `http --policy`: gateway for remote MCP servers, per-user token injection from the control plane | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | needs-build (`RemoteBroker` exists, unwired) | recorder |
+| `http` recording proxy for remote MCP servers | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
+| `http --policy`: gateway for remote MCP servers, per-user token injection from the control plane | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | in-flight (this branch): `http --policy` and `credentials[].broker: { kind: remote }` → `POST /v1/broker/user-token`, tested against a journaling fake vendor MCP and a fake control plane (S17a); no live vendor remote MCP yet (S17b). Touches invariants 1 and 3 (per-user token fetched per call, decision id on the record); invariant 1 is met only with the control plane's injection | recorder |
 | Broker core + 7 credential sources; `credentials` policy section + Rego emitter; gateway synthetic→real swap + result scrub; 4-test e2e suite; live in dogfood 7 | 3 | — | shipped (local broker) | recorder |
 | Added-latency bench, stdio (`npm run bench`, gate p50 < 5 ms) | 3 | — | shipped; not the HTTPS p95 < 50 ms measurement | recorder |
 | Degrade mode, MCP leg: the MCP gateway falls back to read-only when the control plane is unreachable, replacing the all-or-nothing `MCP_RECORDER_DISABLE` (invariant 8) | 3 | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | needs-build (the kill switch removes enforcement entirely) | recorder, MCP leg only |
@@ -443,11 +447,11 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | Blast-radius `query`, `sessions`, replay timeline (`ui`) | 4 | — | shipped | recorder |
 | Live evidence sink (`ship`, `MCP_RECORDER_SINK`) + reference receiver; shipper self-check | 4 | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m) | shipped (HTTPS replica, not NATS) | recorder |
 | `decision_id` as `cresec.broker.decision_id` on swapped `tool_call` events | 4 | — | shipped | recorder |
-| `decision_id` on `policy_decision` events | 4 | — | needs-build | recorder |
-| Actor claims (user, tool, tool-version, host) on every record | 0, 4 | [Actor-claim schema](https://app.clickup.com/t/z8n6b5z507) | needs-build (decision first) | both |
-| `DECISIONS` counting both deny shapes; one deny event shape | 4 | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | needs-build | recorder |
+| `decision_id` on `policy_decision` events | 4 | — | in-flight (this branch): additive optional field, the local engine's uuid or the control plane's own id; invariant 3 (the decision joins the record) | recorder |
+| Actor claims (user, tool, tool-version, host) on every record | 0, 4 | [Actor-claim schema](https://app.clickup.com/t/z8n6b5z507) | in-flight (this branch): ADR 012's shape as `identity.actor`, from `--identity-jwt`; `identity.actor_verified` true only with `--identity-jwks`; invariant 3 | both |
+| `DECISIONS` counting both deny shapes; one deny event shape | 4 | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | in-flight (this branch) for the counting and the replay badges; the two shapes remain (invariant 3's exactly-one-record clause still does not hold: a gateway deny is a `policy_decision` plus a synthetic `tool_call`, a hook call is `pre` + `post`) | recorder |
 | `sessions --tools` census | 4 | — | needs-build | recorder |
-| `receiver/` in package `files`; HTTP export route for signed replica bundles | 4 | — | needs-build | recorder |
+| `receiver/` in package `files`; HTTP export route for signed replica bundles | 4 | — | in-flight (this branch): `receiver/` (and `src/`, which it imports) ship in the package, `receiver/Dockerfile` builds it, `GET /v1/chains/{chain_id}/export` serves the attested replica bundle to the operator; S18's pinned-enrolment arm is in `test/e2e/ship.e2e.test.ts` | recorder |
 | Evidence stream on NATS JetStream; regulator-mapped export pack (Art. 12, SOC 2 CC6/CC7) | 4 | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m), [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff) | needs-build | both |
 | Payload PII/redaction policy decided before the first bundle leaves (invariant 4) | 4 | [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | needs-build (this package's edge-redaction rules and its plaintext hostname/OS-username decision are the starting point) | both |
 | Manager view, security view, ownership-decay alerts | 4 | [z8n6b5z50n](https://app.clickup.com/t/z8n6b5z50n) | needs-build | control plane |
@@ -518,9 +522,12 @@ control-plane lines by reading `cresec-ai/nhi` at `1864a59`.
   a page handed to someone else does say where it came from.
 - *"It stops prompt injection."* — `boundary.injection: flag` is the default and
   does **not** block. What prevents harm is a deny rule on the vector.
-- *"`DECISIONS` shows how much we blocked."* — it reads 0 for every hook session
-  regardless of denies.
-- *"You can gate your remote HTTP MCP servers."* — `http --policy` exits 2.
+- *"`DECISIONS` shows how much we blocked."* — it counts decisions, both the
+  gateway's and the hook's, and an approved hold counts as one; it does not
+  count calls that were never attempted.
+- *"You can gate your remote HTTP MCP servers."* — on this branch, yes, with
+  the same policy as stdio; it has been proven against a fake vendor MCP and
+  a fake control plane, not against a real vendor (S17b).
 - *"Your policy is enforced centrally by OPA."* — `policy compile` emits a bundle
   and nothing consumes it.
 - *"Dana can draft but not send."* — not from this package. Rules key on
@@ -547,8 +554,11 @@ control-plane lines by reading `cresec-ai/nhi` at `1864a59`.
   resolves a credential by its id from env, file, exec, GitHub App, AWS STS,
   Vault or ClickUp sources on the agent's own machine. Nothing in it knows
   which person is acting. Per-user injection is the control plane's
-  [[C1]](https://app.clickup.com/t/z8n6b5z8cm) plus wiring `RemoteBroker`
-  into the gateway.
+  [[C1]](https://app.clickup.com/t/z8n6b5z8cm); the remote broker
+  (`credentials[].broker: { kind: remote }`) is its client and asks for that
+  person's token per call — it is only as per-user as the identity JWT it
+  was started with, and it is not runnable against a real control plane
+  until nhi's endpoint exists.
 - *"Synthetic credentials are useless if stolen."* — useless off the machine;
   on the machine they are redeemable, and on the machine is where the attacker
   already is.
@@ -615,21 +625,21 @@ item is either a ClickUp ticket or a needs-build item the
 names. Every schema change is an additive optional field, because
 `edut.mcp-recorder.event.v1` is frozen.
 
-1. **Actor claims on every record** — once
-   [Actor-claim schema](https://app.clickup.com/t/z8n6b5z507) decides the
-   shape of (user, tool, tool-version, host). Lands in the identity block as
-   optional fields; the gateway learns them from the control plane's identity
-   JWT. Phase 0 decision, then Phase 4 work. **Needs-build.**
+1. **Actor claims on every record** — ADR 012 decided the shape (user, tool,
+   tool-version, host, run_as). Landed in the identity block as the optional
+   `actor` field, learned from the control plane's identity JWT
+   (`--identity-jwt`, `--identity-jwks` to verify it). **In-flight** on this
+   branch; invariant 3.
 2. **`decision_id` on `policy_decision` events** — the join key already on
-   swapped `tool_call` events, made uniform. Phase 4. **Needs-build.**
+   swapped `tool_call` events, made uniform. **In-flight** on this branch.
 3. **`http --policy` plus token injection from the control plane** —
-   [MCP gateway](https://app.clickup.com/t/z8n6b5z50j): forward to a vendor's
-   remote MCP with that user's token, fetched through `RemoteBroker` keyed by
-   (user, connector) rather than by (data-plane instance, synthetic
-   credential) — against an endpoint whose shape, a re-keyed
-   `/broker/exchange` or a new one, nhi has not decided — with the tool and
-   skill identity attached to the session. Phase 3. **Needs-build**; the
-   client exists, the wiring, the keying and the endpoint do not.
+   [MCP gateway](https://app.clickup.com/t/z8n6b5z50j): the gateway over the
+   streamable-HTTP transport, and `RemoteBroker` wired behind
+   `credentials[].broker: { kind: remote }` against nhi's now-decided
+   endpoint, `POST /v1/broker/user-token`, keyed by (user, connector, tool,
+   action class, target) from the identity JWT. **In-flight** on this
+   branch, tested against fakes (S17a); the live vendor run (S17b) and the
+   control plane's own endpoint are what remain. Invariants 1 and 3.
 4. **Degrade mode, MCP leg** — the MCP gateway goes read-only when the
    control plane is unreachable, in place of the all-or-nothing kill switch
    ([Phase 3](https://app.clickup.com/t/z8n6b5z4zr) deliverable
@@ -641,9 +651,10 @@ names. Every schema change is an additive optional field, because
    **Needs-build.**
 5. **One deny event shape** —
    [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr): `DECISIONS` counts
-   both shapes and the replay page badges them alike. A hook deny has no
-   usable JSON-RPC request id, so this is not simply "emit a
-   `policy_decision`". Phase 4. **Needs-build.**
+   both shapes and the replay page badges them alike — **in-flight** on this
+   branch. The shapes themselves stay two: a hook deny has no usable JSON-RPC
+   request id, so it is not simply "emit a `policy_decision`", and invariant
+   3's exactly-one-record clause still does not hold for either surface.
 6. **Export-pack mapping** — the bundle mapped to EU AI Act Art. 12 and
    SOC 2 CC6/CC7 controls
    ([z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff)). Phase 4.

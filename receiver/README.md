@@ -94,6 +94,7 @@ install that can write cannot enumerate the fleet.
 | `GET` | `/v1/health` | none | liveness, no data |
 | `GET` | `/v1/chains` | operator token | what this receiver holds |
 | `GET` | `/v1/chains/{chain_id}` | operator token | one chain, incl. fork branches |
+| `GET` | `/v1/chains/{chain_id}/export` | operator token | the replica's signed bundle as a zip (below) |
 | `GET` | `/v1/rejections` | operator token | every refusal, with its reason |
 | `GET` | `/v1/alerts` | operator token | forks, silence, new identities |
 
@@ -311,6 +312,21 @@ many those are, and what the sender's last signed head claimed.
 npm run receiver -- export --chain <chain_id> --out ./bundle
 cd bundle && node verify.cjs        # zero dependencies, exit 0 = PASS
 ```
+
+The same bundle is served over HTTP, so a remote auditor can pull a signed
+replica without filesystem access to the receiver host:
+
+```
+curl -H "Authorization: Bearer $OPERATOR_TOKEN" -o replica.zip \
+  https://receiver.example/v1/chains/<chain_id>/export
+unzip replica.zip -d replica && cd replica && node verify.cjs --public-key <64hex>
+```
+
+`GET /v1/chains/{chain_id}/export` is read-only and operator-authenticated;
+it answers `409` when the chain holds no verified signature yet (nothing a
+bundle could attest) and `404` for a chain it does not hold. The response
+carries `X-MCPR-Attested-Seq` (the bundle's head) and
+`X-MCPR-Unattested-Records` (held records past it, not in the bundle).
 
 The bundle is produced by the product's own `exportBundle()` driven through
 two read-only adapters, so the manifest, the README and the shipped

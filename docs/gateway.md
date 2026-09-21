@@ -357,9 +357,27 @@ disagree, the header is the one kept next to the code.
   be ordered after a line that was already in flight. An approved hold is
   released into the client-to-server stream the same way, after any client
   line still streaming through.
-- It is stdio-only in v1; `mcp-recorder http --policy` is rejected (exit 2),
-  and `http` ignores an exported `MCP_RECORDER_POLICY` with a one-line note
-  on stderr rather than refusing to start.
+- It runs over both transports. `mcp-recorder http --target URL --policy
+  policy.yaml` is the same gateway in front of a streamable-HTTP server, with
+  the same policy loader (an unloadable policy exits 2 before the port is
+  bound), holds dir, boundary filter, `credentials` swap and events. Over
+  HTTP a `tools/call` request body and its result are buffered long enough
+  to evaluate and filter them — a JSON body whole, an SSE stream one event at
+  a time (each held only until the blank line that ends it) — which is the
+  gateway-mode exception to the streaming promise; without `--policy` the
+  HTTP proxy streams every byte as before. **Every POST is gated, whatever
+  its `content-type` says** (or if it has none): the gate parses the body
+  itself, so a `tools/call` sent as `text/plain` is evaluated exactly like
+  one sent as `application/json`, and a POST body that is not JSON is
+  refused (`400`, JSON-RPC `-32600`) rather than forwarded unread. A batch
+  that carries a refused call is answered locally as a whole; a compressed
+  upstream response is refused (`502`) because the filter cannot read it,
+  and the gateway asks for `identity` so a compliant upstream never sends
+  one. On the way back the boundary filter fails closed on both response
+  shapes: a JSON body the filter blew up on is not delivered at all, and an
+  SSE event carrying a tools/call result the filter blew up on is replaced
+  by a blocked result for that id (the frames around it cross untouched).
+  See the module header of `src/proxy/http.ts`.
 - Recording stays fail-open even in gateway mode: a store failure never
   turns into a deny. Enforcement, on the other hand, fails closed — a policy
   that cannot be evaluated denies, and a hold that cannot be written is a

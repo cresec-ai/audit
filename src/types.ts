@@ -134,7 +134,11 @@ export interface SessionSummary {
    * and the frozen schema's `request_id` is `string | number`, so the
    * decision rides its `notification` event's additive `gateway` field
    * instead. Leaving it out reported `0` for a session where enforcement
-   * had happened.
+   * had happened. The HOOK's deny shape counts too: `mcp-recorder hook`
+   * records a `--policy` deny as the call's own `pre` tool_call with
+   * `error.type: 'policy_denied'` (no JSON-RPC id, so no `policy_decision`),
+   * and that event is one decision here AND one call/error above — the same
+   * arithmetic a gateway deny has, so `DECISIONS` reads alike for both.
    *
    * When the number is surprising, read the session's `policy_decision`
    * events themselves — the POLICY rows in `mcp-recorder ui` — each of

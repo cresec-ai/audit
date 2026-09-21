@@ -138,6 +138,66 @@ Identity context stamped on **every** event ("identity-stamp everything").
 | `client_version` | `string?` | From the MCP `initialize` handshake clientInfo, once seen. Capped (`structuralString`, kind `version`) — see [above](#privacy-posture). |
 | `label` | `string?` | Operator-supplied label (`--identity`). |
 | `credential_fingerprints` | `CredentialFingerprint[]?` | Hashes of secret-looking env values passed to the wrapped server, plus the argv/target-URL pieces described below. **Never the recorder's own configuration** (`MCP_RECORDER_*`) — see *What is never fingerprinted*, below. |
+| `actor` | `ActorClaim?` | Additive, optional (schema stays v1). The ADR 012 actor claim — who acted, through which tool version, from which host, on whose behalf — when the recorder was started with an identity JWT. See [Actor claim](#actor-claim-optional-additive) below. Absent otherwise: an event with no `actor` reads as **unattributed**, which is the honest state. |
+| `actor_verified` | `boolean?` | Additive, optional (schema stays v1); present exactly when `actor` is. Whether the identity JWT's EdDSA signature was checked against a JWKS (`--identity-jwks`). Beside `actor`, never inside it, so `actor` stays the control plane's shape byte for byte. |
+
+### Actor claim (optional, additive)
+
+`identity.actor` carries the actor claim of
+[ADR 012](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/012-actor-claim.md)
+in the Cresec control plane, copied field for field from the **identity JWT**
+the control plane mints for a signed-in person (`docs/internal/contracts/identity-jwt.md`
+there). It is a pure function of the token's claims: `user` from `sub`,
+`email`, `idp`, `idp_sub`; `tool` and `host` from the claims of the same
+name; `run_as` from `run_as`. Nothing is looked up, and nothing else from the
+token is recorded — not the token, its signature, `jti`, `role`, `iat` or
+`exp`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `user` | `{ id: string; email: string; idp: 'okta' \| 'entra' \| 'google' \| 'test'; idp_sub: string }` | The person: the control plane's `user.id` (uuid), their email, which IdP authenticated them and the IdP's own subject (`""` when `idp` is `test` and none was seeded). |
+| `tool` | `{ id: string; name: string; version: string }` | The registered tool version the person signed in through (`tool.id` is the registry uuid, `name` its slug). |
+| `host` | `{ origin: string; kind: 'vercel' \| 'lambda' \| 'other' \| 'local' }` | Where that tool runs, **as registered** — copied from the registry at sign-in, never observed on the wire. |
+| `run_as` | `'user' \| 'owner'` | `owner` for a job token running as the tool's owner with nobody signed in. |
+
+Those four fields are the whole object — exactly `ActorClaim` in the control
+plane's `packages/contracts/src/actor.ts` — so an audit record's `actor` and a
+control-plane record's `actor` for the same person and tool compare equal
+byte for byte. What this leg did to check the token is recorded **beside**
+it:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `identity.actor_verified` | `boolean` | Whether the JWT's EdDSA signature was checked against a JWKS (`--identity-jwks <path-or-url>`). **`false` means the signature was not checked**: the claims were decoded, their `exp`/`iat` were checked (below), and the record says what the token said, no more; an auditor who needs more verifies the token out of band. |
+
+How it gets there: `mcp-recorder record`, `http` and `hook` take
+`--identity-jwt <path>` (a file holding the compact JWS); a policy's
+`credentials[].broker.identity_jwt_env` names an environment variable holding
+the same token (the CLI reads it for `record` and `http`). Without
+`--identity-jwks` the token is decoded only and every event carries
+`actor_verified: false`; with it, the signature is verified against the JWKS
+document (`{ keys: [{ kty: "OKP", crv: "Ed25519", x, kid, alg: "EdDSA" }] }`,
+the control plane's `GET /.well-known/jwks.json?tenant=<slug>`) and a token
+that does not verify is a **startup error** (exit 2) — the operator asked for
+verification and must not get an unverified claim stamped on the chain. In
+**both** modes the token's `exp` and `iat` are checked against the clock
+(`exp > now − 30 s`, `iat ≤ now + 30 s`, identity-jwt.md's verification step
+4): they are claims, not signatures, and an expired token is refused at start
+rather than attributing every record to its subject for as long as the file
+sits there.
+
+The chain and the verifier treat events with and without `actor` identically:
+hashes are computed over the canonical JSON of whatever is there, so a bundle
+holding actor events verifies with the same `verify.cjs` as one without
+(`test/e2e/http-gateway.e2e.test.ts` proves it). As ADR 012 says, the email
+address is therefore in the evidence store in clear — the one identifier a
+record exists to carry.
+
+This touches **invariant 3** (every record carries who acted) and is what
+`docs/pov.md` used to call the actor-claim gap. It does not make the MCP leg
+per-user on its own: the claim is stamped from a token the operator supplies
+at start, so one proxy process is one actor, and a session with no token is
+still unattributed.
 
 ### `ServerContext`
 
@@ -364,7 +424,8 @@ seals a pending request whose id an approved hold reclaims — identical
 
 ## Gateway mode fields (additive)
 
-[Gateway mode](gateway.md) (`record --policy policy.yaml`) enforces a
+[Gateway mode](gateway.md) (`record --policy policy.yaml`, and
+`http --policy policy.yaml` for the streamable-HTTP transport) enforces a
 [`policy.yaml`](policy.md) on `tools/call` traffic. Everything it records is
 **additive under v1**: one new event kind and two optional fields. Records
 written in record mode never carry any of them, and old records verify
@@ -409,6 +470,19 @@ session recorded without a policy reads `0`. The synthetic `tool_call` that
 carries a refusal back to the client is counted under `TOOL_CALLS` and
 `ERRORS` like any other failed call, never a second time here.
 
+It also counts the **hook's** deny shape: `mcp-recorder hook --policy`
+records a deny as the call's own `pre` `tool_call` with `error.type:
+'policy_denied'` (a hook deny has no JSON-RPC id, so it cannot be a
+`policy_decision` either; see [Hook-sourced events](#hook-sourced-events-additive)).
+That event is one decision here and one call/error in `TOOL_CALLS`/`ERRORS`
+— the same arithmetic a gateway deny has — so `DECISIONS` reads alike
+whichever surface refused the call, and the replay page badges both with the
+same red `gw-deny` badge (`hook deny` / `gateway deny`). This closes the
+"one deny event shape" ticket for **invariant 3's** counting; what still
+does not hold is its exactly-one-record clause: a gateway deny is still a
+`policy_decision` plus a synthetic `tool_call`, and a hook call is still a
+`pre` + `post` pair.
+
 It also counts the decisions that cannot BE a `policy_decision` event,
 because `request_id` is `string | number` and these messages have no usable
 id to write one with. Their outcome rides the additive `gateway` field on
@@ -435,11 +509,22 @@ neither left anything in the chain but a line on stderr.
 | `approval_id` | `string?` | Holds only: the UUID the operator saw in `mcp-recorder holds`. Absent when the call was refused before a hold file ever existed — a hold-matching `tools/call` that arrives while the proxy is already shutting down is recorded as `outcome: 'session_end'` with no approval id. |
 | `waited_ms` | `number?` | Holds only: how long the call was parked. |
 | `approver` | `string?` | Holds only: the OS user that ran `mcp-recorder approve`/`deny`, when the hold file recorded one **as a string**. Capped exactly like any identifier copied off the wire (`structuralString`): a value longer than 128 characters or outside the identifier shape is stored as its `sha256:<hex>` reference, and a non-string `decided_by` is ignored entirely. |
+| `decision_id` | `string?` | Additive, optional (schema stays v1). The id of **this** decision, a uuid: minted by the local policy engine for a decision it took itself, or the control plane's own `decision_id` when a remote credential broker (`credentials[].broker: { kind: remote }`, [docs/policy.md](policy.md#credentialsbroker--resolved-by-the-control-plane)) made it — in which case it equals the `cresec.broker.decision_id` attribute the same call carries, so the two events join on one value. The synthetic `tool_call` written next to a deny carries the same id as `cresec.policy.decision_id`. Absent only on events written before the field existed. |
 
 Attributes on a `policy_decision`: `gen_ai.tool.name`, `gen_ai.tool.call.id`,
-`mcp.method.name`, `rpc.system`, `cresec.policy.decision`, and
+`mcp.method.name`, `rpc.system`, `cresec.policy.decision`,
+`cresec.policy.decision_id` (the same value as the `decision_id` field), and
 `cresec.policy.rule_id` when a rule matched. A `tool_call` recorded in gateway
-mode carries the same two `cresec.policy.*` attributes next to its usual ones.
+mode carries the same `cresec.policy.*` attributes next to its usual ones.
+
+`policy_decision` events are written by **both transports** — `record
+--policy` (stdio) and `http --policy` (streamable HTTP) — with the same
+fields. On HTTP a `tools/call` NOTIFICATION the policy refuses is answered
+`202` and recorded on the `notification` event's `gateway` field exactly as
+on stdio; a JSON-RPC batch that carries a refused call is answered locally
+and every refused element gets its own `policy_decision`; an allowed element
+of such a batch is not forwarded either and is recorded as a synthetic
+`tool_call` with `gateway.refusal: 'batch_refused'`.
 A call the gateway refused has `duration_ms: 0` (it never reached the server);
 `waited_ms` carries the hold time, and for a hold that was approved
 `duration_ms` measures from the moment the request was forwarded.

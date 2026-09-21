@@ -720,9 +720,83 @@ function checkCredentialUse(use: CredentialUseInput, base: string, errors: Polic
   }
 }
 
+/** The loopback rule the sink already applies: https everywhere, http only to 127.0.0.1 / localhost / [::1]. */
+function checkControlPlaneUrl(value: unknown, path: string, errors: PolicyError[]): void {
+  if (typeof value !== 'string') return;
+  let url: URL | undefined;
+  try {
+    url = new URL(value);
+  } catch {
+    url = undefined;
+  }
+  if (url === undefined || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
+    errors.push({ path, message: `must be an absolute http(s) URL, got ${JSON.stringify(value)}`, keyword: 'url' });
+    return;
+  }
+  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]' || url.hostname === '::1';
+  if (url.protocol === 'http:' && !loopback) {
+    errors.push({
+      path,
+      message: 'must be https:// (an internal token and a per-user access token travel on this connection); http:// is allowed on loopback only',
+      keyword: 'url',
+    });
+  }
+}
+
+/**
+ * The control plane's closed connector set (cresec-ai/nhi
+ * `packages/contracts/src/names.ts`, `CONNECTORS`). A `broker` credential's
+ * `provider` goes on the wire as `connector`, and the endpoint answers 400
+ * to anything else — which the gateway would then report as a `broker_error`
+ * deny on every call. Said here, at validation, instead.
+ */
+export const CONTROL_PLANE_CONNECTORS: readonly string[] = ['salesforce', 'gmail', 'workspace', 'slack', 'outlook'];
+
+function checkRemoteBroker(credential: CredentialInput, base: string, errors: PolicyError[]): void {
+  const broker = credential.broker;
+  if (broker === undefined) return;
+  checkControlPlaneUrl(broker.url, `${base}/broker/url`, errors);
+  if (credential.provider === undefined) {
+    errors.push({
+      path: `${base}/provider`,
+      message: 'a "broker" credential needs "provider": it is the connector the control plane resolves the per-user token for',
+      keyword: 'required',
+    });
+  } else if (!CONTROL_PLANE_CONNECTORS.includes(credential.provider)) {
+    errors.push({
+      path: `${base}/provider`,
+      message:
+        `"${credential.provider}" is not a connector the control plane knows; a "broker" credential's provider must be one of ` +
+        CONTROL_PLANE_CONNECTORS.join(', '),
+      keyword: 'enum',
+    });
+  }
+  if ((broker.tool_id === undefined) !== (broker.tool_version === undefined)) {
+    errors.push({
+      path: `${base}/broker`,
+      message: '"tool_id" and "tool_version" go together: both or neither (an identity JWT supplies the tool claim otherwise)',
+      keyword: 'remoteBroker',
+    });
+  }
+}
+
 function checkCredential(credential: CredentialInput, i: number, errors: PolicyError[]): void {
   const base = `/credentials/${i}`;
+  if (credential.source === undefined && credential.broker === undefined) {
+    errors.push({
+      path: base,
+      message: 'a credential needs exactly one of "source" (resolved on this machine) or "broker" (resolved by the control plane)',
+      keyword: 'required',
+    });
+  } else if (credential.source !== undefined && credential.broker !== undefined) {
+    errors.push({
+      path: base,
+      message: '"source" and "broker" are mutually exclusive: a credential is resolved locally or by the control plane, not both',
+      keyword: 'credential',
+    });
+  }
   if (credential.source !== undefined) checkCredentialSource(credential.source, `${base}/source`, errors);
+  checkRemoteBroker(credential, base, errors);
   if (credential.use === undefined) return;
   checkDuplicateIds(credential.use, `${base}/use`, errors, 'use site');
   credential.use.forEach((use, j) => checkCredentialUse(use, `${base}/use/${j}`, errors));

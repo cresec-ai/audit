@@ -201,6 +201,7 @@ import {
 } from '../redact/redactor.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
 import { LineScanner, type ScannedLine } from './framing.js';
+import { stampActor, type ActorStamp } from '../identity/stamp.js';
 
 export interface StdioProxyOpts {
   /** argv of the wrapped server, e.g. ['npx','@modelcontextprotocol/server-foo']. */
@@ -219,6 +220,12 @@ export interface StdioProxyOpts {
    * gateway mode (see the module header); absent = byte-for-byte recorder.
    */
   gateway?: GatewayOptions;
+  /**
+   * Additive: the ADR 012 actor claim decoded from `--identity-jwt`, stamped
+   * on the `identity` block of every event. Absent = no `actor` field, the
+   * events read exactly as before the field existed.
+   */
+  actor?: ActorStamp;
 }
 
 interface PendingEntry {
@@ -264,6 +271,13 @@ interface GatewayCall {
    * unsalted, so a ref of a brokered token is a copy of it.
    */
   swapAttributes?: Attributes;
+  /**
+   * The id of the decision the `policy_decision` event for this call
+   * carries (`decision_id`, additive). Set from the control plane's
+   * `decision_id` when the remote broker decided; minted per decision
+   * otherwise. Internal; `recordPolicyDecision` fills it in when absent.
+   */
+  decisionId?: string;
   /**
    * True when this refusal is the gateway FAILING CLOSED, not the operator
    * deciding: the policy could not be evaluated, the hold file could not be
@@ -890,7 +904,17 @@ function lineTerminator(line: ScannedLine): string {
  */
 function spliceRewrittenLine(line: ScannedLine, before: unknown, after: unknown): Buffer {
   const terminator = lineTerminator(line);
-  const text = line.text;
+  const spliced = spliceRewrittenText(line.text, before, after);
+  return Buffer.from((spliced ?? JSON.stringify(after)) + terminator, 'utf8');
+}
+
+/**
+ * The text-level half of {@link spliceRewrittenLine}, shared with the HTTP
+ * gateway (src/proxy/http.ts): the ORIGINAL text with only the subtrees
+ * that differ between `before` and `after` spliced in, or `undefined` when
+ * the edits cannot be located exactly (the caller then re-serializes).
+ */
+export function spliceRewrittenText(text: string | null, before: unknown, after: unknown): string | undefined {
   const paths: JsonPath[] = [];
   if (text !== null && collectDivergences(before, after, [], paths) && paths.length > 0) {
     const edits: { start: number; end: number; json: string }[] = [];
@@ -921,10 +945,10 @@ function spliceRewrittenLine(line: ScannedLine, before: unknown, after: unknown)
         out += text.slice(cursor, e.start) + e.json;
         cursor = e.end;
       }
-      if (ok) return Buffer.from(out + text.slice(cursor) + terminator, 'utf8');
+      if (ok) return out + text.slice(cursor);
     }
   }
-  return Buffer.from(JSON.stringify(after) + terminator, 'utf8');
+  return undefined;
 }
 
 /**
@@ -1352,6 +1376,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     if (credentialFingerprints.length > 0) {
       id.credential_fingerprints = credentialFingerprints.map((c) => ({ ...c }));
     }
+    if (opts.actor !== undefined) stampActor(id, opts.actor);
     return id;
   };
 
@@ -2215,14 +2240,22 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
     const recordPolicyDecision = (call: GatewayCall, hold?: HoldResolution): void => {
       const decision = hold === undefined ? 'deny' : 'hold';
+      // One id per decision: the control plane's when the remote broker
+      // decided (it already sits in `cresec.broker.decision_id`), a fresh
+      // uuid when the local engine did. Set on the call so the synthetic
+      // `tool_call` written next carries the same value as an attribute.
+      if (call.decisionId === undefined) call.decisionId = randomUUID();
+      const attributes = policyAttributes(call, decision);
+      attributes['cresec.policy.decision_id'] = call.decisionId;
       const ev: PolicyDecisionEvent = {
-        ...base('policy_decision', policyAttributes(call, decision)),
+        ...base('policy_decision', attributes),
         kind: 'policy_decision',
         decision,
         tool: call.tool,
         request_id: call.id,
         policy_hash: loaded.hash,
         args_hash: call.argsHash,
+        decision_id: call.decisionId,
       };
       if (call.ruleId !== undefined) ev.rule_id = call.ruleId;
       if (hold !== undefined) {
@@ -2264,6 +2297,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         ...policyAttributes(call, gatewayOutcome.decision === 'deny' ? 'deny' : 'hold'),
         'error.type': errorType,
       };
+      if (call.decisionId !== undefined) attributes['cresec.policy.decision_id'] = call.decisionId;
       const ev: ToolCallEvent = {
         ...base('tool_call', attributes),
         kind: 'tool_call',
@@ -2812,10 +2846,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       hold?: HoldResolution,
     ): void => {
       const refuse = (code: string, failClosed: boolean): void => {
+        // The broker's decision id, when it reached one (a remote 403 carries
+        // the control plane's), is THE decision id of this refusal.
+        const decided = [...outcome.decisions].reverse().find((d) => d.decisionId !== '');
         const refused: GatewayCall = {
           ...call,
           reason: swapDenyReason(code),
           swapAttributes: outcome.attributes,
+          ...(decided !== undefined ? { decisionId: decided.decisionId } : {}),
           ...(failClosed ? { failClosed: true as const } : {}),
         };
         denyCall(refused, undefined, `gateway: credential swap refused tools/call "${call.tool}" (${code})`);

@@ -769,6 +769,14 @@ describe.each(backends)('EvidenceStore (%s)', (backend) => {
     // Exactly one is_error event per failed call: the denied pre and the
     // failing post. The lone pre with no post is NOT an error here.
     expect(hook.error_count).toBe(2);
+    // ONE decision: the denied `clickup_delete_task` pre event. A hook deny
+    // is the call's own `pre` tool_call with `error.type: 'policy_denied'`
+    // (no JSON-RPC id, so no policy_decision event), and it counts here
+    // exactly as a gateway deny does — the same arithmetic (1 decision, 1
+    // call, 1 error) for both shapes of "this call was denied" [z8n6b5z1zr].
+    // NEGATIVE CONTROL: drop the `policy_denied` errorType from the fixture
+    // and this reads 0 again.
+    expect(hook.policy_decision_count).toBe(1);
     // The servers the session's tool calls went to: ClickUp + github +
     // corp-notes. The claude-code session_start/Stop events are not one.
     expect(hook.server_count).toBe(3);

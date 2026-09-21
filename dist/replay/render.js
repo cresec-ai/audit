@@ -276,11 +276,23 @@ function renderPolicyDecision(seq, e) {
   ${timeTag(e.timestamp)}
 </article>`;
 }
+/**
+ * A hook deny is the call's own `pre` tool_call with `error.type:
+ * 'policy_denied'` and no `gateway` field (docs/hooks.md): the same "this
+ * call was denied" as a gateway deny, in the other shape. It gets the same
+ * red `gw-deny` badge so the timeline reads alike whichever surface refused
+ * the call — the label names the surface so a reader can tell them apart.
+ */
+function hookDenyBadge(e) {
+    if (e.gateway !== undefined || e.phase !== 'pre' || e.error?.type !== 'policy_denied')
+        return '';
+    return '<span class="badge gw gw-deny" title="denied by the hook policy (mcp-recorder hook --policy)">hook deny</span>';
+}
 function renderToolCall(seq, e) {
     const hasGenAi = Object.keys(e.attributes).some((k) => k.startsWith('gen_ai.'));
     const genAiBadge = hasGenAi ? '<span class="badge genai">gen_ai</span>' : '';
     const errorBadge = e.is_error ? '<span class="badge err">error</span>' : '';
-    const gwBadges = gatewayBadges(e.gateway);
+    const gwBadges = gatewayBadges(e.gateway) + hookDenyBadge(e);
     let errorInfo = '';
     if (e.error !== undefined) {
         const bits = [];

@@ -22,7 +22,8 @@ import { ensureDataDir, resolveConfig, resolveConfigLenient } from './config.js'
 import { BUNDLE_FILES, exportBundle } from './export/bundle.js';
 import { readZipEntries } from './export/unzip.js';
 import { HoldError, HoldStore } from './gateway/holds.js';
-import { credentialSwapFromPolicy } from './broker/wire.js';
+import { credentialSwapFromPolicy, identityJwtEnvFromPolicy } from './broker/wire.js';
+import { IdentityJwtError, loadActor } from './identity/actor.js';
 import { PolicyLoadError, parsePolicyText, sourceForPath } from './policy/load.js';
 import { bundleFileOrder, compileToRego } from './policy/rego.js';
 import { formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
@@ -96,8 +97,13 @@ Usage:
       banner uses the same pin as 'verify' (identity.pub by default)
   mcp-recorder export   [--data-dir D] [--session ID] [--out FILE.zip] [--dir DIR]
       signed evidence bundle a stranger can verify with plain Node.js
-  mcp-recorder http     --target URL [--port N] [flags]
-      transparent streamable-HTTP proxy in front of an HTTP MCP server
+  mcp-recorder http     --target URL [--port N] [--policy FILE] [flags]
+      transparent streamable-HTTP proxy in front of an HTTP MCP server.
+      With --policy FILE (or MCP_RECORDER_POLICY) it is a GATEWAY like
+      'record --policy': tools/call requests are allowed / held / denied,
+      results pass the boundary filter, and a 'credentials' section swaps
+      a synthetic for a real (or control-plane brokered) token. Only then
+      are tools/call bodies and results buffered; everything else streams
   mcp-recorder setup    --client <claude-desktop|claude-code|cursor> [--config PATH]
                         [--wrapper local|npx|wsl] [--only N,...] [--except N,...]
                         [--bridge NAME=URL,...] [--data-dir D] [--policy FILE] [--dry-run] [--undo] [--json]
@@ -159,10 +165,21 @@ Flags:
   --redact M      redaction mode: allowlist | off      (env MCP_RECORDER_REDACT)
   --name NAME     logical server name stamped on events
   --identity L    operator identity label stamped on events
-  --policy FILE   record: policy.yaml to enforce (gateway mode; env MCP_RECORDER_POLICY)
+  --policy FILE   record / http: policy.yaml to enforce (gateway mode; env MCP_RECORDER_POLICY)
                    setup: bake '--policy <absolute FILE>' into every wrapped entry,
                    already-wrapped ones included
-                   (stdio only: 'http --policy' is rejected)
+  --identity-jwt PATH
+                   record / http / hook: a file holding the identity JWT the
+                   Cresec control plane minted for the signed-in person; its
+                   claims become the 'actor' block (user, tool, host, run_as)
+                   on every event and key the per-user token requests of a
+                   'credentials[].broker: { kind: remote }' policy. Decoded,
+                   NOT verified, unless --identity-jwks is given (the events
+                   say so: identity.actor_verified is false)
+  --identity-jwks PATH|URL
+                   verify the identity JWT's EdDSA signature against this
+                   JWKS ({ keys: [...] }); a token that does not verify is a
+                   startup error (exit 2)
   --target T      policy compile: output target, only 'rego' (default)
                    http: the upstream MCP server URL
   --all           holds: include decided / expired holds, not just pending ones
@@ -210,8 +227,8 @@ Flags:
 Environment:
   MCP_RECORDER_DISABLE=1   pure passthrough, nothing recorded — and no gateway
                            enforcement either (it is the kill switch)
-  MCP_RECORDER_POLICY=F    same as 'record --policy F' when the flag is absent
-                           ('http' ignores it — gateway mode is stdio only)
+  MCP_RECORDER_POLICY=F    same as 'record --policy F' / 'http --policy F' when
+                           the flag is absent
   MCP_RECORDER_MCP_CONFIG=PATH[,PATH...]
                            hook: Claude Code MCP config file(s) to resolve
                            server origins (server.url, policy alias
@@ -256,6 +273,8 @@ const FLAG_DEFS = {
     'dry-run': { type: 'boolean' },
     undo: { type: 'boolean' },
     policy: { type: 'string' },
+    'identity-jwt': { type: 'string' },
+    'identity-jwks': { type: 'string' },
     all: { type: 'boolean' },
     'all-tools': { type: 'boolean' },
     settings: { type: 'string' },
@@ -534,6 +553,90 @@ function loadGatewayPolicy(path) {
     return read.loaded;
 }
 /* ------------------------------ subcommands ------------------------------ */
+/**
+ * The identity JWT (`--identity-jwt PATH`, else the env var a remote
+ * credential's `identity_jwt_env` names), decoded — and verified when
+ * `--identity-jwks` is given. FAIL CLOSED like the policy: a JWT the
+ * operator supplied and the recorder cannot read, or asked to have verified
+ * and cannot, is exit 2 before anything is spawned, never a session that
+ * quietly records no actor. Absent both, `undefined`: events carry no
+ * `actor`, which is the honest unattributed state.
+ */
+async function resolveActor(flags, policy, what) {
+    const jwtPath = asStr(flags['identity-jwt']);
+    const jwks = asStr(flags['identity-jwks']);
+    const jwtEnv = policy === undefined ? undefined : identityJwtEnvFromPolicy(policy.policy);
+    const jwtFromEnv = jwtEnv === undefined ? undefined : process.env[jwtEnv];
+    try {
+        const loaded = await loadActor({
+            ...(jwtPath !== undefined && jwtPath !== '' ? { jwtPath: resolve(jwtPath) } : {}),
+            ...(jwtFromEnv !== undefined && jwtFromEnv !== '' ? { jwt: jwtFromEnv } : {}),
+            ...(jwks !== undefined && jwks !== '' ? { jwks: /^https?:\/\//i.test(jwks) ? jwks : resolve(jwks) } : {}),
+        });
+        if (loaded === undefined) {
+            if (jwks !== undefined && jwks !== '')
+                err(`${what}: --identity-jwks needs an identity JWT (--identity-jwt PATH, or the policy's identity_jwt_env)`);
+            return undefined;
+        }
+        diag(`identity: actor ${loaded.actor.user.email} via ${loaded.actor.tool.name}@${loaded.actor.tool.version}` +
+            ` (run_as ${loaded.actor.run_as}; ${loaded.verified ? 'signature verified' : 'NOT verified: decoded only'})`);
+        return loaded;
+    }
+    catch (cause) {
+        if (cause instanceof IdentityJwtError)
+            return err(`${what}: ${cause.message}`);
+        throw cause;
+    }
+}
+/**
+ * Gateway mode is the ONE deliberate exception to fail-open, and it is
+ * decided here, before any store is opened or any process spawned: an
+ * operator who asked for enforcement gets enforcement or a clear exit 2.
+ * MCP_RECORDER_DISABLE=1 is the documented kill switch — it turns the
+ * gateway off along with recording (pure passthrough, said out loud).
+ * Shared by `record` and `http`, which enforce the same policy the same way.
+ */
+async function resolveGateway(flags, config, what) {
+    const policyPath = resolvePolicyPath(flags, process.env);
+    if (policyPath === undefined) {
+        const loaded = await resolveActor(flags, undefined, what);
+        return loaded === undefined ? {} : { actor: loaded };
+    }
+    if (config.disabled) {
+        diag(`MCP_RECORDER_DISABLE=1 — gateway disabled too (kill switch): policy ${policyPath} is NOT enforced, ` +
+            'pure passthrough');
+        return {};
+    }
+    const policy = loadGatewayPolicy(policyPath);
+    // The actor comes BEFORE the wiring: its claims key the per-user token
+    // requests (user_id, tenant, tool) of a remote credential.
+    const loadedActor = await resolveActor(flags, policy, what);
+    // The holds dir is created lazily by HoldStore (0700) on the first
+    // hold, independent of the evidence store: a store that fails to open
+    // degrades recording to passthrough but never enforcement.
+    const gateway = { policy, holdStore: new HoldStore(config.dataDir) };
+    // A `credentials:` section turns the gateway into a broker as well as a
+    // gate. Building it here, beside the policy, keeps the one deliberate
+    // exception to fail-open in one place: a credentials section that
+    // cannot be turned into a broker exits 2 rather than running with a
+    // swap the operator believes is on. Absent section, absent env
+    // binding, or a broker that refuses its own config are three different
+    // outcomes and the operator hears which one.
+    try {
+        const wiring = credentialSwapFromPolicy({
+            policy: policy.policy,
+            env: process.env,
+            warn: diag,
+            ...(loadedActor !== undefined ? { identity: loadedActor.claims, identityJwt: loadedActor.token } : {}),
+        });
+        if (wiring !== undefined)
+            gateway.credentials = wiring.swap;
+    }
+    catch (e) {
+        err(`policy ${policyPath}: ${e.message}`);
+    }
+    return { gateway, ...(loadedActor !== undefined ? { actor: loadedActor } : {}) };
+}
 async function cmdRecord(flags, serverCommand) {
     if (serverCommand.length === 0) {
         err("record: missing server command (usage: mcp-recorder [record] [flags] -- <command...>)");
@@ -544,41 +647,7 @@ async function cmdRecord(flags, serverCommand) {
     const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
     for (const w of warnings)
         diag(w);
-    // Gateway mode is the ONE deliberate exception to fail-open, and it is
-    // decided here, before any store is opened or any process spawned: an
-    // operator who asked for enforcement gets enforcement or a clear exit 2.
-    // MCP_RECORDER_DISABLE=1 is the documented kill switch — it turns the
-    // gateway off along with recording (pure passthrough, said out loud).
-    const policyPath = resolvePolicyPath(flags, process.env);
-    let gateway;
-    if (policyPath !== undefined) {
-        if (config.disabled) {
-            diag(`MCP_RECORDER_DISABLE=1 — gateway disabled too (kill switch): policy ${policyPath} is NOT enforced, ` +
-                'pure passthrough');
-        }
-        else {
-            const policy = loadGatewayPolicy(policyPath);
-            // The holds dir is created lazily by HoldStore (0700) on the first
-            // hold, independent of the evidence store: a store that fails to open
-            // degrades recording to passthrough but never enforcement.
-            gateway = { policy, holdStore: new HoldStore(config.dataDir) };
-            // A `credentials:` section turns the gateway into a broker as well as a
-            // gate. Building it here, beside the policy, keeps the one deliberate
-            // exception to fail-open in one place: a credentials section that
-            // cannot be turned into a broker exits 2 rather than running with a
-            // swap the operator believes is on. Absent section, absent env
-            // binding, or a broker that refuses its own config are three different
-            // outcomes and the operator hears which one.
-            try {
-                const wiring = credentialSwapFromPolicy({ policy: policy.policy, env: process.env, warn: diag });
-                if (wiring !== undefined)
-                    gateway.credentials = wiring.swap;
-            }
-            catch (e) {
-                err(`policy ${policyPath}: ${e.message}`);
-            }
-        }
-    }
+    const { gateway, actor } = await resolveGateway(flags, config, 'record');
     const setup = await setupProxyRecording(config, diag, { surface: 'record', flags });
     const exitCode = await runStdioProxy({
         command: serverCommand,
@@ -587,6 +656,7 @@ async function cmdRecord(flags, serverCommand) {
         ...(config.serverName !== undefined ? { serverName: config.serverName } : {}),
         ...(config.identityLabel !== undefined ? { identityLabel: config.identityLabel } : {}),
         ...(gateway !== undefined ? { gateway } : {}),
+        ...(actor !== undefined ? { actor } : {}),
         proxyVersion: VERSION,
     });
     writeRunSummary(setup);
@@ -595,26 +665,16 @@ async function cmdRecord(flags, serverCommand) {
 async function cmdHttp(flags) {
     const targetUrl = asStr(flags.target) ?? err('http: --target URL is required');
     const port = parsePort(flags.port);
-    // Gateway mode is stdio-only in v1. An EXPLICIT --policy is refused
-    // (rather than ignored) so an operator never believes enforcement is on
-    // when it is not. MCP_RECORDER_POLICY, on the other hand, is an
-    // environment-wide setting — the very pattern docs/gateway.md recommends
-    // for stdio servers — and refusing it would make `http` unusable in any
-    // shell that exports it. It is ignored instead, out loud.
-    const policyFlag = asStr(flags.policy);
-    if (policyFlag !== undefined && policyFlag !== '') {
-        err('http: gateway mode is available for the stdio transport only (drop --policy)');
-    }
-    const envPolicy = process.env[ENV.POLICY];
-    if (envPolicy !== undefined && envPolicy !== '') {
-        diag('http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio transport only');
-    }
     installUncaughtExceptionGuard();
     // Lenient: nothing about recording configuration may prevent the proxy
     // from standing up. Bad --redact/--store values fall back to defaults.
     const { config, warnings } = resolveConfigLenient({ flags, env: process.env });
     for (const w of warnings)
         diag(w);
+    // The same gateway the stdio proxy runs, over HTTP: same policy loader
+    // (fail closed, exit 2 before the port is bound), same holds dir, same
+    // broker wiring. Without --policy the proxy is the byte-for-byte recorder.
+    const { gateway, actor } = await resolveGateway(flags, config, 'http');
     const setup = await setupProxyRecording(config, diag, { surface: 'http', flags });
     const proxy = await runHttpProxy({
         targetUrl,
@@ -623,8 +683,14 @@ async function cmdHttp(flags) {
         redactor: setup.redactor,
         ...(config.serverName !== undefined ? { serverName: config.serverName } : {}),
         ...(config.identityLabel !== undefined ? { identityLabel: config.identityLabel } : {}),
+        ...(gateway !== undefined ? { gateway } : {}),
+        ...(actor !== undefined ? { actor } : {}),
         proxyVersion: VERSION,
     });
+    if (gateway !== undefined) {
+        const rules = gateway.policy.policy.mcp?.rules.length ?? 0;
+        diag(`gateway: policy ${gateway.policy.name ?? gateway.policy.path} (${rules} rule${rules === 1 ? '' : 's'}) enforced over HTTP`);
+    }
     // Only the origin: the target may carry credentials in its userinfo, path
     // or query, and this line lands in terminals, scrollback and log capture.
     let targetOrigin = '<target>';
@@ -2027,12 +2093,27 @@ async function cmdHook(flags, positionals) {
         const stdinText = await readStdinText(process.stdin);
         const { config } = resolveConfigLenient({ flags, env: process.env });
         const policyPathRaw = asStr(flags.policy);
+        // Fail-open here too: a JWT the hook cannot read means no actor on the
+        // events, said on stderr, never a blocked tool call.
+        let actor;
+        try {
+            const jwtPath = asStr(flags['identity-jwt']);
+            const jwks = asStr(flags['identity-jwks']);
+            const loaded = jwtPath === undefined || jwtPath === ''
+                ? undefined
+                : await loadActor({ jwtPath: resolve(jwtPath), ...(jwks !== undefined && jwks !== '' ? { jwks } : {}) });
+            actor = loaded;
+        }
+        catch (cause) {
+            diag(`hook: identity JWT ignored: ${cause instanceof Error ? cause.message : String(cause)}`);
+        }
         const result = await runHook(stdinText, {
             config,
             clientName: asStr(flags.client) ?? 'claude-code',
             allTools: flags['all-tools'] === true,
             proxyVersion: VERSION,
             ...(policyPathRaw !== undefined ? { policyPath: resolve(policyPathRaw) } : {}),
+            ...(actor !== undefined ? { actor } : {}),
         });
         if (result.stdout !== undefined)
             process.stdout.write(result.stdout + '\n');

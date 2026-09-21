@@ -114,7 +114,7 @@ export function credentialTrustProblems(policy, trust) {
         return [];
     const out = [];
     for (const credential of policy.credentials ?? []) {
-        if (credential.source.type !== 'exec')
+        if (credential.source?.type !== 'exec')
             continue;
         out.push(`credential ${JSON.stringify(credential.id)} resolves through an \`exec\` source, but ${trust.detail} — ` +
             'anything that can write the policy can choose the command it runs, as the recorder, on every call');
