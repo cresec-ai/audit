@@ -194,6 +194,29 @@ function expectCleanStop(code: number | null): void {
   if (process.platform !== 'win32') expect(code).toBe(0);
 }
 
+/**
+ * Wait until `count` policy_decision events have reached the chain.
+ *
+ * Recording is fail-open and therefore asynchronous: the gateway answers the
+ * client first and the event lands after. Waiting for the event instead of
+ * for the process to exit also removes a dependency on a shutdown flush,
+ * which never runs on Windows, where `child.kill()` is TerminateProcess
+ * rather than a signal any handler can catch.
+ */
+async function waitForDecisions(dataDir: string, count: number): Promise<void> {
+  await waitFor(
+    () => {
+      try {
+        return readChain(dataDir).filter((r) => r.event.kind === 'policy_decision').length >= count;
+      } catch {
+        return false; // no chain file yet, or a line still being written
+      }
+    },
+    `${String(count)} policy_decision event(s) in the chain at ${dataDir}`,
+    30_000,
+  );
+}
+
 const post = (url: string, body: unknown): Promise<Response> =>
   fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify(body) });
 
@@ -254,6 +277,7 @@ describe('e2e S17a: http --policy with the per-user token from the control plane
     const echo = await post(gateway.url, { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'echo', arguments: { note: 'e2e-http-echo' } } });
     expect(await echo.text()).toContain('e2e-http-echo');
 
+    await waitForDecisions(dataDir, 3);
     expectCleanStop(await gateway.stop());
     vendor.stop();
     controlPlane.stop();
@@ -388,6 +412,7 @@ describe('e2e S17a: http --policy with the per-user token from the control plane
       expect(body.result.content[0]!.text).toContain(expectReason);
       // Fail CLOSED, not "fail open when the control plane is away".
       expect(body.result.content[0]!.text).not.toContain(ACCESS_TOKEN);
+      await waitForDecisions(dataDir, 1);
       expectCleanStop(await gateway.stop());
       controlPlane.stop();
       const decisions = readChain(dataDir).map((r) => r.event).filter((e): e is PolicyDecisionEvent => e.kind === 'policy_decision');
