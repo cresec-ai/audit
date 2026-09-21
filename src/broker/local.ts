@@ -56,6 +56,7 @@ import { globMatch } from '../policy/glob.js';
 import { registerBrokeredSecret } from '../redact/redactor.js';
 import type {
   Broker,
+  BrokerExchangeHint,
   BrokerExchangeRequest,
   BrokerExchangeResponse,
   DenyReason,
@@ -457,7 +458,9 @@ export class LocalBroker implements Broker {
    */
   async exchange(
     req: BrokerExchangeRequest,
-    ctx: ExchangeContext = {},
+    // The gateway passes a `BrokerExchangeHint` (which site asked); the
+    // local broker resolves by synthetic and reads only its own fields.
+    ctx: ExchangeContext & Partial<BrokerExchangeHint> = {},
   ): Promise<BrokerExchangeResponse> {
     const decisionId = newDecisionId();
     try {

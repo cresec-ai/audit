@@ -26,9 +26,14 @@ the [Governed Tools story page](https://app.clickup.com/90182720801/docs/2kzmy79
 and the [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638).
 This page is the engineering reading of them, checked against the repository.
 
-**Snapshot:** `origin/main` at `74dce0e`, version `0.1.0`, Node `v22.22.2` on
-Linux, checked 2026-09-20. This page will drift; the commit is how you tell
-how far. The command transcripts in
+**Snapshot:** `origin/main` is now `04f5211`, and this checkout is branch
+`claude/routine-production-enterprise-mfrojx` at `b2d7de1`, which adds
+`http --policy` gateway mode, `RemoteBroker` wired to the control plane's
+user-token endpoint, the ADR 012 actor claim, `decision_id` on
+`policy_decision`, the receiver Dockerfile and packaging, the S17a and S18
+tests, and `.github/workflows/staging.yml`, which has never run. Version `0.1.0`, Node `v22.22.2` on Linux; the transcripts below were
+checked at `74dce0e` on 2026-09-20 and have not been re-run since. This page
+will drift; the commit is how you tell how far. The command transcripts in
 [What did we verify, and how?](#what-did-we-verify-and-how) were run at
 `6307cc3` on 2026-09-17 and have not been re-run at `74dce0e`; the three
 merges below landed between the two. Anything we could not run is labelled
@@ -103,13 +108,13 @@ Each row states the limit next to the capability, not below it.
 | Dependency-free bundle verification | `node verify.cjs` inside an exported bundle: `PASS: evidence bundle verified` | **A bundle's key is self-pinned.** Verifying a bundle against the key inside it proves nothing against someone who forged the whole bundle. Real assurance needs `--public-key` obtained out of band. The tool prints this itself |
 | Blast-radius `query` | `query quarterly-revenue-2026` found the canary by hash at `$.args.note`, with no plaintext in the store | Finds what was recorded. A call no vantage point saw is not there |
 | Replay timeline (`ui`) | `ui --out replay.html` wrote a 14,404-byte page with zero `src="http`, `href="http` or `<link` references | Static page or local web UI. No hosted viewer exists. `ui` against a store with no events writes a 0-event page and exits 0 — see [Known gaps](#known-gaps-dogfood-5-raised) |
-| `sessions`, including reopened sessions | named passing test `sessions: a session whose events continue past its session_end reads (reopened), not ENDED`; a live row printed `(open)` with `LAST_EVENT` set | `DECISIONS` counts `policy_decision` events only, so it reads 0 for a hook session that denied calls — see [Known gaps](#known-gaps-dogfood-5-raised) |
+| `sessions`, including reopened sessions | named passing test `sessions: a session whose events continue past its session_end reads (reopened), not ENDED`; a live row printed `(open)` with `LAST_EVENT` set | `DECISIONS` now counts both deny shapes — `policy_decision` events and the hook's `pre` tool_call with `error.type: policy_denied` (`test/store.test.ts`); gap 1 below was closed after this transcript |
 | `setup` for a client's config | `setup --config <fixture> --dry-run` wrapped 1 stdio server and skipped 4 remote ones with `remote transport (url) — not a stdio server, skipped` | Wraps **stdio** servers. Remote connectors are skipped by design — they are not on this machine |
 | Claude Code hook (`hook`) | a PreToolUse deny returned `permissionDecision: "deny"`; the denied call is in the chain as `error.type: "policy_denied"`, `is_error: true`, `phase: "pre"`. Both deny routes also fired against **live** ClickUp calls in cloud dogfood 5, twice each | Claude Code surfaces only. Not claude.ai web, not Claude Desktop chat. Cowork should be assumed **not** covered — see [docs/connector-coverage.md](connector-coverage.md) |
 | Connector resolution, declared-tool fallback | driven against the real binary in dogfood 4's exact failing config shape — see [What did we verify, and how?](#what-did-we-verify-and-how) | Proven against the real binary in that shape. **Not yet exercised by a live session that naturally presents the mismatch** — see [lesson three](#a-live-run-can-pass-for-a-reason-unrelated-to-the-fix-under-test) |
-| Gateway mode (`record --policy`) | the gateway table below, plus a live agent session in cloud dogfood 5 | Stdio only, and the only place the proxy may block or rewrite traffic. See the gateway table for each behaviour's own limit |
+| Gateway mode (`record --policy`, `http --policy`) | the gateway table below, plus a live agent session in cloud dogfood 5 (stdio) | The only place the proxy may block or rewrite traffic. The HTTP form is tested against fakes only (`test/e2e/http-gateway.e2e.test.ts`). See the gateway table for each behaviour's own limit |
 | `policy.yaml` v1 + Rego compiler | `policy validate` and `policy compile` outputs below | This package enforces the **MCP half only**. Egress rules compile and are then the job of Phase 3's [HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h), the re-targeted data-plane proxy in the control plane, which does not exist yet |
-| HTTP MCP proxy (`http`) | `npm test`: `test/http-proxy.test.ts`, 17 tests pass | Records only. `http --policy` exits 2: gateway mode is stdio-only |
+| HTTP MCP proxy (`http`) | `npm test`: `test/http-proxy.test.ts`, 17 tests pass; `test/http-gateway.test.ts` and `test/e2e/http-gateway.e2e.test.ts` for `http --policy` | Records byte-for-byte without `--policy`; with it, the same gateway as `record --policy`, buffering `tools/call` bodies and results to evaluate and filter them. Tested against fakes, not yet a live vendor remote MCP |
 | Typechecked tests | `npm run typecheck` exits 0, running `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json` | Two configs, because `tsconfig.json` emits the committed `dist/`. A new top-level TypeScript directory is unchecked until it is added to `tsconfig.test.json`'s `include` |
 | Test suite | `npm test` at `6307cc3`: 1317 passed, 3 skipped, 32 files, 67.87 s. Not re-run at `74dce0e`; [docs/pov.md](pov.md) records 1,643 after the broker landed | The suite spawns real child processes and is timing-sensitive. Of the 3 skipped, one is the OPA parity test, skipped here because no `opa` binary is on PATH — see the gateway table |
 
@@ -148,7 +153,7 @@ of the connector research and shipped in PR #10 and PR #9.
 | Boundary filter, secrets | an `AKIA…` value in a tool result reached the client as `[redacted:sha256:1a5d44a2dca19669]` | A heuristic on a deliberately narrow pattern set. Over 1.08 million lines of installed third-party TypeScript it rewrites 692 lines (measured by the project and pinned in CI, [docs/policy.md](policy.md)) — a number we cite rather than re-measured here |
 | Boundary filter, injection markers, `block` | a result carrying "Ignore all previous instructions…" came back as `isError` reading `tool result blocked by policy (0 secret-shaped values, 1 injection marker)` | Blocks the whole result, not the marker inside it |
 | Boundary filter, injection markers, `flag` (the default) | the same result reached the client **verbatim**; the evidence event carries `{"boundary":{"action":"flag","injection_found":1,"scanned":true,"secrets_found":0},"decision":"allow"}` and the gateway prints nothing on stderr | **`flag` does not block.** The agent still receives the injected text. The default is `flag`, not `block`, because false positives on security documentation are expected — see [Known gaps](#known-gaps-dogfood-5-raised) |
-| Transport scope | `http --target … --policy …` exits 2: `http: gateway mode is available for the stdio transport only (drop --policy)` | Gateway mode is stdio-only. The `hook` policy is a separate, simpler allow/deny engine |
+| Transport scope | at this transcript's commit `http --target … --policy …` exited 2. Since then `http --policy` is the same gateway over HTTP (`test/e2e/http-gateway.e2e.test.ts`) | The `hook` policy is a separate, simpler allow/deny engine |
 | `policy.yaml` v1 validation | `policy validate docs/examples/policy.laptop.yaml` → `valid (3 mcp rules, 0 egress rules)`, exit 0 | A schema check. It says nothing about whether the rules you wrote match the tool names your client actually sends |
 | Rego compilation | `policy compile` emitted `package cresec.mcp` with a provenance comment naming the policy and its sha256; `--out` wrote `.manifest`, `cresec/mcp/tool.rego`, `cresec/egress/http.rego` | The TypeScript engine and the emitted Rego must stay semantically identical, and an OPA parity test enforces that — **but it is skipped without an `opa` binary**, and it was skipped in our run (`no opa binary found … skipping OPA parity tests`). At `74dce0e` a policy with a `credentials` section also emits `cresec/credentials/broker.rego`; the transcript predates that |
 
@@ -387,11 +392,15 @@ None of these is a miss in the sense of enforcement failing — every deny in
 dogfood 5 fired and every one is recorded. They are ways the evidence reads
 misleadingly, or does less than its name suggests. Each is now tracked.
 
-1. **`sessions`'s `DECISIONS` column reads 0 for a hook session even when
-   hook denies happened.** A hook deny is recorded as a `tool_call` with
-   `error.type: "policy_denied"`, not as a `policy_decision` event, and
-   `DECISIONS` counts only the latter. Reproduced here against the
-   forced-mismatch store, where exactly one call was denied:
+1. **`sessions`'s `DECISIONS` column read 0 for a hook session even when
+   hook denies happened** — closed since: both backends count the hook's
+   `pre` tool_call with `error.type: "policy_denied"` as one decision
+   (`test/store.test.ts`), and the replay page badges it `hook deny` with the
+   same `gw-deny` badge (`test/replay.test.ts`). As found: a hook deny is
+   recorded as a `tool_call` with `error.type: "policy_denied"`, not as a
+   `policy_decision` event, and `DECISIONS` counted only the latter.
+   Reproduced then against the forced-mismatch store, where exactly one call
+   was denied:
 
    ```
    SESSION   STARTED                   ENDED   SERVER       EVENTS  TOOL_CALLS  ERRORS  SERVERS  DECISIONS  LAST_EVENT
@@ -407,13 +416,14 @@ misleadingly, or does less than its name suggests. Each is now tracked.
    `policy_decision` events therefore undercounts hook denies by design. In
    dogfood 5's signed bundle that is 1 `policy_decision` against 5 events
    containing `"policy_denied"`.
-3. **The replay page badges the two differently.** Hook denies render with an
-   `err` badge and inline `policy_denied` text; gateway denies get a
-   pill-style `badge gw gw-deny`, which `src/replay/render.ts` applies only
-   to an event carrying a gateway decision. Both are visible; neither is
-   hidden. They are visually inconsistent for what is conceptually one
-   thing. The difference in the rendered page was observed on dogfood 5's
-   replay output; what we checked here is the code that produces it.
+3. **The replay page badged the two differently** — closed since: a hook
+   deny gets the same red `badge gw gw-deny` a gateway deny does, labelled
+   `hook deny` so the surface is still legible (`src/replay/render.ts`,
+   `test/replay.test.ts`). As found: hook denies rendered with an `err` badge
+   and inline `policy_denied` text; gateway denies got a pill-style `badge gw
+   gw-deny`, which `render.ts` applied only to an event carrying a gateway
+   decision. The difference in the rendered page was observed on dogfood 5's
+   replay output.
 4. **`boundary.injection: flag` flags but does not block.** The agent still
    receives the injected text, as the `flag`-mode output above shows. In
    dogfood 5 only the separate `no-exfil` deny rule prevented harm, and it
@@ -421,10 +431,13 @@ misleadingly, or does less than its name suggests. Each is now tracked.
    vector would have been flagged and nothing more.
 
 Items 1–3 are tracked as
-[One event shape for "this call was denied" — DECISIONS reads 0 for hook sessions](https://app.clickup.com/t/z8n6b5z1zr),
-whose own description names the constraint on fixing it: a hook deny has no
-usable JSON-RPC request id, so it cannot simply become a `policy_decision`
-event, and the event schema is frozen at v1 — additive optional fields only.
+[One event shape for "this call was denied" — DECISIONS reads 0 for hook sessions](https://app.clickup.com/t/z8n6b5z1zr).
+Items 1 and 3 are closed as described; item 2 stays as the ticket's own
+description names the constraint: a hook deny has no usable JSON-RPC request
+id, so it cannot simply become a `policy_decision` event, and the event
+schema is frozen at v1 — additive optional fields only. Both shapes now
+count once and badge alike; the shapes themselves remain two, which is the
+part of invariant 3's exactly-one-record clause that still does not hold.
 Item 4 and the `ui` rough edge below are tracked as
 [Two rough edges dogfood 5 hit: silent empty replay page, and injection:flag not blocking](https://app.clickup.com/t/z8n6b5z1zx).
 
@@ -495,11 +508,11 @@ secrets in tool env.
 
 | Item | Ticket | Owner | What it means for this repository |
 |---|---|---|---|
-| Okta Cross App Access and Entra OBO on top of `/v1/tokens/exchange`; hosted OIDC front issuing the identity JWT | [z8n6b5z50f](https://app.clickup.com/t/z8n6b5z50f), [z8n6b5z9fc](https://app.clickup.com/t/z8n6b5z9fc) | control plane | The RFC 8693 endpoint and the EdDSA JWT issuer exist in the control plane (needs-nhi); the Okta/Entra front does not. The JWT this issues is what the MCP gateway will read for the actor claim |
+| Okta Cross App Access and Entra OBO on top of `/v1/tokens/exchange`; hosted OIDC front issuing the identity JWT | [z8n6b5z50f](https://app.clickup.com/t/z8n6b5z50f), [z8n6b5z9fc](https://app.clickup.com/t/z8n6b5z9fc) | control plane | A **generic** OIDC front now exists and is shipped at L1: nhi's `apps/api/src/identity/` (discovery, callback, session code, JWT issuance, Okta deactivation hook and sweep), tested by `identity-oidc.test.ts`, `identity-deactivation.test.ts`, S4 and S11 against the Okta-shaped fake in its `tests/e2e/mocks/okta.ts`. Okta Cross App Access and Entra OBO specifically are still needs-build. The JWT it issues is what this package reads for the actor claim with `--identity-jwt` |
 | Middleware packages (Next.js/Vercel, Lambda authorizer, Express, FastAPI) | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) | control plane | Nothing here |
-| [A2] Reference tool, both states (`service-account` and `governed` branches) | [z8n6b5z8cg](https://app.clickup.com/t/z8n6b5z8cg) | undecided (nhi supplies the JWT and gateway URLs) | `npm run demo` is not this: it is a fixed script against a corp-notes fixture |
-| [C1] Per-user OAuth connect flows for Salesforce and Gmail; tokens in OpenBao keyed by (user, connector); refresh, revoke, fail closed within a minute of Okta deactivation | [z8n6b5z8cm](https://app.clickup.com/t/z8n6b5z8cm) | control plane | Replaces the synthetic-issuance story earlier revisions carried (fix preseed, an issuance endpoint, a generic revoke endpoint). Per-tenant synthetic issuance is not on Roadmap v2. This is the per-user token path `RemoteBroker` will fetch from once wired; whether that is a `/broker/exchange` re-keyed by (user, connector) or a new endpoint is undecided in nhi |
-| Control-plane authentication and tenancy | — (no ticket; nhi says it precedes every phase) | control plane | No authentication hook across 21 route plugins; every console-facing plugin trusts a caller-supplied `tenant_id`; the two exceptions, `/v1/tokens/exchange` and the Tailscale webhook, authenticate by payload. Nothing on Roadmap v2 names this work, and it is the hard gate on any production use of the control plane |
+| [A2] Reference tool, both states (`service-account` and `governed` branches) | [z8n6b5z8cg](https://app.clickup.com/t/z8n6b5z8cg) | control plane — no longer undecided | Shipped at L1 as nhi's `apps/outreach-tool/`, started as six instances by its `tests/e2e/scripts/stack-local.mjs` (an `OUTREACH_MODE: 'service-account'` instance at line 437, `outreach-tool-nocred` at line 469). `npm run demo` is still not this: it is a fixed script against a corp-notes fixture |
+| [C1] Per-user OAuth connect flows for Salesforce and Gmail; tokens in OpenBao keyed by (user, connector); refresh, revoke, fail closed within a minute of Okta deactivation | [z8n6b5z8cm](https://app.clickup.com/t/z8n6b5z8cm) | control plane | Replaces the synthetic-issuance story earlier revisions carried (fix preseed, an issuance endpoint, a generic revoke endpoint). Per-tenant synthetic issuance is not on Roadmap v2. This is the per-user token path `RemoteBroker` fetches from, and both sides are wired: nhi added a **new** endpoint, `POST /v1/broker/user-token` (`apps/api/src/routes/broker_user_token.ts`, contract `docs/internal/contracts/user-token.md`), and this package calls it behind `credentials[].broker: { kind: remote }` (`src/broker/wire.ts`, `src/broker/remote.ts`, S17a in `test/e2e/http-gateway.e2e.test.ts`). Neither has been run against the other; each has only met the other's fake. The connect flows themselves are shipped at L1 in nhi (`apps/api/src/connectors/`, `connect-flow.test.ts`, S4, S11) |
+| Control-plane authentication and tenancy | — (no ticket; nhi says it precedes every phase) | control plane | Shipped at L1: `apps/api/src/auth/hook.ts` is the one `onRequest` hook, registered at `apps/api/src/server.ts:77` before every route plugin, refusing any route that did not declare `config: { authClass, roles }`; the tenant comes from `req.principal`. Tests `auth-classes.test.ts`, `auth-routes.test.ts`, `no-tenant-in-query.test.ts`; the pre-pivot query-string path is gated on `CRESEC_LEGACY_TENANT_QUERY=1` (`auth-legacy.test.ts`). Nothing on Roadmap v2 named this work; it was done anyway, and it remains a hard gate on any production use — which has not happened, since nothing is deployed |
 
 ### Phase 3 — Egress gateway: HTTPS + MCP mediation (wk 4–9)
 
@@ -509,10 +522,10 @@ tool, version, target).
 
 | Item | Ticket | Owner | What it means for this repository |
 |---|---|---|---|
-| HTTPS egress gateway: `gateway/<connector>/…` base-URL override, per-user token injection, redacted recording | [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h) | control plane | The data-plane proxy re-targeted: needs-build on a needs-nhi base (the Go proxy exists; the JWT validation, per-user fetch and redacted recording do not). Where compiled `egress` rules would finally be enforced; today `policy compile` emits them and nothing consumes them |
-| [A3] Gateway walking skeleton: validate the identity JWT, fetch the per-user token from OpenBao, forward to Salesforce and Gmail, one record per call to NATS, p95 measured | [z8n6b5z8ch](https://app.clickup.com/t/z8n6b5z8ch) | control plane | A Fastify service per the build brief; whether it replaces the re-targeted Go proxy or is absorbed into it is undecided. The p95 < 50 ms criterion is measured there, not by `npm run bench` (0.792 ms p50, stdio, local fixture) |
-| MCP gateway: forward to vendor remote MCPs with per-user tokens; skill/tool identity attached to the session | [z8n6b5z50j](https://app.clickup.com/t/z8n6b5z50j) | recorder | `http --policy` exits 2 today. `RemoteBroker` (`src/broker/remote.ts`) is the fail-closed client for a control plane's `/broker/exchange`, tested and exported; `src/broker/wire.ts` constructs `LocalBroker` only. Wire it in, key by (user, connector) instead of (data-plane instance, synthetic credential) — against whichever endpoint nhi settles on, a re-keyed `/broker/exchange` or a new one — and carry the actor claim |
-| Policy engine: (user × tool version) → (connector × tool × scope); action classes read / draft / send / write; draft-only default | [z8n6b5z50k](https://app.clickup.com/t/z8n6b5z50k) | control plane, recorder | `policy.yaml` v1 is the authoring surface here and compiles to Rego; the control plane's bundle is hand-written, and its sole deny rule keys on a field the exchange never sends. `policy compile` already emits `cresec/credentials/broker.rego` (package `cresec.credentials`) from the `credentials` section; the control plane evaluates package `cresec.broker` with a different input document, so the two do not meet. Removing the second authoring surface — a `cresec/broker/allow.rego` compile target, the bundle generated in CI from a `policy.yaml` in git, one OPA input document — lives under this ticket. Two places a rule can be wrong, neither smoke-tested, is how dogfood 4 failed |
+| HTTPS egress gateway: `gateway/<connector>/…` base-URL override, per-user token injection, redacted recording | [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h) | control plane | Shipped at L1 as nhi's `apps/gateway/`, a **new** Fastify service — not the Go proxy re-targeted (its ADR 014; `apps/data-plane-proxy` is retiring untouched). JWT validation in `apps/gateway/src/auth/`, the per-user fetch in `control-plane.ts` calling `POST /v1/broker/user-token`, redacted recording in `record.ts` with `record.test.ts`; S7 and S8 cover it. Nothing is deployed. Still where compiled `egress` rules would finally be enforced; today `policy compile` emits them and nothing consumes them |
+| [A3] Gateway walking skeleton: validate the identity JWT, fetch the per-user token from OpenBao, forward to Salesforce and Gmail, one record per call to NATS, p95 measured | [z8n6b5z8ch](https://app.clickup.com/t/z8n6b5z8ch) | control plane | Settled by nhi's ADR 014 (`docs/internal/adrs/014-governed-tools-runtime.md`, Accepted 2026-09-21): **neither** — `apps/gateway/` is a new Fastify service and `apps/data-plane-proxy` is retiring untouched; nhi's ticket table now reads "shipped, and superseded by apps/gateway". The p95 < 50 ms criterion is measured there, not by `npm run bench` (0.792 ms p50, stdio, local fixture); its one recorded figure is an **L1 loopback** row in nhi's `docs/pov-measurements.md` |
+| MCP gateway: forward to vendor remote MCPs with per-user tokens; skill/tool identity attached to the session | [z8n6b5z50j](https://app.clickup.com/t/z8n6b5z50j) | recorder | **Shipped on the branch, tested against fakes (S17a).** `http --policy` is the stdio gateway over the streamable-HTTP transport (`src/proxy/http.ts`); `credentials[].broker: { kind: remote }` wires `RemoteBroker` (`src/broker/wire.ts`) to the control plane's `POST /v1/broker/user-token` (nhi `docs/internal/contracts/user-token.md`), keyed by (user, connector, tool, action class, target) from the identity JWT; `--identity-jwt` stamps the actor claim on every event. Still open: S17b, a live vendor remote MCP; degrade mode (a control plane that is away is a deny, never a read-only fallback) |
+| Policy engine: (user × tool version) → (connector × tool × scope); action classes read / draft / send / write; draft-only default | [z8n6b5z50k](https://app.clickup.com/t/z8n6b5z50k) | control plane, recorder | `policy.yaml` v1 is the authoring surface here and compiles to Rego. The control plane now has two hand-written bundles: the pre-pivot `cresec/broker/allow.rego`, whose sole deny rule still keys on a field the exchange never sends, and the new `cresec/gateway/decision.rego` with `decision_test.rego`, which its `apps/api/src/policy/opa.ts` consults on the gateway decision path — last, only for calls the built-in rules already allowed, able only to add denies, and a deny when it cannot answer. `policy compile` already emits `cresec/credentials/broker.rego` (package `cresec.credentials`) from the `credentials` section; the control plane evaluates package `cresec.broker` with a different input document, so the two do not meet. Removing the second authoring surface — a `cresec/broker/allow.rego` compile target, the bundle generated in CI from a `policy.yaml` in git, one OPA input document — lives under this ticket. Two places a rule can be wrong, neither smoke-tested, is how dogfood 4 failed |
 | Degrade mode: read-only when the gateway is unreachable | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | recorder, MCP leg only (the customer's HTTPS tool falling back is the control plane's, in its middleware [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) and gateway [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h)) | `MCP_RECORDER_DISABLE=1` removes recording and enforcement together; there is no read-only fallback for the MCP gateway. Invariant 8 |
 | SDK compatibility list: which vendor SDKs honour base-URL override, which need the MCP route | [z8n6b5z9fe](https://app.clickup.com/t/z8n6b5z9fe) | control plane | Decides per connector whether a tool takes the HTTPS gateway or this package's MCP route |
 | Promote the deny-rule smoke test to `policy test --tool <name>` | — | recorder | The thirty seconds where a rule prints nothing. Today it is a `printf` someone has to remember, and forgetting it is exactly how dogfood 4 failed |
@@ -531,11 +544,11 @@ manager view shows attribution ≥ 90% on the converted tool.
 
 | Item | Ticket | Owner | What it means for this repository |
 |---|---|---|---|
-| Hash-chained evidence stream (user, tool, version, connector, target, action class, time, request hash, redacted payload); signed bundles + verifier CLI; regulator-mapped export pack (EU AI Act Art. 12; SOC 2 CC6/CC7); PII policy for payloads before the first bundle leaves | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m), [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff), [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | recorder, control plane | The chain, `export` and the dependency-free `verify.cjs` are shipped here and verify offline. Missing: the actor-claim fields (after Phase 0), the NATS stream (the sink's reference receiver is a file-backed HTTPS service), the export-pack mapping (nothing in `src/` maps the bundle to Art. 12 or SOC 2 controls), and the PII decision |
-| `decision_id` on `policy_decision` events | — | recorder | Already recorded as `cresec.broker.decision_id` on swapped `tool_call` events; the decision event lacks the field. Additive optional field |
-| One event shape for "this call was denied"; `DECISIONS` counts both; replay badges consistently | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | recorder | Reads 0 for hook sessions however many calls they denied. A hook deny has no usable JSON-RPC request id, so it is not simply "emit a `policy_decision`" |
+| Hash-chained evidence stream (user, tool, version, connector, target, action class, time, request hash, redacted payload); signed bundles + verifier CLI; regulator-mapped export pack (EU AI Act Art. 12; SOC 2 CC6/CC7); PII policy for payloads before the first bundle leaves | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m), [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff), [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | recorder, control plane | The chain, `export` and the dependency-free `verify.cjs` are shipped here and verify offline; the actor-claim fields land as `identity.actor` from `--identity-jwt` (ADR 012, `docs/event-schema.md`). The NATS stream exists, but in nhi, not here: its `apps/api/src/evidence/publish.ts` publishes each appended record to `tenant.<slug>.evidence` on the `cresec-tenant` JetStream, and its S8 searches that subject for plaintext with the run's `record_id` as a positive control. **This** package's reference receiver is still a file-backed HTTPS service. Still missing in both: the export-pack mapping (nothing in `src/` maps the bundle to Art. 12 or SOC 2 controls). The PII decision is no longer missing: nhi's [ADR 015](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/015-payload-redaction.md) (accepted 2026-09-21) decides it for the HTTPS leg and S8 encodes it, and it explicitly leaves this package's rule unchanged — arguments hashed unconditionally, no plaintext payload anywhere. What is still owed here is narrower: the plaintext hostname and OS-username decision, which ADR 015 does not cover |
+| `decision_id` on `policy_decision` events | — | recorder | **Shipped on the branch.** Additive optional field: the local engine's uuid, or the control plane's own `decision_id` when a remote broker decided — the same value the swapped `tool_call` carries as `cresec.broker.decision_id` |
+| One event shape for "this call was denied"; `DECISIONS` counts both; replay badges consistently | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | recorder | **Counting and badging shipped on the branch**: `DECISIONS` counts the hook's `pre` tool_call with `error.type: policy_denied` on both backends, and the replay page badges it `gw-deny`. The shapes stay two — a hook deny has no usable JSON-RPC request id, so it is not simply "emit a `policy_decision`" — which is what still does not hold of invariant 3's exactly-one-record clause |
 | `sessions --tools` per-server, per-tool census | — | recorder | Turns a census from an engineer improvising SQL into a product surface |
-| Ship `receiver/` in package `files`; add an HTTP export route for signed replica bundles | — | recorder | Today a receiver needs a repo clone, and a remote auditor cannot pull a signed replica without filesystem access to the receiver host |
+| Ship `receiver/` in package `files`; add an HTTP export route for signed replica bundles | — | recorder | **Shipped on the branch.** `receiver/` and `src/` are in `files` (`test/pack.test.ts` pins it), `receiver/Dockerfile` builds the reference receiver, and `GET /v1/chains/{chain_id}/export` (operator token) serves the attested replica bundle as a zip |
 | Where this package's sink lands: an ingest endpoint in the control plane speaking the sink's wire contract (`docs/sink.md`, `receiver/` as the reference), or two evidence stores kept apart; NATS revocation reaching the gateway | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m) | undecided (control plane, if it ingests) | Undecided, and nhi's page records it the same way. If the control plane ingests, signed agent-side evidence lands in its append-only storage, which would be the cleanest single piece of integration in the join. The control plane's own chain is a different claim to an auditor and stays separate either way |
 | Manager view; security view (attribution % per tool/connector, before/after, policy violations, break-glass); ownership-decay alerts | [z8n6b5z50n](https://app.clickup.com/t/z8n6b5z50n) | control plane | Nothing here. `ui` is a replay page over one store |
 | SIEM export (Splunk / Sentinel / Datadog / Elastic); fleet aggregation, retention and pruning, external anchoring of chain heads | — | recorder | Not on Roadmap v2. Listed so nobody promises them; the store grows until deleted |
@@ -774,9 +787,12 @@ instant the counts run through, and a named test covers it.
   claim.
 - `docs/e2e-testing.md` in [`cresec-ai/nhi`](https://github.com/cresec-ai/nhi/blob/main/docs/e2e-testing.md)
   — how both repositories are tested end to end against a production-shaped
-  staging: the layers, the scenario suite, and the `staging.yml` workflow this
-  repository gains (the hosted evidence receiver, the injection demo, and
-  `http --policy` against a vendor remote MCP once it exists).
+  staging: the layers, the scenario suite, and `.github/workflows/staging.yml`
+  in this repository — which now exists with two jobs, `ship-staging` (line 40,
+  the hosted evidence receiver) and `demo-injection` (line 167), and has never
+  run, because there is no staging to run it against. Two jobs that page
+  describes are still unwritten here: `receiver-image` and
+  `mcp-http-gateway-staging` (`http --policy` against a vendor remote MCP).
 - ClickUp: the [story page](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-618),
   the [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638),
   the [thesis reconciliation](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-598),

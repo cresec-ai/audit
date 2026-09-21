@@ -9,6 +9,7 @@
  * OPERATOR (read-only, separate token — see receiver/README.md):
  *   GET  /v1/chains                        what this receiver holds
  *   GET  /v1/chains/{chain_id}             one chain in full, incl. forks
+ *   GET  /v1/chains/{chain_id}/export      the replica's signed bundle (zip)
  *   GET  /v1/rejections                    every refusal, newest last
  *   GET  /v1/alerts                        forks, silence, new identities
  *
@@ -26,7 +27,10 @@
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import { gunzip } from 'node:zlib';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import type { IncomingMessage, RequestListener, Server, ServerResponse } from 'node:http';
 import { SINK_PROTOCOL_VERSION } from './protocol.js';
@@ -35,6 +39,8 @@ import { Receiver } from './ingest.js';
 import type { ReceiverOptions } from './ingest.js';
 import { matchesOperatorToken, bearer } from './auth.js';
 import type { ChainState, ForkEvidence, StoredHead } from './store.js';
+import { ReceiverExportError, exportReceivedChain } from './export.js';
+import { VERSION } from '../src/version.js';
 
 export interface ServeOptions extends ReceiverOptions {
   /** Default 0 = ephemeral port. */
@@ -332,6 +338,55 @@ export async function serveReceiver(opts: ServeOptions): Promise<ServerHandle> {
           recent_heads: heads.slice(Math.max(0, heads.length - 20)),
           forks,
         });
+        return;
+      }
+
+      const exportMatch = /^\/v1\/chains\/([^/]+)\/export$/.exec(path);
+      if (exportMatch !== null) {
+        // The replica's bundle over HTTP, so a remote auditor can pull a
+        // signed replica without filesystem access to this host. Same
+        // bundle `receiver export --chain` writes (export.ts): truncated to
+        // attested_seq, carrying the stored verified signature, the
+        // product's own verify.cjs inside. Read-only, operator token.
+        if (method !== 'GET') {
+          res.writeHead(405, { ...JSON_HEADERS, allow: 'GET' });
+          res.end(JSON.stringify({ error: 'bad_request', detail: 'use GET' }) + '\n');
+          return;
+        }
+        if (!requireOperator(req, res)) return;
+        const chainId = decodeSegment(exportMatch[1]!);
+        if (chainId === undefined || receiver.store.chain(chainId) === undefined) {
+          sendError(res, 404, { error: 'bad_request', detail: 'no such chain on this receiver' });
+          return;
+        }
+        const scratch = join(tmpdir(), `mcpr-receiver-export-${randomUUID()}`);
+        const zipPath = join(scratch, `${chainId}.zip`);
+        try {
+          mkdirSync(scratch, { recursive: true, mode: 0o700 });
+          const result = await exportReceivedChain({
+            store: receiver.store,
+            chainId,
+            zipPath,
+            toolVersion: `mcp-recorder-receiver/${VERSION}`,
+          });
+          const zip = readFileSync(zipPath);
+          res.writeHead(200, {
+            'content-type': 'application/zip',
+            'content-length': zip.length,
+            'content-disposition': `attachment; filename="mcp-recorder-replica-${chainId.slice(0, 16)}.zip"`,
+            'x-mcpr-attested-seq': String(result.manifest.range.to_seq),
+            'x-mcpr-unattested-records': String(result.unattested_records),
+          });
+          res.end(zip);
+        } catch (err) {
+          if (err instanceof ReceiverExportError) {
+            sendError(res, 409, { error: 'bad_request', detail: err.message });
+            return;
+          }
+          throw err;
+        } finally {
+          rmSync(scratch, { recursive: true, force: true });
+        }
         return;
       }
 

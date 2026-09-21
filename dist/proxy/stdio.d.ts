@@ -148,6 +148,7 @@
 import { type Readable, type Writable } from 'node:stream';
 import type { GatewayOptions } from '../gateway/options.js';
 import type { RecorderLike, RedactorLike } from '../types.js';
+import { type ActorStamp } from '../identity/stamp.js';
 export interface StdioProxyOpts {
     /** argv of the wrapped server, e.g. ['npx','@modelcontextprotocol/server-foo']. */
     command: string[];
@@ -165,7 +166,20 @@ export interface StdioProxyOpts {
      * gateway mode (see the module header); absent = byte-for-byte recorder.
      */
     gateway?: GatewayOptions;
+    /**
+     * Additive: the ADR 012 actor claim decoded from `--identity-jwt`, stamped
+     * on the `identity` block of every event. Absent = no `actor` field, the
+     * events read exactly as before the field existed.
+     */
+    actor?: ActorStamp;
 }
+/**
+ * The text-level half of {@link spliceRewrittenLine}, shared with the HTTP
+ * gateway (src/proxy/http.ts): the ORIGINAL text with only the subtrees
+ * that differ between `before` and `after` spliced in, or `undefined` when
+ * the edits cannot be located exactly (the caller then re-serializes).
+ */
+export declare function spliceRewrittenText(text: string | null, before: unknown, after: unknown): string | undefined;
 /**
  * Gateway mode: cap on concurrently parked holds. The map is keyed by
  * request id and only shrinks when a hold is resolved, so a client that

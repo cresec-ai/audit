@@ -23,16 +23,21 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   INITIALIZE,
+  REPO_ROOT,
   WIRE_SERVER,
+  cleanEnv,
   killDetachedShipper,
   readChain,
   runCli,
   startRecorder,
   tmpDir,
+  tsxLoader,
   waitFor,
 } from './helpers/harness.js';
 import { TSX_AVAILABLE, startReceiver } from './helpers/receiver.js';
@@ -175,5 +180,111 @@ describe.skipIf(!TSX_AVAILABLE)('e2e ship: live replication to a real receiver',
 
     killDetachedShipper(dataDir);
     receiver.stop();
+  }, 180_000);
+
+  it('S18 pinned enrolment: a sender whose key is not pinned is refused (403) and stores nothing; the pinned key ships, is attested, and its replica exports a bundle that verifies against the pinned key', async () => {
+    const dir = tmpDir('e2e-ship-pinned-');
+    const dataDir = join(dir, 'data');
+    const journal = join(dir, 'journal.jsonl');
+
+    // The recorder's identity exists once it has recorded; the operator pins
+    // its PUBLIC half out of band (S18: `receiver-tokens-json` lists the key
+    // from `e2e-recorder-identity-key`; here, from <data-dir>/identity.pub).
+    await recordOneSession(dataDir, journal, 'pinned-enrolment-e2e');
+    // identity.pub holds the raw key as 64 hex (src/chain/keys.ts), the form
+    // the receiver's `keys` list and CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX take.
+    const ourKey = readFileSync(join(dataDir, 'identity.pub'), 'utf8').trim();
+    expect(ourKey).toMatch(/^[0-9a-f]{64}$/);
+    const localBefore = readChain(dataDir);
+
+    /* --- NEGATIVE ARM: pinned to somebody else's key -------------------- */
+    const strangerKey = 'ab'.repeat(32);
+    const wrong = await startReceiver(join(dir, 'receiver-wrong'), TOKEN, { pinnedKeys: [strangerKey] });
+    const refused = await runCli(['ship', '--drain', '--data-dir', dataDir, '--store', 'jsonl'], {
+      MCP_RECORDER_SINK: wrong.url,
+      MCP_RECORDER_SINK_TOKEN: TOKEN,
+    });
+    // Fail-open on the sender: a refusal is loud, never a non-zero exit, and
+    // nothing was delivered.
+    expect(refused.code).toBe(0);
+    expect(refused.stderr).toContain("sink refused this install's credential (403)");
+    expect(refused.stderr).toContain('ship: delivered 0 record(s)');
+    // The receiver wrote the refusal down and stored NOTHING.
+    expect(wrong.chainIds()).toEqual([]);
+    const rejections = wrong.rejections();
+    expect(rejections.length).toBeGreaterThan(0);
+    expect(rejections[0]).toMatchObject({ status: 403, error: 'forbidden' });
+    expect(rejections[0]!.detail).toContain('not enrolled');
+    expect(rejections[0]!.detail).toContain(ourKey);
+    wrong.stop();
+    // And the LOCAL chain is untouched by any of it: same records, still verifies.
+    expect(readChain(dataDir)).toEqual(localBefore);
+    const verifyLocal = await runCli(['verify', '--data-dir', dataDir, '--store', 'jsonl']);
+    expect(verifyLocal.code).toBe(0);
+    expect(verifyLocal.stdout).toContain('PASS');
+
+    /* --- POSITIVE ARM: pinned to OUR key -------------------------------- */
+    const pinned = await startReceiver(join(dir, 'receiver-pinned'), TOKEN, { pinnedKeys: [ourKey] });
+    const delivered = await runCli(['ship', '--drain', '--data-dir', dataDir, '--store', 'jsonl'], {
+      MCP_RECORDER_SINK: pinned.url,
+      MCP_RECORDER_SINK_TOKEN: TOKEN,
+    });
+    expect(delivered.code).toBe(0);
+    expect(delivered.stderr).toContain('ship: delivered');
+    const chainId = pinned.chainIds()[0]!;
+    expect(chainId).toBe(localBefore[0]!.hash);
+    const replicated = pinned.records(chainId);
+    expect(JSON.stringify(replicated)).toBe(JSON.stringify(localBefore));
+    expect(pinned.rejections()).toEqual([]);
+    // A pinned key is acknowledged the moment it writes: no `new_identity`
+    // alert, so every delivered record counts as attested once its head
+    // signature arrives.
+    expect(pinned.alerts().filter((a) => a.kind === 'new_identity')).toEqual([]);
+    pinned.stop();
+
+    // `receiver verify --chain` and `receiver export --chain --out`, the two
+    // commands S18's nightly runs over the replica (both flags required).
+    const loader = tsxLoader()!;
+    const receiverCli = (args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve) => {
+        const child = spawn(process.execPath, ['--import', pathToFileURL(loader).href, join(REPO_ROOT, 'receiver', 'main.ts'), ...args], {
+          cwd: REPO_ROOT,
+          env: cleanEnv(),
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (c: string) => (stdout += c));
+        child.stderr.on('data', (c: string) => (stderr += c));
+        child.on('close', (code) => resolve({ code, stdout, stderr }));
+      });
+    const verified = await receiverCli(['verify', '--chain', chainId, '--data-dir', pinned.dataDir]);
+    expect(verified.stdout, verified.stderr).toContain('PASS');
+    expect(verified.code).toBe(0);
+    const bundleDir = join(dir, 'replica-bundle');
+    const exported = await receiverCli(['export', '--chain', chainId, '--out', bundleDir, '--data-dir', pinned.dataDir]);
+    expect(exported.code, exported.stderr).toBe(0);
+    expect(existsSync(join(bundleDir, 'verify.cjs'))).toBe(true);
+
+    // The stranger's verification, pinned to the recorder's public key the
+    // way S18 pins CRESEC_E2E_RECORDER_PUBLIC_KEY_HEX: plain node, no repo.
+    const stranger = await new Promise<{ code: number | null; stdout: string }>((resolve) => {
+      const child = spawn(process.execPath, ['verify.cjs', '--public-key', ourKey], { cwd: bundleDir, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (c: string) => (stdout += c));
+      child.on('close', (code) => resolve({ code, stdout }));
+    });
+    expect(stranger.code).toBe(0);
+    expect(stranger.stdout).toContain('PASS');
+    expect(stranger.stdout).toContain('matches the --public-key you pinned');
+    // NEGATIVE CONTROL: pinned to the stranger's key, the same bundle FAILS.
+    const mismatch = await new Promise<{ code: number | null }>((resolve) => {
+      const child = spawn(process.execPath, ['verify.cjs', '--public-key', strangerKey], { cwd: bundleDir, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.on('close', (code) => resolve({ code }));
+    });
+    expect(mismatch.code).toBe(1);
   }, 180_000);
 });

@@ -122,10 +122,16 @@ export const POLICY_SCHEMA: JsonSchema = {
     credential: {
       type: 'object',
       additionalProperties: false,
-      required: ['id', 'source', 'use'],
+      required: ['id', 'use'],
+      description:
+        'One credential. Exactly one of "source" (resolved on this machine) or "broker" (resolved by the Cresec control plane per user) is required.',
       properties: {
         id: { $ref: '#/$defs/identifier', description: 'Unique within the section. Recorded on every decision; never the credential value.' },
-        provider: { $ref: '#/$defs/identifier', description: 'Informational, e.g. "github". Recorded on the decision.' },
+        provider: {
+          $ref: '#/$defs/identifier',
+          description:
+            'Informational, e.g. "github". Recorded on the decision. For a "broker" credential it is the connector sent to the control plane and is required; validation then holds it to the control plane\'s closed set (salesforce, gmail, workspace, slack, outlook) — a conditional this schema\'s keyword subset cannot express.',
+        },
         scopes: {
           type: 'array',
           items: { type: 'string', minLength: 1, maxLength: 128 },
@@ -133,6 +139,7 @@ export const POLICY_SCHEMA: JsonSchema = {
             'Informational: what the REAL credential can do. Recorded on the decision so blast radius is answerable from the chain rather than reconstructed.',
         },
         source: { $ref: '#/$defs/credentialSource' },
+        broker: { $ref: '#/$defs/remoteBroker' },
         use: {
           type: 'array',
           minItems: 1,
@@ -165,6 +172,46 @@ export const POLICY_SCHEMA: JsonSchema = {
           enum: ['deny'],
           description:
             'What happens when the credential cannot be resolved. Only "deny": forwarding the call would forward the synthetic to the upstream.',
+        },
+      },
+    },
+    remoteBroker: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind', 'url', 'token_env'],
+      description:
+        'Resolve this credential through the Cresec control plane: POST <url>/v1/broker/user-token per docs/internal/contracts/user-token.md in cresec-ai/nhi. The returned per-user access token is swapped at the declared sites exactly as a local source would be; the control plane\'s decision_id lands on the tool_call and policy_decision events. A 403 is a deny with the control plane\'s reason; a 5xx, a timeout or a connection failure is a deny with reason control_plane_unavailable (fail closed: the credential is absent).',
+      properties: {
+        kind: { const: 'remote' },
+        url: { type: 'string', minLength: 1, maxLength: 2048, description: 'Control plane base URL (https://; http:// only on loopback).' },
+        token_env: {
+          type: 'string',
+          pattern: ENV_VAR_PATTERN,
+          description: 'Environment variable holding the internal bearer token (Authorization: Bearer). Named here, never its value.',
+        },
+        tenant: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Tenant slug or uuid sent as X-Cresec-Tenant. Optional when the identity JWT carries tenant_id.',
+        },
+        user_env: {
+          type: 'string',
+          pattern: ENV_VAR_PATTERN,
+          description: 'Environment variable holding the user id (uuid) to request tokens for. Optional when --identity-jwt (or identity_jwt_env) supplies sub.',
+        },
+        identity_jwt_env: {
+          type: 'string',
+          pattern: ENV_VAR_PATTERN,
+          description: 'Environment variable holding the identity JWT itself; an alternative to --identity-jwt PATH. Supplies user_id, tenant and tool, and the actor claim stamped on every event.',
+        },
+        tool_id: { type: 'string', minLength: 1, maxLength: 128, description: 'Tool registry id (uuid) when no identity JWT supplies the tool claim.' },
+        tool_version: { type: 'string', minLength: 1, maxLength: 64, description: 'Tool version when no identity JWT supplies the tool claim.' },
+        timeout_ms: {
+          type: 'integer',
+          minimum: LIMITS.credential_timeout_ms.min,
+          maximum: LIMITS.credential_timeout_ms.max,
+          description: 'Round-trip budget for the control plane. Default 5000. Overrunning it denies this call (control_plane_unavailable).',
         },
       },
     },
@@ -271,6 +318,17 @@ export const POLICY_SCHEMA: JsonSchema = {
         path: { $ref: '#/$defs/credentialPath' },
         action: { $ref: '#/$defs/credentialAction', description: 'Default "allow".' },
         reason: { type: 'string', maxLength: 512, description: 'Shown to the model on a deny; also copied into the compiled Rego.' },
+        action_class: {
+          type: 'string',
+          enum: ['read', 'draft', 'send', 'write'],
+          description:
+            'The control plane\'s action class for this site (user-token.md). Sent as action_class on the per-user token request of a "broker" credential; informational otherwise. Default "write", the class that always needs a grant.',
+        },
+        method: {
+          type: 'string',
+          pattern: '^[A-Za-z]{1,16}$',
+          description: 'The HTTP method this site\'s request maps onto (target.method on the per-user token request). Default "POST". Upper-cased.',
+        },
       },
     },
     credentialHost: {

@@ -160,6 +160,7 @@ import { planSpawn, spawnWrapped, terminateChild, withNodeDirOnPath } from './sp
 import { SCHEMA } from '../schema/events.js';
 import { STRUCTURAL_STRING_MAX_LEN, collectEnvCredentialFingerprints, scrubArgv, scrubToolArguments, structuralString, } from '../redact/redactor.js';
 import { LineScanner } from './framing.js';
+import { stampActor } from '../identity/stamp.js';
 const NL = 0x0a;
 /** Explicit rule ids (`ID_PATTERN`) and the auto-assigned `rule[<i>]` survive as-is. */
 const RULE_ID_SHAPE = /^(?:[A-Za-z0-9_.:/-]{1,64}|rule\[[0-9]+\])$/;
@@ -718,7 +719,16 @@ function lineTerminator(line) {
  */
 function spliceRewrittenLine(line, before, after) {
     const terminator = lineTerminator(line);
-    const text = line.text;
+    const spliced = spliceRewrittenText(line.text, before, after);
+    return Buffer.from((spliced ?? JSON.stringify(after)) + terminator, 'utf8');
+}
+/**
+ * The text-level half of {@link spliceRewrittenLine}, shared with the HTTP
+ * gateway (src/proxy/http.ts): the ORIGINAL text with only the subtrees
+ * that differ between `before` and `after` spliced in, or `undefined` when
+ * the edits cannot be located exactly (the caller then re-serializes).
+ */
+export function spliceRewrittenText(text, before, after) {
     const paths = [];
     if (text !== null && collectDivergences(before, after, [], paths) && paths.length > 0) {
         const edits = [];
@@ -750,10 +760,10 @@ function spliceRewrittenLine(line, before, after) {
                 cursor = e.end;
             }
             if (ok)
-                return Buffer.from(out + text.slice(cursor) + terminator, 'utf8');
+                return out + text.slice(cursor);
         }
     }
-    return Buffer.from(JSON.stringify(after) + terminator, 'utf8');
+    return undefined;
 }
 /**
  * The bytes of a client->server JSON-RPC batch with the refused elements
@@ -1142,6 +1152,8 @@ export async function runStdioProxy(opts) {
         if (credentialFingerprints.length > 0) {
             id.credential_fingerprints = credentialFingerprints.map((c) => ({ ...c }));
         }
+        if (opts.actor !== undefined)
+            stampActor(id, opts.actor);
         return id;
     };
     const currentServer = () => {
@@ -1986,14 +1998,23 @@ export async function runStdioProxy(opts) {
         };
         const recordPolicyDecision = (call, hold) => {
             const decision = hold === undefined ? 'deny' : 'hold';
+            // One id per decision: the control plane's when the remote broker
+            // decided (it already sits in `cresec.broker.decision_id`), a fresh
+            // uuid when the local engine did. Set on the call so the synthetic
+            // `tool_call` written next carries the same value as an attribute.
+            if (call.decisionId === undefined)
+                call.decisionId = randomUUID();
+            const attributes = policyAttributes(call, decision);
+            attributes['cresec.policy.decision_id'] = call.decisionId;
             const ev = {
-                ...base('policy_decision', policyAttributes(call, decision)),
+                ...base('policy_decision', attributes),
                 kind: 'policy_decision',
                 decision,
                 tool: call.tool,
                 request_id: call.id,
                 policy_hash: loaded.hash,
                 args_hash: call.argsHash,
+                decision_id: call.decisionId,
             };
             if (call.ruleId !== undefined)
                 ev.rule_id = call.ruleId;
@@ -2034,6 +2055,8 @@ export async function runStdioProxy(opts) {
                 ...policyAttributes(call, gatewayOutcome.decision === 'deny' ? 'deny' : 'hold'),
                 'error.type': errorType,
             };
+            if (call.decisionId !== undefined)
+                attributes['cresec.policy.decision_id'] = call.decisionId;
             const ev = {
                 ...base('tool_call', attributes),
                 kind: 'tool_call',
@@ -2537,10 +2560,14 @@ export async function runStdioProxy(opts) {
          */
         const settleSwap = (call, msg, line, outcome, hold) => {
             const refuse = (code, failClosed) => {
+                // The broker's decision id, when it reached one (a remote 403 carries
+                // the control plane's), is THE decision id of this refusal.
+                const decided = [...outcome.decisions].reverse().find((d) => d.decisionId !== '');
                 const refused = {
                     ...call,
                     reason: swapDenyReason(code),
                     swapAttributes: outcome.attributes,
+                    ...(decided !== undefined ? { decisionId: decided.decisionId } : {}),
                     ...(failClosed ? { failClosed: true } : {}),
                 };
                 denyCall(refused, undefined, `gateway: credential swap refused tools/call "${call.tool}" (${code})`);

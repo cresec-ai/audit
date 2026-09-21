@@ -34,6 +34,7 @@ import type { ChainHead } from '../src/types.js';
 import { serveReceiver } from '../receiver/server.js';
 import type { ServerHandle } from '../receiver/server.js';
 import { exportReceivedChain } from '../receiver/export.js';
+import { readZipEntries } from '../src/export/unzip.js';
 import { HEADERS, sinkSignedPayload } from '../receiver/protocol.js';
 import type { RecordsBatch, SinkCursor, SinkHead } from '../receiver/protocol.js';
 
@@ -1233,5 +1234,64 @@ describe('receiver: exporting from the replica', () => {
         toolVersion: '0.1.0',
       }),
     ).rejects.toThrow(/no verified signature/);
+  });
+});
+
+describe('receiver: GET /v1/chains/{chain_id}/export — the replica bundle over HTTP', () => {
+  it('serves the attested bundle as a zip to the operator, refuses the ingest token, and 409s a chain with nothing attested', async () => {
+    const server = await start();
+    const id = newIdentity();
+    const records = buildChain(3);
+    const chainId = records[0]!.hash;
+    const stored = await post(server.url, {
+      chainId,
+      id,
+      from: 1,
+      to: 3,
+      baseHash: GENESIS_HASH,
+      records,
+      signatures: [headSignature(id, 3, records[2]!.hash)],
+      head: headFor(id, records),
+    });
+    expect(stored.status).toBe(202);
+
+    const url = `${server.url}/v1/chains/${chainId}/export`;
+    // The ingest token buys no read: an install that can write cannot pull the fleet's bundles.
+    const asInstall = await fetch(url, { headers: { authorization: `Bearer ${INGEST_TOKEN}` } });
+    expect(asInstall.status).toBe(401);
+
+    const res = await fetch(url, { headers: { authorization: `Bearer ${OPERATOR_TOKEN}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('application/zip');
+    expect(res.headers.get('x-mcpr-attested-seq')).toBe('3');
+    expect(res.headers.get('x-mcpr-unattested-records')).toBe('0');
+    const zip = Buffer.from(await res.arrayBuffer());
+    expect(zip.subarray(0, 2).toString('latin1')).toBe('PK');
+    const entries = readZipEntries(zip, ['README.txt', 'events.jsonl', 'manifest.json', 'public_key.pem', 'verify.cjs']);
+    const names = [...entries.keys()].sort();
+    expect(names).toEqual(['README.txt', 'events.jsonl', 'manifest.json', 'public_key.pem', 'verify.cjs']);
+    const manifest = JSON.parse(entries.get('manifest.json')!.toString('utf8')) as { range: { from_seq: number; to_seq: number }; signature: { public_key: string } };
+    expect(manifest.range).toEqual({ from_seq: 1, to_seq: 3 });
+    expect(manifest.signature.public_key).toBe(id.pub);
+    // The bundle verifies with the product's own verifier, pinned to the sender's key.
+    const lines = entries.get('events.jsonl')!.toString('utf8').trim().split('\n').map((l) => JSON.parse(l) as ChainRecord);
+    const verification = await verifyRecords(lines, [manifest.signature as unknown as HeadSignature], { expectedPublicKeyHex: id.pub });
+    expect(verification.ok).toBe(true);
+
+    // Nothing attested yet: a chain delivered without a head signature has
+    // nothing a bundle could carry, and the route says so instead of
+    // inventing one (a receiver holds no private key).
+    const bare = buildChain(2, 'y');
+    const bareId = bare[0]!.hash;
+    const other = newIdentity();
+    const unattested = await post(server.url, { chainId: bareId, id: other, from: 1, to: 2, baseHash: GENESIS_HASH, records: bare, head: headFor(other, bare) });
+    expect(unattested.status).toBe(202);
+    const none = await fetch(`${server.url}/v1/chains/${bareId}/export`, { headers: { authorization: `Bearer ${OPERATOR_TOKEN}` } });
+    expect(none.status).toBe(409);
+    const unknown = await fetch(`${server.url}/v1/chains/${'0'.repeat(64)}/export`, { headers: { authorization: `Bearer ${OPERATOR_TOKEN}` } });
+    expect(unknown.status).toBe(404);
+    // And no verb mutates it.
+    const del = await fetch(url, { method: 'DELETE', headers: { authorization: `Bearer ${OPERATOR_TOKEN}` } });
+    expect(del.status).toBe(405);
   });
 });

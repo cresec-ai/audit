@@ -115,6 +115,14 @@ export declare function toUnicodeSource(pattern: string): string;
  */
 export declare function checkRe2Subset(pattern: string): string | undefined;
 /**
+ * The control plane's closed connector set (cresec-ai/nhi
+ * `packages/contracts/src/names.ts`, `CONNECTORS`). A `broker` credential's
+ * `provider` goes on the wire as `connector`, and the endpoint answers 400
+ * to anything else — which the gateway would then report as a `broker_error`
+ * deny on every call. Said here, at validation, instead.
+ */
+export declare const CONTROL_PLANE_CONNECTORS: readonly string[];
+/**
  * Validate a parsed policy document. On success the returned policy is
  * normalized (defaults filled, globs as lists, every rule with an id).
  */

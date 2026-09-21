@@ -6,10 +6,27 @@ those calls before they run. This page is for deciding whether to run it, and
 for knowing what changed once you have.
 
 It is the MCP gateway and evidence-chain leg of Cresec Governed Tools: the part that sits on the
-agent's MCP tool-call path and produces the signed record. What it lacks today
-— which named person is acting, through which tool version, with which
-per-user credential — is the control plane's job, and
-[docs/pov.md](pov.md) says which Roadmap v2 phase supplies each piece.
+agent's MCP tool-call path and produces the signed record. All three of the things it used to lack — which named person is acting,
+through which tool version, with which per-user credential — are now present,
+but only with a control plane behind them: `identity.actor` carries the person
+and the tool version, decoded from the identity JWT given with
+`--identity-jwt` ([docs/event-schema.md](event-schema.md), "Actor claim";
+`test/identity.test.ts`), and `credentials[].broker: { kind: remote }` fetches
+that person's own token per call (`src/broker/wire.ts`,
+`src/broker/remote.ts`). Both need a control plane to mint the JWT and hold the
+token, and neither has been run against a real one — only against the fakes in
+`test/e2e/`. [docs/pov.md](pov.md) says which Roadmap v2 phase supplies each
+piece.
+
+**Which commit this page describes.** The actor claim and `--identity-jwt`
+(`src/identity/`), `http --policy` (`src/proxy/http-gateway.ts`) and the
+remote broker pointed at `POST /v1/broker/user-token` land on branch
+`claude/routine-production-enterprise-mfrojx` (`b2d7de1`) and are **not** in
+`origin/main` (`04f5211`) — which is what `npm install -g
+github:cresec-ai/audit#main`, the only install command this project publishes,
+fetches. On `main` there is no `src/identity/` and no `src/proxy/http-gateway.ts`,
+and `src/broker/remote.ts` still calls the pre-pivot `/broker/exchange`. Read
+every present tense about those three as "on this branch".
 
 It does not repeat [docs/install.md](install.md), which is the installation
 walkthrough for each client, or the 60-second quickstart in
@@ -44,12 +61,16 @@ This records each of those calls as it happens, into a hash-chained local log
 with payloads hashed rather than stored, so afterwards you can reconstruct
 what the agent saw and did, and demonstrate that the log was not edited.
 
-In Governed Tools' words: the record is the product. What this log does not
-yet say is which named person was behind the call and through which tool
-version — the audit line still reads as an OS user on a hostname, not as
-`maya.s@company.com via outreach-tool v3`. That half is what the control
-plane's identity gate and per-user credentials add on top of this log; see
-[docs/pov.md](pov.md).
+In Governed Tools' words: the record is the product. Started **without** an
+identity JWT, this log does not say which named person was behind the call or
+through which tool version — the audit line reads as an OS user on a hostname,
+not as `maya.s@company.com via outreach-tool v3`. Started **with** one
+(`--identity-jwt`), every event also carries `identity.actor` — `user`, `tool`,
+`host`, `run_as`, exactly ADR 012's shape — and `identity.actor_verified`,
+which is `false` when the signature was never checked
+([docs/event-schema.md](event-schema.md), "Actor claim (optional, additive)").
+The token comes from the control plane's identity gate, so that half still
+depends on it; see [docs/pov.md](pov.md).
 
 ## What is running once it is installed?
 
@@ -108,8 +129,13 @@ from the transparent path (this paragraph is by reading, not by running): `src/s
 and `node:tls` to replicate sealed records to an evidence sink, and only when
 `MCP_RECORDER_SINK` is set — with it unset there is no shipper and no
 connection ([docs/sink.md](sink.md)); and `src/broker/remote.ts` (PR #20)
-is a client for a control plane's `/broker/exchange`, exported and tested but
-not constructed by the CLI, which wires the local broker only. PR #20 also
+is a client for the control plane's `POST /v1/broker/user-token` (nhi's
+`docs/internal/contracts/user-token.md`) — not `/broker/exchange` — and the CLI
+**does** construct it: `src/broker/wire.ts` wires it behind
+`credentials[].broker: { kind: remote }`, and `policy validate` requires that
+credential's provider to be one of the control plane's connectors. Covered by
+`test/e2e/http-gateway.e2e.test.ts` (S17a) against a fake control plane; it has
+never met a real one. PR #20 also
 added four credential sources (`github-app`, `aws-sts`, `vault`, `clickup`)
 in `src/broker/sources.ts` that reach their provider through the same
 `sinkFetch` transport, and only when a policy's `credentials` section
@@ -291,7 +317,7 @@ each surface exposes; this table is the short form.
 | --- | --- | --- | --- | --- |
 | `record` — stdio proxy | your client launches the server through it, one config line | every JSON-RPC message in both directions, for that one local server | nothing in record mode; allow / hold / deny per tool, and a boundary filter over results, in gateway mode | verified here: `npm run demo` with and without `--policy`, a 200-call session, both transparency tests, a live hold/approve round trip |
 | `hook` — Claude Code PreToolUse / PostToolUse / PostToolUseFailure | entries in a Claude Code settings file | per call: tool name, the full input, and the response or the error string — for every `mcp__*` tool, **including Anthropic-hosted connectors** | deny a call before it runs, via `--policy` | verified here against the documented hook JSON on stdin, including a deny; and live in cloud dogfood 5, where two deny rules blocked four real ClickUp calls — see below for what that did and did not prove |
-| `http` — HTTP-transport proxy | you point the client at the proxy instead of the server | the HTTP MCP traffic it proxies | nothing; `http --policy` is rejected with exit 2 | the repository's `test/http-proxy.test.ts` was run here, 17 tests pass; the `--policy` rejection was run here; no live remote server was exercised for this page |
+| `http` — HTTP-transport proxy | you point the client at the proxy instead of the server | the HTTP MCP traffic it proxies | gateway mode with `--policy`: `src/proxy/http.ts:10` names it ("GATEWAY MODE (`opts.gateway` present, i.e. `http --policy`)"), `src/proxy/http-gateway.ts` implements it, `src/cli.ts:219` documents the flag for `record / http`. Every POST is gated whatever its content-type claims, a non-JSON POST body is refused 400 and never forwarded, and the SSE boundary path fails closed | the repository's `test/http-proxy.test.ts` was run here, 17 tests pass; `--policy` over HTTP is covered by `test/http-gateway.test.ts`, `test/http-gateway-failclosed.test.ts` and `test/e2e/http-gateway.e2e.test.ts` (S17a) against a **fake** vendor MCP — S17b, a live vendor remote MCP, was not run, and no live remote server was exercised for this page |
 
 A fourth arrangement is really the first one in disguise: `setup --bridge`
 replaces a remote connector with a local `mcp-remote` process, which the
@@ -654,8 +680,9 @@ byte-for-byte transparent: a line it cannot parse, or one larger than the
 scanner's buffer (32 MiB, `DEFAULT_MAX_LINE_BYTES` in `src/proxy/framing.ts`),
 is refused with a JSON-RPC error instead of being forwarded, because it cannot
 be shown harmless without parsing. Hold approvals are local trust — anyone who
-can write the data directory can approve a held call. And enforcement is stdio
-only:
+can write the data directory can approve a held call. Enforcement used to be
+stdio only — this transcript, run at `6307cc3`, is what `http --policy` did
+then, and is kept only as the record of a limit that has been lifted:
 
 ```
 $ mcp-recorder http --target http://127.0.0.1:9/mcp --policy hold-policy.yaml
@@ -663,6 +690,13 @@ $ mcp-recorder http --target http://127.0.0.1:9/mcp --policy hold-policy.yaml
 $ echo $?
 2
 ```
+
+Since `b2d7de1` that refusal is gone and `http --policy` enforces: the
+implementation is `src/proxy/http-gateway.ts`, covered by
+`test/http-gateway.test.ts` and `test/e2e/http-gateway.e2e.test.ts`. The error
+string above exists nowhere in `src/` any more. Like everything else on this
+branch, it is **not** in `origin/main` (`04f5211`), which is what the install
+command on the landing page fetches.
 
 ## Known gaps in what this reports
 
@@ -854,11 +888,21 @@ It does not fit if you expect any of the following from this package alone,
 because each is the control plane's job in Roadmap v2 Phases 2–4, or
 nobody's ([docs/pov.md](pov.md) says which):
 
-- per-user attribution — events carry an OS username and a hostname, not a
-  named person, and no tool version;
-- per-user credential injection — the local broker resolves credentials on
-  the agent's own machine from env, file or command sources; there is no
-  control plane behind it;
+- per-user attribution beyond a supplied token — with `--identity-jwt` events
+  carry `identity.actor` (user, tool, host, run_as) and
+  `identity.actor_verified`, but the claim is only as good as that token:
+  `actor_verified: false` means the signature was never checked, the token is
+  read once at start so one proxy process is one actor, and without a token an
+  event carries only an OS username and a hostname;
+- per-user credential injection proven against a real control plane — the
+  **local** broker resolves credentials on the agent's own machine from env,
+  file or command sources, while `credentials[].broker: { kind: remote }` does
+  put a control plane behind it: `RemoteBroker` fetches the person's own token
+  per call from `POST /v1/broker/user-token` and swaps it at the declared site,
+  with 403 a deny carrying the control plane's reason and anything else
+  `control_plane_unavailable` (fail closed) — `src/broker/remote.ts`,
+  [docs/policy.md](policy.md), S17a. It has only ever run against a fake
+  control plane;
 - a credential swap on Anthropic-hosted connectors — architecturally
   impossible from the customer side; the hook can deny those calls and
   nothing can swap their credential;
@@ -875,8 +919,11 @@ It also does not fit if:
 - you need readable payloads in the log for debugging;
 - you need tamper prevention, a WORM store, or an auditor-grade retention
   regime;
-- you need enforcement over the HTTP transport (`http --policy` is rejected),
-  or enforcement that is byte-for-byte transparent;
+- you need enforcement over the HTTP transport that is byte-for-byte
+  transparent — `http --policy` now enforces (`src/proxy/http-gateway.ts`,
+  `test/http-gateway.test.ts`, `test/http-gateway-failclosed.test.ts`), but
+  gateway mode buffers `tools/call` bodies and results, so it is not
+  byte-for-byte; without `--policy` the HTTP proxy still streams every byte;
 - you need a single console that reports every enforcement action uniformly —
   today the two paths report differently, as
   [Known gaps](#known-gaps-in-what-this-reports) sets out;

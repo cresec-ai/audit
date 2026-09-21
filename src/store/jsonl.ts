@@ -684,6 +684,21 @@ export class JsonlStore implements EvidenceStore {
       if (ev.kind === 'policy_decision') {
         summary.policy_decision_count += 1;
       }
+      // A HOOK deny: `mcp-recorder hook` records it as the call's own `pre`
+      // tool_call with `error.type: 'policy_denied'` (it has no JSON-RPC id,
+      // so it cannot be a `policy_decision` either). It counts here so a
+      // hook session that refused work no longer reads 0. The gateway's
+      // synthetic deny tool_call has no `phase` and is NOT counted twice.
+      // Must stay in step with the sqlite backend's SQL.
+      if (
+        ev.kind === 'tool_call' &&
+        (ev as { phase?: unknown }).phase === 'pre' &&
+        typeof (ev as { error?: { type?: unknown } }).error === 'object' &&
+        (ev as { error?: { type?: unknown } }).error !== null &&
+        (ev as { error?: { type?: unknown } }).error?.type === 'policy_denied'
+      ) {
+        summary.policy_decision_count += 1;
+      }
       if (ev.kind === 'session_end') {
         if (summary.ended_at === undefined || ev.timestamp > summary.ended_at) {
           summary.ended_at = ev.timestamp;

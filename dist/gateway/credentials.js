@@ -684,7 +684,7 @@ export class CredentialSwap {
                 req.request.user_agent = ctx.userAgent;
             let res;
             try {
-                res = await this.withDeadline(this.broker.exchange(req));
+                res = await this.withDeadline(this.broker.exchange(req, { credential: planned.site.credential, site: planned.site.id }));
             }
             catch (err) {
                 // CODES only: the underlying message may quote a command line, a

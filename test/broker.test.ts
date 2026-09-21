@@ -49,6 +49,7 @@ import {
   MAX_DECISION_CACHE,
   RemoteBroker,
   SOURCE_UNHEALTHY_MS,
+  templatePath,
   SYNTHETIC_PREFIX,
   FILE_MODE_CHECK_APPLIES,
   assessConfigTrust,
@@ -63,7 +64,10 @@ import {
   syntheticHashesEqual,
   validateCredentialEntry,
   xmlTag,
+  credentialSwapFromPolicy,
 } from '../src/broker/index.js';
+import { formatPolicyErrors, validatePolicyObject } from '../src/policy/validate.js';
+import type { Policy } from '../src/policy/types.js';
 import type {
   BrokerDecisionRecord,
   BrokerExchangeRequest,
@@ -1315,5 +1319,344 @@ describe('invariant 3 — a brokered secret never reaches the evidence chain', (
     expect(out).toMatchObject({ denied: true, deny_reason: 'exclusion_capacity' });
     expect(out.real_token).toBeUndefined();
     expect(warnings.join('\n')).toContain('exclusion set is full');
+  });
+});
+
+/* ---------------- RemoteBroker — the per-user token endpoint ------------ */
+
+describe('RemoteBroker — POST /v1/broker/user-token (user-token.md), the contract byte for byte', () => {
+  const SYN = 'cresec_synth_v1_' + Buffer.alloc(32, 0x5a).toString('base64url');
+  const USER = '3c9f2d0e-4b1a-4f7e-9d21-6a0b1c2d3e4f';
+  const TOOL = '9e1d7c3a-2f4b-4c6d-8e0f-1a2b3c4d5e6f';
+  const DECISION = '6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f';
+  const ACCESS = 'ya29.mock-dana-gmail-1-CANARY-0123456789';
+  const hint = { credential: 'gmail-drafts', site: 'gmail-drafts/draft' };
+
+  function userTokenBroker(
+    fetch: (r: { url: string; body: string; headers: Record<string, string> }) => Promise<{ status: number; body: string }>,
+    sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [],
+  ): RemoteBroker {
+    return new RemoteBroker({
+      baseUrl: 'https://api.cresec.test/',
+      dataPlaneInstanceId: 'dp-1',
+      authToken: 'internal-token-fake',
+      warn: () => {},
+      userToken: {
+        tenant: 'e2e',
+        userId: USER,
+        tool: { id: TOOL, version: '3' },
+        runAs: 'user',
+        credentials: {
+          'gmail-drafts': {
+            synthetic: SYN,
+            connector: 'gmail',
+            sites: { 'gmail-drafts/draft': { action_class: 'draft', method: 'POST' } },
+          },
+        },
+      },
+      fetch: (r) => {
+        sent.push({ url: r.url, body: r.body, headers: r.headers });
+        return fetch(r);
+      },
+    });
+  }
+
+  const allow = (): Promise<{ status: number; body: string }> =>
+    Promise.resolve({
+      status: 200,
+      body: JSON.stringify({
+        decision_id: DECISION,
+        decision: 'allow',
+        reason: 'ok',
+        token: { access_token: ACCESS, token_type: 'Bearer', api_base: 'http://localhost:9010', expires_at: '2026-09-21T10:14:03.201Z' },
+        ttl_ms: 300000,
+        actor: {},
+      }),
+    });
+
+  afterEach(() => forgetBrokeredSecrets());
+
+  it('sends exactly the request the contract specifies, with X-Cresec-Tenant and the internal bearer', async () => {
+    const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+    const broker = userTokenBroker(allow, sent);
+    const out = await broker.exchange(
+      req({ host: 'GMAIL.googleapis.com', path_template: '/gmail/v1/users/{userId}/drafts', user_agent: 'claude/1' }, SYN),
+      hint,
+    );
+    expect(out).toEqual({ real_token: ACCESS, ttl_seconds: 300, decision_id: DECISION });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.url).toBe('https://api.cresec.test/v1/broker/user-token');
+    expect(sent[0]!.headers).toEqual({
+      'content-type': 'application/json',
+      accept: 'application/json',
+      'x-cresec-tenant': 'e2e',
+      authorization: 'Bearer internal-token-fake',
+    });
+    expect(JSON.parse(sent[0]!.body)).toEqual({
+      user_id: USER,
+      connector: 'gmail',
+      tool: { id: TOOL, version: '3' },
+      action_class: 'draft',
+      target: { host: 'gmail.googleapis.com', path_template: '/gmail/v1/users/{userId}/drafts', method: 'POST' },
+      run_as: 'user',
+      job_token: null,
+      run_id: null,
+    });
+    // The synthetic never leaves this process: it is what is swapped, not what is sent.
+    expect(sent[0]!.body).not.toContain(SYN);
+    expect(sent[0]!.body).not.toContain('synthetic');
+    // The access token is a brokered secret the moment it is returned.
+    expect(isBrokeredSecret(ACCESS)).toBe(true);
+  });
+
+  it('403 is the control plane\'s deny, with its reason and decision id; the credential is absent', async () => {
+    const broker = userTokenBroker(() =>
+      Promise.resolve({
+        status: 403,
+        body: JSON.stringify({ error: 'policy_denied', decision_id: DECISION, decision: 'deny', reason: 'grant_required', action_class: 'send' }),
+      }),
+    );
+    const out = await broker.exchange(req({}, SYN), hint);
+    expect(out).toEqual({ decision_id: DECISION, ttl_seconds: 0, denied: true, deny_reason: 'grant_required' });
+    expect(out.real_token).toBeUndefined();
+  });
+
+  it('a 5xx, a timeout or a connection failure is control_plane_unavailable (ADR 013: fail closed, never a crash)', async () => {
+    const cases: Array<[() => Promise<{ status: number; body: string }>, string]> = [
+      [() => Promise.reject(new Error('ECONNREFUSED')), 'control_plane_unavailable'],
+      [() => Promise.reject(new Error('timeout')), 'control_plane_unavailable'],
+      [() => Promise.resolve({ status: 500, body: 'oops' }), 'control_plane_unavailable'],
+      [() => Promise.resolve({ status: 502, body: '<html>' }), 'control_plane_unavailable'],
+      [() => Promise.resolve({ status: 503, body: '{}' }), 'control_plane_unavailable'],
+      // The two token-production failures keep their own code (user-token.md, 503).
+      [() => Promise.resolve({ status: 503, body: JSON.stringify({ error: 'vault_unavailable', decision_id: DECISION, reason: 'vault_unavailable', action_class: 'read' }) }), 'vault_unavailable'],
+      [() => Promise.resolve({ status: 503, body: JSON.stringify({ error: 'connector_unavailable', decision_id: DECISION, reason: 'connector_unavailable', action_class: 'read' }) }), 'connector_unavailable'],
+      // A 4xx that is not a deny, or a 200 with nothing to swap, is a broker error.
+      [() => Promise.resolve({ status: 401, body: '{"error":"unauthenticated"}' }), 'broker_error'],
+      [() => Promise.resolve({ status: 200, body: 'not json' }), 'broker_error'],
+      [() => Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', ttl_ms: 1000 }) }), 'broker_error'],
+      // A 200 whose ttl is missing, not a number, zero or under one second is a malformed allow: no made-up lifetime.
+      [() => Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', reason: 'ok', token: { access_token: ACCESS } }) }), 'broker_error'],
+      [() => Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', reason: 'ok', token: { access_token: ACCESS }, ttl_ms: '300000' }) }), 'broker_error'],
+      [() => Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', reason: 'ok', token: { access_token: ACCESS }, ttl_ms: 0 }) }), 'broker_error'],
+      [() => Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', reason: 'ok', token: { access_token: ACCESS }, ttl_ms: 999 }) }), 'broker_error'],
+    ];
+    for (const [fetch, reason] of cases) {
+      const broker = userTokenBroker(fetch);
+      const out = await broker.exchange(req({}, SYN), hint);
+      expect(out.deny_reason, reason).toBe(reason);
+      expect(out.denied).toBe(true);
+      expect(out.real_token).toBeUndefined();
+    }
+  });
+
+  it('ttl_seconds is floor(ttl_ms / 1000), as the contract maps it', async () => {
+    const withTtl = (ttl_ms: number) => () =>
+      Promise.resolve({ status: 200, body: JSON.stringify({ decision_id: DECISION, decision: 'allow', reason: 'ok', token: { access_token: ACCESS }, ttl_ms }) });
+    expect((await userTokenBroker(withTtl(1999)).exchange(req({}, SYN), hint)).ttl_seconds).toBe(1);
+    expect((await userTokenBroker(withTtl(300000)).exchange(req({}, SYN), hint)).ttl_seconds).toBe(300);
+    expect((await userTokenBroker(withTtl(1000)).exchange(req({}, SYN), hint)).ttl_seconds).toBe(1);
+  });
+
+  it('target.path_template goes out with identifiers replaced (ADR 015): a message id, a record id or a uuid in a URL path never reaches the control plane', async () => {
+    const cases: Array<[string, string]> = [
+      ['/gmail/v1/users/me/drafts', '/gmail/v1/users/me/drafts'],
+      ['/gmail/v1/users/me/messages/18c2a1b2f3e4d5a6/modify', '/gmail/v1/users/me/messages/{id}/modify'],
+      ['/gmail/v1/users/me/drafts/r-1234567890123456789', '/gmail/v1/users/me/drafts/{id}'],
+      ['/services/data/v61.0/sobjects/Account/001xx000003DGbYAAW', '/services/data/v61.0/sobjects/Account/{id}'],
+      ['/api/v2/team/90182720801/task', '/api/v2/team/{id}/task'],
+      ['/tenants/0b7b4e5a-0c1d-4e2f-8a3b-4c5d6e7f8a9b/users', '/tenants/{id}/users'],
+      ['/', '/'],
+      // A site with no URL argument sends the tool name, which has no segments to replace.
+      ['gmail_create_draft', 'gmail_create_draft'],
+    ];
+    expect(cases.map(([given]) => templatePath(given))).toEqual(cases.map(([, want]) => want));
+    const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+    await userTokenBroker(allow, sent).exchange(req({ path_template: '/gmail/v1/users/me/messages/18c2a1b2f3e4d5a6/modify' }, SYN), hint);
+    expect((JSON.parse(sent[0]!.body) as { target: { path_template: string } }).target.path_template).toBe('/gmail/v1/users/me/messages/{id}/modify');
+    expect(sent[0]!.body).not.toContain('18c2a1b2f3e4d5a6');
+  });
+
+  it('keeps the control plane\'s decision_id on a 503 it can parse, and mints one otherwise', async () => {
+    const vault = await userTokenBroker(() =>
+      Promise.resolve({ status: 503, body: JSON.stringify({ error: 'vault_unavailable', decision_id: DECISION, reason: 'vault_unavailable', action_class: 'read' }) }),
+    ).exchange(req({}, SYN), hint);
+    expect(vault.decision_id).toBe(DECISION);
+    const dead = await userTokenBroker(() => Promise.reject(new Error('down'))).exchange(req({}, SYN), hint);
+    expect(dead.decision_id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('a synthetic that is not the one bound to the site\'s credential, or a site it does not know, is unknown_synthetic / denied_by_policy — nothing is sent', async () => {
+    const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+    const broker = userTokenBroker(allow, sent);
+    const wrong = await broker.exchange(req({}, 'cresec_synth_v1_' + Buffer.alloc(32, 0x41).toString('base64url')), hint);
+    expect(wrong.deny_reason).toBe('unknown_synthetic');
+    const noHint = await broker.exchange(req({}, SYN));
+    expect(noHint.deny_reason).toBe('unknown_synthetic');
+    const otherCred = await broker.exchange(req({}, SYN), { credential: 'salesforce', site: 'salesforce/x' });
+    expect(otherCred.deny_reason).toBe('unknown_synthetic');
+    const otherSite = await broker.exchange(req({}, SYN), { credential: 'gmail-drafts', site: 'gmail-drafts/send' });
+    expect(otherSite.deny_reason).toBe('denied_by_policy');
+    expect(sent).toEqual([]);
+  });
+});
+
+/* ---------------- wire.ts — selecting the remote broker ----------------- */
+
+describe('credentialSwapFromPolicy: credentials[].broker { kind: remote } selects the RemoteBroker', () => {
+  const SYN = 'cresec_synth_v1_' + Buffer.alloc(32, 0x5b).toString('base64url');
+  const USER = '3c9f2d0e-4b1a-4f7e-9d21-6a0b1c2d3e4f';
+  const TOOL = '9e1d7c3a-2f4b-4c6d-8e0f-1a2b3c4d5e6f';
+  const ACCESS = 'ya29.mock-wire-CANARY-0123456789abcdef';
+
+  function policy(): Policy {
+    const r = validatePolicyObject({
+      version: 1,
+      mcp: { default: 'allow' },
+      credentials: [
+        {
+          id: 'gmail-drafts',
+          provider: 'gmail',
+          broker: { kind: 'remote', url: 'https://api.cresec.test', token_env: 'CRESEC_INTERNAL_TOKEN', tenant: 'e2e', user_env: 'CRESEC_USER_ID', tool_id: TOOL, tool_version: '3' },
+          use: [{ id: 'draft', tool: 'gmail_create_draft', arg: 'headers.Authorization', host: { fixed: 'gmail.googleapis.com' }, action_class: 'draft' }],
+        },
+      ],
+    });
+    if (!r.ok) throw new Error(formatPolicyErrors(r.errors));
+    return r.policy;
+  }
+
+  afterEach(() => forgetBrokeredSecrets());
+
+  it('exchanges through the control plane, keyed by the policy\'s user_env / tenant / tool when no identity JWT is given', async () => {
+    const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+    const wiring = credentialSwapFromPolicy({
+      policy: policy(),
+      env: { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_INTERNAL_TOKEN: 'internal-token-fake', CRESEC_USER_ID: USER },
+      warn: () => {},
+      remoteFetch: (r) => {
+        sent.push({ url: r.url, body: r.body, headers: r.headers });
+        return Promise.resolve({
+          status: 200,
+          body: JSON.stringify({ decision_id: '6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f', decision: 'allow', reason: 'ok', token: { access_token: ACCESS, token_type: 'Bearer', api_base: 'x', expires_at: 'y' }, ttl_ms: 30000 }),
+        });
+      },
+    });
+    expect(wiring).toBeDefined();
+    const message = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'gmail_create_draft', arguments: { headers: { Authorization: `Bearer ${SYN}` } } } };
+    const plan = wiring!.swap.plan({ server: 'gmail', tool: 'gmail_create_draft', args: message.params.arguments });
+    expect(plan).toHaveLength(1);
+    const outcome = await wiring!.swap.exchange(message, plan, { server: 'gmail', tool: 'gmail_create_draft' });
+    expect(outcome.kind).toBe('allow');
+    if (outcome.kind !== 'allow') return;
+    expect(JSON.stringify(outcome.message)).toContain(ACCESS);
+    expect(outcome.attributes['cresec.broker.decision_id']).toBe('6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f');
+    expect(sent[0]!.url).toBe('https://api.cresec.test/v1/broker/user-token');
+    expect(sent[0]!.headers['x-cresec-tenant']).toBe('e2e');
+    expect(JSON.parse(sent[0]!.body)).toMatchObject({ user_id: USER, connector: 'gmail', tool: { id: TOOL, version: '3' }, action_class: 'draft', target: { host: 'gmail.googleapis.com', method: 'POST' } });
+    // The internal token is a brokered secret from the moment the policy is wired.
+    expect(isBrokeredSecret('internal-token-fake')).toBe(true);
+  });
+
+  it('the identity JWT\'s claims win over the policy: sub, tenant_id, tool and run_as key the request', async () => {
+    const sent: Array<{ body: string; headers: Record<string, string> }> = [];
+    const wiring = credentialSwapFromPolicy({
+      policy: policy(),
+      env: { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_INTERNAL_TOKEN: 't', CRESEC_USER_ID: USER },
+      identity: {
+        iss: 'cresec', aud: 'cresec-gateway', sub: 'aaaaaaaa-1111-4222-8333-444444444444', jti: 'j', iat: 1, exp: 2, kind: 'human', run_as: 'user',
+        tenant_id: '0b7b4e5a-0c1d-4e2f-8a3b-4c5d6e7f8a9b', tenant: 'e2e', email: 'dana@cresec.ai', idp: 'okta', idp_sub: '00u1', role: 'rep',
+        tool: { id: 'bbbbbbbb-1111-4222-8333-444444444444', name: 'outreach-tool', version: '7' }, host: { origin: 'https://tool.test', kind: 'vercel' },
+      },
+      warn: () => {},
+      remoteFetch: (r) => {
+        sent.push({ body: r.body, headers: r.headers });
+        return Promise.resolve({ status: 403, body: JSON.stringify({ error: 'policy_denied', decision_id: '6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f', decision: 'deny', reason: 'grant_required', action_class: 'draft' }) });
+      },
+    });
+    const message = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'gmail_create_draft', arguments: { headers: { Authorization: `Bearer ${SYN}` } } } };
+    const plan = wiring!.swap.plan({ server: 'gmail', tool: 'gmail_create_draft', args: message.params.arguments });
+    const outcome = await wiring!.swap.exchange(message, plan, { server: 'gmail', tool: 'gmail_create_draft' });
+    expect(outcome.kind).toBe('deny');
+    if (outcome.kind !== 'deny') return;
+    expect(outcome.code).toBe('grant_required');
+    expect(outcome.attributes['cresec.broker.decision_id']).toBe('6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f');
+    expect(JSON.parse(sent[0]!.body)).toMatchObject({ user_id: 'aaaaaaaa-1111-4222-8333-444444444444', tool: { id: 'bbbbbbbb-1111-4222-8333-444444444444', version: '7' }, run_as: 'user' });
+    expect(sent[0]!.headers['x-cresec-tenant']).toBe('0b7b4e5a-0c1d-4e2f-8a3b-4c5d6e7f8a9b');
+  });
+
+  it('a job token (kind job, run_as owner) is sent as job_token — the JWT itself, as identity-jwt.md defines it — and without its raw form the wiring refuses to start', async () => {
+    const JOB_CLAIMS = {
+      iss: 'cresec', aud: 'cresec-gateway', sub: 'aaaaaaaa-1111-4222-8333-444444444444', jti: 'j', iat: 1, exp: 2, kind: 'job' as const, run_as: 'owner' as const,
+      tenant_id: '0b7b4e5a-0c1d-4e2f-8a3b-4c5d6e7f8a9b', tenant: 'e2e', email: 'owner@cresec.ai', idp: 'okta' as const, idp_sub: '00u1', role: 'admin',
+      tool: { id: 'bbbbbbbb-1111-4222-8333-444444444444', name: 'outreach-tool', version: '7' }, host: { origin: 'https://tool.test', kind: 'vercel' as const },
+    };
+    const JOB_JWT = 'eyJhbGciOiJFZERTQSJ9.eyJmYWtlIjoiam9iLXRva2VuIn0.c2lnbmF0dXJlLWZha2U';
+    const env = { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_INTERNAL_TOKEN: 't', CRESEC_USER_ID: USER };
+    const sent: Array<{ body: string }> = [];
+    const wiring = credentialSwapFromPolicy({
+      policy: policy(),
+      env,
+      identity: JOB_CLAIMS,
+      identityJwt: JOB_JWT,
+      warn: () => {},
+      remoteFetch: (r) => {
+        sent.push({ body: r.body });
+        return Promise.resolve({ status: 403, body: JSON.stringify({ error: 'policy_denied', decision_id: '6f0c2a4e-1b3d-4a5c-9e7f-8a9b0c1d2e3f', decision: 'deny', reason: 'grant_required', action_class: 'draft' }) });
+      },
+    });
+    const message = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'gmail_create_draft', arguments: { headers: { Authorization: `Bearer ${SYN}` } } } };
+    const plan = wiring!.swap.plan({ server: 'gmail', tool: 'gmail_create_draft', args: message.params.arguments });
+    await wiring!.swap.exchange(message, plan, { server: 'gmail', tool: 'gmail_create_draft' });
+    expect(JSON.parse(sent[0]!.body)).toMatchObject({ user_id: 'aaaaaaaa-1111-4222-8333-444444444444', run_as: 'owner', job_token: JOB_JWT });
+
+    // The raw token is what the control plane needs; claims alone cannot produce it. Exit 2, not a 400 on every call.
+    expect(() => credentialSwapFromPolicy({ policy: policy(), env, identity: JOB_CLAIMS, warn: () => {} })).toThrow(/job_token/);
+    // A token that is a job token only by half (kind job, run_as user; or the reverse) is off-contract.
+    expect(() => credentialSwapFromPolicy({ policy: policy(), env, identity: { ...JOB_CLAIMS, run_as: 'user' }, identityJwt: JOB_JWT, warn: () => {} })).toThrow(/kind job with run_as owner/);
+    // NEGATIVE CONTROL: a human token sends job_token: null and run_as: user whether or not the raw JWT is supplied.
+    const human: Array<{ body: string }> = [];
+    const humanWiring = credentialSwapFromPolicy({
+      policy: policy(),
+      env,
+      identity: { ...JOB_CLAIMS, kind: 'human', run_as: 'user' },
+      identityJwt: JOB_JWT,
+      warn: () => {},
+      remoteFetch: (r) => {
+        human.push({ body: r.body });
+        return Promise.resolve({ status: 403, body: '{}' });
+      },
+    });
+    await humanWiring!.swap.exchange(message, plan, { server: 'gmail', tool: 'gmail_create_draft' });
+    expect(JSON.parse(human[0]!.body)).toMatchObject({ run_as: 'user', job_token: null });
+  });
+
+  it('the env var identity_jwt_env names is registered as a brokered secret before the recorder opens, like token_env', () => {
+    const r = validatePolicyObject({
+      version: 1,
+      mcp: { default: 'allow' },
+      credentials: [
+        {
+          id: 'gmail-drafts',
+          provider: 'gmail',
+          broker: { kind: 'remote', url: 'https://api.cresec.test', token_env: 'CRESEC_INTERNAL_TOKEN', tenant: 'e2e', user_env: 'CRESEC_USER_ID', tool_id: TOOL, tool_version: '3', identity_jwt_env: 'CRESEC_IDENTITY_JWT' },
+          use: [{ id: 'draft', tool: 'gmail_create_draft', arg: 'headers.Authorization', host: { fixed: 'gmail.googleapis.com' } }],
+        },
+      ],
+    });
+    if (!r.ok) throw new Error(formatPolicyErrors(r.errors));
+    const jwt = 'eyJhbGciOiJFZERTQSJ9.eyJmYWtlIjoiaWRlbnRpdHkifQ.c2lnbmF0dXJlLWZha2U';
+    credentialSwapFromPolicy({ policy: r.policy, env: { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_INTERNAL_TOKEN: 't', CRESEC_USER_ID: USER, CRESEC_IDENTITY_JWT: jwt }, warn: () => {} });
+    expect(isBrokeredSecret(jwt)).toBe(true);
+  });
+
+  it('refuses to start (CredentialWiringError) when the internal token, the user or the tool cannot be resolved', () => {
+    const base = { policy: policy(), warn: () => {} };
+    expect(() => credentialSwapFromPolicy({ ...base, env: { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_USER_ID: USER } })).toThrow(/CRESEC_INTERNAL_TOKEN/);
+    expect(() => credentialSwapFromPolicy({ ...base, env: { MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS: SYN, CRESEC_INTERNAL_TOKEN: 't' } })).toThrow(/user_env/);
+    // No synthetic bound at all: nothing to swap, said out loud, not fatal.
+    const warned: string[] = [];
+    expect(credentialSwapFromPolicy({ ...base, env: { CRESEC_INTERNAL_TOKEN: 't', CRESEC_USER_ID: USER }, warn: (l) => warned.push(l) })).toBeUndefined();
+    expect(warned.join('\n')).toContain('MCP_RECORDER_SYNTHETIC_GMAIL_DRAFTS');
   });
 });

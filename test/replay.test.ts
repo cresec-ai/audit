@@ -726,6 +726,45 @@ describe('renderTimelineHtml renders gateway-mode evidence (policy_decision rows
     expect(html).toContain(`delivered result ${sha256Ref('delivered')}`);
   });
 
+  it('a HOOK deny (a `pre` tool_call with error.type policy_denied, no gateway field) carries the same red gw-deny badge', () => {
+    // One deny event shape [z8n6b5z1zr]: the hook records a deny as the
+    // call's own pre event, and until now the timeline showed it with only
+    // the generic `error` badge, so nothing said "policy" — a reader could
+    // not tell a hook deny from a tool that merely failed.
+    const hookDir = mkdtempSync(join(tmpdir(), 'mcp-recorder-replay-hook-'));
+    const hookStore = openStore({ dataDir: hookDir, backend: 'sqlite' });
+    try {
+      const SESSION_H = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+      const denied: ToolCallEvent = {
+        ...toolCall(SESSION_H, '2026-06-12T10:00:01.000Z', 'clickup_delete_task', { task_id: 'abc' }, { isError: true }),
+        source: 'hook',
+        phase: 'pre',
+        error: { type: 'policy_denied', message_ref: sha256Ref('denied by policy') },
+      };
+      const failed: ToolCallEvent = {
+        ...toolCall(SESSION_H, '2026-06-12T10:00:02.000Z', 'clickup_get_task', { task_id: 'abc' }, { isError: true }),
+        source: 'hook',
+        phase: 'post',
+        error: { type: 'tool_error', message_ref: sha256Ref('boom') },
+      };
+      hookStore.append(seal([sessionStart(SESSION_H, '2026-06-12T10:00:00.000Z'), denied, failed]));
+      const html = renderTimelineHtml(hookStore, { sessionId: SESSION_H });
+      const cards = html.split('<article');
+      const deniedCard = cards.find((c) => c.includes('clickup_delete_task'))!;
+      expect(deniedCard).toContain('<span class="badge gw gw-deny"');
+      expect(deniedCard).toContain('hook deny');
+      // NEGATIVE CONTROL (in-suite): an ordinary failed hook call gets the
+      // generic error badge and nothing that says "policy".
+      const failedCard = cards.find((c) => c.includes('clickup_get_task'))!;
+      expect(failedCard).toContain('<span class="badge err">error</span>');
+      expect(failedCard).not.toContain('gw-deny');
+      expect(failedCard).not.toContain('hook deny');
+    } finally {
+      hookStore.close();
+      rmSync(hookDir, { recursive: true, force: true });
+    }
+  });
+
   it('escapes an attacker-shaped rule id everywhere it appears', () => {
     const html = renderTimelineHtml(store, { sessionId: SESSION_C });
     expect(html).not.toContain('<img src=x');

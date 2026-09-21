@@ -43,6 +43,7 @@ export {
 } from './protocol.js';
 export type {
   Broker,
+  BrokerExchangeHint,
   BrokerExchangeRequest,
   BrokerExchangeResponse,
   DenyReason,
@@ -100,5 +101,7 @@ export type {
   LocalBrokerOptions,
 } from './local.js';
 
-export { RemoteBroker, REMOTE_TIMEOUT_MS } from './remote.js';
-export type { RemoteBrokerOptions } from './remote.js';
+export { RemoteBroker, REMOTE_TIMEOUT_MS, USER_TOKEN_PATH, templatePath } from './remote.js';
+export type { RemoteBrokerOptions, UserTokenConfig, UserTokenCredential, UserTokenSite } from './remote.js';
+export { CompositeBroker, CredentialWiringError, credentialSwapFromPolicy, registerPolicyEnvSecrets, syntheticEnvVar } from './wire.js';
+export type { CredentialSwapWiring, WireOptions } from './wire.js';

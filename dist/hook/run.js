@@ -47,6 +47,7 @@ import { resolveServerOrigin } from './mcp-config.js';
 import { hostAliasToolName, parseToolName } from './names.js';
 import { evaluatePolicy, loadPolicy } from './policy.js';
 import { claimSessionStart, markPending, sweepStalePending, takePending } from './state.js';
+import { stampActor } from '../identity/stamp.js';
 /** sha256:<hex> of canonical `null` — result_hash for a PreToolUse marker
  *  (no result exists yet). */
 const NULL_RESULT_HASH = sha256Ref(canonicalJson(null));
@@ -189,6 +190,8 @@ export async function runHook(stdinText, opts) {
             identity.hostname = host;
         if (opts.config.identityLabel)
             identity.label = opts.config.identityLabel;
+        if (opts.actor !== undefined)
+            stampActor(identity, opts.actor);
         // Scrubbed like argv (AGENTS.md: no readable payload strings reach the
         // store) even though this particular string is a local constant, never
         // attacker/remote controlled — defense in depth, and it costs nothing.

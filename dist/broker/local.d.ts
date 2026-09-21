@@ -50,7 +50,7 @@
  *    machine and the id answers every question the value would.
  */
 import { Buffer } from 'node:buffer';
-import type { Broker, BrokerExchangeRequest, BrokerExchangeResponse, DenyReason } from './protocol.js';
+import type { Broker, BrokerExchangeHint, BrokerExchangeRequest, BrokerExchangeResponse, DenyReason } from './protocol.js';
 import type { CredentialSource, CredentialSourceSpec, SourceSeams } from './sources.js';
 /**
  * Where a swap-site's `host` / `path_template` are taken from.
@@ -251,7 +251,7 @@ export declare class LocalBroker implements Broker {
      * throw would leave the caller deciding what an exception means about
      * authorisation, and the answer has to be "no" in one shape only.
      */
-    exchange(req: BrokerExchangeRequest, ctx?: ExchangeContext): Promise<BrokerExchangeResponse>;
+    exchange(req: BrokerExchangeRequest, ctx?: ExchangeContext & Partial<BrokerExchangeHint>): Promise<BrokerExchangeResponse>;
     /**
      * Every declared swap site, so the gateway can bind the swap to a site.
      *

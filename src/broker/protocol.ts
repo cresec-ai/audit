@@ -65,8 +65,24 @@ export interface BrokerExchangeResponse {
   deny_reason?: string;
 }
 
+/**
+ * Which declared site asked for the exchange. Additive and OPTIONAL: the
+ * wire request above is keyed on the synthetic alone, exactly as NHI's is,
+ * and a broker that resolves by synthetic (the local one, the `/broker/
+ * exchange` remote) ignores this. The per-user token path needs it because
+ * the control plane's request is keyed on (user, connector, tool, action
+ * class, target) and the connector, action class and method are properties
+ * of the SITE the policy declared, not of the synthetic.
+ */
+export interface BrokerExchangeHint {
+  /** `credentials[].id` of the site's credential. */
+  credential: string;
+  /** `credentials[].use[].id` (`<credential>/<site>`). */
+  site: string;
+}
+
 export interface Broker {
-  exchange(req: BrokerExchangeRequest): Promise<BrokerExchangeResponse>;
+  exchange(req: BrokerExchangeRequest, hint?: BrokerExchangeHint): Promise<BrokerExchangeResponse>;
 }
 
 /**
@@ -125,7 +141,13 @@ export type DenyReason =
   // ── local: the broker itself could not answer ───────────────────────
   | 'exclusion_capacity'
   | 'broker_unreachable'
-  | 'broker_error';
+  | 'broker_error'
+  // ── remote, per-user token endpoint (user-token.md, ADR 013) ────────
+  /** A 5xx other than the two below, a timeout or a connection failure: the control plane could not decide. */
+  | 'control_plane_unavailable'
+  /** The decision was allow but the token could not be produced (503 bodies). */
+  | 'vault_unavailable'
+  | 'connector_unavailable';
 
 /** Mint a fresh synthetic. 32 random bytes, base64url, prefixed — NHI's `mintSyntheticValue`. */
 export function mintSynthetic(): string {

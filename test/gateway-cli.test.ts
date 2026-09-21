@@ -750,17 +750,23 @@ describe('record --policy: startup is fail-closed', () => {
     expect(storeFiles(dataDir)).toEqual([]);
   }, 120_000);
 
-  it('http --policy exits 2: gateway mode is stdio-only', async () => {
+  it('http --policy: an invalid policy exits 2 BEFORE the port is bound (fail closed, same loader as record)', async () => {
     const dir = tmpDir('mcp-rec-gw-http-');
-    const policy = writePolicy(dir, 'policy.yaml', VALID_POLICY);
+    const policy = writePolicy(dir, 'policy.yaml', INVALID_POLICY);
     const res = await runCli(['http', '--target', 'http://127.0.0.1:1/mcp', '--policy', policy, '--data-dir', join(dir, 'data')]);
     expect(res.code).toBe(2);
-    expect(res.stderr).toContain('stdio transport only');
+    expect(res.stderr).toContain('invalid policy');
+    expect(res.stderr).not.toContain('http proxy listening');
+    // And a policy with nothing for the gateway to enforce is refused the same way.
+    const egressOnly = writePolicy(dir, 'egress-only.yaml', ['version: 1', 'egress:', '  default: deny', ''].join('\n'));
+    const res2 = await runCli(['http', '--target', 'http://127.0.0.1:1/mcp', '--policy', egressOnly, '--data-dir', join(dir, 'data')]);
+    expect(res2.code).toBe(2);
+    expect(res2.stderr).toContain('no `mcp` section');
   }, 60_000);
 
-  it('http IGNORES MCP_RECORDER_POLICY (one stderr note) and records as usual', async () => {
+  it('http honours MCP_RECORDER_POLICY exactly as record does: the proxy starts as a gateway', async () => {
     // Exporting MCP_RECORDER_POLICY in a shell is the pattern docs/gateway.md
-    // recommends for stdio servers; it must not make `http` unusable.
+    // recommends; `http` now enforces it rather than ignoring it out loud.
     const dir = tmpDir('mcp-rec-gw-http-env-');
     const policy = writePolicy(dir, 'policy.yaml', VALID_POLICY);
     // In-process tsx, not the tsx CLI: `http` is stopped with SIGINT below and
@@ -782,24 +788,21 @@ describe('record --policy: startup is fail-closed', () => {
     const exited = waitExit(child);
     await waitForText(stderrText, 'http proxy listening at');
 
-    const note = stderrText()
-      .split('\n')
-      .filter((l) => l.includes('MCP_RECORDER_POLICY'));
-    expect(note).toEqual([
-      '[mcp-recorder] http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio transport only',
-    ]);
-    expect(stderrText()).not.toContain('stdio transport only (drop --policy)');
+    // NEGATIVE CONTROL: the old behaviour printed an "ignored" note and
+    // started without enforcement; neither line may appear now.
+    expect(stderrText()).toContain('gateway: policy cli-test (2 rules) enforced over HTTP');
+    expect(stderrText()).not.toContain('MCP_RECORDER_POLICY ignored');
+    expect(stderrText()).not.toContain('stdio transport only');
 
     if (process.platform === 'win32') {
       // No POSIX signals on Windows: child.kill() is TerminateProcess, so a
       // clean-shutdown exit code cannot be observed there (same caveat as the
-      // signal tests in cli.test.ts). The note above is the assertion.
+      // signal tests in cli.test.ts). The lines above are the assertion.
       child.kill();
       await exited;
       return;
     }
-    // Ctrl-C shuts the proxy down cleanly: exit 0 and the usual run summary,
-    // proving the ignored variable left recording itself untouched.
+    // Ctrl-C shuts the proxy down cleanly: exit 0 and the usual run summary.
     child.kill('SIGINT');
     expect(await exited).toBe(0);
     expect(stderrText()).toMatch(/\[mcp-recorder\] session [0-9a-f-]+ recorded \d+ events/);

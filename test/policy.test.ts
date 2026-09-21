@@ -1226,9 +1226,9 @@ describe('credentials: the section as a whole', () => {
     expectError(credErrors((c) => ((c.source as Mutable).file = '/tmp/x')), '/credentials/0/source', 'oneOf');
   });
 
-  it('requires an id, a source and at least one use site', () => {
+  it('requires an id, a source (or a broker) and at least one use site', () => {
     expectError(credErrors((c) => delete c.id), '/credentials/0', 'required');
-    expectError(credErrors((c) => delete c.source), '/credentials/0', 'required');
+    expectError(credErrors((c) => delete c.source), '/credentials/0', 'required', /exactly one of "source".*"broker"/);
     expectError(credErrors((c) => (c.use = [])), '/credentials/0/use', 'minItems');
   });
 
@@ -1239,6 +1239,87 @@ describe('credentials: the section as a whole', () => {
     expectError(credErrors((_c, u) => (u.action = 'hold')), '/credentials/0/use/0/action', 'enum');
     expect(credPolicy((_c, u) => (u.action = 'deny')).credentials![0]!.use[0]!.action).toBe('deny');
     expectError(credErrors((c) => (c.on_unresolved = 'allow')), '/credentials/0/on_unresolved', 'enum');
+  });
+});
+
+describe('credentials[].broker: resolved by the control plane (user-token.md)', () => {
+  const REMOTE = { kind: 'remote', url: 'https://api.cresec.test', token_env: 'CRESEC_INTERNAL_TOKEN', tenant: 'e2e' };
+  const toRemote = (c: Mutable): void => {
+    delete c.source;
+    c.broker = { ...REMOTE };
+    c.provider = 'gmail';
+  };
+  const remote = (mutate: (c: Mutable, u: Mutable, doc: Mutable) => void = () => {}) =>
+    credsMutated((c, u, doc) => {
+      toRemote(c);
+      mutate(c, u, doc);
+    });
+
+  it('accepts a remote credential in place of a local source, and normalizes its defaults', () => {
+    const result = validatePolicyObject(remote());
+    expect(result.ok, result.ok ? '' : formatPolicyErrors(result.errors)).toBe(true);
+    if (!result.ok) return;
+    const cred = result.policy.credentials![0]!;
+    expect(cred.source).toBeUndefined();
+    expect(cred.broker).toEqual({ ...REMOTE, timeout_ms: 5000 });
+    // The site's action class and method default to the class that always
+    // needs a grant and the method a swap site of an MCP tool almost always is.
+    expect(cred.use[0]!.action_class).toBe('write');
+    expect(cred.use[0]!.method).toBe('POST');
+  });
+
+  it('carries action_class and method per site, upper-casing the method', () => {
+    const result = validatePolicyObject(remote((_c, u) => {
+      u.action_class = 'draft';
+      u.method = 'get';
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.policy.credentials![0]!.use[0]).toMatchObject({ action_class: 'draft', method: 'GET' });
+    expectError(credErrors((_c, u) => (u.action_class = 'delete')), '/credentials/0/use/0/action_class', 'enum');
+    expectError(credErrors((_c, u) => (u.method = 'P O S T')), '/credentials/0/use/0/method', 'pattern');
+  });
+
+  it('source and broker are mutually exclusive, and a broker credential needs a provider (the connector)', () => {
+    expectError(
+      credErrors((c) => (c.broker = { ...REMOTE })),
+      '/credentials/0',
+      'credential',
+      /mutually exclusive/,
+    );
+    expectError(credErrors((c) => { toRemote(c); delete c.provider; }), '/credentials/0/provider', 'required', /connector/);
+  });
+
+  it("a broker credential's provider is one of the control plane's connectors (names.ts CONNECTORS); anything else is refused at validation, not as a 400 on every call", () => {
+    for (const ok of ['salesforce', 'gmail', 'workspace', 'slack', 'outlook']) {
+      const r = validatePolicyObject(remote((c) => (c.provider = ok)));
+      expect(r.ok, `${ok}: ${r.ok ? '' : formatPolicyErrors(r.errors)}`).toBe(true);
+    }
+    for (const bad of ['github', 'clickup', 'Gmail', 'google']) {
+      expectError(credErrors((c) => { toRemote(c); c.provider = bad; }), '/credentials/0/provider', 'enum', /not a connector the control plane knows/);
+    }
+    // NEGATIVE CONTROL: a LOCAL credential's provider is informational and stays free-form.
+    const local = validatePolicyObject(credsMutated((c) => (c.provider = 'github')));
+    expect(local.ok, local.ok ? '' : formatPolicyErrors(local.errors)).toBe(true);
+  });
+
+  it('the control plane URL is https, or http on loopback only; the internal token is named, never carried', () => {
+    for (const bad of ['http://api.cresec.test', 'ftp://x', 'not a url']) {
+      expectError(credErrors((c) => { toRemote(c); c.broker = { ...REMOTE, url: bad }; }), '/credentials/0/broker/url', 'url');
+    }
+    for (const ok of ['http://127.0.0.1:9010', 'http://localhost:9010/', 'https://api.cresec.test/']) {
+      const r = validatePolicyObject(remote((c) => (c.broker = { ...REMOTE, url: ok })));
+      expect(r.ok, `${ok}: ${r.ok ? '' : formatPolicyErrors(r.errors)}`).toBe(true);
+    }
+    expectError(credErrors((c) => { toRemote(c); c.broker = { ...REMOTE, token_env: 'not-a-var' }; }), '/credentials/0/broker/token_env', 'pattern');
+    expectError(credErrors((c) => { toRemote(c); c.broker = { ...REMOTE, token: 'sekrit' }; }), '/credentials/0/broker/token', 'additionalProperties');
+    expectError(credErrors((c) => { toRemote(c); c.broker = { ...REMOTE, kind: 'local' }; }), '/credentials/0/broker/kind', 'const');
+  });
+
+  it('tool_id and tool_version go together', () => {
+    expectError(credErrors((c) => { toRemote(c); c.broker = { ...REMOTE, tool_id: '9e1d7c3a-2f4b-4c6d-8e0f-1a2b3c4d5e6f' }; }), '/credentials/0/broker', 'remoteBroker');
+    const r = validatePolicyObject(remote((c) => (c.broker = { ...REMOTE, tool_id: '9e1d7c3a-2f4b-4c6d-8e0f-1a2b3c4d5e6f', tool_version: '3', user_env: 'CRESEC_USER_ID', identity_jwt_env: 'CRESEC_IDENTITY_JWT' })));
+    expect(r.ok, r.ok ? '' : formatPolicyErrors(r.errors)).toBe(true);
   });
 });
 

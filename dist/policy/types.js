@@ -51,6 +51,12 @@ export const DEFAULTS = {
         timeout_ms: 5_000,
         on_unresolved: 'deny',
         action: 'allow',
+        /** The class that always needs a grant at the control plane: the safe default for a site whose author said nothing. */
+        action_class: 'write',
+        /** `target.method` when the site does not say: what a swap site of an MCP tool almost always is. */
+        method: 'POST',
+        /** `credentials[].broker.timeout_ms`: the same 5 s the local resolver and NHI's client carry. */
+        broker_timeout_ms: 5_000,
         /** NHI's broker reads `{"token": ...}` out of the vault blob; same key here. */
         vault_field: 'token',
         /** AWS's minimum session length: the shortest-lived token STS will mint. */
@@ -241,20 +247,45 @@ function normalizeCredentialUse(use, index, credentialId) {
         host: normalizeCredentialHost(use.host),
         path: normalizeCredentialPath(use.path),
         action: use.action ?? DEFAULTS.credential.action,
+        action_class: use.action_class ?? DEFAULTS.credential.action_class,
+        method: (use.method ?? DEFAULTS.credential.method).toUpperCase(),
     };
     if (use.reason !== undefined)
         out.reason = use.reason;
     return out;
 }
+function normalizeRemoteBroker(broker) {
+    const out = {
+        kind: 'remote',
+        url: broker.url,
+        token_env: broker.token_env,
+        timeout_ms: broker.timeout_ms ?? DEFAULTS.credential.broker_timeout_ms,
+    };
+    if (broker.tenant !== undefined)
+        out.tenant = broker.tenant;
+    if (broker.user_env !== undefined)
+        out.user_env = broker.user_env;
+    if (broker.identity_jwt_env !== undefined)
+        out.identity_jwt_env = broker.identity_jwt_env;
+    if (broker.tool_id !== undefined)
+        out.tool_id = broker.tool_id;
+    if (broker.tool_version !== undefined)
+        out.tool_version = broker.tool_version;
+    return out;
+}
 function normalizeCredential(credential) {
     const out = {
         id: credential.id,
-        source: normalizeCredentialSource(credential.source),
         use: credential.use.map((use, i) => normalizeCredentialUse(use, i, credential.id)),
         ttl_seconds: credential.ttl_seconds ?? DEFAULTS.credential.ttl_seconds,
         timeout_ms: credential.timeout_ms ?? DEFAULTS.credential.timeout_ms,
         on_unresolved: credential.on_unresolved ?? DEFAULTS.credential.on_unresolved,
     };
+    // Validation guarantees exactly one of the two is present.
+    if (credential.source !== undefined)
+        out.source = normalizeCredentialSource(credential.source);
+    if (credential.broker !== undefined)
+        out.broker = normalizeRemoteBroker(credential.broker);
     if (credential.synthetic_env !== undefined)
         out.synthetic_env = credential.synthetic_env;
     if (credential.provider !== undefined)

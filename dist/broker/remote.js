@@ -1,13 +1,23 @@
 /**
  * RemoteBroker — the same exchange, answered by a real control plane.
  *
- * This is the reason the wire shape in `protocol.ts` is copied field for
- * field instead of being "inspired by": with a control plane reachable, the
- * gateway holds one of these instead of a `LocalBroker` and nothing above it
- * changes. It is the TypeScript twin of `packages/brokerclient/client.go`,
- * which both NHI data planes use, down to the rule that decides allow from
- * deny — the HTTP STATUS is the source of truth, not the body's `denied`
- * field, because a 403's body is the only one guaranteed to carry it.
+ * Two wire shapes, one class, one fail-closed rule:
+ *
+ *  - **`/broker/exchange`** (the default): the TypeScript twin of
+ *    `packages/brokerclient/client.go`, which both NHI data planes use, down
+ *    to the rule that decides allow from deny — the HTTP STATUS is the
+ *    source of truth, not the body's `denied` field, because a 403's body
+ *    is the only one guaranteed to carry it. Keyed by (data-plane instance,
+ *    synthetic).
+ *  - **`/v1/broker/user-token`** (`userToken` option; what `credentials[].
+ *    broker: { kind: remote }` wires): the per-user token endpoint of
+ *    cresec-ai/nhi `docs/internal/contracts/user-token.md`, keyed by (user,
+ *    connector, tool, action class, target). Request and response fields
+ *    are copied from that page and from `packages/contracts/src/user-token.ts`
+ *    byte for byte; the synthetic never leaves this process (it is what is
+ *    swapped, not what is sent) and is checked here against the credential
+ *    the site named, so a placeholder for one credential cannot buy another
+ *    credential's token.
  *
  * Transport is the sink's `sinkFetch` by default: HTTPS_PROXY/NO_PROXY
  * CONNECT tunnelling and split connect/total timeouts, with certificate
@@ -21,16 +31,57 @@
  * decision id, never an exception for the caller to interpret and never a
  * pass-through. The Go client returns an error there and leaves the choice to
  * its caller; we do not have that luxury on a forwarding path, so the choice
- * is made here and it is "no".
+ * is made here and it is "no". On the per-user path the code for "the
+ * control plane could not decide" is `control_plane_unavailable` (ADR 013),
+ * and the credential is absent — invariant 1 wins over invariant 8.
+ *
+ * What is never logged, recorded or quoted: the access token, the internal
+ * token, a response body. The token is registered as a brokered secret
+ * before it is returned, so no fingerprinting surface can hash it.
  */
 import { Buffer } from 'node:buffer';
 import { sinkFetch } from '../sink/http.js';
-import { denyResponse, newDecisionId } from './protocol.js';
+import { registerBrokeredSecret } from '../redact/redactor.js';
+import { denyResponse, hashSynthetic, mintPepper, newDecisionId, syntheticHashesEqual } from './protocol.js';
 /** Default round-trip budget: 5 s, the same the Go client's http.Client uses. */
 export const REMOTE_TIMEOUT_MS = 5_000;
+/** The endpoint path of user-token.md, relative to the control plane base. */
+export const USER_TOKEN_PATH = '/v1/broker/user-token';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A reason code as policy-decide.md spells them; anything else is not copied onto an event. */
+const REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+/** A path segment that names one thing rather than one kind of thing. */
+const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NUMERIC_SEGMENT = /^\d+$/;
+const HEX_SEGMENT = /^[0-9a-f]{12,}$/i;
+/** 16+ opaque characters with at least one digit: message ids, record ids, base64url handles. */
+const OPAQUE_SEGMENT = /^(?=.*\d)[A-Za-z0-9_.=-]{16,}$/;
+/**
+ * `target.path_template` "with identifiers replaced" (user-token.md; ADR 015
+ * in cresec-ai/nhi): every path segment that looks like an identifier —
+ * a uuid, a run of digits, long hex, or a long opaque token carrying a
+ * digit — becomes `{id}`, so a message id, a record id or a draft id in a
+ * URL argument never reaches the control plane's `policy_decision` row. A
+ * template says what KIND of thing was touched, not which. The tool name
+ * (a site with no URL argument) has no segments to replace and crosses as
+ * it is. Conservative by design: a segment this misses is one the
+ * operator's `path.allow` globs can still constrain, and the control plane
+ * records what it was given.
+ */
+export function templatePath(pathTemplate) {
+    if (pathTemplate === '' || !pathTemplate.startsWith('/'))
+        return pathTemplate;
+    return pathTemplate
+        .split('/')
+        .map((seg) => seg !== '' && (UUID_SEGMENT.test(seg) || NUMERIC_SEGMENT.test(seg) || HEX_SEGMENT.test(seg) || OPAQUE_SEGMENT.test(seg)) ? '{id}' : seg)
+        .join('/');
+}
 export class RemoteBroker {
     #opts;
     #warn;
+    /** Per-credential synthetic hashes, peppered per process, for the user-token path. */
+    #credentials = new Map();
+    #pepper;
     constructor(opts) {
         if (!opts.baseUrl)
             throw new Error('mcp-recorder: RemoteBroker needs a baseUrl');
@@ -38,13 +89,148 @@ export class RemoteBroker {
             throw new Error('mcp-recorder: RemoteBroker needs a dataPlaneInstanceId');
         }
         this.#opts = opts;
+        this.#pepper = mintPepper();
         this.#warn =
             opts.warn ??
                 ((line) => {
                     process.stderr.write(`mcp-recorder: ${line}\n`);
                 });
+        if (opts.userToken !== undefined) {
+            const ut = opts.userToken;
+            if (ut.tenant === '')
+                throw new Error('mcp-recorder: RemoteBroker user-token mode needs a tenant');
+            if (!UUID.test(ut.userId))
+                throw new Error('mcp-recorder: RemoteBroker user-token mode needs a uuid user id');
+            if (ut.tool.id === '' || ut.tool.version === '')
+                throw new Error('mcp-recorder: RemoteBroker user-token mode needs a tool id and version');
+            for (const [id, cred] of Object.entries(ut.credentials)) {
+                if (cred.synthetic === '')
+                    throw new Error(`mcp-recorder: credential "${id}" has no synthetic bound`);
+                this.#credentials.set(id, {
+                    syntheticHash: hashSynthetic(cred.synthetic, this.#pepper),
+                    connector: cred.connector,
+                    sites: cred.sites,
+                });
+            }
+        }
     }
-    async exchange(req) {
+    async exchange(req, hint) {
+        if (this.#opts.userToken !== undefined)
+            return this.#userToken(req, hint);
+        return this.#brokerExchange(req);
+    }
+    /* ----------------------- /v1/broker/user-token ---------------------- */
+    async #userToken(req, hint) {
+        const ut = this.#opts.userToken;
+        // The site names the credential; the synthetic must be the one bound to
+        // it. Both "unknown credential" and "wrong synthetic" answer the same
+        // code, so a caller learns nothing from the difference.
+        const cred = hint === undefined ? undefined : this.#credentials.get(hint.credential);
+        if (cred === undefined || hint === undefined)
+            return denyResponse(newDecisionId(), 'unknown_synthetic');
+        if (!syntheticHashesEqual(hashSynthetic(req.synthetic, this.#pepper), cred.syntheticHash)) {
+            return denyResponse(newDecisionId(), 'unknown_synthetic');
+        }
+        const site = cred.sites[hint.site];
+        if (site === undefined)
+            return denyResponse(newDecisionId(), 'denied_by_policy');
+        const url = `${this.#opts.baseUrl.replace(/\/+$/, '')}${USER_TOKEN_PATH}`;
+        const headers = {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            'x-cresec-tenant': ut.tenant,
+        };
+        if (this.#opts.authToken !== undefined)
+            headers.authorization = `Bearer ${this.#opts.authToken}`;
+        // user-token.md, "Request": every field under the contract's name.
+        // `host` lowercase and `method` uppercase are the contract's rules.
+        const body = JSON.stringify({
+            user_id: ut.userId,
+            connector: cred.connector,
+            tool: { id: ut.tool.id, version: ut.tool.version },
+            action_class: site.action_class,
+            target: { host: req.request.host.toLowerCase(), path_template: templatePath(req.request.path_template), method: site.method.toUpperCase() },
+            run_as: ut.runAs,
+            job_token: ut.jobToken ?? null,
+            run_id: ut.runId ?? null,
+        });
+        let res;
+        try {
+            res = await this.#fetch({ method: 'POST', url, headers, body, timeoutMs: this.#opts.timeoutMs ?? REMOTE_TIMEOUT_MS });
+        }
+        catch (err) {
+            // ADR 013: a connect error or a timeout means the control plane could
+            // not decide; the credential is absent and the call is denied.
+            this.#warn(`broker: ${USER_TOKEN_PATH} unreachable: ${err instanceof Error ? err.message : String(err)}`);
+            return denyResponse(newDecisionId(), 'control_plane_unavailable');
+        }
+        let parsed = undefined;
+        try {
+            parsed = JSON.parse(res.body);
+        }
+        catch {
+            parsed = undefined;
+        }
+        const obj = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : undefined;
+        const decisionId = obj !== undefined && typeof obj.decision_id === 'string' && UUID.test(obj.decision_id) ? obj.decision_id : newDecisionId();
+        const reasonOf = (fallback) => {
+            const reason = obj?.reason;
+            return typeof reason === 'string' && REASON_CODE.test(reason) ? reason : fallback;
+        };
+        if (res.status === 403) {
+            // The control plane's deny, with its reason; the status wins over the body.
+            return { decision_id: decisionId, ttl_seconds: 0, denied: true, deny_reason: reasonOf('policy_denied') };
+        }
+        if (res.status === 503) {
+            // "the decision was allow but the token could not be produced; the
+            // caller records a deny with the same reason" — vault_unavailable or
+            // connector_unavailable. Anything else on a 503 is the control plane
+            // being unavailable as a whole.
+            const reason = reasonOf('control_plane_unavailable');
+            const code = reason === 'vault_unavailable' || reason === 'connector_unavailable' ? reason : 'control_plane_unavailable';
+            this.#warn(`broker: ${USER_TOKEN_PATH} answered 503 (${code})`);
+            return denyResponse(decisionId, code);
+        }
+        if (res.status !== 200) {
+            this.#warn(`broker: ${USER_TOKEN_PATH} answered ${String(res.status)}`);
+            return denyResponse(decisionId, res.status >= 500 ? 'control_plane_unavailable' : 'broker_error');
+        }
+        if (obj === undefined) {
+            this.#warn(`broker: ${USER_TOKEN_PATH} body is not a JSON object`);
+            return denyResponse(decisionId, 'broker_error');
+        }
+        const token = obj.token;
+        const accessToken = typeof token === 'object' && token !== null && !Array.isArray(token)
+            ? token.access_token
+            : undefined;
+        if (typeof accessToken !== 'string' || accessToken === '') {
+            // A 200 with no token is not an allow. Fail closed rather than forward
+            // a call with nothing swapped into it.
+            this.#warn(`broker: ${USER_TOKEN_PATH} answered 200 with no token.access_token`);
+            return denyResponse(decisionId, 'broker_error');
+        }
+        // Registered BEFORE it is handed back, exactly as LocalBroker does: no
+        // fingerprinting surface may ever hash this value.
+        if (!registerBrokeredSecret(accessToken)) {
+            this.#warn('broker: brokered-secret exclusion set is full; denying rather than risk a fingerprint');
+            return denyResponse(decisionId, 'exclusion_capacity');
+        }
+        // `ttl_ms` is the degrade-cache bound (min(expires_at - now, 300000));
+        // the swap engine only uses it to size the reverse-scrub window. The
+        // contract's mapping is `ttl_seconds: floor(ttl_ms / 1000)`, and an
+        // allow whose ttl is missing, not a number, or under one second is a
+        // malformed allow — exactly as the /broker/exchange path treats a zero
+        // `ttl_seconds` — not a token to forward with a made-up lifetime.
+        const ttlMs = obj.ttl_ms;
+        const ttl = typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0 ? Math.floor(ttlMs / 1000) : 0;
+        if (ttl === 0) {
+            this.#warn(`broker: ${USER_TOKEN_PATH} answered 200 with no usable ttl_ms`);
+            return denyResponse(decisionId, 'broker_error');
+        }
+        return { real_token: accessToken, ttl_seconds: ttl, decision_id: decisionId };
+    }
+    /* --------------------------- /broker/exchange ------------------------ */
+    async #brokerExchange(req) {
         const url = `${this.#opts.baseUrl.replace(/\/+$/, '')}/broker/exchange`;
         const headers = {
             'content-type': 'application/json',

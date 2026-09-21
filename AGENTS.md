@@ -16,13 +16,26 @@ that tool version, injects that person's own credential, and writes a signed
 record. Two repositories build it. The control plane — identity gate,
 per-user credential vault, HTTPS egress gateway, policy, views — is
 [cresec-ai/nhi](https://github.com/cresec-ai/nhi)'s job (its share of
-Roadmap v2 runs through Phases 1–4 and 6; none of it is runnable from a clean
-checkout today). This package is the
+Roadmap v2 runs through Phases 1–4 and 6. From a clean checkout of that
+repository at `d1346a7` on branch `claude/routine-production-enterprise-mfrojx`,
+`node tests/e2e/scripts/stack-local.mjs` brings up the api, the gateway, six
+tool instances and the console against compose Postgres/OpenBao/NATS/OPA, and
+its S0–S16 stack suite passes — at **L1**: nothing is deployed anywhere and
+every vendor answer comes from a fake in its `tests/e2e/mocks/`). This package is the
 MCP gateway and the evidence chain. `docs/pov.md` says what this package
 contributes to the four-week proof of value, with a status on every
-capability, and what it must not be claimed to do (no per-user identity, no
-actor claims on events, no per-user token injection, no views, no degrade
-mode).
+capability, and what it must not be claimed to do. Three of those five limits
+still hold: no per-user identity (there is no Okta or OIDC code in this
+package), no views, and no degrade mode. Two no longer do. **Actor claims on
+events**: `identity.actor` (ADR 012's four fields) and `identity.actor_verified`
+are stamped on every event for `record`, `http` and `hook` when the recorder is
+started with `--identity-jwt` (`docs/event-schema.md:141-142`,
+`test/identity.test.ts`); without a JWT an event is unattributed, as before.
+**Per-user token injection**: `RemoteBroker` behind
+`credentials[].broker: { kind: remote }` fetches the person's own token per call
+from the control plane's `POST /v1/broker/user-token` (`src/broker/wire.ts`,
+`src/broker/remote.ts`, S17a in `test/e2e/http-gateway.e2e.test.ts`) — tested
+against a **fake** control plane only, never against the real one.
 
 The build brief's invariants that bind this repository, numbered as in the
 brief ([ClickUp](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638)):
@@ -48,8 +61,10 @@ events. Invariant 1 is not met by this package alone: the local broker keeps
 the real credential out of the model's context, the transcript and the chain
 at declared swap sites, but the secret is resolvable on the agent's own
 machine, so it is a context and audit control, not credential absence.
-Credential absence is the control plane's per-user injection (`RemoteBroker`,
-unwired). Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
+Credential absence is the control plane's per-user injection; `RemoteBroker`
+is its client, wired behind `credentials[].broker: { kind: remote }` against
+`POST /v1/broker/user-token`, tested against a fake control plane and not yet
+run against a real one. Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
 removes enforcement entirely and there is no read-only fallback. A PR that
 touches one of these says which. Package name, binary name, commands and the
 event schema do not change with the positioning.
@@ -120,10 +135,15 @@ setup hook calls the same script:
   stops reproducing `record.hash`. Never couple it to gateway enforcement —
   that is fail-CLOSED and decided entirely in-process. See docs/sink.md.
 
-- Gateway mode (`record --policy`) is the ONLY place the proxy may block,
-  delay or rewrite traffic, and only for `tools/call` requests and their
-  results. Without `--policy` the byte-for-byte, fail-open behaviour above is
-  untouched. Inside gateway mode, recording stays fail-open (a store failure
+- Gateway mode — `record --policy` over stdio and `http --policy` over the
+  streamable-HTTP transport (`src/cli.ts:219`, `--policy FILE   record / http`)
+  — is the ONLY place the proxy may block, delay or rewrite traffic, and only
+  for `tools/call` requests and their results. `src/proxy/http.ts:10` states the
+  same rule for the HTTP leg ("GATEWAY MODE (`opts.gateway` present, i.e.
+  `http --policy`) is the ONE place the above is set aside"); its tests are
+  `test/http-gateway.test.ts` and `test/http-gateway-failclosed.test.ts`.
+  Without `--policy` the byte-for-byte, fail-open behaviour above is
+  untouched, on both transports. Inside gateway mode, recording stays fail-open (a store failure
   never becomes a deny) while enforcement fails closed (an unevaluable policy
   or an unwritable hold is a deny). Hold files under `<data-dir>/holds/` and
   `policy_decision` events carry hashed arguments only — the no-readable-

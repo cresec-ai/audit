@@ -242,7 +242,10 @@ export class LocalBroker {
      * throw would leave the caller deciding what an exception means about
      * authorisation, and the answer has to be "no" in one shape only.
      */
-    async exchange(req, ctx = {}) {
+    async exchange(req, 
+    // The gateway passes a `BrokerExchangeHint` (which site asked); the
+    // local broker resolves by synthetic and reads only its own fields.
+    ctx = {}) {
         const decisionId = newDecisionId();
         try {
             return await this.#exchange(req, ctx, decisionId);
