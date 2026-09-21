@@ -345,8 +345,10 @@ credentials:
 A credential with `broker: { kind: remote }` has no local `source`: the
 gateway resolves it by calling the control plane's per-user token endpoint,
 `POST <url>/v1/broker/user-token`, exactly as
-[`docs/internal/contracts/user-token.md`](https://github.com/cresec-ai/nhi/blob/main/docs/internal/contracts/user-token.md)
-in cresec-ai/nhi specifies (the contract page spells the block
+[`docs/internal/contracts/user-token.md`](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/contracts/user-token.md)
+in cresec-ai/nhi specifies (that file, and all of
+`docs/internal/contracts/`, exists on the branch linked above and not on that
+repository's `main`) (the contract page spells the block
 `credentials.broker`; here `credentials` is a list, so the block sits on the
 credential it brokers). One call per mediated call, at the declared site and
 only there:
@@ -380,9 +382,9 @@ body says `vault_unavailable` or `connector_unavailable` is a deny with that
 reason. Any other `5xx`, a timeout (`timeout_ms`, default 5 000 ms) or a
 connection failure is a deny with reason **`control_plane_unavailable`** —
 never a crash, never a hang, never a forward: the credential is absent
-([ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md):
-invariant 1 wins over invariant 8; there is no read-only fallback in this
-leg).
+([ADR 013](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/013-degrade-mode.md),
+on that repository's branch rather than its `main`: invariant 1 wins over
+invariant 8; there is no read-only fallback in this leg).
 
 Every remote credential in one policy names the same control plane (same
 `url` and `token_env`). Local and remote credentials mix freely: the swap

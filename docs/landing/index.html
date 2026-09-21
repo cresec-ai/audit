@@ -102,9 +102,10 @@
     allowed, held or denied before it runs. With credential brokering, the real
     credential stays out of the model's context, the transcript and the evidence chain.
   </p>
+  <div class="install"><span class="dollar">$</span> npm install -g github:cresec-ai/audit#main</div>
   <div class="install"><span class="dollar">$</span> mcp-recorder setup --client claude-desktop</div>
   <p class="hero-links">
-    Transparent stdio proxy &middot; fail-open &middot; &lt;5ms p50 added latency &middot; GPL-3.0
+    Not on npm yet &mdash; install from git, as above &middot; Transparent stdio proxy &middot; fail-open &middot; &lt;5ms p50 added latency (stdio proxy, local fixture; not gateway mode, the HTTP transport or a control-plane hop) &middot; GPL-3.0
   </p>
 </header>
 
@@ -186,10 +187,21 @@ signed head: seq 17 by ed25519 c397380b4a18ee5a&hellip; at 2026-09-15T09:14:21.8
   <div class="cta">
     <h2>Built in the open. One design partner wanted.</h2>
     <p>
-      A four-week proof of value of Governed Tools: you bring an Okta admin, a Salesforce
+      A four-week proof of value of Governed Tools: you would bring an Okta admin, a Salesforce
       admin, a Google Workspace admin, one rep with a working Claude routine, and a named
       tool owner. Three admin actions, zero production traffic rerouted, no capture SDK.
       Week 3 ends with a signed evidence bundle your security team verifies offline.
+    </p>
+    <p>
+      <strong>Status, so nobody is surprised.</strong> The signed bundle and the offline
+      verifier are real today on the MCP leg: <code>mcp-recorder export</code> writes it and
+      the bundled <code>verify.cjs</code> checks it with bare Node, no install, no account,
+      no network. The rest of the four weeks is not runnable yet. The Cresec control plane
+      &mdash; the identity gate, the per-user credential vault and the HTTPS egress gateway &mdash;
+      passes its own end-to-end suite against <em>vendor fakes</em> on a branch of
+      <a href="https://github.com/cresec-ai/nhi">cresec-ai/nhi</a>, and is deployed nowhere.
+      No Okta, Salesforce or Google Workspace tenant has ever been connected. Talk to us about
+      being the first; do not expect to start next week.
     </p>
     <a class="btn solid" href="https://github.com/cresec-ai/audit">GitHub</a>
     <a class="btn" href="https://github.com/cresec-ai/audit/issues">Become the design partner</a>

@@ -144,8 +144,10 @@ Identity context stamped on **every** event ("identity-stamp everything").
 ### Actor claim (optional, additive)
 
 `identity.actor` carries the actor claim of
-[ADR 012](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/012-actor-claim.md)
-in the Cresec control plane, copied field for field from the **identity JWT**
+[ADR 012](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/012-actor-claim.md)
+in the Cresec control plane — on that repository's branch
+`claude/routine-production-enterprise-mfrojx`, not yet on its `main`, whose
+`docs/internal/adrs/` holds 001–011 only — copied field for field from the **identity JWT**
 the control plane mints for a signed-in person (`docs/internal/contracts/identity-jwt.md`
 there). It is a pure function of the token's claims: `user` from `sub`,
 `email`, `idp`, `idp_sub`; `tool` and `host` from the claims of the same

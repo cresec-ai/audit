@@ -256,13 +256,15 @@ warning line above) while the run step would exit 2 on it — read the
 validate step's output, or grep the policy for an `mcp:` section, if your
 runner's policy is generated rather than hand-written.
 
-`MCP_RECORDER_POLICY=/path/to/policy.yaml` is honoured by `record` when
-`--policy` is not given, which is convenient when the client's config is
-generated and you cannot edit its argv. Exporting it in a shell is safe:
-`mcp-recorder http` ignores the variable (it prints
-`http: MCP_RECORDER_POLICY ignored — gateway mode is available for the stdio
-transport only` on stderr and records as usual); only an explicit
-`http --policy` is an error.
+`MCP_RECORDER_POLICY=/path/to/policy.yaml` is honoured by **both** `record`
+and `http` when `--policy` is not given, which is convenient when the client's
+config is generated and you cannot edit its argv — `src/cli.ts:281` documents
+it as "same as `record --policy F` / `http --policy F`", and
+[features.md](features.md) says the same. The earlier refusal, in which `http`
+printed that gateway mode was available for the stdio transport only, is gone:
+gateway mode runs over both transports, so an exported `MCP_RECORDER_POLICY` is
+enforced by `http` exactly as by `record`. Export it deliberately, not by
+habit: every `http` process that inherits it becomes an enforcing gateway.
 
 To ship the same policy to the Cresec control plane (the hosted gateway and
 the sidecar consume Rego through its OPA bundle endpoint):
