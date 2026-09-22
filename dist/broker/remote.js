@@ -45,6 +45,12 @@ import { registerBrokeredSecret } from '../redact/redactor.js';
 import { denyResponse, hashSynthetic, mintPepper, newDecisionId, syntheticHashesEqual } from './protocol.js';
 /** Default round-trip budget: 5 s, the same the Go client's http.Client uses. */
 export const REMOTE_TIMEOUT_MS = 5_000;
+/**
+ * How long an observed control-plane outage refuses per-user token requests
+ * without asking, before one probe is let through (ADR 013; the corrected
+ * outage contract of ClickUp z8n6b5z9fd, 2026-09-21). See {@link RemoteBroker}.
+ */
+export const OUTAGE_COOLDOWN_MS = 5_000;
 /** The endpoint path of user-token.md, relative to the control plane base. */
 export const USER_TOKEN_PATH = '/v1/broker/user-token';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -76,9 +82,36 @@ export function templatePath(pathTemplate) {
         .map((seg) => seg !== '' && (UUID_SEGMENT.test(seg) || NUMERIC_SEGMENT.test(seg) || HEX_SEGMENT.test(seg) || OPAQUE_SEGMENT.test(seg)) ? '{id}' : seg)
         .join('/');
 }
+/**
+ * ## Degrade: fail closed, fast, and say so
+ *
+ * The per-user path has no fallback. The agent holds only a synthetic, and
+ * nothing here keeps a stored credential or a cached token to serve a read
+ * with (invariant 1 wins over invariant 8, ADR 013; the corrected contract
+ * says so for reads too), so a control plane that cannot be reached means
+ * the call is refused with `control_plane_unavailable` — never forwarded,
+ * never forwarded with the synthetic.
+ *
+ * What an outage must not do is cost every call the full round-trip budget.
+ * The first failure opens an outage window: for {@link OUTAGE_COOLDOWN_MS}
+ * every call that needs the control plane is refused at once, with the same
+ * code, without a request. After the window ONE call probes; the others are
+ * still refused until it answers. Any answer that shows the control plane is
+ * up (an allow, a deny, a 4xx, a 503 naming the vault or a connector) closes
+ * the window; a failed probe reopens it. Only admission is affected: a call
+ * already swapped and forwarded to the vendor is not recalled or cancelled.
+ *
+ * The outage is logged twice, at its start and its end, each line marked as
+ * this process's own observation — nothing here claims a complete outage
+ * history, and the chain holds exactly what happened to each call: a
+ * `policy_decision` whose `cresec.credential.deny_reason` is
+ * `control_plane_unavailable`.
+ */
 export class RemoteBroker {
     #opts;
     #warn;
+    #now;
+    #outage;
     /** Per-credential synthetic hashes, peppered per process, for the user-token path. */
     #credentials = new Map();
     #pepper;
@@ -89,6 +122,7 @@ export class RemoteBroker {
             throw new Error('mcp-recorder: RemoteBroker needs a dataPlaneInstanceId');
         }
         this.#opts = opts;
+        this.#now = opts.now ?? Date.now;
         this.#pepper = mintPepper();
         this.#warn =
             opts.warn ??
@@ -134,6 +168,65 @@ export class RemoteBroker {
         const site = cred.sites[hint.site];
         if (site === undefined)
             return denyResponse(newDecisionId(), 'denied_by_policy');
+        if (!this.#admit())
+            return denyResponse(newDecisionId(), 'control_plane_unavailable');
+        let res;
+        try {
+            res = await this.#userTokenRequest(ut, cred, site, req);
+        }
+        catch (err) {
+            // Not expected — the request path turns every failure into a deny —
+            // but a probe that threw must not leave the window stuck on "probing",
+            // which would refuse every later call for the life of the process.
+            this.#observeDown();
+            throw err;
+        }
+        if (res.denied === true && res.deny_reason === 'control_plane_unavailable')
+            this.#observeDown();
+        else
+            this.#observeUp();
+        return res;
+    }
+    /**
+     * May a request go to the control plane now? Closed window: yes. Open
+     * window: no, until it expires; then exactly one probe goes, and every
+     * other call is refused until that probe has answered.
+     */
+    #admit() {
+        const o = this.#outage;
+        if (o === undefined)
+            return true;
+        if (o.probing || this.#now() < o.retryAt) {
+            o.refused += 1;
+            return false;
+        }
+        o.probing = true;
+        return true;
+    }
+    #observeDown() {
+        const now = this.#now();
+        const cooldown = this.#opts.outageCooldownMs ?? OUTAGE_COOLDOWN_MS;
+        const o = this.#outage;
+        if (o === undefined) {
+            this.#outage = { since: now, retryAt: now + cooldown, probing: false, refused: 0 };
+            this.#warn(`broker: control plane unavailable (observed by this process at ${new Date(now).toISOString()}); ` +
+                `calls that need it are refused as control_plane_unavailable, with no credential fallback, ` +
+                `and one is let through every ${String(cooldown)} ms to probe`);
+            return;
+        }
+        o.retryAt = now + cooldown;
+        o.probing = false;
+    }
+    #observeUp() {
+        const o = this.#outage;
+        if (o === undefined)
+            return;
+        this.#outage = undefined;
+        const now = this.#now();
+        this.#warn(`broker: control plane reachable again at ${new Date(now).toISOString()} — unavailable for ` +
+            `${String(now - o.since)} ms as observed by this process, ${String(o.refused)} call(s) refused without asking it`);
+    }
+    async #userTokenRequest(ut, cred, site, req) {
         const url = `${this.#opts.baseUrl.replace(/\/+$/, '')}${USER_TOKEN_PATH}`;
         const headers = {
             'content-type': 'application/json',

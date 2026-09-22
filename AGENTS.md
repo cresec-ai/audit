@@ -24,9 +24,11 @@ its S0–S16 stack suite passes — at **L1**: nothing is deployed anywhere and
 every vendor answer comes from a fake in its `tests/e2e/mocks/`). This package is the
 MCP gateway and the evidence chain. `docs/pov.md` says what this package
 contributes to the four-week proof of value, with a status on every
-capability, and what it must not be claimed to do. Three of those five limits
+capability, and what it must not be claimed to do. Two of those five limits
 still hold: no per-user identity (there is no Okta or OIDC code in this
-package), no views, and no degrade mode. Two no longer do. **Actor claims on
+package) and no views. Three no longer do. **Degrade**: the MCP gateway
+fails closed when the control plane is unreachable, fast and retryable,
+with no credential or cached fallback (below, invariant 8). **Actor claims on
 events**: `identity.actor` (ADR 012's four fields) and `identity.actor_verified`
 are stamped on every event for `record`, `http` and `hook` when the recorder is
 started with `--identity-jwt` (`docs/event-schema.md:141-142`,
@@ -64,8 +66,14 @@ machine, so it is a context and audit control, not credential absence.
 Credential absence is the control plane's per-user injection; `RemoteBroker`
 is its client, wired behind `credentials[].broker: { kind: remote }` against
 `POST /v1/broker/user-token`, tested against a fake control plane and not yet
-run against a real one. Invariant 8 is not implemented here: `MCP_RECORDER_DISABLE=1`
-removes enforcement entirely and there is no read-only fallback. A PR that
+run against a real one. Invariant 8, as the corrected outage contract of
+[z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) (2026-09-21) reads it for
+the MCP leg, is fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). There is
+deliberately no read-only fallback: a tool that holds no secret has nothing
+to read with, and the contract forbids serving reads from a cached token.
+Only admission is affected; a call already forwarded is not recalled.
+`MCP_RECORDER_DISABLE=1` is unchanged and is not the degrade path: it removes
+recording and enforcement together. A PR that
 touches one of these says which. Package name, binary name, commands and the
 event schema do not change with the positioning.
 

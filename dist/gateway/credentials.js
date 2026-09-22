@@ -155,6 +155,13 @@ export const SWAP_DENY = {
  * code for the same class and is listed for that reason.
  */
 const RESOLUTION_FAILURE_CODES = new Set([
+    // The control plane could not be asked, or could not produce the token
+    // it decided to give (ADR 013; user-token.md, 503). Nobody decided "no":
+    // the refusal must read as retryable, not as the operator's policy.
+    'control_plane_unavailable',
+    'vault_unavailable',
+    'connector_unavailable',
+    'broker_unreachable',
     SWAP_DENY.timeout,
     SWAP_DENY.unavailable,
     SWAP_DENY.noToken,

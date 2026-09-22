@@ -102,9 +102,19 @@ export interface RemoteBrokerOptions {
         body: string;
     }>;
     warn?: (line: string) => void;
+    /** Per-user path only: see {@link OUTAGE_COOLDOWN_MS}. Tests shorten it. */
+    outageCooldownMs?: number;
+    /** Clock seam for the outage window. Tests inject; production gets `Date.now`. */
+    now?: () => number;
 }
 /** Default round-trip budget: 5 s, the same the Go client's http.Client uses. */
 export declare const REMOTE_TIMEOUT_MS = 5000;
+/**
+ * How long an observed control-plane outage refuses per-user token requests
+ * without asking, before one probe is let through (ADR 013; the corrected
+ * outage contract of ClickUp z8n6b5z9fd, 2026-09-21). See {@link RemoteBroker}.
+ */
+export declare const OUTAGE_COOLDOWN_MS = 5000;
 /** The endpoint path of user-token.md, relative to the control plane base. */
 export declare const USER_TOKEN_PATH = "/v1/broker/user-token";
 /**
@@ -120,6 +130,31 @@ export declare const USER_TOKEN_PATH = "/v1/broker/user-token";
  * records what it was given.
  */
 export declare function templatePath(pathTemplate: string): string;
+/**
+ * ## Degrade: fail closed, fast, and say so
+ *
+ * The per-user path has no fallback. The agent holds only a synthetic, and
+ * nothing here keeps a stored credential or a cached token to serve a read
+ * with (invariant 1 wins over invariant 8, ADR 013; the corrected contract
+ * says so for reads too), so a control plane that cannot be reached means
+ * the call is refused with `control_plane_unavailable` — never forwarded,
+ * never forwarded with the synthetic.
+ *
+ * What an outage must not do is cost every call the full round-trip budget.
+ * The first failure opens an outage window: for {@link OUTAGE_COOLDOWN_MS}
+ * every call that needs the control plane is refused at once, with the same
+ * code, without a request. After the window ONE call probes; the others are
+ * still refused until it answers. Any answer that shows the control plane is
+ * up (an allow, a deny, a 4xx, a 503 naming the vault or a connector) closes
+ * the window; a failed probe reopens it. Only admission is affected: a call
+ * already swapped and forwarded to the vendor is not recalled or cancelled.
+ *
+ * The outage is logged twice, at its start and its end, each line marked as
+ * this process's own observation — nothing here claims a complete outage
+ * history, and the chain holds exactly what happened to each call: a
+ * `policy_decision` whose `cresec.credential.deny_reason` is
+ * `control_plane_unavailable`.
+ */
 export declare class RemoteBroker implements Broker {
     #private;
     constructor(opts: RemoteBrokerOptions);
