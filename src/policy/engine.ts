@@ -18,6 +18,15 @@
  *   to be truncated, which let `"x".repeat(5000) + "rm -rf /"` sail through a
  *   `cmd: "rm -rf /"` deny rule, so an over-long value is now unevaluable and
  *   denies (see {@link VALUE_TOO_LONG}).
+ * - any_arg: one regex against every STRING LEAF of `input.args`, at any
+ *   depth and under any key — `walk(input.args, [_, v]); is_string(v);
+ *   regex.match(pat, v)` in the Rego twin, behind the same explicit
+ *   `is_object(input.args)`. The leaves are collected once and matched in ONE
+ *   bounded request, and a call whose arguments exceed the leaf/byte budget
+ *   is UNEVALUABLE and denies rather than being scanned in part. OPA has no
+ *   budget, so the two engines can differ only PAST it, in the safe
+ *   direction (local deny, control-plane allow) — the same residual the
+ *   `REGEX_VALUE_CAP` on `args` already has.
  * - max_args_bytes / max_body_bytes: `<=` on the caller-supplied byte count.
  *
  * Every `args` regex runs through `regex-guard.ts`, which matches it off the
@@ -36,9 +45,9 @@
  */
 
 import { globMatch } from './glob.js';
-import { RegexGuardError, matchBounded } from './regex-guard.js';
-import type { Action, EgressRule, McpRule, Policy } from './types.js';
-import { DEFAULTS, REGEX_VALUE_CAP } from './types.js';
+import { RegexGuardError, matchAnyBounded, matchBounded } from './regex-guard.js';
+import type { Action, AnyArgBudget, EgressRule, McpRule, Policy } from './types.js';
+import { ANY_ARG_MAX_BYTES, ANY_ARG_MAX_LEAVES, DEFAULTS, REGEX_VALUE_CAP } from './types.js';
 
 export interface McpRequestInput {
   server: string;
@@ -76,6 +85,36 @@ export interface Decision {
    * schema; no event gains a field.
    */
   failClosed?: true;
+  /**
+   * A STABLE machine label for WHY the gateway could not decide, set only
+   * beside `failClosed`. `reason` is free-form prose that names a rule id and
+   * a byte count; `errorCode` is the thing a person, a refusal clause and
+   * `mcp-recorder why` can all agree on.
+   *
+   * It exists because the three sides used to disagree: the model was told a
+   * RULE had denied it, the proxy's own stderr said `rule default`, and the
+   * recorded event carried neither — so `why` could explain nothing and the
+   * refusal told the model to retry a call that is refused identically every
+   * time. This is an internal TypeScript type; the event field it feeds
+   * (`policy_decision.error_code`) is an additive optional one.
+   */
+  errorCode?: PolicyErrorCode;
+}
+
+/**
+ * Why a fail-closed deny happened. Deliberately small and closed: each value
+ * has a remedy a person can act on, and a refusal clause of its own.
+ */
+export type PolicyErrorCode = 'arguments-too-large-to-scan' | 'value-too-long' | 'regex-timed-out' | 'policy-unevaluable';
+
+/** An internal evaluation failure that knows its own {@link PolicyErrorCode}. */
+export class PolicyEvalError extends Error {
+  readonly code: PolicyErrorCode;
+  constructor(message: string, code: PolicyErrorCode) {
+    super(message);
+    this.name = 'PolicyEvalError';
+    this.code = code;
+  }
 }
 
 export type McpDecision = Decision;
@@ -159,16 +198,17 @@ function argsMatch(args: Record<string, string>, input: unknown, ruleId: string)
     const s = coerceScalar(getPath(input, dotPath));
     if (s === undefined) return false;
     if (s === VALUE_TOO_LONG) {
-      throw new Error(
+      throw new PolicyEvalError(
         `args value at ${JSON.stringify(dotPath)} is longer than the ${REGEX_VALUE_CAP}-character regex cap` +
           ` and cannot be matched safely (${ruleId})`,
+        'value-too-long',
       );
     }
     let matched: boolean;
     try {
       matched = matchBounded(pattern, s);
     } catch (err) {
-      if (err instanceof RegexGuardError) throw new Error(`${err.message} (${ruleId})`);
+      if (err instanceof RegexGuardError) throw new PolicyEvalError(`${err.message} (${ruleId})`, 'regex-timed-out');
       throw err;
     }
     if (!matched) return false;
@@ -176,11 +216,90 @@ function argsMatch(args: Record<string, string>, input: unknown, ruleId: string)
   return true;
 }
 
-function mcpRuleMatches(rule: McpRule, input: McpRequestInput): boolean {
+/**
+ * Every string leaf of `root`, at any depth, in document order — the exact
+ * set `walk(input.args, [_, v]); is_string(v)` yields in Rego, minus object
+ * KEYS (a key is a path element there, never a value).
+ *
+ * Returns undefined when the root is not a plain object, which is
+ * `is_object(input.args)`: a `params.arguments` that is an array, a scalar
+ * or null matches no `any_arg` condition in either engine.
+ *
+ * Throws when the arguments exceed {@link ANY_ARG_MAX_LEAVES} or
+ * {@link ANY_ARG_MAX_BYTES}. It stops at the budget rather than collecting
+ * the rest, so a hostile payload cannot buy unbounded work by being refused
+ * — but it never returns a PARTIAL set, because a partial scan is a deny
+ * that silently became an allow. Traversal is iterative: a 10 000-deep
+ * argument tree must not be a stack overflow on the proxy thread.
+ */
+export function collectStringLeaves(root: unknown, budget?: AnyArgBudget): string[] | undefined {
+  const maxLeaves = budget?.max_leaves ?? ANY_ARG_MAX_LEAVES;
+  const maxBytes = budget?.max_bytes ?? ANY_ARG_MAX_BYTES;
+  if (typeof root !== 'object' || root === null || Array.isArray(root)) return undefined;
+  const leaves: string[] = [];
+  let bytes = 0;
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (typeof node === 'string') {
+      if (leaves.length >= maxLeaves) {
+        throw new PolicyEvalError(
+          `arguments too large to scan: more than ${maxLeaves} string values (raise mcp.any_arg.max_leaves, or split the call)`,
+          'arguments-too-large-to-scan',
+        );
+      }
+      bytes += Buffer.byteLength(node, 'utf8');
+      if (bytes > maxBytes) {
+        throw new PolicyEvalError(
+          `arguments too large to scan: more than ${maxBytes} bytes of string values (raise mcp.any_arg.max_bytes, or split the call)`,
+          'arguments-too-large-to-scan',
+        );
+      }
+      leaves.push(node);
+      continue;
+    }
+    if (Array.isArray(node)) {
+      for (let i = node.length - 1; i >= 0; i--) stack.push(node[i]);
+      continue;
+    }
+    if (typeof node === 'object' && node !== null) {
+      const entries = Object.keys(node as Record<string, unknown>);
+      for (let i = entries.length - 1; i >= 0; i--) stack.push((node as Record<string, unknown>)[entries[i] as string]);
+    }
+    // numbers, booleans, null, undefined: not strings, so `is_string(v)` is
+    // false for them in Rego too. Nothing to do.
+  }
+  return leaves;
+}
+
+/**
+ * `match.any_arg` for one rule. Throws when the arguments are past the scan
+ * budget or the regex is unevaluable — the caller's fail-closed path turns
+ * either into a deny naming `ruleId`, never a miss.
+ */
+function anyArgMatches(pattern: string, input: unknown, ruleId: string, budget: AnyArgBudget): boolean {
+  let leaves: string[] | undefined;
+  try {
+    leaves = collectStringLeaves(input, budget);
+  } catch (err) {
+    if (err instanceof PolicyEvalError) throw new PolicyEvalError(`${err.message} (${ruleId})`, err.code);
+    throw new PolicyEvalError(`${err instanceof Error ? err.message : String(err)} (${ruleId})`, 'policy-unevaluable');
+  }
+  if (leaves === undefined) return false;
+  try {
+    return matchAnyBounded(pattern, leaves);
+  } catch (err) {
+    if (err instanceof RegexGuardError) throw new PolicyEvalError(`${err.message} (${ruleId})`, 'regex-timed-out');
+    throw err;
+  }
+}
+
+function mcpRuleMatches(rule: McpRule, input: McpRequestInput, budget: AnyArgBudget): boolean {
   const m = rule.match;
   if (!m.server.some((g) => globMatch(g, '/', input.server))) return false;
   if (!m.tool.some((g) => globMatch(g, '/', input.tool))) return false;
   if (m.args !== undefined && !argsMatch(m.args, input.args, rule.id)) return false;
+  if (m.any_arg !== undefined && !anyArgMatches(m.any_arg, input.args, rule.id, budget)) return false;
   if (m.max_args_bytes !== undefined && !(input.argsBytes <= m.max_args_bytes)) return false;
   return true;
 }
@@ -212,7 +331,8 @@ function decide<R extends { id: string; action: Action; reason?: string }>(
 
 function evaluationError(err: unknown): Decision {
   const msg = err instanceof Error ? err.message : String(err);
-  return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}`, failClosed: true };
+  const code: PolicyErrorCode = err instanceof PolicyEvalError ? err.code : 'policy-unevaluable';
+  return { action: 'deny', matched: false, reason: `policy evaluation error: ${msg}`, failClosed: true, errorCode: code };
 }
 
 /**
@@ -223,7 +343,10 @@ export function evaluateMcp(policy: Policy, input: McpRequestInput): McpDecision
   try {
     const mcp = policy.mcp;
     if (mcp === undefined) return { action: DEFAULTS.mcp.default, matched: false };
-    return decide(mcp.rules, mcp.default, (rule) => mcpRuleMatches(rule, input));
+    // `any_arg` is absent on a policy object built before the budget was
+    // settable (normalizePolicy always fills it); the defaults stand in.
+    const budget: AnyArgBudget = mcp.any_arg ?? { max_leaves: ANY_ARG_MAX_LEAVES, max_bytes: ANY_ARG_MAX_BYTES };
+    return decide(mcp.rules, mcp.default, (rule) => mcpRuleMatches(rule, input, budget));
   } catch (err) {
     return evaluationError(err);
   }
@@ -244,7 +367,14 @@ export function evaluateEgress(policy: Policy, input: EgressRequestInput): Egres
   }
 }
 
-/** The rule id that produced a decision, or "default". */
+/**
+ * The rule id that produced a decision, or — for a fail-closed deny, where no
+ * rule decided anything — the stable error code. It is the label the proxy's
+ * own diagnostics print, and it must not read `default` for a refusal the
+ * default did not make: that is the disagreement that left a person with a
+ * client message naming one rule, a stderr line naming another and an event
+ * naming neither.
+ */
 export function ruleLabel(decision: Decision): string {
-  return decision.ruleId ?? 'default';
+  return decision.ruleId ?? decision.errorCode ?? 'default';
 }

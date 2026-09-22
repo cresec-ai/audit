@@ -28,6 +28,8 @@ export const DEFAULTS = {
         on_oversize: 'flag',
     },
     egress: { default: 'deny' },
+    /** `mcp.any_arg`: the scan budget a policy that says nothing gets. */
+    any_arg: { max_leaves: 256, max_bytes: 256 * 1024 },
     match: { server: '*', path: '/**' },
     credential: {
         /**
@@ -73,6 +75,14 @@ export const LIMITS = {
     credential_timeout_ms: { min: 100, max: 30_000 },
     /** AWS STS: 15 minutes to 12 hours. */
     aws_duration_seconds: { min: 900, max: 43_200 },
+    /**
+     * `mcp.any_arg`. The maxima bound how much work one hostile call can ask
+     * of the proxy thread the client is waiting on; the minima keep a policy
+     * from setting a budget so small that every real call is unscannable and
+     * therefore denied.
+     */
+    any_arg_max_leaves: { min: 16, max: 65_536 },
+    any_arg_max_bytes: { min: 4_096, max: 16 * 1024 * 1024 },
 };
 /** Identifier pattern shared by `name` and rule `id`. */
 export const ID_PATTERN = '^[A-Za-z0-9_.:/-]{1,64}$';
@@ -106,6 +116,22 @@ export const ROLE_ARN_PATTERN = '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$';
  * more permissive. Documented in `docs/policy.md`.
  */
 export const REGEX_VALUE_CAP = 4_096;
+/**
+ * `match.any_arg` DEFAULT budget: the most string leaves of one
+ * `params.arguments` the engine will scan when the policy does not say.
+ * Past it the call is denied fail-closed (`policy evaluation error:
+ * arguments too large to scan …`) rather than scanned in part — a partial
+ * scan is a deny that silently became an allow.
+ *
+ * A policy raises or lowers it with `mcp.any_arg: { max_leaves, max_bytes }`
+ * (docs/policy.md). The cliff is REACHABLE BY ORDINARY WORK: a 300 KiB file
+ * write, a bulk push, a long document. That is why it is settable, why the
+ * refusal says which of the two budgets it hit, and why it does not tell the
+ * model to retry — retrying the same call is refused identically.
+ */
+export const ANY_ARG_MAX_LEAVES = 256;
+/** `match.any_arg` DEFAULT budget: the most total UTF-8 bytes of leaf text scanned per call. */
+export const ANY_ARG_MAX_BYTES = 256 * 1024;
 /* ------------------------------- normalize -------------------------------- */
 function toList(v) {
     return typeof v === 'string' ? [v] : [...v];
@@ -137,6 +163,8 @@ function normalizeMcpRule(rule, index) {
     };
     if (rule.match.args !== undefined)
         match.args = { ...rule.match.args };
+    if (rule.match.any_arg !== undefined)
+        match.any_arg = rule.match.any_arg;
     if (rule.match.max_args_bytes !== undefined)
         match.max_args_bytes = rule.match.max_args_bytes;
     const out = { id: rule.id ?? autoRuleId(index), match, action: rule.action };
@@ -317,6 +345,10 @@ export function normalizePolicy(raw) {
                 injection: m.boundary?.injection ?? DEFAULTS.boundary.injection,
                 max_scan_bytes: m.boundary?.max_scan_bytes ?? DEFAULTS.boundary.max_scan_bytes,
                 on_oversize: m.boundary?.on_oversize ?? DEFAULTS.boundary.on_oversize,
+            },
+            any_arg: {
+                max_leaves: m.any_arg?.max_leaves ?? DEFAULTS.any_arg.max_leaves,
+                max_bytes: m.any_arg?.max_bytes ?? DEFAULTS.any_arg.max_bytes,
             },
         };
     }

@@ -9,6 +9,11 @@
  * Validation rejects the obvious shapes; this module is the guarantee that
  * holds whatever the pattern is.
  *
+ * One request may carry ONE value (`match.args`, one dot-path) or a LIST of
+ * them (`match.any_arg`, every string leaf of the arguments): the list is a
+ * single round trip under a single deadline, never one hop per leaf, and the
+ * worker stops at the first match.
+ *
  * How: a lazily created `worker_threads` Worker (inline source via
  * `new Worker(code, { eval: true })`, so it works identically from `src/`
  * under tsx and from the compiled `dist/`) does the matching, and the caller
@@ -130,3 +135,13 @@ export declare function warmRegexGuard(): boolean;
  *   is not provably linear.
  */
 export declare function matchBounded(pattern: string, value: string): boolean;
+/**
+ * `matchBounded` over a LIST: true when ANY value matches, under ONE
+ * deadline for the whole list. This is what `match.any_arg` runs — every
+ * string leaf of one call's arguments in a single request, never one round
+ * trip per leaf. An empty list never matches and costs nothing.
+ *
+ * Throws exactly what {@link matchBounded} throws, so the engine's
+ * fail-closed path is the same one.
+ */
+export declare function matchAnyBounded(pattern: string, values: readonly string[]): boolean;

@@ -51,6 +51,26 @@ export const POLICY_SCHEMA = {
                 rules: { type: 'array', items: { $ref: '#/$defs/mcpRule' } },
                 hold: { $ref: '#/$defs/hold' },
                 boundary: { $ref: '#/$defs/boundary' },
+                any_arg: { $ref: '#/$defs/anyArgBudget' },
+            },
+        },
+        anyArgBudget: {
+            type: 'object',
+            additionalProperties: false,
+            description: 'How much of one call\'s arguments match.any_arg may scan before the local engine denies fail-closed. Raising it scans MORE, never less.',
+            properties: {
+                max_leaves: {
+                    type: 'integer',
+                    minimum: LIMITS.any_arg_max_leaves.min,
+                    maximum: LIMITS.any_arg_max_leaves.max,
+                    description: 'Most string leaves scanned per call. Default 256.',
+                },
+                max_bytes: {
+                    type: 'integer',
+                    minimum: LIMITS.any_arg_max_bytes.min,
+                    maximum: LIMITS.any_arg_max_bytes.max,
+                    description: 'Most total UTF-8 bytes of leaf text scanned per call. Default 262144.',
+                },
             },
         },
         mcpRule: {
@@ -77,6 +97,12 @@ export const POLICY_SCHEMA = {
                 args: {
                     type: 'object',
                     description: 'Dot-path (a.b.0.c) -> RE2-compatible regex. Every value must be a string regex; all entries must match. A missing path never matches.',
+                },
+                any_arg: {
+                    type: 'string',
+                    minLength: 1,
+                    maxLength: 2048,
+                    description: 'One RE2-compatible regex searched against every STRING LEAF of params.arguments, at any depth and under any key; the rule matches when any one leaf matches. Object keys, numbers and booleans are not scanned. Arguments past the scan budget (256 leaves / 256 KiB) are unevaluable and deny.',
                 },
                 max_args_bytes: {
                     type: 'integer',

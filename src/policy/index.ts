@@ -14,3 +14,4 @@ export * from './redos.js';
 export * from './regex-guard.js';
 export * from './engine.js';
 export * from './rego.js';
+export * from './starter.js';

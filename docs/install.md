@@ -1,8 +1,20 @@
 # Install guide
 
-Canonical instructions for getting `mcp-recorder` in front of your MCP servers.
-For the story behind the tool, see the [README](../README.md); for the event
-format, see [docs/event-schema.md](event-schema.md).
+Canonical instructions for getting `mcp-recorder` in front of your MCP servers
+**as a gate**, and for the recording that sits underneath it. For the story
+behind the tool, see the [README](../README.md); for the event format, see
+[docs/event-schema.md](event-schema.md).
+
+**The short version.** Two typed commands and one client restart:
+
+```sh
+npm install -g github:cresec-ai/audit#main
+mcp-recorder protect --client claude-code
+```
+
+Then fully quit and restart your client and ask your agent to do something it
+should not. Everything after the [one-command way](#the-one-command-way-mcp-recorder-protect)
+is for people who want to know what that did, or who need to do it by hand.
 
 ## Requirements
 
@@ -24,7 +36,7 @@ today — but once it ships, this is the intended path and needs no separate
 install step:
 
 ```sh
-npx -y @edut/mcp-recorder --version
+npx -y @edut/mcp-recorder protect --client claude-code
 ```
 
 Watch the project for the npm release; the commands below (B) are the way to
@@ -79,14 +91,124 @@ npm install -g .       # optional: put `mcp-recorder` on your PATH from this clo
 client and each server's stdio, so the client's config just needs to launch
 the server *through* the recorder instead of directly.
 
-### The one-command way: `mcp-recorder setup`
+### The one-command way: `mcp-recorder protect`
+
+```sh
+mcp-recorder protect --client claude-code
+```
+
+```
+mcp-recorder protect --client <claude-desktop|claude-code|cursor> [--config PATH]
+                     [--data-dir D] [--settings PATH] [--no-probe] [--dry-run]
+```
+
+This is the command the product is about, and it is a thin front over the two
+below, not a third way to do their job:
+
+1. **Writes the starter policy** to `<data-dir>/policy.starter.yaml` — four
+   deny rules, three hold-for-approval rules, everything else runs — and, for
+   `claude-code`, its hook twin `policy.starter.json`. Both are written ONCE.
+   A second `protect` run leaves your edits exactly as you left them and says
+   so; that is what makes "this file is yours" true rather than claimed.
+2. **Runs `setup --client C --policy <that file>`** — the same code path, the
+   same timestamped backup and sidecar, so `mcp-recorder setup --client <same>
+   --undo` reverses it exactly.
+3. For `claude-code`, **runs `hook install --policy <the twin>`**. The hook is
+   the only thing that sees the Anthropic-hosted connectors (`mcp__ClickUp__*`,
+   `mcp__Gmail__*`, …) that no local proxy can reach — see
+   [docs/hooks.md](hooks.md).
+4. **Runs `doctor`** and prints its verdict last, so the final thing on screen
+   is a measurement rather than a claim. It exits non-zero when doctor found a
+   failure, so a scripted install cannot report success on a broken one.
+
+It ends by naming its own blind spots on screen, and by handing you a sentence
+to try — chosen from the tools `doctor` actually discovered on **your**
+servers, not from a canned script. If nothing you have is covered by any deny
+or hold rule, it says that instead, loudly, because that is the failure that
+does not otherwise report itself.
+
+`--dry-run` writes the starter policy (it has to exist to be inspected) and
+previews everything else without touching a config.
+
+**Then fully quit and restart your client.** Closing the window is not enough:
+MCP clients launch their stdio servers at startup, and Claude Code snapshots
+its hooks when a session begins. A policy installed mid-session is a false
+negative that looks exactly like the product failing.
+
+### Check it is really on: `mcp-recorder doctor`
+
+```sh
+mcp-recorder doctor --client claude-code
+mcp-recorder doctor --no-probe --json     # the CI pre-flight
+```
+
+Doctor answers one question — *is enforcement in force, right now, for the
+client that is actually running?* — and it is built to detect an **absence**,
+because that is the shape this product fails in: a policy that loads,
+validates and matches nothing, every call sailing through, and an evidence
+chain that looks perfectly healthy.
+
+Every check is tri-state, **OK / FAIL / INCOMPLETE**, and a check that could
+not be performed is INCOMPLETE and is never folded into OK.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | every check ran and every check passed |
+| `1` | at least one check FAILED |
+| `2` | doctor could not run at all (no config, unreadable policy, usage error) |
+| `3` | no failures, but at least one check was INCOMPLETE — never treat it as a pass |
+
+The six checks are C1 wiring, C2 hook, C3 tool-name spellings, C4 coverage
+against the tools your servers really expose, C5 a live denied call pushed
+through a real spawned proxy in a throwaway data dir, and C6 chain health. C3
+and C4 are the two that exist because of a specific failure: a run where the
+client's config keys and its `mcp__<server>__<tool>` names disagreed, both
+deny rules matched nothing, two live connector calls went through to a real
+workspace, and the 62-event signed bundle verified clean with zero policy
+decisions in it. C3 checks every deny rule against six spellings of every tool
+— including one nobody has ever observed — and fails a rule that is anchored
+to any of them. C4 fails when the deny-and-hold set is empty across every
+discovered tool.
+
+`--json` prints `{ verdict, checks[], policy, hook_policy, tools,
+gateway_servers, coverage, stdio, connectors }` and is the stable machine
+interface.
+
+**`protect` uses the same exit codes**, including `3` — an INCOMPLETE check is
+never a pass there either, so `mcp-recorder protect --client X && echo
+installed` cannot print that line over a server that failed to start during
+discovery and was therefore never checked against the policy. It applies one
+discount, and only one: `protect` writes `.claude/settings.json`, so running
+it from inside a live Claude Code session necessarily makes that session's
+hook snapshot stale. That C2 FAIL (`code: "stale-session"` in `--json`) is the
+correct consequence of a *successful* install and its remedy is the restart
+line `protect` already prints, so `protect` does not count it. `doctor`, which
+writes nothing, still reports it as a FAIL — a live session that began before
+the hook was installed really is ungoverned.
+
+### When something was stopped: `mcp-recorder why`
+
+```sh
+mcp-recorder why [--data-dir D] [--limit N] [--session ID] [--json]
+```
+
+Read-only over the evidence chain: what was stopped, why, what did and did not
+happen, and — for a deny — the file to open and the rule id to delete or
+narrow. The agent's own refusal deliberately does **not** carry that
+instruction; the agent under policy is exactly the party that must not be
+handed the command that relaxes it. `why` prints no argument or result text at
+all: every string it shows comes from your policy file, the tool name and the
+rule id.
+
+### Doing it yourself: `mcp-recorder setup`
 
 `setup` rewrites a client's MCP config in place, wrapping every stdio server
-entry with the recorder. Always preview first:
+entry with the recorder. Use it directly when you have a policy of your own,
+or when you want recording without enforcement. Always preview first:
 
 ```sh
 mcp-recorder setup --client claude-desktop --dry-run
-mcp-recorder setup --client claude-desktop
+mcp-recorder setup --client claude-desktop --policy /abs/path/policy.yaml
 ```
 
 ```
@@ -506,20 +628,27 @@ You can hand the install off to Claude itself — Claude Desktop or Claude
 Code — with a prompt like this. Copy it in as-is:
 
 ```
-Install @edut/mcp-recorder and wrap my MCP servers with it.
+Install @edut/mcp-recorder and put its starter policy in front of my MCP
+servers.
 
 1. It isn't on npm yet, so install it from git:
    npm install -g github:cresec-ai/audit#main
    Confirm with: mcp-recorder --version
 
-2. Run `mcp-recorder setup --client <claude-desktop|claude-code|cursor> --dry-run`
+2. Run `mcp-recorder protect --client <claude-desktop|claude-code|cursor> --dry-run`
    for my client (pick the one you're running in, or ask me). Show me the
-   diff it would make before changing anything.
+   diff it would make, and show me the starter policy it wrote, before
+   changing anything.
 
 3. Once I confirm, run the same command without --dry-run to apply it.
 
-4. Tell me to fully quit and restart the client — closing the window is not
-   enough, the MCP servers only reload on relaunch.
+4. Show me the whole `doctor:` block it prints at the end, unedited,
+   including any FAIL or INCOMPLETE lines. Do not summarise it as "done" or
+   "working" — a check that did not run is not a pass.
+
+5. Tell me to fully quit and restart the client — closing the window is not
+   enough, the MCP servers only reload on relaunch and hooks are captured
+   when a session starts.
 
 If I'm on Windows or WSL, follow the Windows and WSL section of
 docs/install.md and tell me which option you're using before changing
@@ -530,17 +659,33 @@ one config file is present.
 ```
 
 For this to work, Claude needs either a shell/terminal tool (to run `npm
-install` and `mcp-recorder setup`) or, at minimum, the ability to read and
+install` and `mcp-recorder protect`) or, at minimum, the ability to read and
 write the client's config file directly and reminders about the restart step.
 
 ## Check it works
 
-After wrapping a server and restarting the client, make one tool call
-through it (ask the agent to do something trivial, like listing files), then
-from a terminal:
+Start with the gate, because that is the part that can silently not be there:
 
 ```sh
-mcp-recorder sessions          # your session should show up: server, event/tool-call counts
+mcp-recorder doctor --client claude-code   # exit 0 = in force and matching your real tools
+```
+
+Then restart the client and ask the agent for something the policy stops (the
+sentence `protect` printed). The agent should come back refused, naming the
+rule. Then:
+
+```sh
+mcp-recorder why               # what was stopped, why, and how to change it
+```
+
+An expectation like "it blocked" is checked against the recorded evidence,
+never inferred from the session finishing: the failure mode here is an
+*absence*, which no command reports as an error unless it is looking for one.
+
+Then the evidence underneath:
+
+```sh
+mcp-recorder sessions          # your session should show up — DECISIONS counts the refusals
 mcp-recorder verify            # PASS — chain intact, head signature valid
 mcp-recorder ui                # opens the HTML replay timeline in your browser
 mcp-recorder query "<a value your call touched>"   # blast-radius: which sessions/events touched it

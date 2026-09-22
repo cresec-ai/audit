@@ -95,13 +95,52 @@ setup hook calls the same script:
 - `npm run demo` — scripted prompt-injection incident, recorded and verified.
 - `npm run bench` — latency gate (p50 added latency must stay under 5 ms).
 - `npm run bench:gateway` — the same round-trip measured with a policy in
-  force, so gateway-mode added latency is comparable to record mode. Opt-in;
-  it does not change `npm run bench` or its gate.
+  force, so gateway-mode added latency is comparable to record mode. The
+  policy it loads is the SHIPPED STARTER POLICY (`src/policy/starter.ts`), the
+  one `mcp-recorder protect` installs, because that is the number the product
+  owes rather than a number about a fixture — and it is the expensive shape:
+  four of its seven rules carry `match.any_arg`, which collects every string
+  leaf of the arguments and matches a regex against all of them. Opt-in; it
+  does not change `npm run bench` or its gate.
 - `npm run bench:boundary` — what the tool-result boundary filter costs
   synchronously on the forwarding path, by result size and content. Its ReDoS
   alarm is a ratio between cells of the same run (a scan that goes
   superlinear in input size), not a wall-clock threshold, so it holds on a
   loaded runner. Run by `npm test` and by CI.
+
+## Enforcement is the front door
+
+The first thing a newcomer meets is `mcp-recorder protect --client <C>`:
+enforcement selected in one command, with nothing to author. It materialises
+the starter policy (`src/policy/starter.ts`) into the data directory, drives
+the existing `setup --policy` and `hook install --policy` paths, and ends by
+running `doctor` so the last line on screen is a measurement rather than a
+claim. `docs/first-run.md` is the design; `README.md` and `docs/install.md`
+lead with it.
+
+This does NOT weaken the gateway-mode rule below. `protect` is a separate
+subcommand that WRITES files; `--protect` on `record`/`http` resolves to
+`<data-dir>/policy.starter.yaml` and never writes it (a missing starter file
+is exit 2 before the server is spawned, naming `protect`); and a starter
+policy sitting in the data directory is NOT an input to `resolvePolicyPath`.
+A bare `record` still takes the two-raw-`.pipe()` branch with no Transform,
+and `test/protect-doctor.test.ts` pins that with a byte-for-byte differential.
+Anything that makes a bare `record` start denying is a violation, not a
+feature.
+
+`mcp-recorder doctor` exists to detect an ABSENCE — the dogfood-4 shape, where
+a policy loads, validates and matches nothing while the chain looks healthy.
+Every check is tri-state (OK / FAIL / INCOMPLETE) and a check that could not
+be performed is never folded into OK; exit 3 means "nothing failed and
+something was unchecked". Anything that resolves a connector or a tool name is
+tested against BOTH orderings, key-matches-segment and key-does-not
+(`src/doctor/spellings.ts`).
+
+`mcp-recorder why` is the person's side of the refusal boundary. The text the
+model receives on a deny is unchanged (`src/gateway/boundary.ts`) and
+deliberately does not say how to relax a rule; `why` does, and it prints no
+argument or result text — every string it shows comes from the policy file,
+the tool name and the rule id.
 
 ## Rules that must hold
 
@@ -135,22 +174,36 @@ setup hook calls the same script:
   stops reproducing `record.hash`. Never couple it to gateway enforcement —
   that is fail-CLOSED and decided entirely in-process. See docs/sink.md.
 
-- Gateway mode — `record --policy` over stdio and `http --policy` over the
-  streamable-HTTP transport (`src/cli.ts:219`, `--policy FILE   record / http`)
+- Gateway mode — `record --policy` (or `--protect`, which resolves to
+  `<data-dir>/policy.starter.yaml` and nothing else) over stdio, and
+  `http --policy` / `http --protect` over the streamable-HTTP transport
   — is the ONLY place the proxy may block, delay or rewrite traffic, and only
-  for `tools/call` requests and their results. `src/proxy/http.ts:10` states the
+  for `tools/call` requests and their results. `src/proxy/http.ts` states the
   same rule for the HTTP leg ("GATEWAY MODE (`opts.gateway` present, i.e.
   `http --policy`) is the ONE place the above is set aside"); its tests are
   `test/http-gateway.test.ts` and `test/http-gateway-failclosed.test.ts`.
-  Without `--policy` the byte-for-byte, fail-open behaviour above is
-  untouched, on both transports. Inside gateway mode, recording stays fail-open (a store failure
+  Without one of those flags the byte-for-byte, fail-open behaviour above is
+  untouched, on both transports — the existence of a policy FILE never
+  switches enforcement on, only a flag or `MCP_RECORDER_POLICY` does. Inside gateway mode, recording stays fail-open (a store failure
   never becomes a deny) while enforcement fails closed (an unevaluable policy
   or an unwritable hold is a deny). Hold files under `<data-dir>/holds/` and
   `policy_decision` events carry hashed arguments only — the no-readable-
   payloads rule applies to them exactly as to the store. `policy.yaml` v1 is
   documented in `docs/policy.md` and its JSON Schema in
   `docs/policy-schema.json`; the TypeScript engine and the emitted Rego must
-  stay semantically identical (the OPA parity test enforces it).
+  stay semantically identical (the OPA parity test enforces it, and
+  `test/protect-doctor.test.ts` runs the same gate over the shipped starter
+  policy). `match.args` and `match.any_arg` both fail CLOSED past their
+  budgets: an over-long value, a timed-out regex, and arguments past the
+  256-leaf / 256-KiB `any_arg` scan budget are all denies, never truncated
+  scans — truncating turns a deny into an allow. That `any_arg` budget is
+  SETTABLE (`mcp.any_arg: { max_leaves, max_bytes }`) because the cliff is
+  reachable by ordinary work; raising it scans more, never less. A fail-closed
+  deny carries a stable `errorCode` that reaches three places which must keep
+  agreeing: the guidance clause the model reads, the `rule <label>` on stderr,
+  and `policy_decision.error_code` in the chain. `mcp-recorder why` explains
+  those refusals, and never attributes a reason or an "edit this file" remedy
+  to a policy file whose bytes do not hash to the decision's `policy_hash`.
 
 ## The repository records itself
 

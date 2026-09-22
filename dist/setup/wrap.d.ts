@@ -88,6 +88,20 @@ export declare function mergeWslEnv(existing: string | undefined, keys: readonly
  * see {@link buildWslWrappedEntry}); otherwise only `command`/`args` change. */
 export declare function buildWrappedEntry(name: string, original: ServerEntry, opts: WrapOpts): ServerEntry;
 /**
+ * The recorder's OWN arguments of a wrapped entry — everything between the
+ * command and the `--` that closes them — or undefined when the entry has no
+ * readable recorder-args segment. This is what `doctor` reads to answer "is
+ * this entry actually enforcing, and which policy?" without re-deriving the
+ * wrap shape.
+ */
+export declare function recorderPrefixArgs(entry: ServerEntry): string[] | undefined;
+/**
+ * The value of `--policy` (either spelling) in a wrapped entry's recorder
+ * arguments, or undefined when the entry carries none — which is the
+ * "recording only, nothing is enforced" state `doctor` C1 fails on.
+ */
+export declare function recorderPolicyArg(entry: ServerEntry): string | undefined;
+/**
  * Rewrite an ALREADY-wrapped entry so its recorder arguments carry
  * `--policy <policyPath>`: replacing the value of an existing `--policy`
  * (both the `--policy X` pair and the `--policy=X` spelling a hand edit may

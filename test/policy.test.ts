@@ -302,6 +302,7 @@ describe('validatePolicyObject: happy path', () => {
         ],
         hold: { timeout_ms: 60000, on_timeout: 'deny' },
         boundary: { secrets: 'redact', injection: 'flag', max_scan_bytes: 1048576, on_oversize: 'flag' },
+        any_arg: { max_leaves: 256, max_bytes: 262144 },
       },
       egress: {
         default: 'deny',
@@ -998,6 +999,7 @@ describe('normalizePolicy', () => {
         ],
         hold: { timeout_ms: 60000, on_timeout: 'deny' },
         boundary: { secrets: 'redact', injection: 'flag', max_scan_bytes: 1048576, on_oversize: 'flag' },
+        any_arg: { max_leaves: 256, max_bytes: 262144 },
       },
       egress: { default: 'deny', rules: [{ id: 'rule[0]', match: { host: ['h'], path: ['/**'] }, action: 'deny' }] },
     });
@@ -1023,6 +1025,7 @@ describe('normalizePolicy', () => {
       rules: [],
       hold: { timeout_ms: 60000, on_timeout: 'allow' },
       boundary: { secrets: 'off', injection: 'flag', max_scan_bytes: 1048576, on_oversize: 'flag' },
+      any_arg: { max_leaves: 256, max_bytes: 262144 },
     });
     expect('reason' in policy.mcp!).toBe(false);
     expect(JSON.parse(JSON.stringify(policy))).toEqual(policy); // JSON-plain
@@ -1797,6 +1800,7 @@ describe('evaluateMcp', () => {
       reason:
         'policy evaluation error: args value at "s" is longer than the 4096-character regex cap and cannot be matched safely (tail)',
       failClosed: true,
+      errorCode: 'value-too-long',
     });
     expect(coerceScalar('a'.repeat(REGEX_VALUE_CAP))).toHaveLength(REGEX_VALUE_CAP);
     expect(coerceScalar('a'.repeat(REGEX_VALUE_CAP + 1))).toBe(VALUE_TOO_LONG);
@@ -1904,6 +1908,9 @@ describe('evaluateMcp', () => {
       matched: false,
       reason: 'policy evaluation error: boom',
       failClosed: true,
+      // Nothing the engine can name: a stable code says only that no
+      // decision was reached, which is what `why` prints.
+      errorCode: 'policy-unevaluable',
     });
     // A malformed policy object (rules not iterable) is also caught.
     expect(evaluateMcp({ version: 1, mcp: { rules: null } } as unknown as Policy, { server: 's', tool: 't', args: {}, argsBytes: 2 }).action).toBe('deny');
@@ -1960,6 +1967,8 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
       reason: 'policy evaluation error: regex timed out (exfil-guard)',
       // An unevaluable regex is the gateway failing closed, not a decision.
       failClosed: true,
+      // The stable label the event, the stderr line and `why` all share.
+      errorCode: 'regex-timed-out',
     });
     // Without the guard this call alone is minutes long.
     expect(elapsed).toBeLessThan(5_000);
@@ -2071,6 +2080,7 @@ describe('evaluateMcp: args regexes run under a hard deadline', () => {
       matched: false,
       reason: 'policy evaluation error: regex could not be evaluated safely (guard worker unavailable) (exfil-guard)',
       failClosed: true,
+      errorCode: 'regex-timed-out',
     });
     expect(elapsed).toBeLessThan(1_000); // 40 s before the fix, at 30 characters
     expect(regexGuardState()).toMatchObject({ worker: false, degraded: true });

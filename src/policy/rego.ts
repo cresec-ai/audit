@@ -234,20 +234,36 @@ function mcpRuleBody(rule: McpRule): string[] {
   const lines: string[] = [];
   lines.push(...globLines(m.server, '/', 'input.server', 's'));
   lines.push(...globLines(m.tool, '/', 'input.tool', 'p'));
-  if (m.args !== undefined) {
+  if (m.args !== undefined || m.any_arg !== undefined) {
     // The ROOT must be a plain object, like `getPath` in the TS engine: an
     // array or scalar `params.arguments` is malformed per MCP and matches no
     // args condition in either engine. This used to be implicit in
     // `object.get`, which ERRORS on a non-object root — and an erroring
     // builtin is undefined, so the agreement rested on a silent failure.
     // Stated as a condition, it is the same answer for the same reason.
+    // `any_arg` needs it for its own reason: `walk` accepts any value, so
+    // without this line a STRING `params.arguments` would be walked and
+    // matched here and not in the local engine.
     lines.push('is_object(input.args)');
+  }
+  if (m.args !== undefined) {
     Object.entries(m.args).forEach(([dotPath, pattern], n) => {
       const v = `v${n}`;
       lines.push(`${v} := input.args${argsRef(dotPath)}`);
       lines.push(`type_name(${v}) in {"string", "number", "boolean"}`);
       lines.push(`regex.match(${q(toRe2Source(pattern))}, scalar_text(${v}))`);
     });
+  }
+  if (m.any_arg !== undefined) {
+    // Every string leaf at any depth, under any key. `walk` yields
+    // [path, value] pairs, so an object KEY is a path element and never a
+    // `value` — which is exactly the TypeScript engine's rule that keys are
+    // not scanned in v1. `some` declares the two variables explicitly so the
+    // module passes `opa check --strict`.
+    lines.push('some a_leaf');
+    lines.push('walk(input.args, [_, a_leaf])');
+    lines.push('is_string(a_leaf)');
+    lines.push(`regex.match(${q(toRe2Source(m.any_arg))}, a_leaf)`);
   }
   if (m.max_args_bytes !== undefined) lines.push(`input.args_bytes <= ${m.max_args_bytes}`);
   return lines;

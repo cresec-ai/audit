@@ -153,7 +153,7 @@ import { Transform } from 'node:stream';
 import { canonicalJson, sha256Ref } from '../chain/hash.js';
 import { applyBoundary, boundarySecretPatterns, deniedText, synthesizeDeniedResult, } from '../gateway/boundary.js';
 import { MAX_INFLIGHT_SWAPS, SWAP_DENY, swapDenyReason, unplannableSwap, } from '../gateway/credentials.js';
-import { evaluateMcp } from '../policy/engine.js';
+import { PolicyEvalError, evaluateMcp } from '../policy/engine.js';
 import { setRegexGuardDiag, warmRegexGuard } from '../policy/regex-guard.js';
 import { normalizePolicy } from '../policy/types.js';
 import { planSpawn, spawnWrapped, terminateChild, withNodeDirOnPath } from './spawn.js';
@@ -1884,6 +1884,7 @@ export async function runStdioProxy(opts) {
             // Same marker `evaluateMcp` sets for its own internal errors: nothing
             // was decided here, so the model is told it may retry.
             failClosed: true,
+            errorCode: err instanceof PolicyEvalError ? err.code : 'policy-unevaluable',
         });
         /**
          * Canonical JSON of a call's arguments, plus its hash. The canonical
@@ -1979,6 +1980,8 @@ export async function runStdioProxy(opts) {
                 call.reason = decision.reason;
             if (decision.failClosed === true)
                 call.failClosed = true;
+            if (decision.errorCode !== undefined)
+                call.errorCode = decision.errorCode;
             return { call, action: decision.action };
         };
         /* ---- events ---- */
@@ -2018,6 +2021,8 @@ export async function runStdioProxy(opts) {
             };
             if (call.ruleId !== undefined)
                 ev.rule_id = call.ruleId;
+            if (call.errorCode !== undefined)
+                ev.error_code = call.errorCode;
             if (hold !== undefined) {
                 ev.outcome = hold.outcome;
                 if (hold.approvalId !== undefined)
@@ -2084,6 +2089,8 @@ export async function runStdioProxy(opts) {
                 input.reason = call.reason;
             if (call.failClosed === true)
                 input.failClosed = true;
+            if (call.errorCode !== undefined)
+                input.errorCode = call.errorCode;
             if (hold !== undefined && hold.approvalId !== undefined) {
                 input.approvalId = hold.approvalId;
                 input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
@@ -2103,7 +2110,7 @@ export async function runStdioProxy(opts) {
                 return;
             }
             if (hold === undefined) {
-                diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
+                diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? call.errorCode ?? 'default'})`);
             }
         };
         /**
@@ -2826,7 +2833,7 @@ export async function runStdioProxy(opts) {
                 // it is refused and recorded, but not answered a second time.
                 claimed.add(pendingKey('c2s:', call.id));
                 answer(call.id, synthesizeDeny(refused));
-                diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
+                diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? call.errorCode ?? 'default'})`);
             });
             if (kept.length > 0)
                 forwardC2s(keptBatchBytes(line, raw, batch, keptIndexes));

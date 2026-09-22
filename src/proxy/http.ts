@@ -98,7 +98,7 @@ import {
   type SwapOutcome,
 } from '../gateway/credentials.js';
 import type { HoldRecord, HoldWaitResult } from '../gateway/holds.js';
-import { evaluateMcp, type McpDecision } from '../policy/engine.js';
+import { PolicyEvalError, evaluateMcp, type McpDecision, type PolicyErrorCode } from '../policy/engine.js';
 import { stampActor, type ActorStamp } from '../identity/stamp.js';
 import {
   INVALID_ID_TOOLS_CALL_MESSAGE,
@@ -851,6 +851,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
     swapAttributes?: Attributes;
     decisionId?: string;
     failClosed?: true;
+    /** The engine's stable code for a fail-closed refusal; see the stdio leg. */
+    errorCode?: PolicyErrorCode;
   }
   interface HoldResolution {
     outcome: HoldOutcome;
@@ -918,6 +920,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
             matched: false,
             reason: `policy evaluation error: ${err instanceof Error ? err.message : String(err)}`,
             failClosed: true,
+            errorCode: err instanceof PolicyEvalError ? err.code : 'policy-unevaluable',
           });
 
           const evaluate = (rawTool: string, args: unknown): { decision: McpDecision; argsHash: string } => {
@@ -969,6 +972,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
             }
             if (decision.reason !== undefined) call.reason = decision.reason;
             if (decision.failClosed === true) call.failClosed = true;
+            if (decision.errorCode !== undefined) call.errorCode = decision.errorCode;
             return { call, action: decision.action };
           };
 
@@ -1002,6 +1006,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
               decision_id: call.decisionId,
             };
             if (call.ruleId !== undefined) ev.rule_id = call.ruleId;
+            if (call.errorCode !== undefined) ev.error_code = call.errorCode;
             if (hold !== undefined) {
               ev.outcome = hold.outcome;
               if (hold.approvalId !== undefined) ev.approval_id = hold.approvalId;
@@ -1053,6 +1058,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
             if (call.rawRuleId !== undefined) input.ruleId = call.rawRuleId;
             if (call.reason !== undefined) input.reason = call.reason;
             if (call.failClosed === true) input.failClosed = true;
+            if (call.errorCode !== undefined) input.errorCode = call.errorCode;
             if (hold !== undefined && hold.approvalId !== undefined) {
               input.approvalId = hold.approvalId;
               input.outcome = hold.outcome === 'approved' ? 'session_end' : hold.outcome;
@@ -1069,7 +1075,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
             const response = synthesizeDeny(call, hold);
             respondJson(res, 200, response);
             if (diagLine !== undefined) diag(diagLine);
-            else if (hold === undefined) diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? 'default'})`);
+            else if (hold === undefined) diag(`gateway: denied tools/call "${call.tool}" (rule ${call.ruleId ?? call.errorCode ?? 'default'})`);
           };
 
           /** Register a forwarded tools/call so its response becomes the tool_call event. */
