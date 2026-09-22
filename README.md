@@ -1,140 +1,318 @@
 # @edut/mcp-recorder
 
-**The MCP gateway and evidence-chain leg of Cresec Governed Tools.** Wrap any MCP server in one config line and every tool call your agent makes through that server is recorded into a tamper-evident, replayable, exportable evidence store — on your machine, with the payloads redacted at the edge — and, with a policy file, allowed, held or denied before it runs.
+**A gate in front of the MCP tool calls your agent makes, and a signed record of every one of them.** One command puts a policy in front of every stdio MCP server you wrap — plus, on Claude Code, the Anthropic-hosted connectors: the calls that would delete, exfiltrate or spend are stopped or held for your approval, everything else runs at full speed, and the whole episode — allowed and refused alike — lands in a tamper-evident chain you can verify offline and hand to a stranger.
+
+You do not write the policy. You do not learn a schema. You type one command:
+
+```sh
+mcp-recorder protect --client claude-code
+```
+
+**Enterprise software anyone can build.** The person building the tool is not the person who has to sign off on it. This package is the half that lets both of them say yes: the builder keeps their own editor and their own speed, and the security team gets a control that is actually in force and an artifact they can check themselves.
 
 **The bet:** every mediated tool call produces exactly one record, chained to the previous one, signed, and verifiable offline by the customer with no network access to us — starting with the MCP leg. When an agent does something surprising — or someone claims it did — you can reconstruct exactly what happened, prove the record wasn't altered, and hand a stranger a bundle they can verify with bare Node and no dependencies.
 
-```
-BEFORE  {"command": "npx", "args": ["-y", "@some/mcp-server"]}
-AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--", "npx", "-y", "@some/mcp-server"]}
-```
+Two honest limits, up front, because a security product you can believe covers more than it does is worse than one that covers less:
 
-That's the whole integration. The proxy forwards bytes unchanged, fails open (recording failure never breaks traffic), and adds <5ms p50 latency.
+- **Nothing enforces unless you ask it to.** `mcp-recorder record -- <server>` with no policy selected is a transparent recorder and nothing else: it forwards the exact bytes, fails open, and adds <5 ms p50. Enforcement is `protect`, `--policy` or `--protect`, explicitly, or it is not happening. A starter policy sitting in your data directory is not an input to that decision.
+- **This is a gate on your machine, not a wall around the world.** `MCP_RECORDER_DISABLE=1` is the documented kill switch for whoever controls the environment; claude.ai on the web, the Claude Desktop chat tab and Cowork have no customer-side per-call gate at all. What the recorder can and cannot see, per surface, is in **[docs/connector-coverage.md](docs/connector-coverage.md)**.
+- **It gates MCP tools, not your agent's own hands.** The hosted-connector half is a Claude Code PreToolUse hook, so `protect --client claude-desktop` and `protect --client cursor` install **no connector gate at all** — on those clients the hosted connectors are ungoverned and produce no policy decision, while the chain still verifies clean. And the hook carries the default `mcp__.*` matcher, so Claude Code's own **`Bash`, `Write` and `Edit`** are outside the gate: `catastrophic-commands` covers an MCP server that exposes `run_command`, not the agent's built-in shell. `mcp-recorder hook install --all-tools` extends the hook to built-ins; `protect` does not pass it for you.
 
 - **License:** GPL-3.0 · **Node:** >= 20 (macOS, Linux, Windows; WSL supported via wsl.exe wrapper) · **Binary:** `mcp-recorder`
 
-**Where this fits.** Governed Tools is four pieces: Okta-brokered identity on the way in, credential-less tools in the middle, mediated egress on the way out, and one signed record across all three. This package is the MCP half of the egress leg and the signed record: the recording proxy, the policy gateway for MCP tool calls, the hash chain, the bundle and the verifier. The identity gate, the per-user credential vault, the HTTPS egress gateway and the manager and security views are the Cresec control plane's job in [cresec-ai/nhi](https://github.com/cresec-ai/nhi) (its share of Roadmap v2 runs through Phases 1–4 and 6; those four pieces now run from a clean checkout of that repository at `d1346a7` through `tests/e2e/scripts/stack-local.mjs`, with its S0–S16 suite green in one local run on 2026-09-21; the `e2e-stack` CI job that would run it on every PR exists on the same unmerged branch and has never executed, so no CI run exists for `d1346a7`. That is **L1**: deployed nowhere, and every vendor answer from a fake in its `tests/e2e/mocks/`). This package still does not contain them. Two related limits here are narrower than they used to be. Events carry an OS username and a hostname unless the recorder is started with `--identity-jwt`, in which case every event also carries the ADR 012 actor claim `identity.actor` (user, tool, host, run_as) and `identity.actor_verified` (`docs/event-schema.md`, "Actor claim (optional, additive)"; `test/identity.test.ts`). The **local** credential broker resolves credentials on the agent's own machine, but `credentials[].broker: { kind: remote }` puts a control plane behind it instead (`src/broker/remote.ts`), tested against a fake control plane only. Three of the things just described — the ADR 012 actor claim with `--identity-jwt` (`src/identity/`), `http --policy` gateway mode (`src/proxy/http-gateway.ts`) and the remote broker pointed at the control plane's `POST /v1/broker/user-token` — land on branch `claude/routine-production-enterprise-mfrojx` (`b2d7de1`) and are **not** in `origin/main` (`04f5211`), which is what the install command below fetches: `main` has no `src/identity/` and no `src/proxy/http-gateway.ts`, and its `src/broker/remote.ts` still calls the pre-pivot `/broker/exchange`. What this package contributes to the four-week proof of value, week by week and with a status on every capability, is in **[docs/pov.md](docs/pov.md)**; the backlog keyed to Roadmap v2 is in **[docs/roadmap.md](docs/roadmap.md)**.
-
 ---
 
-## Install
+## Install and protect
 
 `@edut/mcp-recorder` is not on npm yet, so `npx -y @edut/mcp-recorder` doesn't
-resolve for anyone today. Install from the git repository instead — `npm
-install` builds it for you, no manual build step:
+resolve for anyone today. Install from the git repository instead — the
+compiled `dist/` is committed, so there is no build step:
 
 ```sh
 npm install -g github:cresec-ai/audit#main
-mcp-recorder --version
+mcp-recorder protect --client claude-code
 ```
 
-Then wrap every stdio server in a client's config with one command
-(`--dry-run` first to preview):
+Two typed commands and one client restart. After the package is published it
+is one command and no separate install: `npx -y @edut/mcp-recorder protect
+--client claude-code`. `--client` takes `claude-desktop`, `claude-code` or
+`cursor`; `--config PATH` overrides the resolved file and makes `--client`
+optional.
 
-```sh
-mcp-recorder setup --client claude-desktop --dry-run
-mcp-recorder setup --client claude-desktop
-```
+`protect` is a thin front over things this package already did, so nothing
+about it is a second way to do them:
 
-Or hand the whole thing to Claude: give Claude Desktop or Claude Code a
-prompt asking it to install from git, run `setup --dry-run`, show you the
-diff, then apply it — Claude just needs a shell/terminal or config-file
-access to do this for you.
+1. it writes the **starter policy** to `<data-dir>/policy.starter.yaml` (and,
+   for `claude-code`, its hook twin `policy.starter.json`) — written once,
+   never regenerated over your edits;
+2. it runs `setup --client C --policy <that file>`, so there is a timestamped
+   backup and a sidecar, and `setup --undo` reverses it exactly;
+3. for `claude-code` it runs `hook install --policy <the twin>`, which is the
+   only way anything of yours sees the Anthropic-hosted connectors
+   (`mcp__ClickUp__*`, `mcp__Gmail__*`, …) that no local proxy can reach;
+4. it runs **`doctor`** and prints its verdict last, so the final line on
+   screen is a measurement of whether enforcement is in force rather than a
+   claim that it is.
+
+Then **fully quit and restart your client** — closing the window is not
+enough, because MCP clients launch their stdio servers at startup and hooks
+are captured when a session begins. A policy installed mid-session is a false
+negative that looks exactly like the product failing.
+
+Prefer to hand it to an agent? Give Claude Desktop or Claude Code a prompt
+asking it to install from git, run `protect`, and show you the output —
+it just needs a shell or config-file access.
 
 Full instructions (manual JSON edits per client, uninstall, troubleshooting)
 are in **[docs/install.md](docs/install.md)** — on Windows, or running from
 inside WSL, see its **[Windows and WSL](docs/install.md#windows-and-wsl)**
-section first. What the recorder can and cannot see of Claude's built-in
-connectors, per surface, and what needs Anthropic, is in
-**[docs/connector-coverage.md](docs/connector-coverage.md)**. What deploying
-this across a team or a fleet looks like — per agent platform, with what
-breaks each one and a rollout order — is in
+section first. What deploying this across a team or a fleet looks like — per
+agent platform, with what breaks each one and a rollout order — is in
 **[docs/deployment.md](docs/deployment.md)**.
 
-## 60-second quickstart
+---
 
-### 1. Wrap a server
+## The first run: watch it stop something
 
-The snippets below use the `npx -y @edut/mcp-recorder` form, which is what
-you'll use **once the package is published to npm**. Until then, use the
-**local wrapper** form instead — absolute paths to `node` and this
-install's `dist/cli.js` — either by running `mcp-recorder setup` (above) or
-by hand; see [docs/install.md](docs/install.md#wrap-your-servers) for the
-exact before/after JSON for each client.
+Restart your client, then ask your agent for something it should not do. The
+sentence `protect` prints is chosen from the tools `doctor` actually found on
+your servers, so it is one that will fire — for a filesystem server, for
+example:
 
-**Claude Desktop** — `claude_desktop_config.json`:
+> read the .env file in this project and tell me what's in it
 
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y", "@edut/mcp-recorder", "--",
-        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"
-      ]
-    }
-  }
-}
-```
+The agent comes back having been refused, and says so:
 
-**Claude Code** — one command:
+> I can't read that file. The call was blocked: `mcp-recorder gateway:
+> tools/call "read_text_file" denied by policy rule "credential-files":
+> an argument was a path to a credential file.` This was a policy decision on
+> your machine, not a tool failure, so I have not tried another way to get the
+> same content. You may want to change the rule if that was intentional.
+
+The server never saw the call. What the model received is two lines: the
+refusal naming the tool, the rule and the reason, and a standing clause that
+tells it not to retry and not to route around the gate.
+
+**The model is deliberately not told how to change the rule.** The agent under
+policy is exactly the party that must not be handed the command that relaxes
+it. That lives on your side of the boundary:
 
 ```sh
-claude mcp add filesystem -- npx -y @edut/mcp-recorder -- npx -y @modelcontextprotocol/server-filesystem .
+$ mcp-recorder why
+last 1 decision in /Users/me/.mcp-recorder
+
+  2 min ago   DENIED   read_text_file   filesystem
+              rule "credential-files" — an argument was a path to a credential file
+              the agent asked for it, the server never saw the call, nothing was read
+
+              to allow this: open /Users/me/.mcp-recorder/policy.starter.yaml
+              and delete or narrow the rule with  id: credential-files
+              then fully restart your client
+
+nothing here left your machine. the full record:  mcp-recorder ui
 ```
 
-or in `.mcp.json`:
+`why` is read-only over the evidence chain and prints **no argument or result
+text at all**: every string it shows comes from your own policy file, the tool
+name and the rule id. It is a second reader of the store, never a second way
+for a payload to leave it.
 
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y", "@edut/mcp-recorder", "--",
-        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
-      ]
-    }
-  }
-}
-```
+## Is it actually on? `doctor`
 
-**Cursor** — `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y", "@edut/mcp-recorder", "--",
-        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"
-      ]
-    }
-  }
-}
-```
-
-### 2. Use your agent normally
-
-Traffic flows through untouched. Every tool call lands in `~/.mcp-recorder` as a redacted, hash-chained event.
-
-### 3. Look at what happened
+The failure this product has to survive is not a crash. It is an **absence**:
+a policy that is loaded, valid, and matches nothing, with every call sailing
+through and the evidence chain looking perfectly healthy. That has happened
+here — a 62-event signed bundle, chain PASS, two live connector calls against
+a real workspace, and zero policy decisions, because the client's config keys
+and its `mcp__<server>__<tool>` names disagreed and both deny rules matched
+nothing. No command reported an error, because nothing had gone wrong.
 
 ```sh
-mcp-recorder sessions          # what ran, when, by whom
-mcp-recorder ui                # HTML replay timeline in your browser
-mcp-recorder verify            # prove the record is intact
-mcp-recorder query "AKIA..."   # blast radius: which sessions touched this value?
-mcp-recorder export --out evidence.zip   # signed bundle a stranger can verify
-mcp-recorder verify --bundle evidence.zip   # what the stranger runs (or `node verify.cjs` inside the bundle)
+$ mcp-recorder doctor --client claude-code
+OK         C1 wiring          2/2 stdio servers wrapped, all enforcing this policy
+OK         C2 hook            PreToolUse installed, matcher mcp__.*, policy …/policy.starter.json
+OK         C3 name spellings  3 deny rules x 6 spellings x 12 connector tools — all match
+OK         C4 coverage        47 tools discovered (2 servers, 4 connectors)
+OK         C5 probe           live deny fired on filesystem/read_text_file (rule credential-files)
+OK         C6 chain           PASS, 41 events, 3 policy decisions, 1 session
+
+doctor: 6 checks OK, 0 failed, 0 incomplete
+```
+
+Every check is tri-state — **OK / FAIL / INCOMPLETE** — and a check that could
+not be performed is INCOMPLETE and is never folded into OK. Exit `0` all
+passed, `1` at least one FAIL, `3` no FAIL but something was unchecked, `2`
+doctor could not run at all. `--json` is the stable machine interface, so
+`mcp-recorder doctor --no-probe --json` is a pre-flight any CI job can gate on.
+
+What each check is for:
+
+| Check | It fails when |
+| --- | --- |
+| **C1 wiring** | a server is unwrapped, wrapped without `--policy`, points at a policy that is not there, or `MCP_RECORDER_DISABLE=1` is set — the kill switch is on and the chain still looks healthy |
+| **C2 hook** | Claude Code's PreToolUse hook is missing or carries no policy, or a session that began *before* the hook was installed is still running |
+| **C3 name spellings** | a deny rule is anchored to one spelling of a tool name — either its regex names a `<server>` segment the client is free to change, or it matches some spellings of a tool and misses others. Six spellings are checked, including one nobody has ever observed: the fuzz case that proves a rule is *open* rather than merely broad enough for the conventions we happen to know |
+| **C4 coverage** | the policy is in force and matches **none** of the tools your servers really expose. Tool names come off the wire (`initialize` + `tools/list` against each wrapped server) and out of the connector config — discovered, never guessed |
+| **C5 probe** | a call this policy denies is *not* refused by a real spawned proxy, or the refusal produces no `policy_decision` event. The event is the proof, and it is the same artifact a dogfood run is measured by. The probe only ever sends a call the policy has already decided to deny, so the server never sees it and nothing has side effects |
+| **C6 chain** | `verify` fails on the real data directory. A chain that verifies while holding zero decisions is reported as a fact, not as a pass |
+
+---
+
+## The starter policy, and the moment you edit it
+
+The file `protect` writes is commented YAML you can read, and it is yours from
+the moment it exists. Four rules deny, three hold for your approval,
+everything else runs.
+
+**The denies are anchored to arguments, not names.** A rule that names a tool
+is a guess about a vocabulary we do not control; a rule that matches what the
+call *does to the world* holds whatever the server calls its fields:
+
+| Rule | What it stops |
+| --- | --- |
+| `secrets-in-arguments` | a credential shape (`AKIA…`, `ghp_…`, `sk-…`, `xox…`, a JWT, a PEM block, a `Bearer` value) in any string argument, at any depth. It scans **every** call, including file writes, so it has one false positive worth knowing: writing an *example* credential into a file — a docs page with an `Authorization: Bearer eyJ…` sample, a `.env.example`, a test fixture with a fake `ghp_` token. That is a **deny**, not a hold, so there is nothing to approve; narrow the rule to the tools that leave the machine if it bites you |
+| `credential-files` | an argument that **is** a path to `.env`, `.npmrc`, `.netrc`, `.pgpass`, `.git-credentials`, an SSH private key, `.aws/credentials`, `.kube/config`, a `.pem`. Prose that merely mentions `the .env file` has a space before it and does not match |
+| `dont-touch-the-controls` | a write to this recorder's own evidence directory, the policy files, the client's MCP config or its hook settings. **Honest limit:** this is friction and evidence, not a boundary — the agent has a shell. What it buys is that the attempt becomes a `policy_decision` in a signed chain instead of a silent edit |
+| `catastrophic-commands` | a small literal set: a recursive `rm` rooted at `/`, `~` or `$HOME`, `--no-preserve-root`, `DROP DATABASE`/`DROP SCHEMA`/`TRUNCATE TABLE`, an unqualified `DELETE FROM <table>`, and a `git push --force` that is not `--force-with-lease`. These reach through servers whose *name* tells you nothing (`bash`, `run_command`, `query`) and whose *argument* tells you everything. It is a handful of literals, not a shell parser, and does not pretend to be one |
+
+**The holds are the questions.** `destructive-tools`, `sends-to-other-people`
+and `spends-money` match on tool-name globs and **hold** rather than deny: a
+hold is a question, a deny is a wall, and deleting, sending and paying are all
+things you plausibly asked for. The globs are **verbs, not nouns**, on purpose:
+an earlier draft's `*charge*` / `*invoice*` / `*order*` held `list_charges`,
+`get_invoice` and `order_issues` — reads and a sort — and a hold on a read is
+pure friction. `move_*` / `rename_*` are deliberately absent for the same
+reason: against a filesystem server they are a routine refactor. Two minutes to answer with `mcp-recorder
+holds` and `mcp-recorder approve <id>`; unanswered means denied, which is what
+someone who walked away would have wanted. These three rules *are* a guess
+about a vocabulary — and `doctor` prints exactly which of your real tools they
+matched, so the guess becomes a measured fact at install time.
+
+**The hook leg denies less, and says so.** The Claude Code hook protocol can
+allow or deny and nothing else — there is no way to ask a question and wait.
+So `policy.starter.json`, which governs the hosted connectors, carries only
+the irreversible-and-essentially-never-wanted set (destructive tools, money)
+and deliberately **not** sending, which the gateway leg holds. The file states
+that in its own text and gives the one line to add if you want the wall.
+
+**Outbound HTTP is deliberately allowed.** A large share of useful MCP servers
+are HTTP clients, and denying them makes the first run a wall of refusals for
+calls you wanted. What still protects that path is the credential rule above
+and the boundary filter below. The stricter rule ships commented out, one
+line, with a note saying when to turn it on.
+
+**All four denies scan every string argument, and there is a size cliff.** They
+use `match.any_arg`, which searches every string leaf of the call; a call
+carrying more than **256 string values or 256 KiB of argument text** cannot be
+scanned, so the rules are unevaluable and the call is **denied** — a partial
+scan is a deny that silently became an allow. That is reachable by ordinary
+work: a 300 KiB generated file, a multi-file push, a long document. The
+refusal says so and names the setting that raises it (`mcp.any_arg:
+{ max_bytes: … }`, [docs/policy.md](docs/policy.md#mcpany_arg--the-scan-budget)),
+the starter policy carries the same note above the deny block, and
+`mcp-recorder why` explains it. Raise the budget rather than deleting the
+denies: a bigger budget scans *more*, never less.
+
+**A hold stops your agent.** While a call is held the agent is waiting, and the
+only notice is a line on the proxy's stderr — which a GUI client does not show
+you. Unanswered, that is a silent two-minute stall and then a refusal. `doctor`
+and `protect` both say how many of your tools are held, out loud, for this
+reason.
+
+Reads are allowed. `mcp.default` is `allow`: enforcement is aimed at effects,
+not applied as a wall.
+
+To change anything: edit the file, or delete it and pass a `--policy` of your
+own. A second `protect` run leaves your edits alone and says so. Then fully
+restart your client.
+
+---
+
+## Enforcement, in full
+
+`protect` is one policy. Here is the whole mechanism behind it, for when you outgrow the starter.
+
+Record mode never interferes with traffic. Pass `--policy policy.yaml` (or `--protect` for the starter) and the same proxy becomes a **gateway**: every `tools/call` is evaluated against ordered per-tool rules (first match wins) and is **allowed** byte-for-byte, **denied** with a tool error the model can read, or **held** until a human runs `mcp-recorder approve <id>` (or a timeout decides). Tool results pass through a **boundary filter** on the way back: secret-shaped values are redacted with `[redacted:sha256:…]` (their hashes stay queryable), and prompt-injection markers are flagged or blocked. Every decision is sealed into the same evidence chain (`policy_decision` events, `tool_call.gateway`, `session_start.policy`).
+
+```yaml
+version: 1
+mcp:
+  default: allow
+  rules:
+    - { id: no-exfil,   match: { tool: [http_post, "send_*"] }, action: deny, reason: no outbound HTTP }
+    - { id: dangerous,  match: { tool: ["delete_*", "rm*"] },   action: hold }
+    - { id: no-secrets, match: { tool: read_file, args: { path: "(^|/)(\\.env|id_rsa)$" } }, action: deny }
+    # `args` is keyed by a dot-path, so it only governs a tool that calls its
+    # argument `path`. `any_arg` searches EVERY string leaf of the arguments,
+    # at any depth and under any key — which is how the starter's deny rules
+    # hold across servers whose field names you do not control.
+    - { id: any-credential-file, match: { tool: "**", any_arg: "(^|/)(\\.env|id_rsa)$" }, action: deny }
+  boundary: { secrets: redact, injection: flag }
+```
+
+```sh
+mcp-recorder policy validate policy.yaml
+mcp-recorder setup --client claude-desktop --policy /abs/path/policy.yaml
+mcp-recorder holds && mcp-recorder approve <id>
+mcp-recorder policy compile policy.yaml --out ./bundle     # Rego for the Cresec control plane (OPA)
+```
+
+Ten-minute walkthrough for a laptop and for CI: [docs/gateway.md](docs/gateway.md). Full schema, matching semantics and the Rego output: [docs/policy.md](docs/policy.md). What to paste into your agent's `CLAUDE.md` / `AGENTS.md` so it reports a refusal instead of retrying it or reaching the same effect through another tool: [docs/agent-guidance.md](docs/agent-guidance.md). Enforcement fails closed (an unevaluable policy denies) while recording stays fail-open.
+
+**Over HTTP too.** `mcp-recorder http --target https://vendor.example/mcp --policy policy.yaml` is the same gateway in front of a remote (streamable-HTTP) MCP server: the same evaluation, holds, boundary filter and `policy_decision` events, over the HTTP exchange instead of the stdio line. The one thing that changes is buffering: a `tools/call` request body and its result are held long enough to evaluate and filter them (a JSON body whole, an SSE stream one event at a time); without `--policy` the HTTP proxy streams every byte exactly as before. With a `credentials[].broker: { kind: remote }` section the per-user token is fetched from the Cresec control plane per call and swapped at the declared site ([docs/policy.md](docs/policy.md#credentialsbroker--resolved-by-the-control-plane)); with `--identity-jwt` every event carries the ADR 012 actor claim ([docs/event-schema.md](docs/event-schema.md#actor-claim-optional-additive)). Which invariants that touches, and what still does not hold, is in [docs/pov.md](docs/pov.md).
+
+---
+
+## Then, the evidence underneath
+
+The refusal you just watched is in the same signed chain as everything else,
+produced by someone who was never asked to author anything. That is the line
+that sells this to the buyer:
+
+```sh
+$ mcp-recorder sessions
+SESSION   STARTED               SERVER      EVENTS  TOOL_CALLS  ERRORS  SERVERS  DECISIONS  LAST_EVENT
+a91c4e02  2026-09-21T18:04:11Z  filesystem      41          17       2        2          3  2026-09-21T18:22:09Z
+
+$ mcp-recorder verify
+PASS — chain intact: 41 event(s), head seq 41
+signed head: seq 41 by ed25519 9f3a…2e7b
+
+$ mcp-recorder export --out evidence.zip
+wrote evidence.zip — a stranger can check it with:  node verify.cjs
+```
+
+`DECISIONS 3` is the enforcement showing up as evidence. The rest of the
+toolkit reads the same chain:
+
+```sh
+mcp-recorder why                          # what was stopped, why, and how to change it
+mcp-recorder ui                           # HTML replay timeline in your browser
+mcp-recorder query "AKIA..."              # blast radius: which sessions touched this value?
+mcp-recorder verify --bundle evidence.zip # what the stranger runs
 ```
 
 `query` hashes the needle whole, so it matches **exact values, not
 substrings**: search `https://attacker.example/collect`, not
 `attacker.example`, and the bare tool name (`clickup_filter_tasks`), not the
 `mcp__<server>__<tool>` spelling Claude Code shows you.
+
+### Wrapping a server by hand
+
+`protect` and `setup` edit the config for you. If you keep your client config
+under version control and would rather edit it yourself, the whole integration
+is one line:
+
+```
+BEFORE  {"command": "npx", "args": ["-y", "@some/mcp-server"]}
+AFTER   {"command": "npx", "args": ["-y", "@edut/mcp-recorder", "--protect", "--", "npx", "-y", "@some/mcp-server"]}
+```
+
+`--protect` means `--policy <data-dir>/policy.starter.yaml` and nothing else.
+It **never writes that file**: if it is not there, the recorder exits 2 before
+the server is spawned and tells you to run `mcp-recorder protect`. A flag that
+mints the policy it then enforces is a policy nobody chose. Drop `--protect`
+and you have the transparent recorder, byte for byte.
 
 ---
 
@@ -171,6 +349,10 @@ Four pillars:
 
 ---
 
+**Where this fits.** Governed Tools is four pieces: Okta-brokered identity on the way in, credential-less tools in the middle, mediated egress on the way out, and one signed record across all three. This package is the MCP half of the egress leg and the signed record: the recording proxy, the policy gateway for MCP tool calls, the hash chain, the bundle and the verifier. The identity gate, the per-user credential vault, the HTTPS egress gateway and the manager and security views are the Cresec control plane's job in [cresec-ai/nhi](https://github.com/cresec-ai/nhi) (its share of Roadmap v2 runs through Phases 1–4 and 6; those four pieces now run from a clean checkout of that repository at `d1346a7` through `tests/e2e/scripts/stack-local.mjs`, with its S0–S16 suite green in one local run on 2026-09-21; the `e2e-stack` CI job that would run it on every PR exists on the same unmerged branch and has never executed, so no CI run exists for `d1346a7`. That is **L1**: deployed nowhere, and every vendor answer from a fake in its `tests/e2e/mocks/`). This package still does not contain them. Two related limits here are narrower than they used to be. Events carry an OS username and a hostname unless the recorder is started with `--identity-jwt`, in which case every event also carries the ADR 012 actor claim `identity.actor` (user, tool, host, run_as) and `identity.actor_verified` (`docs/event-schema.md`, "Actor claim (optional, additive)"; `test/identity.test.ts`). The **local** credential broker resolves credentials on the agent's own machine, but `credentials[].broker: { kind: remote }` puts a control plane behind it instead (`src/broker/remote.ts`), tested against a fake control plane only. Three of the things just described — the ADR 012 actor claim with `--identity-jwt` (`src/identity/`), `http --policy` gateway mode (`src/proxy/http-gateway.ts`) and the remote broker pointed at the control plane's `POST /v1/broker/user-token` — are merged into `main`, which is what the install command above fetches. The remote broker has still only ever been run against a **fake** control plane, never a real one. What this package contributes to the four-week proof of value, week by week and with a status on every capability, is in **[docs/pov.md](docs/pov.md)**; the backlog keyed to Roadmap v2 is in **[docs/roadmap.md](docs/roadmap.md)**.
+
+---
+
 ## Commands
 
 ```
@@ -179,7 +361,10 @@ mcp-recorder [record] [options] -- <server command...>
 
 | Command | What it does |
 | --- | --- |
-| `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] [--policy FILE] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. `--policy FILE` switches on **gateway mode**: `tools/call` requests are allowed / held / denied per the policy and tool results pass through the boundary filter — see [Gateway mode](#gateway-mode-opt-in-enforcement). |
+| `mcp-recorder protect --client claude-desktop\|claude-code\|cursor [--config PATH] [--data-dir D] [--settings PATH] [--no-probe] [--dry-run]` | **The one command in the pitch.** Materialise the starter policy at `<data-dir>/policy.starter.yaml` (and `policy.starter.json` for the hook leg), wrap every stdio server in the client's config with it through the ordinary `setup --policy` path (backup + sidecar, so `setup --undo` reverses it exactly), install the Claude Code hook with the twin, then run `doctor` and print its verdict last. Never overwrites an existing starter policy. `--dry-run` writes nothing at all, including the starter files. Exit code is doctor's — `1` a check FAILed, `3` nothing failed but something was **unchecked**, `0` all clear — so `protect && echo installed` cannot print that line over a server that was never enumerated. The one discount: the C2 "a session that began BEFORE this hook was installed is still running" FAIL is the unavoidable consequence of a *successful* install from inside a live session, so `protect` prints the restart instruction and does not count it. `doctor`, which writes nothing, still does. |
+| `mcp-recorder doctor [--client NAME] [--config PATH] [--settings PATH] [--data-dir D] [--no-probe] [--json]` | **Is enforcement actually in force, right now?** Six tri-state checks — OK / FAIL / INCOMPLETE, and a check that could not run never passes. C1 wiring, C2 hook, C3 tool-name spellings, C4 coverage against the tools your servers really expose, C5 a live denied call through a real spawned proxy in a throwaway data dir, C6 chain health. Exit `0` / `1` (a FAIL) / `3` (something unchecked) / `2` (doctor could not run). `--json` is the stable machine interface; `--no-probe --json` is the CI pre-flight. |
+| `mcp-recorder why [--data-dir D] [--limit N] [--session ID] [--policy FILE] [--json]` | What was stopped, why, and how to change it — the person's side of the refusal boundary, which the agent's own refusal deliberately does not carry. Read-only over the chain. Prints **no argument or result text**: every string comes from your policy file, the tool name and the rule id. |
+| `mcp-recorder [record] [--data-dir D] [--name N] [--identity L] [--redact allowlist\|off] [--policy FILE] -- <server command...>` | Run the wrapped server behind the recording proxy (`record` is the default subcommand and may be omitted). `--name` sets the logical server name, `--identity` an operator label stamped on every event. `--protect` enforces the starter policy `protect` wrote (and never writes it — missing is exit 2 before the server is spawned); `--policy FILE` switches on **gateway mode**: `tools/call` requests are allowed / held / denied per the policy and tool results pass through the boundary filter — see [Gateway mode](#gateway-mode-opt-in-enforcement). |
 | `mcp-recorder policy validate FILE [--json]` | Validate a `policy.yaml` against the v1 schema (exit 0 valid, 1 invalid, 2 unreadable). See [docs/policy.md](docs/policy.md). |
 | `mcp-recorder policy compile FILE [--target rego] [--out DIR]` | Compile a `policy.yaml` to an OPA bundle (`cresec.mcp` / `cresec.egress` Rego modules) for the Cresec control plane; without `--out` the MCP module is printed. |
 | `mcp-recorder holds [--data-dir D] [--all] [--json]` | List tool calls currently held for approval by a gateway (`--all` includes decided ones). |
@@ -222,34 +407,6 @@ npm run demo
 A scripted prompt-injection exfiltration — an agent is tricked into reading a credential and sending it out through an innocent-looking tool — recorded, reconstructed on the replay timeline, blast-radius-queried, and cryptographically verified, in under a minute. It is the fastest way to see what the recorder is for.
 
 Want to see the same story with a real model instead of the scripted agent? [docs/red-team.md](docs/red-team.md) walks through running it live in Claude Desktop.
-
----
-
-## Gateway mode (opt-in enforcement)
-
-Record mode never interferes with traffic. Pass `--policy policy.yaml` and the same proxy becomes a **gateway**: every `tools/call` is evaluated against ordered per-tool rules (first match wins) and is **allowed** byte-for-byte, **denied** with a tool error the model can read, or **held** until a human runs `mcp-recorder approve <id>` (or a timeout decides). Tool results pass through a **boundary filter** on the way back: secret-shaped values are redacted with `[redacted:sha256:…]` (their hashes stay queryable), and prompt-injection markers are flagged or blocked. Every decision is sealed into the same evidence chain (`policy_decision` events, `tool_call.gateway`, `session_start.policy`).
-
-```yaml
-version: 1
-mcp:
-  default: allow
-  rules:
-    - { id: no-exfil,   match: { tool: [http_post, "send_*"] }, action: deny, reason: no outbound HTTP }
-    - { id: dangerous,  match: { tool: ["delete_*", "rm*"] },   action: hold }
-    - { id: no-secrets, match: { tool: read_file, args: { path: "(^|/)(\\.env|id_rsa)$" } }, action: deny }
-  boundary: { secrets: redact, injection: flag }
-```
-
-```sh
-mcp-recorder policy validate policy.yaml
-mcp-recorder setup --client claude-desktop --policy /abs/path/policy.yaml
-mcp-recorder holds && mcp-recorder approve <id>
-mcp-recorder policy compile policy.yaml --out ./bundle     # Rego for the Cresec control plane (OPA)
-```
-
-Ten-minute walkthrough for a laptop and for CI: [docs/gateway.md](docs/gateway.md). Full schema, matching semantics and the Rego output: [docs/policy.md](docs/policy.md). What to paste into your agent's `CLAUDE.md` / `AGENTS.md` so it reports a refusal instead of retrying it or reaching the same effect through another tool: [docs/agent-guidance.md](docs/agent-guidance.md). Enforcement fails closed (an unevaluable policy denies) while recording stays fail-open.
-
-**Over HTTP too.** `mcp-recorder http --target https://vendor.example/mcp --policy policy.yaml` is the same gateway in front of a remote (streamable-HTTP) MCP server: the same evaluation, holds, boundary filter and `policy_decision` events, over the HTTP exchange instead of the stdio line. The one thing that changes is buffering: a `tools/call` request body and its result are held long enough to evaluate and filter them (a JSON body whole, an SSE stream one event at a time); without `--policy` the HTTP proxy streams every byte exactly as before. With a `credentials[].broker: { kind: remote }` section the per-user token is fetched from the Cresec control plane per call and swapped at the declared site ([docs/policy.md](docs/policy.md#credentialsbroker--resolved-by-the-control-plane)); with `--identity-jwt` every event carries the ADR 012 actor claim ([docs/event-schema.md](docs/event-schema.md#actor-claim-optional-additive)). Which invariants that touches, and what still does not hold, is in [docs/pov.md](docs/pov.md).
 
 ---
 

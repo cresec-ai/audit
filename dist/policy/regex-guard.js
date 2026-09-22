@@ -9,6 +9,11 @@
  * Validation rejects the obvious shapes; this module is the guarantee that
  * holds whatever the pattern is.
  *
+ * One request may carry ONE value (`match.args`, one dot-path) or a LIST of
+ * them (`match.any_arg`, every string leaf of the arguments): the list is a
+ * single round trip under a single deadline, never one hop per leaf, and the
+ * worker stops at the first match.
+ *
  * How: a lazily created `worker_threads` Worker (inline source via
  * `new Worker(code, { eval: true })`, so it works identically from `src/`
  * under tsx and from the compiled `dist/`) does the matching, and the caller
@@ -108,7 +113,14 @@ parentPort.on('message', (msg) => {
       if (cache.size >= ${REGEX_CACHE_SIZE}) cache.clear();
       cache.set(msg.p, re);
     }
-    out = re.test(msg.v) ? ${MATCH} : ${NO_MATCH};
+    if (Array.isArray(msg.vs)) {
+      out = ${NO_MATCH};
+      for (let i = 0; i < msg.vs.length; i++) {
+        if (re.test(msg.vs[i])) { out = ${MATCH}; break; }
+      }
+    } else {
+      out = re.test(msg.v) ? ${MATCH} : ${NO_MATCH};
+    }
   } catch {
     out = ${BAD_PATTERN};
   }
@@ -391,14 +403,28 @@ function noteRefusal(pattern, why) {
  * poisoned: it can cost the proxy one over-budget match, never two, and never
  * an allow.
  */
-function matchInThread(pattern, re, value) {
-    const why = checkProvablyLinear(pattern, value.length);
+function matchInThread(pattern, re, values) {
+    // The longest value is what bounds the work: `checkProvablyLinear` is a
+    // statement about this pattern against an input of that size, and a list
+    // is scanned under ONE deadline, so the longest leaf is the one that can
+    // overrun it.
+    let longest = 0;
+    for (const v of values)
+        if (v.length > longest)
+            longest = v.length;
+    const why = checkProvablyLinear(pattern, longest);
     if (why !== undefined) {
         noteRefusal(pattern, why);
         throw new RegexGuardError('unavailable', 'regex could not be evaluated safely (guard worker unavailable)');
     }
     const started = performance.now();
-    const matched = re.test(value);
+    let matched = false;
+    for (const v of values) {
+        if (re.test(v)) {
+            matched = true;
+            break;
+        }
+    }
     if (performance.now() - started > deadlineMs) {
         poison(pattern);
         throw timedOut();
@@ -416,22 +442,45 @@ function matchInThread(pattern, re, value) {
  *   is not provably linear.
  */
 export function matchBounded(pattern, value) {
+    return matchValues(pattern, [value], { p: '', v: value });
+}
+/**
+ * `matchBounded` over a LIST: true when ANY value matches, under ONE
+ * deadline for the whole list. This is what `match.any_arg` runs — every
+ * string leaf of one call's arguments in a single request, never one round
+ * trip per leaf. An empty list never matches and costs nothing.
+ *
+ * Throws exactly what {@link matchBounded} throws, so the engine's
+ * fail-closed path is the same one.
+ */
+export function matchAnyBounded(pattern, values) {
+    if (values.length === 0) {
+        // Still compile, so a pattern V8 rejects is a SyntaxError here too
+        // rather than an answer that depends on the arguments being empty.
+        compile(pattern);
+        if (poisoned.has(pattern))
+            throw timedOut();
+        return false;
+    }
+    return matchValues(pattern, values, { p: '', vs: values });
+}
+function matchValues(pattern, values, payload) {
     const { re, source } = compile(pattern); // compiling is linear; only matching can blow up
     if (poisoned.has(pattern))
         throw timedOut();
     const guard = ensureWorker();
     if (guard === undefined)
-        return matchInThread(pattern, re, value);
+        return matchInThread(pattern, re, values);
     const { ctrl } = guard;
     Atomics.store(ctrl, RESULT, NO_MATCH);
     Atomics.store(ctrl, STATE, 0);
     try {
-        guard.worker.postMessage({ p: source, v: value });
+        guard.worker.postMessage({ ...payload, p: source });
     }
     catch (err) {
         dropWorker();
         diag(`policy: regex worker post failed (${err instanceof Error ? err.message : String(err)})`);
-        return matchInThread(pattern, re, value);
+        return matchInThread(pattern, re, values);
     }
     let waited;
     try {
@@ -443,7 +492,7 @@ export function matchBounded(pattern, value) {
         // rather than turning the bounded path off for the whole process.
         dropWorker();
         degrade(err instanceof Error ? err.message : String(err));
-        return matchInThread(pattern, re, value);
+        return matchInThread(pattern, re, values);
     }
     if (waited === 'timed-out') {
         dropWorker(); // the worker is stuck inside the regex; it never comes back
@@ -455,7 +504,7 @@ export function matchBounded(pattern, value) {
     // The worker refused a pattern this thread just compiled: fall back rather
     // than guess, so the two engines can never disagree silently.
     if (result === BAD_PATTERN)
-        return matchInThread(pattern, re, value);
+        return matchInThread(pattern, re, values);
     return result === MATCH;
 }
 //# sourceMappingURL=regex-guard.js.map

@@ -6,6 +6,8 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
@@ -47,6 +49,35 @@ describe('npm pack --dry-run', () => {
     expect(files).toContain('dist/cli.js');
     expect(files).toContain('docs/event-schema.md');
     expect(files).toContain('docs/policy-schema.json');
+    // The enforcement-first entry points, and the doc README and
+    // docs/gateway.md both link to.
+    expect(files).toContain('dist/doctor/run.js');
+    expect(files).toContain('dist/policy/starter.js');
+    expect(files).toContain('docs/first-run.md');
+  });
+
+  it('is publishable so a STRANGER can npx it', () => {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
+      name: string;
+      bin: Record<string, string>;
+      publishConfig?: { access?: string };
+      scripts: Record<string, string>;
+    };
+    // `@edut/...` is SCOPED, and npm defaults a scoped package to
+    // `restricted` — which a stranger cannot install at all, and which a free
+    // account cannot publish. `npx @edut/mcp-recorder` working for someone
+    // who has never heard of us is the whole pitch, so pin it.
+    expect(pkg.name.startsWith('@')).toBe(true);
+    expect(pkg.publishConfig?.access).toBe('public');
+    // The bin npx resolves, present in the tarball, with a shebang.
+    expect(files).toContain(pkg.bin['mcp-recorder']);
+    expect(readFileSync(join(ROOT, pkg.bin['mcp-recorder'] as string), 'utf8').startsWith('#!/usr/bin/env node')).toBe(true);
+    // AGENTS.md's first rule: none of these script names may exist, or npm
+    // runs a nested install inside a git clone and the documented
+    // `npm install -g github:cresec-ai/audit#main` fails in global mode.
+    for (const banned of ['build', 'prepare', 'prepack', 'install', 'postinstall']) {
+      expect(banned in pkg.scripts, banned).toBe(false);
+    }
   });
 
   it('never ships evidence, tests or the dogfood store', () => {

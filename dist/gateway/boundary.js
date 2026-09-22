@@ -97,6 +97,17 @@ export const POLICY_REFUSAL_GUIDANCE = 'This is a policy decision by the operato
  * instructions that still hold are the ones that make the gateway a control
  * rather than a speed bump: do not route around it, and tell the user.
  */
+/**
+ * The clause for a refusal that RETRYING CANNOT FIX. A call whose arguments
+ * are past the `any_arg` scan budget is refused identically every time, so
+ * {@link FAIL_CLOSED_REFUSAL_GUIDANCE}'s "You may retry it" sends the model
+ * into a loop and the person into believing the recorder is broken. This
+ * names the two things that actually work, in the order the model can try
+ * them: make the call smaller, or ask the person to raise the budget.
+ */
+export const UNSCANNABLE_REFUSAL_GUIDANCE = 'The gateway could not scan arguments this large, so it refused this call rather than allow them unchecked. ' +
+    'Retrying the same call will be refused identically: send less in one call, or ask the user to raise ' +
+    'mcp.any_arg in their policy. Do not use another tool to get the same effect, and report it to the user.';
 export const FAIL_CLOSED_REFUSAL_GUIDANCE = 'The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. ' +
     'You may retry it; do not use another tool to get the same effect, and report it to the user.';
 /**
@@ -104,7 +115,9 @@ export const FAIL_CLOSED_REFUSAL_GUIDANCE = 'The gateway could not reach a polic
  * refusal's first line byte-for-byte what it was before the clause existed,
  * so the rule id and reason still read exactly as the docs quote them.
  */
-function withRefusalGuidance(text, failClosed) {
+function withRefusalGuidance(text, failClosed, errorCode) {
+    if (errorCode === 'arguments-too-large-to-scan')
+        return `${text}\n${UNSCANNABLE_REFUSAL_GUIDANCE}`;
     return `${text}\n${failClosed ? FAIL_CLOSED_REFUSAL_GUIDANCE : POLICY_REFUSAL_GUIDANCE}`;
 }
 /**
@@ -801,7 +814,7 @@ export function deniedText(input) {
         text += ' (no rule matched; mcp.default is deny)';
     if (input.outcome === 'cancelled')
         return text;
-    return withRefusalGuidance(text, input.failClosed === true);
+    return withRefusalGuidance(text, input.failClosed === true, input.errorCode);
 }
 /** JSON-RPC response carrying a tool-execution error (MCP `isError`). */
 export function synthesizeDeniedResult(id, text) {

@@ -45,6 +45,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
+import { STARTER_POLICY_YAML } from '../src/policy/starter.js';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const ECHO_SERVER = join(ROOT, 'test', 'fixtures', 'echo-server.cjs');
@@ -57,31 +58,23 @@ const WARMUP = 20;
 const P50_GATE_MS = 5;
 
 /**
- * The policy the --gateway series enforces. `echo` matches none of the rules,
- * so every call walks the whole rule list and lands on `default: allow` —
- * the shape a real deployment has, and the one that prices the rule walk
- * rather than an empty-policy short circuit. Boundary settings are left
- * unset so the series runs the shipped defaults.
+ * The policy the --gateway series enforces: THE SHIPPED STARTER POLICY, the
+ * one `mcp-recorder protect` installs.
+ *
+ * It used to be a small synthetic policy written here. The starter is the
+ * better benchmark now for two reasons. It is what a person who typed one
+ * command is actually running, so this row is the number the product owes
+ * rather than a number about a fixture. And it is the expensive shape: four
+ * of its seven rules carry `match.any_arg`, which collects every string leaf
+ * of the arguments and matches one regex against all of them on the guard
+ * worker — work that a `tool`-glob-only policy never does.
+ *
+ * `echo` matches none of its name rules, so every call walks the whole rule
+ * list, runs every `any_arg` scan and lands on `default: allow` — the shape
+ * a real deployment has, and the one that prices the walk rather than an
+ * empty-policy short circuit.
  */
-const GATEWAY_POLICY = [
-  'version: 1',
-  'name: bench-gateway',
-  'mcp:',
-  '  default: allow',
-  '  rules:',
-  '    - id: no-exfil',
-  '      match: { tool: [http_post, "send_*"] }',
-  '      action: deny',
-  '      reason: no outbound HTTP',
-  '    - id: careful-writes',
-  '      match: { tool: ["delete_*", "write_*"] }',
-  '      action: hold',
-  '    - id: no-secrets-dir',
-  '      match: { tool: "read_*", args: { path: "^/etc/" } }',
-  '      action: deny',
-  '      reason: not readable through the gateway',
-  '',
-].join('\n');
+const GATEWAY_POLICY = STARTER_POLICY_YAML;
 
 /** A live child driven over stdio with one JSON message per line. */
 class Harness {

@@ -137,6 +137,7 @@ never silently disables a rule.
 | `rules` | array | `[]` | Ordered; first match wins. |
 | `hold` | object | see below | Hold behaviour. |
 | `boundary` | object | see below | Tool-result boundary filter. |
+| `any_arg` | object | 256 leaves / 256 KiB | How much of one call's arguments `match.any_arg` may scan before the call is denied as unscannable. See [`mcp.any_arg`](#mcpany_arg--the-scan-budget). |
 
 ### `mcp.rules[]`
 
@@ -146,6 +147,7 @@ never silently disables a rule.
 | `match.server` | glob \| glob[] | no | Matches the recorder's logical server name (`--name`, else the name learned from the `initialize` handshake, else the wrapped command's basename). Any one entry of the list matching is enough. Default `*`. Delimiter `/`. |
 | `match.tool` | glob \| glob[] | yes | Matches the `tools/call` `params.name`. Any one entry of the list matching is enough. Delimiter `/`. |
 | `match.args` | object of regex | no | Each key is a dot-path into `params.arguments`; each value an RE2-compatible regex. **All** entries must match. A missing path — or an `arguments` that is not an object — never matches. |
+| `match.any_arg` | regex | no | One RE2-compatible regex searched against **every string leaf** of `params.arguments`, at any depth and under any key; the rule matches when any one leaf matches. Object *keys*, numbers and booleans are not scanned in v1. See [`match.any_arg`](#matchany_arg) below. |
 | `match.max_args_bytes` | integer ≥ 0 | no | Rule matches only when the canonical JSON of `params.arguments` is at most this many bytes. |
 | `action` | `allow` \| `hold` \| `deny` | yes | |
 | `reason` | string ≤ 512 | no | Shown to the model on a deny / hold-denied result; also copied into the compiled Rego. Longer than 512 characters is a validation error. |
@@ -465,6 +467,95 @@ evident, not tamper-proof.
 | `rules[].action` | `allow` \| `hold` \| `deny` | required | |
 | `rules[].reason` | string ≤ 512 | — | |
 
+### `match.any_arg`
+
+`match.args` is keyed by a dot-path, so it can only constrain an argument
+whose **name** you already know — `path`, but not `file_path`,
+`absolute_path`, `uri`, `source`, `target`. Across servers you did not write,
+that is a guess. `match.any_arg` removes it:
+
+```yaml
+- id: credential-files
+  match:
+    tool: "**"
+    any_arg: '(^|/|\\)(\.env|\.npmrc|\.netrc|id_rsa|id_ed25519)$'
+  action: deny
+  reason: credential files are off limits
+```
+
+One regex, searched against every string leaf of `params.arguments` at any
+depth and under any key. The rule matches when **any one** leaf matches.
+
+Rules, all of which follow the discipline `match.args` already has:
+
+- the same RE2 subset and the same `policy validate` rejections — no
+  lookaround, no backreferences, no inline flags, no ambiguous repeated
+  groups, no `\s`;
+- `params.arguments` must be a plain object (the same `is_object(input.args)`
+  rule as `match.args`): an array, a string, a number, a boolean or `null`
+  matches no `any_arg` condition in either engine;
+- **object keys are not scanned** in v1, and neither are numbers or booleans.
+  Only string leaves. The Rego twin says the same thing for the same reason:
+  `walk` yields `[path, value]` pairs, so a key is a path element and never a
+  value;
+- matched on the guard worker under the existing 25 ms deadline, **one
+  request per rule carrying every leaf**, not one round trip per leaf;
+- **budget: by default at most 256 leaves and 256 KiB of total leaf text per
+  call.** Past the budget the call is denied fail-closed with `policy
+  evaluation error: arguments too large to scan (<rule id>)` — never
+  truncated, for exactly the reason the `REGEX_VALUE_CAP` note below gives:
+  truncating turns a deny into an allow. The budget is settable per policy;
+  see [`mcp.any_arg`](#mcpany_arg--the-scan-budget) below.
+
+Rego parity: it compiles to `walk(input.args, [_, v]); is_string(v);
+regex.match(<pattern>, v)` behind the same explicit `is_object(input.args)`.
+OPA has no leaf budget, so the two engines can differ **only past the budget**,
+in the safe direction — a local deny where the control plane would have
+allowed. That is the same residual the `REGEX_VALUE_CAP` on `match.args`
+already has.
+
+`any_arg` and `args` may appear on the same rule; both must then match, like
+every other `match` condition.
+
+The event schema is untouched: a rule that matched by `any_arg` produces the
+same `policy_decision` event any other rule does, carrying the rule id and the
+hash of the arguments, never a leaf.
+
+### `mcp.any_arg` — the scan budget
+
+```yaml
+mcp:
+  any_arg:
+    max_leaves: 256        # most string leaves scanned per call (16 … 65536)
+    max_bytes: 262144      # most total UTF-8 bytes of leaf text (4096 … 16 MiB)
+```
+
+**This cliff is reachable by ordinary work, not only by attacks.** A 300 KiB
+generated file through a filesystem server, a multi-file `push_files`, a long
+document: any call whose string arguments exceed the budget cannot be scanned,
+so every `any_arg` rule on it is unevaluable and the call is **denied**. That
+is the right direction — a partial scan is a deny that silently became an
+allow — but it is a refusal a person has to be able to fix.
+
+Three things follow, and the product does all three:
+
+- the refusal **names the budget it hit** and says which setting raises it;
+- its guidance clause does **not** invite a retry, because retrying the same
+  call is refused identically (see [What the actions do](#what-the-actions-do-gateway-mode));
+- the `policy_decision` event carries `error_code:
+  "arguments-too-large-to-scan"`, so `mcp-recorder why` can explain a refusal
+  that names no rule.
+
+**Raising the budget never widens the gate.** A bigger budget means more calls
+are *scanned*; the calls past it were refused, not allowed. What it costs is
+time on the proxy thread your client is waiting on, which is why it is bounded
+rather than unlimited. Do **not** reach for `match.max_args_bytes` instead:
+that turns an over-budget call from a deny into a *non-match*, which is an
+allow — the exact inversion this section exists to prevent.
+
+OPA has no budget at all (RE2 is linear, so it does not need one), so raising
+the local budget narrows the local/Rego divergence and can never widen it.
+
 ## Matching semantics
 
 **First match wins.** Rules are evaluated top to bottom; the first rule whose
@@ -620,6 +711,19 @@ too large to scan — carry a different one:
 ```
 The gateway could not reach a policy decision, so it refused this call rather than allow it unchecked. You may retry it; do not use another tool to get the same effect, and report it to the user.
 ```
+
+**One fail-closed class gets a third clause, because retrying it cannot
+work.** Arguments past the [`mcp.any_arg` budget](#mcpany_arg--the-scan-budget)
+are refused identically every time, so telling the model it may retry sends it
+into a loop and the person into believing the recorder is broken:
+
+```
+The gateway could not scan arguments this large, so it refused this call rather than allow them unchecked. Retrying the same call will be refused identically: send less in one call, or ask the user to raise mcp.any_arg in their policy. Do not use another tool to get the same effect, and report it to the user.
+```
+
+That refusal, its `rule <label>` on the proxy's stderr, and the
+`policy_decision.error_code` in the chain all carry the same stable string —
+`arguments-too-large-to-scan` — so the three sides of one event agree.
 
 Nobody decided those, so the text does not claim they did, and it does not
 forbid the retry that is often the fix — `too many pending holds` clears the

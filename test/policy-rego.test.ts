@@ -1133,7 +1133,7 @@ describe('CI cannot silently skip the OPA parity gate (B4, B5)', () => {
     const usesOpa = readdirSync(testDir)
       .filter((f) => f.endsWith('.test.ts'))
       .filter((f) => readFileSync(join(testDir, f), 'utf8').includes('function findOpa('));
-    expect(usesOpa.sort()).toEqual(['gateway-cli.test.ts', 'policy-rego.test.ts']);
+    expect(usesOpa.sort()).toEqual(['gateway-cli.test.ts', 'policy-rego.test.ts', 'protect-doctor.test.ts']);
     for (const f of usesOpa) {
       const text = readFileSync(join(testDir, f), 'utf8');
       expect(text, `${f} self-skips without honouring MCP_RECORDER_REQUIRE_OPA`).toContain('MCP_RECORDER_REQUIRE_OPA');

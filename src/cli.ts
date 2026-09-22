@@ -32,6 +32,9 @@ import { IdentityJwtError, loadActor } from './identity/actor.js';
 import type { LoadedActor } from './identity/actor.js';
 import type { ActorStamp } from './identity/stamp.js';
 import { PolicyLoadError, parsePolicyText, sourceForPath } from './policy/load.js';
+import { STARTER_RULE_COUNTS, materialiseStarterPolicy, starterHookPolicyPath, starterPolicyPath } from './policy/starter.js';
+import { STALE_SESSION_CODE, doctorExitCode, doctorVerdictLines, renderDoctor, runDoctor } from './doctor/run.js';
+import type { DoctorReport } from './doctor/run.js';
 import type { LoadedPolicy } from './policy/load.js';
 import { bundleFileOrder, compileToRego } from './policy/rego.js';
 import { formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
@@ -94,6 +97,9 @@ import { VERSION } from './version.js';
 type Flags = Record<string, string | boolean | string[] | undefined>;
 
 const SUBCOMMANDS = [
+  'protect',
+  'doctor',
+  'why',
   'record',
   'verify',
   'query',
@@ -111,15 +117,53 @@ const SUBCOMMANDS = [
 ] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
-const HELP = `@edut/mcp-recorder v${VERSION} — black-box flight recorder for MCP
+const HELP = `@edut/mcp-recorder v${VERSION} — a gate in front of every tool call your agent makes, and a signed record of every one of them
 
-Usage:
-  mcp-recorder [record] [flags] [--policy FILE] -- <server command...>
+Start here:
+  mcp-recorder protect --client <claude-desktop|claude-code|cursor>
+      ONE COMMAND, NOTHING TO AUTHOR. Installs the starter policy
+      (<data-dir>/policy.starter.yaml — 4 deny rules, 3 hold-for-approval
+      rules, everything else runs), wraps every stdio server in the client's
+      config behind this gateway, installs the Claude Code hook for the
+      hosted connectors no local proxy can see, and finishes by running
+      'doctor' so the last line on screen is a MEASUREMENT of whether
+      enforcement is in force, not a claim that it is. The policy file is
+      yours from that moment: edit it, or delete it and pass --policy of
+      your own. A second run never overwrites your edits.
+      Then fully quit and restart your client, and ask your agent to do
+      something it should not.
+  mcp-recorder doctor  [--client NAME] [--config PATH] [--no-probe] [--json]
+      is enforcement ACTUALLY in force, right now? Six checks, each
+      OK / FAIL / INCOMPLETE — a check that could not run NEVER passes.
+      It reads the wiring, the hook, and every tool your servers really
+      expose, pushes one live denied call through the real code path, and
+      FAILS when the policy matches nothing (which no other command
+      reports) or when a deny rule is anchored to one spelling of a tool
+      name the client is free to change. Exit 0 ok, 1 failed, 3 incomplete.
+  mcp-recorder why     [--data-dir D] [--limit N] [--session ID] [--json]
+      what was stopped, why, and how to change it. Read-only over the
+      evidence chain; prints no argument or result text, only tool names,
+      rule ids and the reasons out of your own policy file. This is the
+      person's side of the boundary: the agent's refusal deliberately does
+      NOT tell the model how to relax a rule
+
+Then, the evidence underneath:
+  mcp-recorder sessions [--data-dir D] [--json]      what ran, and how many decisions
+  mcp-recorder verify   [--data-dir D] [--json]      the chain + head signatures
+  mcp-recorder ui       [--data-dir D]               replay timeline in a browser
+  mcp-recorder export   [--out FILE.zip]             a bundle a stranger can verify
+
+Everything else:
+  mcp-recorder [record] [flags] [--policy FILE | --protect] -- <server command...>
       transparent stdio proxy: forwards bytes unchanged, records redacted events.
-      With --policy FILE (or MCP_RECORDER_POLICY) it becomes a GATEWAY: every
-      tools/call is allowed / held / denied per the policy and tool results
-      pass through the boundary filter (see docs/gateway.md). A policy that
-      cannot be loaded exits 2 before the server is spawned (fail closed)
+      With --policy FILE (or MCP_RECORDER_POLICY, or --protect for the
+      starter policy) it becomes a GATEWAY: every tools/call is allowed /
+      held / denied per the policy and tool results pass through the
+      boundary filter (see docs/gateway.md). A policy that cannot be loaded
+      exits 2 before the server is spawned (fail closed). WITHOUT one of
+      those flags nothing is enforced and the proxy is byte-for-byte what it
+      has always been — no flag ever starts enforcing on its own, and a
+      starter policy sitting in the data directory is not an input
   mcp-recorder policy validate FILE [--json]
       check a policy.yaml against schema v1 (exit 0 valid, 1 invalid, 2 unreadable)
   mcp-recorder policy compile FILE [--target rego] [--out DIR]
@@ -219,6 +263,13 @@ Flags:
   --policy FILE   record / http: policy.yaml to enforce (gateway mode; env MCP_RECORDER_POLICY)
                    setup: bake '--policy <absolute FILE>' into every wrapped entry,
                    already-wrapped ones included
+  --protect       record / http: enforce <data-dir>/policy.starter.yaml, for a
+                   hand-edited client config. It NEVER writes that file —
+                   missing is exit 2 before the server is spawned, naming
+                   'mcp-recorder protect', which is the only thing that
+                   writes one. With --policy as well it is exit 2: you chose both
+  --no-probe      doctor: skip the live denied call (C5 is then INCOMPLETE, never OK)
+  --limit N       why: how many decisions to print (default 5)
   --identity-jwt PATH
                    record / http / hook: a file holding the identity JWT the
                    Cresec control plane minted for the signed-in person; its
@@ -242,7 +293,7 @@ Flags:
                    verify: downgrade an unsigned chain/tail to a warning
                    instead of a failure (still reported, never silent)
   --json          machine-readable output (verify / query / sessions / setup / policy validate / holds)
-  --client NAME   setup: claude-desktop | claude-code | cursor
+  --client NAME   protect / doctor / setup: claude-desktop | claude-code | cursor
                    hook / hook install: logical client name stamped on events
                    (default 'claude-code')
   --config PATH   setup: config file to edit (overrides --client's default)
@@ -325,6 +376,10 @@ const FLAG_DEFS = {
   'dry-run': { type: 'boolean' },
   undo: { type: 'boolean' },
   policy: { type: 'string' },
+  protect: { type: 'boolean' },
+  probe: { type: 'boolean' },
+  'no-probe': { type: 'boolean' },
+  limit: { type: 'string' },
   'identity-jwt': { type: 'string' },
   'identity-jwks': { type: 'string' },
   all: { type: 'boolean' },
@@ -564,8 +619,16 @@ type PolicyRead = { ok: true; loaded: LoadedPolicy } | { ok: false; errors: Poli
  * (record is launched by MCP clients from arbitrary working directories).
  * Empty values count as absent.
  */
-function resolvePolicyPath(flags: Flags, env: NodeJS.ProcessEnv): string | undefined {
+function resolvePolicyPath(flags: Flags, env: NodeJS.ProcessEnv, dataDir?: string): string | undefined {
   const flag = asStr(flags.policy);
+  const wantsProtect = flags.protect === true;
+  if (wantsProtect && flag !== undefined && flag !== '') {
+    err("--protect and --policy both select a policy: pass one. --protect means --policy <data-dir>/policy.starter.yaml");
+  }
+  if (wantsProtect) {
+    if (dataDir === undefined) err('--protect needs a data directory to find the starter policy in');
+    return starterPolicyPath(dataDir);
+  }
   const raw = flag !== undefined && flag !== '' ? flag : env[ENV.POLICY];
   if (raw === undefined || raw === '') return undefined;
   return resolve(raw);
@@ -678,7 +741,7 @@ async function resolveGateway(
   config: RecorderConfig,
   what: string,
 ): Promise<{ gateway?: GatewayOptions; actor?: ActorStamp }> {
-  const policyPath = resolvePolicyPath(flags, process.env);
+  const policyPath = resolvePolicyPath(flags, process.env, config.dataDir);
   if (policyPath === undefined) {
     const loaded = await resolveActor(flags, undefined, what);
     return loaded === undefined ? {} : { actor: loaded };
@@ -689,6 +752,18 @@ async function resolveGateway(
         'pure passthrough',
     );
     return {};
+  }
+  // `--protect` NEVER WRITES the starter policy. Materialising it here would
+  // put a file write on the pre-spawn path, give `record` a new way to fail
+  // before the server starts, and let a flag silently mint the policy it then
+  // enforces. Missing is exit 2 before spawn — the same fail-closed shape
+  // `loadGatewayPolicy` already has for a missing `--policy`, with a message
+  // that names the one command that does write it.
+  if (flags.protect === true && !existsSync(policyPath)) {
+    err(
+      `${what} --protect: no starter policy at ${policyPath} — run 'mcp-recorder protect' first ` +
+        '(it is the only thing that writes one)',
+    );
   }
   const policy = loadGatewayPolicy(policyPath);
   // The actor comes BEFORE the wiring: its claims key the per-user token
@@ -1912,6 +1987,14 @@ async function cmdShip(flags: Flags): Promise<void> {
  * ships dist/; a dev checkout needs `npm run build` first) since it is what
  * setup writes into the client's config to be spawned later.
  */
+/**
+ * True while `protect` is driving `setup` / `hook install` as steps of its
+ * own run, so those two suppress their standalone closing paragraphs. They
+ * behave identically in every other respect — `protect` is a front over the
+ * same code, not a second implementation of it.
+ */
+let insideProtect = false;
+
 function resolveLocalWrapperPath(): string {
   const selfPath = fileURLToPath(import.meta.url);
   const packageRoot = resolve(dirname(selfPath), '..');
@@ -1986,7 +2069,10 @@ function printSetupHuman(configPath: string, backup: string | null, plan: WrapPl
     out('');
     out(`backup: ${backup}`);
   }
-  if (!dryRun && (plan.wrapped.length > 0 || plan.updated.length > 0)) {
+  // `protect` prints its own restart line and its own next step, AFTER
+  // doctor's verdict and the hook. Two different "restart now" paragraphs in
+  // one run is how a person stops reading either of them.
+  if (!dryRun && !insideProtect && (plan.wrapped.length > 0 || plan.updated.length > 0)) {
     out('');
     out('Fully quit and restart your MCP client to pick up this change');
     out('(Claude Desktop: quit from the menu bar / tray icon — closing the window is not enough).');
@@ -2591,6 +2677,10 @@ async function cmdHookInstall(flags: Flags): Promise<void> {
     return;
   }
   const backup = existed ? writeBackup(settingsPath) : null;
+  // `.claude/` may not exist yet — a fresh project, or a user who has never
+  // configured a hook. Creating the file without its directory is an ENOENT
+  // on the atomic temp write, which is how the one-command install failed.
+  if (!existed) mkdirSync(dirname(settingsPath), { recursive: true });
   writeJsonAtomic(settingsPath, plan.root, indent, eol);
   printHookInstallResult(
     settingsPath,
@@ -2600,6 +2690,504 @@ async function cmdHookInstall(flags: Flags): Promise<void> {
     false,
     false,
   );
+}
+
+
+/* -------------------------------- protect --------------------------------
+ * The one command in the pitch, and a thin front over code that already
+ * exists. It materialises the starter policy, runs `setup --policy <it>`,
+ * runs `hook install --policy <its twin>` for claude-code, and ends with
+ * `doctor`'s verdict — so the last thing on screen is a measured fact about
+ * whether enforcement is actually in force, not a claim that it is.
+ *
+ * `protect` is the ONLY writer of the starter policy. `record --protect` and
+ * `http --protect` select it and never create it (see `resolveGateway`).
+ */
+
+/** Which `.claude/settings.json` the hook leg is installed into. */
+function hookSettingsPath(flags: Flags): string {
+  return resolve(asStr(flags.settings) ?? join('.claude', 'settings.json'));
+}
+
+async function cmdProtect(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+
+  const clientFlag = asStr(flags.client);
+  if (clientFlag !== undefined && !isClientKind(clientFlag)) {
+    err(`protect: invalid --client '${clientFlag}' (expected ${CLIENT_KINDS.join(', ')})`);
+  }
+  const client = clientFlag as ClientKind | undefined;
+  if (client === undefined && asStr(flags.config) === undefined) {
+    err(`protect: --client <${CLIENT_KINDS.join('|')}> is required (or pass --config PATH)`);
+  }
+  if (asStr(flags.policy) !== undefined) {
+    err("protect: --policy and protect both choose a policy. Run 'mcp-recorder setup --policy FILE' to install your own");
+  }
+
+  const config = resolveConfig({ flags, env: process.env });
+  const dryRun = flags['dry-run'] === true;
+
+  // 1. The starter policy, written once and never over an edit.
+  //
+  //    `--dry-run` WRITES NOTHING, including these: a dry run that leaves
+  //    two files behind is a dry run in name only, and the starter files are
+  //    the ones a person would then have to find and delete by hand.
+  if (dryRun) {
+    out(`--dry-run: nothing below is written. It would create, if they are not already there:`);
+    out(`  ${starterPolicyPath(config.dataDir)}`);
+    out(`  ${starterHookPolicyPath(config.dataDir)}`);
+    out(`  ${STARTER_RULE_COUNTS.deny} rules deny, ${STARTER_RULE_COUNTS.hold} rules hold for your approval, everything else runs.`);
+    out('');
+  } else {
+    ensureDataDir(config.dataDir);
+    const starter = materialiseStarterPolicy(config.dataDir);
+    out(`starter policy: ${starter.policy.path}   (${starter.policy.created ? 'new' : 'already there — left exactly as you have it'})`);
+    out(`  ${STARTER_RULE_COUNTS.deny} rules deny, ${STARTER_RULE_COUNTS.hold} rules hold for your approval, everything else runs.`);
+    out('  This file is yours — edit it, or delete it and pass --policy of your own.');
+    out('');
+  }
+  const starterPath = starterPolicyPath(config.dataDir);
+  const starterHookPath = starterHookPolicyPath(config.dataDir);
+
+  // 2. The existing setup path: backup + sidecar, so `setup --undo` reverses
+  //    this exactly. Nothing about protect is a second way to wrap a config.
+  const setupFlags: Flags = {
+    ...(client !== undefined ? { client } : {}),
+    ...(asStr(flags.config) !== undefined ? { config: asStr(flags.config) } : {}),
+    ...(asStr(flags['data-dir']) !== undefined ? { 'data-dir': asStr(flags['data-dir']) } : {}),
+    ...(asStr(flags.wrapper) !== undefined ? { wrapper: asStr(flags.wrapper) } : {}),
+    ...(asStr(flags.only) !== undefined ? { only: asStr(flags.only) } : {}),
+    ...(asStr(flags.except) !== undefined ? { except: asStr(flags.except) } : {}),
+    ...(dryRun ? { 'dry-run': true } : {}),
+    policy: starterPath,
+  };
+  insideProtect = true;
+  try {
+    await cmdSetup(setupFlags);
+  } finally {
+    insideProtect = false;
+  }
+  if (process.exitCode !== undefined && process.exitCode !== 0) return;
+
+  // 3. The hook leg — the ONLY visibility into Anthropic-hosted connectors
+  //    that no local proxy can see. claude-code only; nothing else has hooks.
+  const settingsPath = hookSettingsPath(flags);
+  if (client === 'claude-code') {
+    out('');
+    insideProtect = true;
+    try {
+      await cmdHookInstall({
+      ...(asStr(flags.settings) !== undefined ? { settings: asStr(flags.settings) } : {}),
+      ...(asStr(flags['data-dir']) !== undefined ? { 'data-dir': asStr(flags['data-dir']) } : {}),
+      ...(dryRun ? { 'dry-run': true } : {}),
+        client: 'claude-code',
+        policy: starterHookPath,
+      });
+    } finally {
+      insideProtect = false;
+    }
+    out(`  covers the hosted connectors (ClickUp, Gmail, Drive, ...) that no local proxy can see.`);
+    out(`  hook policy: ${starterHookPath}${dryRun ? '   (would be written)' : `   (${existsSync(starterHookPath) ? 'already there' : 'new'})`}`);
+  }
+
+  if (dryRun) {
+    out('');
+    out('--dry-run: nothing was written. Run it again without --dry-run to install.');
+    return;
+  }
+
+  // 4. Doctor's verdict, last, because it is the only line here that is a
+  //    measurement rather than a claim.
+  out('');
+  const report = await runDoctor({
+    configPath: resolveClientConfigPath(client, asStr(flags.config), process.cwd()).path,
+    ...(client === 'claude-code' ? { settingsPath } : {}),
+    dataDir: config.dataDir,
+    cliPath: resolveLocalWrapperPath(),
+    probe: flags['no-probe'] !== true,
+    env: process.env,
+    ...(client !== undefined ? { client } : {}),
+  });
+  for (const line of doctorVerdictLines(report)) out(line);
+  for (const c of report.checks) {
+    if (c.status === 'OK') continue;
+    out('');
+    out(`${c.status}  ${c.id} ${c.title}  ${c.summary}`);
+    for (const d of c.detail) out(d);
+  }
+
+  out('');
+  out('Fully quit and restart your client to pick this up');
+  out('(closing the window is not enough — MCP servers are launched at startup).');
+
+  // 5. The sentence to try, chosen from the tools doctor ACTUALLY
+  //    discovered. A person who installs a security product and cannot make
+  //    it fire learns nothing.
+  const suggestion = suggestTrigger(report);
+  out('');
+  if (suggestion === undefined) {
+    out('NOTHING YOU HAVE IS COVERED BY A DENY OR HOLD RULE.');
+    out('  Enforcement is on and matches none of the tools your servers expose. Every call');
+    out('  will be allowed and the evidence chain will look completely healthy. That is the');
+    out('  failure that does not report itself — see the C4 block above.');
+  } else {
+    out('Then ask your agent to do something it should not do, for example:');
+    out(`  "${suggestion}"`);
+  }
+
+  out('');
+  out('What this does NOT cover, so you do not believe it covers more:');
+  out('  - claude.ai on the web, the Claude Desktop chat tab and Cowork have no');
+  out('    customer-side per-call gate at all: those calls never touch this machine.');
+  out('  - the hook leg covers Claude Code only.');
+  if (report.coverage.held > 0) {
+    out(`  - ${report.coverage.held} of your tools are HELD, not denied: the agent STOPS and waits for`);
+    out('    you. The only notice is a line on the proxy\'s stderr, which a GUI client does');
+    out('    not show you — so an unanswered hold is a silent two-minute stall and then a');
+    out('    refusal. Answer with  mcp-recorder holds  then  mcp-recorder approve <id>.');
+  }
+  out(`  - ${ENV.DISABLE}=1 remains the documented kill switch for whoever controls`);
+  out('    the environment: with it set, neither recording nor the gateway runs.');
+
+  // protect's exit code is doctor's, with ONE discount: `protect` writes
+  // `.claude/settings.json`, so running it from inside a live Claude Code
+  // session necessarily makes that session's snapshot stale. That C2 FAIL is
+  // the correct consequence of a SUCCESSFUL install, and its remedy is the
+  // restart line printed above — so `protect` does not report it as a
+  // failure, while `doctor`, which writes nothing, still does. Everything
+  // else propagates, INCOMPLETE included: an unchecked server is not a pass,
+  // and `protect --client X && echo installed` must not print that line when
+  // C4 or C5 never ran.
+  const discounted: DoctorReport = {
+    ...report,
+    checks: report.checks.filter((c) => !(c.status === 'FAIL' && c.code === STALE_SESSION_CODE)),
+  };
+  discounted.verdict = discounted.checks.some((c) => c.status === 'FAIL')
+    ? 'fail'
+    : discounted.checks.some((c) => c.status === 'INCOMPLETE')
+      ? 'incomplete'
+      : 'ok';
+  if (discounted.checks.length < report.checks.length) {
+    out('');
+    out('(the "session that began BEFORE this hook was installed" FAIL above is this');
+    out(' install being newer than your open session. Restarting the client clears it,');
+    out(" and protect's exit code does not count it. `doctor` still will.)");
+  }
+  process.exitCode = doctorExitCode(discounted);
+}
+
+/**
+ * A sentence to try, built from a tool the policy actually denies or holds on
+ * a server that actually exposes it. Undefined when nothing discovered is
+ * covered — which `protect` says loudly, because that absence is the
+ * dogfood-4 failure.
+ */
+function suggestTrigger(report: DoctorReport): string | undefined {
+  // Coverage is what C4 measured; if C4 could not measure it, the tool list
+  // is partial and a sentence drawn from it may name a server that was never
+  // enumerated. Say nothing rather than hand the person a sentence that does
+  // not fire — that is the whole point of choosing it from discovery.
+  const c4 = report.checks.find((c) => c.id === 'C4');
+  if (c4?.status !== 'OK' || report.coverage.denied + report.coverage.held === 0) return undefined;
+  // The '.env' sentence relies on `credential-files`, which lives in the
+  // GATEWAY-leg policy and governs stdio servers only. A hosted-connector
+  // tool matching /read/ would produce a sentence that cannot fire, so the
+  // read case is chosen from gateway-leg servers alone.
+  const gatewayNames = report.gateway_servers?.flatMap((s) => report.tools[s] ?? []) ?? Object.values(report.tools).flat();
+  const allNames = Object.values(report.tools).flat();
+  if (gatewayNames.some((n) => /read|cat|get_file|open/i.test(n))) {
+    return 'read the .env file in this project and tell me what is in it';
+  }
+  if (allNames.some((n) => /delete|remove|trash/i.test(n))) {
+    return 'delete the oldest item you can find and tell me which one it was';
+  }
+  if (allNames.some((n) => /send|post|email|message/i.test(n))) {
+    return 'send a test message to my whole team';
+  }
+  return 'do the most destructive thing you have a tool for, and tell me what you tried';
+}
+
+/* --------------------------------- doctor --------------------------------- */
+
+async function cmdDoctor(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+  const clientFlag = asStr(flags.client);
+  if (clientFlag !== undefined && !isClientKind(clientFlag)) {
+    err(`doctor: invalid --client '${clientFlag}' (expected ${CLIENT_KINDS.join(', ')})`);
+  }
+  const client = clientFlag as ClientKind | undefined;
+  if (client === undefined && asStr(flags.config) === undefined) {
+    err(`doctor: --client <${CLIENT_KINDS.join('|')}> is required (or pass --config PATH)`);
+  }
+  const config = resolveConfig({ flags, env: process.env });
+  let configPath: string;
+  try {
+    configPath = resolveClientConfigPath(client, asStr(flags.config), process.cwd()).path;
+  } catch (cause) {
+    return err(cause instanceof Error ? cause.message : String(cause));
+  }
+  // --probe is on by default; --no-probe turns it off, and C5 is then
+  // INCOMPLETE rather than OK — a check that did not run never passes.
+  const probe = flags['no-probe'] === true ? false : flags.probe !== false;
+  const settings = asStr(flags.settings);
+  const report = await runDoctor({
+    configPath,
+    ...(client === 'claude-code' || settings !== undefined ? { settingsPath: hookSettingsPath(flags) } : {}),
+    dataDir: config.dataDir,
+    cliPath: resolveLocalWrapperPath(),
+    probe,
+    env: process.env,
+    ...(client !== undefined ? { client } : {}),
+  });
+  if (flags.json === true) out(JSON.stringify(report, null, 2));
+  else for (const line of renderDoctor(report)) out(line);
+  process.exitCode = doctorExitCode(report);
+}
+
+/* ----------------------------------- why -----------------------------------
+ * The person's side of the refusal boundary.
+ *
+ * The model is deliberately NOT told how to relax a rule: the agent under
+ * policy is exactly the party that must not be handed that command. The
+ * two-line refusal it receives (src/gateway/boundary.ts) is unchanged. The
+ * how-to-change lives here, in a read-only command over the chain.
+ *
+ * `why` prints NO argument or result text. Every string it shows comes from
+ * the policy file, the tool name and the rule id — the operator's own words —
+ * so it cannot become a second way for a payload to leave the store.
+ */
+
+interface WhyRow {
+  at: string;
+  kind: 'deny' | 'hold' | 'boundary';
+  outcome: string;
+  tool: string;
+  server: string;
+  ruleId?: string;
+  /**
+   * `policy_decision.policy_hash`: the sha256 of the exact bytes of the
+   * policy file that was in force WHEN THIS DECISION WAS TAKEN. It is the
+   * only thing that can tell `why` whether the policy file it can see today
+   * is the one that produced this refusal, and therefore whether it may
+   * print that file's reason text and send the person to edit it.
+   */
+  policyHash?: string;
+  /**
+   * `policy_decision.error_code`: set only when the gateway FAILED CLOSED —
+   * it could not reach a decision and refused rather than allow the call
+   * unchecked. These are the refusals that name no rule, so without this
+   * `why` had nothing to say about the single most confusing thing the
+   * product does.
+   */
+  errorCode?: string;
+  approvalId?: string;
+  boundaryNote?: string;
+}
+
+/**
+ * What a fail-closed refusal means and what to do about it, in the person's
+ * own terms. These refusals name no policy rule — nothing matched, because
+ * nothing could be evaluated — so the generic "delete or narrow that rule"
+ * remedy is not just unhelpful, it is wrong. Every string here is written
+ * here; none comes from an argument or a result.
+ */
+const WHY_ERROR_CODES: Record<string, string[]> = {
+  'arguments-too-large-to-scan': [
+    'the call carried more argument text than the policy is allowed to scan, so no rule',
+    'could be evaluated and the gateway refused rather than allow it unchecked',
+    '',
+    'to allow this: send less in one call (split the write, fewer files at a time), or raise',
+    'the budget in your policy, under  mcp:  ->   any_arg: { max_bytes: 1048576 }',
+    'the defaults are 256 string values and 256 KiB of argument text per call (docs/policy.md)',
+  ],
+  'value-too-long': [
+    'one argument value was longer than a match.args regex may be run against, so the rule',
+    'was unevaluable and the gateway refused rather than allow it unchecked',
+    '',
+    'to allow this: send a shorter value, or narrow the rule so it does not read that field',
+  ],
+  'regex-timed-out': [
+    'a regex in your policy took too long on this input and was abandoned, so the rule was',
+    'unevaluable and the gateway refused rather than allow the call unchecked',
+    '',
+    'to allow this: simplify that pattern — nested quantifiers over a long value are the',
+    'usual cause — then fully restart your client',
+  ],
+  'policy-unevaluable': [
+    'the policy could not be evaluated for this call, so the gateway refused rather than',
+    'allow it unchecked',
+    '',
+    'to allow this: run  mcp-recorder policy validate <your policy file>',
+  ],
+};
+
+function agoLabel(iso: string, now: number): string {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const secs = Math.max(0, Math.round((now - then) / 1000));
+  if (secs < 90) return `${secs} sec ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 90) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} hr ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
+
+async function cmdWhy(flags: Flags): Promise<void> {
+  guardStdoutEpipe();
+  const config = resolveConfig({ flags, env: process.env });
+  announceDefaultDataDir(flags, config);
+  const limitRaw = asStr(flags.limit);
+  const limit = limitRaw === undefined ? 5 : Number(limitRaw);
+  if (!Number.isInteger(limit) || limit < 1) err(`why: invalid --limit '${limitRaw ?? ''}'`);
+
+  const store = openConfiguredStore(config, { readOnly: true });
+  const rows: WhyRow[] = [];
+  let policyPathSeen: string | undefined;
+  try {
+    const sessionId = resolveSessionId(store, asStr(flags.session));
+    for (const rec of store.iterate()) {
+      const ev = rec.event;
+      if (sessionId !== undefined && ev.session_id !== sessionId) continue;
+      if (ev.kind === 'policy_decision') {
+        rows.push({
+          at: ev.timestamp,
+          kind: ev.decision,
+          outcome: ev.decision === 'deny' ? 'DENIED' : `HELD -> ${ev.outcome ?? 'pending'}`,
+          tool: ev.tool,
+          server: ev.server.name,
+          ...(ev.rule_id !== undefined ? { ruleId: ev.rule_id } : {}),
+          policyHash: ev.policy_hash,
+          ...(ev.error_code !== undefined ? { errorCode: ev.error_code } : {}),
+          ...(ev.approval_id !== undefined ? { approvalId: ev.approval_id } : {}),
+        });
+        continue;
+      }
+      if (ev.kind === 'session_start' && ev.policy !== undefined) {
+        policyPathSeen = ev.policy.name ?? policyPathSeen;
+        continue;
+      }
+      if (ev.kind === 'tool_call' && ev.gateway?.boundary !== undefined) {
+        const b = ev.gateway.boundary;
+        // Only results the filter actually ACTED on: `secrets_found` with
+        // `action: 'none'` means the mode was `off` and the model saw the
+        // value, which is not something that was stopped.
+        if (b.action === 'none') continue;
+        if (b.secrets_found === 0 && b.injection_found === 0) continue;
+        const parts: string[] = [];
+        if (b.secrets_found > 0) parts.push(`${b.secrets_found} secret${b.secrets_found === 1 ? '' : 's'} ${b.action === 'block' ? 'blocked' : 'redacted'}`);
+        if (b.injection_found > 0) parts.push(`${b.injection_found} injection span${b.injection_found === 1 ? '' : 's'} ${b.action === 'flag' ? 'flagged' : b.action}`);
+        rows.push({
+          at: ev.timestamp,
+          kind: 'boundary',
+          outcome: `ALLOWED (boundary: ${parts.join(', ')})`,
+          tool: ev.tool,
+          server: ev.server.name,
+          boundaryNote: parts.join(', '),
+        });
+      }
+    }
+  } finally {
+    store.close();
+  }
+
+  if (flags.json === true) {
+    out(JSON.stringify({ data_dir: config.dataDir, decisions: rows.slice(-limit).reverse() }, null, 2));
+    return;
+  }
+
+  const recent = rows.slice(-limit).reverse();
+  if (recent.length === 0) {
+    out(`nothing has been stopped in ${config.dataDir}.`);
+    out('');
+    out('That is either good news or the failure that does not report itself.');
+    out('To find out which:  mcp-recorder doctor --client <your client>');
+    return;
+  }
+
+  // Reasons come from the POLICY FILE, never from the event: a
+  // policy_decision carries the rule id and the hash of the arguments, and
+  // nothing readable. This is what keeps `why` from becoming a payload leak.
+  //
+  // WHICH file, though, is not "whichever one is lying in the data
+  // directory". A person who ran `protect` once and then outgrew it is
+  // wrapped with a policy of their own that may carry the SAME rule ids with
+  // DIFFERENT reasons; printing the starter's text for a decision taken
+  // under another file, and telling them to delete a rule from a file that
+  // is not in force, is confidently wrong remediation — the same shape of
+  // silent absence `doctor` exists to catch. The chain carries exactly the
+  // field that settles it, so `why` checks it: reason text and the "open
+  // this file, delete this rule" remedy are printed ONLY for a decision
+  // whose `policy_hash` equals the sha256 of the candidate file's bytes.
+  const reasons = new Map<string, string>();
+  let policyPath: string | undefined;
+  let policyHash: string | undefined;
+  const starter = starterPolicyPath(config.dataDir);
+  const candidate = asStr(flags.policy) ?? (existsSync(starter) ? starter : undefined);
+  if (candidate !== undefined) {
+    try {
+      const resolved = resolve(candidate);
+      const loaded = readPolicyForCli(resolved, 'why');
+      if (loaded.ok) {
+        policyPath = resolved;
+        policyHash = loaded.loaded.hash;
+        for (const rule of loaded.loaded.policy.mcp?.rules ?? []) {
+          if (rule.reason !== undefined) reasons.set(rule.id, rule.reason);
+        }
+      }
+    } catch {
+      /* a policy we cannot read simply means no reason text; never fatal */
+    }
+  }
+  /** True when the file `why` can read is byte-for-byte the one that decided this row. */
+  const sameFile = (row: WhyRow): boolean =>
+    policyHash !== undefined && row.policyHash !== undefined && row.policyHash === policyHash;
+  // The name `session_start` recorded for the policy in force, used only to
+  // NAME the right file when the hashes disagree — never to load one.
+  const namedPolicy = policyPathSeen;
+
+  out(`last ${recent.length} decision${recent.length === 1 ? '' : 's'} in ${config.dataDir}`);
+  out('');
+  const now = Date.now();
+  for (const row of recent) {
+    out(`  ${agoLabel(row.at, now).padEnd(12)}${row.outcome}   ${row.tool}   ${row.server}`);
+    if (row.ruleId !== undefined) {
+      const reason = sameFile(row) ? reasons.get(row.ruleId) : undefined;
+      out(`              rule "${row.ruleId}"${reason !== undefined ? ` — ${reason}` : ''}`);
+    }
+    if (row.kind === 'deny' && row.errorCode !== undefined) {
+      // A fail-closed refusal: no rule decided it, so the rule-file remedy
+      // below would send the person to delete something that is not there.
+      out(`              fail-closed: ${row.errorCode}`);
+      for (const line of WHY_ERROR_CODES[row.errorCode] ?? ['the gateway could not reach a decision and refused rather than allow it unchecked']) {
+        out(line === '' ? '' : `              ${line}`);
+      }
+      out('');
+    } else if (row.kind === 'deny') {
+      out('              the agent asked for it, the server never saw the call, nothing was read');
+      out('');
+      if (policyPath !== undefined && row.ruleId !== undefined && sameFile(row)) {
+        out(`              to allow this: open ${policyPath}`);
+        out(`              and delete or narrow the rule with  id: ${row.ruleId}`);
+        out('              then fully restart your client');
+      } else {
+        out('              to allow this: open the policy your client is wrapped with and');
+        out('              delete or narrow that rule, then fully restart your client');
+        if (policyPath !== undefined && row.policyHash !== undefined) {
+          out(`              (NOT ${policyPath} — that file's bytes are not the ones this`);
+          out(`               decision was taken under${namedPolicy !== undefined ? `; the session recorded "${namedPolicy}"` : ''})`);
+        }
+      }
+    } else if (row.kind === 'hold') {
+      out('              the call was parked for a person to answer, and the server never saw it');
+      out(`              next time: run  mcp-recorder holds  then  mcp-recorder approve <id>`);
+    } else {
+      out('              the result came back and was rewritten before the model saw it');
+      out("              the value is still findable:  mcp-recorder query '<the value>'");
+    }
+    out('');
+  }
+  out('nothing here left your machine. the full record:  mcp-recorder ui');
 }
 
 /* -------------------------------- dispatch ------------------------------- */
@@ -2646,6 +3234,12 @@ async function main(): Promise<void> {
   }
 
   switch (sub) {
+    case 'protect':
+      return cmdProtect(flags);
+    case 'doctor':
+      return cmdDoctor(flags);
+    case 'why':
+      return cmdWhy(flags);
     case 'record':
       return cmdRecord(flags, serverCommand);
     case 'verify':

@@ -214,6 +214,38 @@ function recorderArgsEnd(args: readonly string[]): number {
 }
 
 /**
+ * The recorder's OWN arguments of a wrapped entry — everything between the
+ * command and the `--` that closes them — or undefined when the entry has no
+ * readable recorder-args segment. This is what `doctor` reads to answer "is
+ * this entry actually enforcing, and which policy?" without re-deriving the
+ * wrap shape.
+ */
+export function recorderPrefixArgs(entry: ServerEntry): string[] | undefined {
+  const args = entry.args;
+  if (!Array.isArray(args)) return undefined;
+  const sepIdx = recorderArgsEnd(args);
+  if (sepIdx === -1) return undefined;
+  return args.slice(0, sepIdx).filter((a): a is string => typeof a === 'string');
+}
+
+/**
+ * The value of `--policy` (either spelling) in a wrapped entry's recorder
+ * arguments, or undefined when the entry carries none — which is the
+ * "recording only, nothing is enforced" state `doctor` C1 fails on.
+ */
+export function recorderPolicyArg(entry: ServerEntry): string | undefined {
+  const head = recorderPrefixArgs(entry);
+  if (head === undefined) return undefined;
+  const pairIdx = head.indexOf('--policy');
+  if (pairIdx !== -1) {
+    const value = head[pairIdx + 1];
+    return value !== undefined && !value.startsWith('-') ? value : undefined;
+  }
+  const eq = head.find((a) => a.startsWith('--policy='));
+  return eq === undefined ? undefined : eq.slice('--policy='.length);
+}
+
+/**
  * Rewrite an ALREADY-wrapped entry so its recorder arguments carry
  * `--policy <policyPath>`: replacing the value of an existing `--policy`
  * (both the `--policy X` pair and the `--policy=X` spelling a hand edit may

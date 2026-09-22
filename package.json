@@ -17,6 +17,17 @@
     "cresec"
   ],
   "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cresec-ai/audit.git"
+  },
+  "homepage": "https://github.com/cresec-ai/audit#readme",
+  "bugs": {
+    "url": "https://github.com/cresec-ai/audit/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -34,6 +45,7 @@
     "src",
     "docs/agent-guidance.md",
     "docs/event-schema.md",
+    "docs/first-run.md",
     "docs/gateway.md",
     "docs/install.md",
     "docs/policy.md",

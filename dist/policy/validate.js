@@ -561,6 +561,21 @@ function checkMcpRule(rule, i, errors) {
     if (rule.match.server !== undefined)
         checkGlobField(rule.match.server, `${base}/server`, errors);
     checkGlobField(rule.match.tool, `${base}/tool`, errors);
+    if (rule.match.any_arg !== undefined) {
+        const path = `${base}/any_arg`;
+        if (typeof rule.match.any_arg !== 'string') {
+            errors.push({
+                path,
+                message: `expected a regex string, got ${Array.isArray(rule.match.any_arg) ? 'array' : typeof rule.match.any_arg}`,
+                keyword: 'type',
+            });
+        }
+        else {
+            const why = checkRe2Subset(rule.match.any_arg);
+            if (why !== undefined)
+                errors.push({ path, message: why, keyword: 'regex' });
+        }
+    }
     if (rule.match.args === undefined)
         return;
     for (const [key, pattern] of Object.entries(rule.match.args)) {

@@ -15,6 +15,31 @@ AFTER   {"command": "node", "args": ["/path/to/dist/cli.js", "--policy", "/path/
 Nothing changes for servers you don't pass `--policy` to. The full option
 reference is in [docs/policy.md](policy.md).
 
+## Before you write anything: `mcp-recorder protect`
+
+If you just want enforcement, you do not need this page. One command installs
+a starter policy and wires every server and the Claude Code hook to it, and
+ends by running `doctor` to say whether it is actually in force:
+
+```sh
+mcp-recorder protect --client claude-code
+```
+
+The file it writes is commented YAML at `<data-dir>/policy.starter.yaml` and
+it is yours to edit — it is never regenerated over your changes. What is in
+it, and why each rule is defensible knowing nothing about your servers, is in
+the [README](../README.md#the-starter-policy-and-the-moment-you-edit-it) and
+in [docs/first-run.md](first-run.md). `record --protect` / `http --protect`
+select that same file for a config you edit by hand, and never write it: if it
+is not there, that is exit 2 before the server is spawned, naming `protect`.
+`doctor` reads a `--protect` entry as **enforcing** and resolves it to the same
+`<data-dir>/policy.starter.yaml` (taking the entry's own `--data-dir` when it
+has one), so a hand-edited config is not reported as "recording only" and is
+not told to run `protect`, which would rewrite it.
+
+The rest of this page is for when you outgrow it — a policy of your own,
+credential swaps, CI.
+
 ## 0. Install (1 minute)
 
 ```sh
@@ -47,6 +72,10 @@ mcp:
       match: { tool: ["delete_*", "rm*", "drop_*"] }
       action: hold
     - id: no-credential-files
+      # `args` is keyed by a dot-path, so this only governs a tool that calls
+      # its argument `path`. `any_arg` searches EVERY string leaf instead,
+      # whatever the key is called and however deep it is — see
+      # docs/policy.md#matchany_arg, and the starter policy, which uses it.
       match:
         tool: read_file
         args: { path: "(^|/)(\\.env|secrets\\.env|id_rsa|\\.npmrc)$" }

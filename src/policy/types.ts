@@ -32,6 +32,12 @@ export interface McpMatchInput {
   server?: GlobOrList;
   tool: GlobOrList;
   args?: Record<string, string>;
+  /**
+   * One RE2-portable regex searched against EVERY string leaf of
+   * `params.arguments`, at any depth, whatever the key is called. See
+   * {@link McpMatch.any_arg}.
+   */
+  any_arg?: string;
   max_args_bytes?: number;
 }
 
@@ -54,11 +60,30 @@ export interface BoundaryConfigInput {
   on_oversize?: OnOversize;
 }
 
+/**
+ * How much of one call's arguments `match.any_arg` may scan before the local
+ * engine gives up and DENIES. Settable so that a person whose ordinary work
+ * is large — writing a generated fixture through a filesystem server,
+ * pushing several files at once through a github server — can raise it
+ * instead of deleting the four argument-anchored denies that are the good
+ * half of the starter policy.
+ *
+ * Raising it never makes the gateway more permissive: past the budget the
+ * call is refused, so a bigger budget means MORE calls are scanned, not
+ * fewer. It costs proxy-thread time on the forwarding path, which is why it
+ * is bounded rather than unlimited.
+ */
+export interface AnyArgBudgetInput {
+  max_leaves?: number;
+  max_bytes?: number;
+}
+
 export interface McpPolicyInput {
   default?: Action;
   rules?: McpRuleInput[];
   hold?: HoldConfigInput;
   boundary?: BoundaryConfigInput;
+  any_arg?: AnyArgBudgetInput;
 }
 
 export interface EgressMatchInput {
@@ -402,6 +427,23 @@ export interface McpMatch {
   tool: string[];
   /** Dot-path -> RE2-compatible regex. All entries must match. */
   args?: Record<string, string>;
+  /**
+   * RE2-compatible regex searched against every STRING LEAF of
+   * `params.arguments`, at any depth and under any key; the rule matches
+   * when any one leaf matches. `args` is keyed by a dot-path, so it can only
+   * constrain an argument whose NAME the policy author already knows
+   * (`path`, but not `file_path`, `absolute_path`, `uri`, `source`,
+   * `target`); this constrains what the call does to the world regardless of
+   * what the server calls the field.
+   *
+   * Object KEYS are not scanned in v1, and neither are numbers or booleans
+   * (the Rego twin is `walk(input.args, [_, v]); is_string(v)`). Bounded by
+   * {@link ANY_ARG_MAX_LEAVES} / {@link ANY_ARG_MAX_BYTES}: arguments past
+   * the budget are never truncated, they are UNEVALUABLE and deny — for the
+   * reason `docs/policy.md` gives for `REGEX_VALUE_CAP`, that truncating
+   * turns a deny into an allow.
+   */
+  any_arg?: string;
   /** Rule only matches when canonical JSON of args is <= this many bytes. */
   max_args_bytes?: number;
 }
@@ -426,11 +468,23 @@ export interface BoundaryConfig {
   on_oversize: OnOversize;
 }
 
+/** {@link AnyArgBudgetInput}, with the defaults filled in. */
+export interface AnyArgBudget {
+  max_leaves: number;
+  max_bytes: number;
+}
+
 export interface McpPolicy {
   default: Action;
   rules: McpRule[];
   hold: HoldConfig;
   boundary: BoundaryConfig;
+  /**
+   * Always filled in by {@link normalizePolicy}; optional on the type so a
+   * policy object built by hand (a test, a caller that predates the field)
+   * still type-checks and gets the defaults from the engine.
+   */
+  any_arg?: AnyArgBudget;
 }
 
 export interface EgressMatch {
@@ -476,6 +530,8 @@ export const DEFAULTS = {
     on_oversize: 'flag' as OnOversize,
   },
   egress: { default: 'deny' as Action },
+  /** `mcp.any_arg`: the scan budget a policy that says nothing gets. */
+  any_arg: { max_leaves: 256, max_bytes: 256 * 1024 },
   match: { server: '*', path: '/**' },
   credential: {
     /**
@@ -522,6 +578,14 @@ export const LIMITS = {
   credential_timeout_ms: { min: 100, max: 30_000 },
   /** AWS STS: 15 minutes to 12 hours. */
   aws_duration_seconds: { min: 900, max: 43_200 },
+  /**
+   * `mcp.any_arg`. The maxima bound how much work one hostile call can ask
+   * of the proxy thread the client is waiting on; the minima keep a policy
+   * from setting a budget so small that every real call is unscannable and
+   * therefore denied.
+   */
+  any_arg_max_leaves: { min: 16, max: 65_536 },
+  any_arg_max_bytes: { min: 4_096, max: 16 * 1024 * 1024 },
 } as const;
 
 /** Identifier pattern shared by `name` and rule `id`. */
@@ -561,6 +625,24 @@ export const ROLE_ARN_PATTERN = '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$';
  */
 export const REGEX_VALUE_CAP = 4_096;
 
+/**
+ * `match.any_arg` DEFAULT budget: the most string leaves of one
+ * `params.arguments` the engine will scan when the policy does not say.
+ * Past it the call is denied fail-closed (`policy evaluation error:
+ * arguments too large to scan …`) rather than scanned in part — a partial
+ * scan is a deny that silently became an allow.
+ *
+ * A policy raises or lowers it with `mcp.any_arg: { max_leaves, max_bytes }`
+ * (docs/policy.md). The cliff is REACHABLE BY ORDINARY WORK: a 300 KiB file
+ * write, a bulk push, a long document. That is why it is settable, why the
+ * refusal says which of the two budgets it hit, and why it does not tell the
+ * model to retry — retrying the same call is refused identically.
+ */
+export const ANY_ARG_MAX_LEAVES = 256;
+
+/** `match.any_arg` DEFAULT budget: the most total UTF-8 bytes of leaf text scanned per call. */
+export const ANY_ARG_MAX_BYTES = 256 * 1024;
+
 /* ------------------------------- normalize -------------------------------- */
 
 function toList(v: GlobOrList): string[] {
@@ -596,6 +678,7 @@ function normalizeMcpRule(rule: McpRuleInput, index: number): McpRule {
     tool: toList(rule.match.tool),
   };
   if (rule.match.args !== undefined) match.args = { ...rule.match.args };
+  if (rule.match.any_arg !== undefined) match.any_arg = rule.match.any_arg;
   if (rule.match.max_args_bytes !== undefined) match.max_args_bytes = rule.match.max_args_bytes;
   const out: McpRule = { id: rule.id ?? autoRuleId(index), match, action: rule.action };
   if (rule.reason !== undefined) out.reason = rule.reason;
@@ -753,6 +836,10 @@ export function normalizePolicy(raw: PolicyInput): Policy {
         injection: m.boundary?.injection ?? DEFAULTS.boundary.injection,
         max_scan_bytes: m.boundary?.max_scan_bytes ?? DEFAULTS.boundary.max_scan_bytes,
         on_oversize: m.boundary?.on_oversize ?? DEFAULTS.boundary.on_oversize,
+      },
+      any_arg: {
+        max_leaves: m.any_arg?.max_leaves ?? DEFAULTS.any_arg.max_leaves,
+        max_bytes: m.any_arg?.max_bytes ?? DEFAULTS.any_arg.max_bytes,
       },
     };
   }

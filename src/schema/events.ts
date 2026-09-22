@@ -373,6 +373,18 @@ export interface PolicyDecisionEvent extends EventBase {
    * field existed.
    */
   decision_id?: string;
+  /**
+   * Additive optional field (schema stays v1). Set ONLY on a fail-closed
+   * refusal — one where the gateway could not reach a decision and denied
+   * rather than allow the call unchecked — and it names WHICH way it could
+   * not: `arguments-too-large-to-scan`, `value-too-long`, `regex-timed-out`,
+   * `policy-unevaluable`. `rule_id` is absent on exactly these events
+   * (nothing matched), which used to leave `mcp-recorder why` with nothing
+   * to say about the most confusing refusal the product produces. Absent on
+   * every ordinary allow / deny / hold, and on events written before the
+   * field existed.
+   */
+  error_code?: string;
 }
 
 /** Any other correlated JSON-RPC request/response (tools/list, resources/read, ...). */

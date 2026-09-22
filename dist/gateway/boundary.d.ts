@@ -129,6 +129,15 @@ export declare const POLICY_REFUSAL_GUIDANCE: string;
  * instructions that still hold are the ones that make the gateway a control
  * rather than a speed bump: do not route around it, and tell the user.
  */
+/**
+ * The clause for a refusal that RETRYING CANNOT FIX. A call whose arguments
+ * are past the `any_arg` scan budget is refused identically every time, so
+ * {@link FAIL_CLOSED_REFUSAL_GUIDANCE}'s "You may retry it" sends the model
+ * into a loop and the person into believing the recorder is broken. This
+ * names the two things that actually work, in the order the model can try
+ * them: make the call smaller, or ask the person to raise the budget.
+ */
+export declare const UNSCANNABLE_REFUSAL_GUIDANCE: string;
 export declare const FAIL_CLOSED_REFUSAL_GUIDANCE: string;
 /** One high-confidence secret family the boundary filter is allowed to act on. */
 export interface BoundarySecretFamily {
@@ -286,6 +295,15 @@ export interface DeniedTextInput {
      * the reason string, which is free-form and comes from the policy file.
      */
     failClosed?: boolean;
+    /**
+     * The stable code for a fail-closed refusal (the policy engine's
+     * `Decision.errorCode`). It selects a guidance clause whose remedy is the
+     * real one for that class — today only `arguments-too-large-to-scan`,
+     * whose {@link UNSCANNABLE_REFUSAL_GUIDANCE} replaces an invitation to
+     * retry a call that cannot succeed. It changes NOTHING about the first
+     * line, so every refusal the docs quote still reads exactly as before.
+     */
+    errorCode?: string;
 }
 /**
  * The text the model sees for a call the gateway did not forward. The first
