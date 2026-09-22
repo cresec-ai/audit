@@ -384,9 +384,15 @@ body says `vault_unavailable` or `connector_unavailable` is a deny with that
 reason. Any other `5xx`, a timeout (`timeout_ms`, default 5 000 ms) or a
 connection failure is a deny with reason **`control_plane_unavailable`** —
 never a crash, never a hang, never a forward: the credential is absent
-([ADR 013](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/013-degrade-mode.md),
-on that repository's branch rather than its `main`: invariant 1 wins over
-invariant 8; there is no read-only fallback in this leg).
+([ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md),
+now on that repository's `main`: invariant 1 wins over invariant 8; there
+is no read-only fallback in this leg). An outage is not paid for on every
+call: the first `control_plane_unavailable` opens a 5 s window in which
+further calls that need the control plane are refused with the same reason
+without a request, one call per window probes, and any answer (an allow, a
+deny, a 4xx, a 503 naming the vault or a connector) closes it. The refusal
+the model reads says it may retry. The start and the end of the outage are
+each logged once on stderr, as this process observed them.
 
 Every remote credential in one policy names the same control plane (same
 `url` and `token_env`). Local and remote credentials mix freely: the swap

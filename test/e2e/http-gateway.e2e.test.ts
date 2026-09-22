@@ -412,13 +412,36 @@ describe('e2e S17a: http --policy with the per-user token from the control plane
       expect(body.result.content[0]!.text).toContain(expectReason);
       // Fail CLOSED, not "fail open when the control plane is away".
       expect(body.result.content[0]!.text).not.toContain(ACCESS_TOKEN);
-      await waitForDecisions(dataDir, 1);
+      // Nobody decided "no": the model is told it may retry, not that the
+      // operator refused it (which would tell it never to try again).
+      expect(body.result.content[0]!.text).toContain('You may retry it');
+      expect(body.result.content[0]!.text).not.toContain('policy decision by the operator');
+      let calls = 1;
+      if (mode === 'down') {
+        // Degrade: inside the outage window the next calls are refused at
+        // once, with the same code, and the control plane is not asked.
+        for (const id of [3, 4]) {
+          const again = (await (await post(gateway.url, draft(id, 'gmail.googleapis.com'))).json()) as {
+            result: { isError: boolean; content: Array<{ text: string }> };
+          };
+          expect(again.result.isError).toBe(true);
+          expect(again.result.content[0]!.text).toContain('control_plane_unavailable');
+        }
+        calls = 3;
+        expect(readJournalFile(join(dir, `cp-${mode}.jsonl`))).toHaveLength(1);
+        expect(gateway.stderr()).toContain('control plane unavailable (observed by this process at');
+      }
+      await waitForDecisions(dataDir, calls);
       expectCleanStop(await gateway.stop());
       controlPlane.stop();
       const decisions = readChain(dataDir).map((r) => r.event).filter((e): e is PolicyDecisionEvent => e.kind === 'policy_decision');
-      expect(decisions).toHaveLength(1);
-      expect(decisions[0]!.attributes['cresec.credential.deny_reason']).toBe(expectReason);
-      expect(decisions[0]!.decision_id).toMatch(/^[0-9a-f-]{36}$/);
+      // One record per refused call, each with its own decision id.
+      expect(decisions).toHaveLength(calls);
+      for (const d of decisions) {
+        expect(d.attributes['cresec.credential.deny_reason']).toBe(expectReason);
+        expect(d.decision_id).toMatch(/^[0-9a-f-]{36}$/);
+      }
+      expect(new Set(decisions.map((d) => d.decision_id)).size).toBe(calls);
       expectAbsentFromDataDir(dataDir, ACCESS_TOKEN, "Dana's access token");
     };
     await run('503', 'vault_unavailable');

@@ -37,12 +37,18 @@ import { STALE_SESSION_CODE, doctorExitCode, doctorVerdictLines, renderDoctor, r
 import type { DoctorReport } from './doctor/run.js';
 import type { LoadedPolicy } from './policy/load.js';
 import { bundleFileOrder, compileToRego } from './policy/rego.js';
+import { detectLeg, smokeGateway, smokeHook } from './policy/smoke.js';
+import type { PolicyLeg, SmokeResult } from './policy/smoke.js';
+import { parsePolicy as parseHookPolicy } from './hook/policy.js';
+import type { CompiledPolicy } from './hook/policy.js';
+import { parseToolName as parseHookToolName } from './hook/names.js';
 import { formatPolicyErrors, validatePolicyObject } from './policy/validate.js';
 import type { PolicyError } from './policy/validate.js';
 import { buildHookCommand, planHookInstall, planHookUndo } from './hook/install.js';
 import { runHook } from './hook/run.js';
 import { runHttpProxy } from './proxy/http.js';
 import { runStdioProxy } from './proxy/stdio.js';
+import { toolCensus } from './query/census.js';
 import { queryStore } from './query/touched.js';
 import { resolveSinkConfig } from './sink/config.js';
 import type { SinkSurface } from './sink/protocol.js';
@@ -169,6 +175,15 @@ Everything else:
   mcp-recorder policy compile FILE [--target rego] [--out DIR]
       compile a policy.yaml to an OPA bundle for the Cresec control plane;
       without --out the MCP module (cresec/mcp/...) is printed to stdout
+  mcp-recorder policy test FILE --tool NAME [--server S] [--args JSON]
+                           [--leg gateway|hook] [--expect allow|deny|hold] [--json]
+      the deny-rule smoke test: what this policy decides for one tool name,
+      spelled exactly as observed, through the same engine the gateway
+      (policy.yaml) or the hook (its JSON policy) uses. The leg is detected
+      from the file. On the hook leg it also checks every other server
+      segment a client could choose and warns when the verdict changes.
+      Exit 0 evaluated, 1 --expect not met (on the hook leg: under EVERY
+      spelling) or invalid policy, 2 usage/unreadable
   mcp-recorder holds    [--data-dir D] [--all] [--json]
       list tools/call requests a gateway is holding for approval
       (--all includes decided / expired ones)
@@ -185,6 +200,9 @@ Everything else:
       blast radius: trace a value through the evidence chain
   mcp-recorder sessions [--data-dir D] [--json]
       list recorded sessions
+  mcp-recorder sessions --tools [--data-dir D] [--session ID] [--json]
+      per-server, per-tool census of what was actually called: calls,
+      errors, denied, held, how many sessions, last seen
   mcp-recorder ui       [--data-dir D] [--session ID] [--port N] [--out FILE] [--no-open]
                         [--public-key K] [--allow-unsigned]
       replay timeline (local web UI, opened in your browser unless --no-open
@@ -285,14 +303,20 @@ Flags:
   --target T      policy compile: output target, only 'rego' (default)
                    http: the upstream MCP server URL
   --all           holds: include decided / expired holds, not just pending ones
-  --session ID    select a session (query / ui / export); a unique prefix of
+  --session ID    select a session (query / ui / export / sessions --tools); a unique prefix of
                    the id works too, same as the ids 'sessions' prints
   --public-key K  pin verify to this ed25519 key instead of the default
                    (64-hex, or a path to a file holding hex or a PEM)
   --allow-unsigned
                    verify: downgrade an unsigned chain/tail to a warning
                    instead of a failure (still reported, never silent)
-  --json          machine-readable output (verify / query / sessions / setup / policy validate / holds)
+  --json          machine-readable output (verify / query / sessions / setup / policy validate / policy test / holds)
+  --tools         sessions: one row per (server, tool) instead of per session
+  --tool NAME     policy test: the tool name to evaluate, exactly as observed
+  --server S      policy test (gateway leg): the server the call goes to
+  --args JSON     policy test (gateway leg): the call's arguments object
+  --leg L         policy test: gateway | hook (default: detected from the file)
+  --expect A      policy test: exit 1 unless the verdict is A (allow | deny | hold)
   --client NAME   protect / doctor / setup: claude-desktop | claude-code | cursor
                    hook / hook install: logical client name stamped on events
                    (default 'claude-code')
@@ -394,6 +418,12 @@ const FLAG_DEFS = {
   timeout: { type: 'string' },
   'idle-exit': { type: 'string' },
   surface: { type: 'string' },
+  tools: { type: 'boolean' },
+  tool: { type: 'string' },
+  server: { type: 'string' },
+  args: { type: 'string' },
+  expect: { type: 'string' },
+  leg: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'V' },
 } as const;
@@ -1372,12 +1402,49 @@ function endedCell(s: SessionSummary): string {
   return s.ended_at;
 }
 
+/**
+ * `sessions --tools`: the per-server, per-tool census (src/query/census.ts),
+ * over the whole chain or one session (`--session`, a prefix works).
+ */
+function printToolCensus(store: EvidenceStore, flags: Flags): void {
+  const rawSession = asStr(flags.session);
+  const sessionId = rawSession === undefined ? undefined : resolveSessionId(store, rawSession);
+  const rows = toolCensus(store.iterate(sessionId === undefined ? undefined : { sessionId }));
+  if (flags.json === true) {
+    out(JSON.stringify(rows, null, 2));
+    return;
+  }
+  if (rows.length === 0) {
+    out(sessionId === undefined ? 'no tool calls recorded' : `no tool calls recorded in session ${id8(sessionId)}`);
+    return;
+  }
+  out(
+    formatTable(
+      ['SERVER', 'TOOL', 'CALLS', 'ERRORS', 'DENIED', 'HELD', 'SESSIONS', 'LAST_SEEN'],
+      rows.map((r) => [
+        r.server === '' ? '-' : r.server,
+        r.tool,
+        String(r.calls),
+        String(r.errors),
+        String(r.denied),
+        String(r.held),
+        String(r.sessions),
+        r.last_seen,
+      ]),
+    ),
+  );
+}
+
 async function cmdSessions(flags: Flags): Promise<void> {
   guardStdoutEpipe();
   const config = resolveConfig({ flags, env: process.env });
   announceDefaultDataDir(flags, config);
   const store = openConfiguredStore(config, { readOnly: true });
   try {
+    if (flags.tools === true) {
+      printToolCensus(store, flags);
+      return;
+    }
     const sessions = store.sessions();
     if (flags.json === true) {
       out(JSON.stringify(sessions, null, 2));
@@ -1571,13 +1638,143 @@ function policyRuleCounts(loaded: LoadedPolicy): { mcp: number; egress: number }
   };
 }
 
+/**
+ * `policy test`: one tool name through the engine that governs its leg, the
+ * deny-rule smoke test docs/pov.md asks for before a policy meeting ends.
+ * Exit 0 when evaluated (and, with --expect, when the verdict is the one
+ * expected), 1 when --expect is not met or the policy is invalid, 2 on a
+ * usage error or an unreadable file. Nothing is spawned, nothing recorded.
+ */
+function cmdPolicyTest(path: string, flags: Flags, jsonOut: boolean): void {
+  const tool = asStr(flags.tool) ?? err('policy test: missing --tool NAME (the tool name exactly as observed)');
+  if (tool === '') err('policy test: --tool must not be empty');
+  const expect = asStr(flags.expect);
+  if (expect !== undefined && expect !== 'allow' && expect !== 'deny' && expect !== 'hold') {
+    err(`policy test: invalid --expect '${expect}' (expected allow, deny or hold)`);
+  }
+  const legFlag = asStr(flags.leg);
+  if (legFlag !== undefined && legFlag !== 'gateway' && legFlag !== 'hook') {
+    err(`policy test: invalid --leg '${legFlag}' (expected gateway or hook)`);
+  }
+
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (cause) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    return err(`policy test: cannot read policy file ${path}: ${msg}`);
+  }
+  let leg: PolicyLeg;
+  if (legFlag !== undefined) {
+    leg = legFlag;
+  } else {
+    let doc: unknown;
+    try {
+      doc = parsePolicyText(text, sourceForPath(path), path);
+    } catch {
+      doc = undefined; // the gateway reader below reports the parse error
+    }
+    leg = detectLeg(doc);
+  }
+
+  let result: SmokeResult;
+  if (leg === 'hook') {
+    if (flags.server !== undefined || flags.args !== undefined) {
+      err('policy test: --server and --args apply to the gateway leg; a hook rule sees only the full tool name');
+    }
+    let hookPolicy: CompiledPolicy;
+    try {
+      hookPolicy = parseHookPolicy(text);
+    } catch (cause) {
+      // The real hook DENIES every call it governs when this happens; say
+      // so, and fail rather than report that denial as a rule's verdict.
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      process.exitCode = 1;
+      out(`${path}: invalid hook policy (${msg}) — 'mcp-recorder hook --policy' would deny every call it governs`);
+      return;
+    }
+    result = smokeHook(hookPolicy, tool);
+  } else {
+    const read = readPolicyForCli(path, 'policy test');
+    if (!read.ok) {
+      printPolicyInvalid(path, read.errors, jsonOut);
+      return;
+    }
+    if (read.loaded.policy.mcp === undefined) {
+      err(`policy test: ${path} has no "mcp" section — nothing for the gateway to evaluate`);
+    }
+    let server = asStr(flags.server);
+    let bare = tool;
+    if (server === undefined) {
+      const parsed = parseHookToolName(tool);
+      if (!parsed.isMcp) {
+        err(
+          'policy test: the gateway leg needs --server S (the wrapped server\'s name, as --name or its serverInfo gives it), ' +
+            'or a tool spelled mcp__<server>__<tool>',
+        );
+      }
+      server = parsed.server;
+      bare = parsed.tool;
+    }
+    let args: unknown = {};
+    const rawArgs = asStr(flags.args);
+    if (rawArgs !== undefined) {
+      try {
+        args = JSON.parse(rawArgs);
+      } catch (cause) {
+        const msg = cause instanceof Error ? cause.message : String(cause);
+        err(`policy test: --args is not JSON: ${msg}`);
+      }
+      if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+        err('policy test: --args must be a JSON object (the tools/call params.arguments)');
+      }
+    }
+    result = smokeGateway(read.loaded.policy, server, bare, args);
+  }
+
+  // A verdict that changes with the server segment is not the verdict the
+  // person expected: it holds for one session's spelling (cloud dogfood 4).
+  const anchoredCount = result.anchored?.length ?? 0;
+  const met = expect === undefined || (result.action === expect && anchoredCount === 0);
+  // Exit code BEFORE printing, for the same EPIPE reason as cmdVerify.
+  if (!met) process.exitCode = 1;
+  if (jsonOut) {
+    out(JSON.stringify({ path, ...result, ...(expect !== undefined ? { expect, expectation_met: met } : {}) }, null, 2));
+    return;
+  }
+  const subject = result.leg === 'gateway' ? `server=${result.server ?? ''} tool=${result.tool}` : result.tool;
+  const by = result.leg === 'gateway' ? `  rule ${result.rule ?? 'default'}` : '';
+  out(`${result.action.toUpperCase()}  ${subject}${by}   (${result.leg} leg, ${path})`);
+  if (result.reason !== undefined) out(`  reason: ${result.reason}`);
+  if (result.fail_closed === true) out('  the policy could not be evaluated for this call, so the gateway refuses it (fail closed)');
+  if (result.anchored !== undefined && result.spellings !== undefined) {
+    if (result.anchored.length === 0) {
+      out(`  same verdict under all ${String(result.spellings.length)} server-segment spellings a client could choose`);
+    } else {
+      out(
+        `  WARNING: ${String(result.anchored.length)} of ${String(result.spellings.length)} spellings of this tool get a different verdict —`,
+      );
+      out('  the server segment is the client\'s to choose, so this rule holds for one spelling only:');
+      for (const s of result.anchored) out(`    ${s.action.toUpperCase()}  ${s.name}   (${s.origin})`);
+    }
+  }
+  if (!met) {
+    out(
+      result.action === expect
+        ? `  expected ${expect} under every spelling, got it under ${String((result.spellings?.length ?? 0) - anchoredCount)} of ${String(result.spellings?.length ?? 0)}`
+        : `  expected ${expect ?? ''}, got ${result.action}`,
+    );
+  }
+}
+
 async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
   guardStdoutEpipe();
   const usage =
-    'usage: mcp-recorder policy validate <file> [--json] | mcp-recorder policy compile <file> [--target rego] [--out DIR]';
-  const verb = positionals[0] ?? err(`policy: missing <validate|compile> (${usage})`);
-  if (verb !== 'validate' && verb !== 'compile') {
-    err(`policy: unknown verb '${verb}' (expected 'validate' or 'compile'; ${usage})`);
+    'usage: mcp-recorder policy validate <file> [--json] | mcp-recorder policy compile <file> [--target rego] [--out DIR]' +
+    ' | mcp-recorder policy test <file> --tool NAME [--server S] [--args JSON] [--leg gateway|hook] [--expect allow|deny|hold] [--json]';
+  const verb = positionals[0] ?? err(`policy: missing <validate|compile|test> (${usage})`);
+  if (verb !== 'validate' && verb !== 'compile' && verb !== 'test') {
+    err(`policy: unknown verb '${verb}' (expected 'validate', 'compile' or 'test'; ${usage})`);
   }
   const fileArg = positionals[1] ?? err(`policy ${verb}: missing <file> (${usage})`);
   if (positionals.length > 2) {
@@ -1585,6 +1782,11 @@ async function cmdPolicy(flags: Flags, positionals: string[]): Promise<void> {
   }
   const jsonOut = flags.json === true;
   const path = resolve(fileArg);
+
+  if (verb === 'test') {
+    cmdPolicyTest(path, flags, jsonOut);
+    return;
+  }
 
   if (verb === 'validate') {
     const read = readPolicyForCli(path, 'policy validate');

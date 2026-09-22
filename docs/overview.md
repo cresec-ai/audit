@@ -907,9 +907,12 @@ nobody's ([docs/pov.md](pov.md) says which):
   impossible from the customer side; the hook can deny those calls and
   nothing can swap their credential;
 - a manager or security view — `ui` is a replay page over one store;
-- a degrade-to-read-only mode — `MCP_RECORDER_DISABLE=1` removes recording
-  and enforcement together; the MCP gateway's read-only fallback is this
-  package's to build, and the HTTPS tool's is the control plane's.
+- a degrade-to-read-only mode — by design: when the control plane is
+  unreachable the MCP gateway fails closed, quickly and retryably, with no
+  credential or cached-token fallback (the corrected outage contract of
+  ClickUp z8n6b5z9fd); `MCP_RECORDER_DISABLE=1` removes recording and
+  enforcement together and is a kill switch, not a degrade mode. The HTTPS
+  tool's behaviour is the control plane's.
 
 It also does not fit if:
 

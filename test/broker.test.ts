@@ -1335,12 +1335,14 @@ describe('RemoteBroker — POST /v1/broker/user-token (user-token.md), the contr
   function userTokenBroker(
     fetch: (r: { url: string; body: string; headers: Record<string, string> }) => Promise<{ status: number; body: string }>,
     sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [],
+    extra: { now?: () => number; outageCooldownMs?: number; warn?: (line: string) => void } = {},
   ): RemoteBroker {
     return new RemoteBroker({
       baseUrl: 'https://api.cresec.test/',
       dataPlaneInstanceId: 'dp-1',
       authToken: 'internal-token-fake',
       warn: () => {},
+      ...extra,
       userToken: {
         tenant: 'e2e',
         userId: USER,
@@ -1484,6 +1486,117 @@ describe('RemoteBroker — POST /v1/broker/user-token (user-token.md), the contr
     expect(vault.decision_id).toBe(DECISION);
     const dead = await userTokenBroker(() => Promise.reject(new Error('down'))).exchange(req({}, SYN), hint);
     expect(dead.decision_id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  describe('degrade: an unreachable control plane is refused fast, probed once per window, and never bypassed', () => {
+    // A control plane whose availability the test switches, and a clock it moves.
+    function harness(cooldown = 5_000) {
+      let clock = 1_000_000;
+      let up = false;
+      const lines: string[] = [];
+      const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+      const broker = userTokenBroker(
+        () => (up ? allow() : Promise.reject(new Error('ECONNREFUSED'))),
+        sent,
+        { now: () => clock, outageCooldownMs: cooldown, warn: (l) => lines.push(l) },
+      );
+      return {
+        broker,
+        sent,
+        lines,
+        advance: (ms: number) => {
+          clock += ms;
+        },
+        setUp: (v: boolean) => {
+          up = v;
+        },
+        call: () => broker.exchange(req({}, SYN), hint),
+      };
+    }
+
+    it('the first failure opens a window in which calls are refused without a request', async () => {
+      const h = harness();
+      const first = await h.call();
+      expect(first).toMatchObject({ denied: true, deny_reason: 'control_plane_unavailable' });
+      expect(h.sent).toHaveLength(1);
+      h.advance(4_999);
+      for (let i = 0; i < 3; i++) {
+        const out = await h.call();
+        expect(out).toMatchObject({ denied: true, deny_reason: 'control_plane_unavailable' });
+        expect(out.decision_id).toMatch(/^[0-9a-f-]{36}$/);
+        expect(out.real_token).toBeUndefined();
+      }
+      // No request in the window: the calls did not each wait out the timeout.
+      expect(h.sent).toHaveLength(1);
+      // One line at the start, marked as this process's observation.
+      expect(h.lines.filter((l) => l.includes('control plane unavailable'))).toHaveLength(1);
+      expect(h.lines.join('\n')).toContain('observed by this process');
+      expect(h.lines.join('\n')).toContain('no credential fallback');
+    });
+
+    it('after the window one call probes; a failed probe reopens it, a successful one closes it and says how long it was down', async () => {
+      const h = harness();
+      await h.call();
+      h.advance(5_000);
+      await h.call(); // the probe, still down
+      expect(h.sent).toHaveLength(2);
+      await h.call(); // inside the reopened window
+      expect(h.sent).toHaveLength(2);
+
+      h.setUp(true);
+      h.advance(5_000);
+      const probe = await h.call();
+      expect(probe).toEqual({ real_token: ACCESS, ttl_seconds: 300, decision_id: DECISION });
+      expect(h.sent).toHaveLength(3);
+      const recovered = h.lines.find((l) => l.includes('reachable again'));
+      expect(recovered).toBeDefined();
+      expect(recovered).toContain('unavailable for 10000 ms as observed by this process');
+      expect(recovered).toContain('1 call(s) refused without asking it');
+      // Closed: the next call asks at once.
+      await h.call();
+      expect(h.sent).toHaveLength(4);
+    });
+
+    it('while a probe is in flight every other call is refused without a request', async () => {
+      let release: (v: { status: number; body: string }) => void = () => {};
+      let calls = 0;
+      let clock = 0;
+      const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+      const broker = userTokenBroker(
+        () => {
+          calls += 1;
+          if (calls === 1) return Promise.reject(new Error('ECONNREFUSED'));
+          if (calls > 2) return allow();
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+        sent,
+        { now: () => clock, outageCooldownMs: 100 },
+      );
+      await broker.exchange(req({}, SYN), hint);
+      clock = 100;
+      const probe = broker.exchange(req({}, SYN), hint);
+      const other = await broker.exchange(req({}, SYN), hint);
+      expect(other).toMatchObject({ denied: true, deny_reason: 'control_plane_unavailable' });
+      expect(sent).toHaveLength(2);
+      release({ status: 403, body: JSON.stringify({ decision_id: DECISION, reason: 'grant_required' }) });
+      // A deny is an answer: the control plane is up, and its reason stands.
+      expect(await probe).toMatchObject({ denied: true, deny_reason: 'grant_required' });
+      await broker.exchange(req({}, SYN), hint);
+      expect(sent).toHaveLength(3);
+    });
+
+    it('a 503 naming the vault or a connector is the control plane answering, and opens no window', async () => {
+      const sent: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+      const broker = userTokenBroker(
+        () => Promise.resolve({ status: 503, body: JSON.stringify({ error: 'vault_unavailable', decision_id: DECISION, reason: 'vault_unavailable', action_class: 'read' }) }),
+        sent,
+        { now: () => 0 },
+      );
+      for (let i = 0; i < 3; i++) expect((await broker.exchange(req({}, SYN), hint)).deny_reason).toBe('vault_unavailable');
+      expect(sent).toHaveLength(3);
+    });
   });
 
   it('a synthetic that is not the one bound to the site\'s credential, or a site it does not know, is unknown_synthetic / denied_by_policy — nothing is sent', async () => {

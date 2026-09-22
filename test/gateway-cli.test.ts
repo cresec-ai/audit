@@ -399,7 +399,7 @@ describe('mcp-recorder policy validate', () => {
     const path = writePolicy(dir, 'policy.yaml', VALID_POLICY);
     const noVerb = await runCli(['policy']);
     expect(noVerb.code).toBe(2);
-    expect(noVerb.stderr).toContain('missing <validate|compile>');
+    expect(noVerb.stderr).toContain('missing <validate|compile|test>');
     const unknown = await runCli(['policy', 'frobnicate', path]);
     expect(unknown.code).toBe(2);
     expect(unknown.stderr).toContain("unknown verb 'frobnicate'");
