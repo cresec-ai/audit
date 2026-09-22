@@ -2441,12 +2441,28 @@ async function cmdProtect(flags) {
     //    discovered. A person who installs a security product and cannot make
     //    it fire learns nothing.
     const suggestion = suggestTrigger(report);
+    // Two DIFFERENT propositions, and they must not share a branch: "nothing is
+    // covered" is a fact about coverage, while "no example sentence" is a fact
+    // about whether the tool list was complete enough to pick one from.
+    // suggestTrigger returns undefined for BOTH, and for a third case besides —
+    // C4 merely INCOMPLETE, which any server slow to enumerate produces. Printing
+    // the first sentence on the second condition told a user with nine denied
+    // tools, listed by name directly above it, that none of them were covered.
+    const covered = report.coverage.denied + report.coverage.held;
     out('');
-    if (suggestion === undefined) {
+    if (covered === 0) {
         out('NOTHING YOU HAVE IS COVERED BY A DENY OR HOLD RULE.');
         out('  Enforcement is on and matches none of the tools your servers expose. Every call');
         out('  will be allowed and the evidence chain will look completely healthy. That is the');
         out('  failure that does not report itself — see the C4 block above.');
+    }
+    else if (suggestion === undefined) {
+        out(`${covered} of your tools ARE covered by a deny or hold rule, and enforcement is on.`);
+        out('  No example to try is offered here because the tool list is INCOMPLETE — see the');
+        out('  C4 block above for which servers could not be enumerated. A sentence chosen from');
+        out('  a partial list can name a tool you do not have, and then nothing happens and you');
+        out('  learn the wrong thing. Fix the enumeration, re-run `mcp-recorder doctor`, and it');
+        out('  will pick one for you.');
     }
     else {
         out('Then ask your agent to do something it should not do, for example:');

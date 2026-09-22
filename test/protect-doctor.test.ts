@@ -58,6 +58,7 @@ import type { ChainRecord } from '../src/schema/events.js';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TOOLS_SERVER = fileURLToPath(new URL('./fixtures/tools-server.cjs', import.meta.url));
 const ECHO_SERVER = fileURLToPath(new URL('./fixtures/echo-server.cjs', import.meta.url));
+const HANG_SERVER = fileURLToPath(new URL('./fixtures/hang-server.cjs', import.meta.url));
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -501,6 +502,42 @@ describe('mcp-recorder protect', () => {
     expect(r.stdout).not.toContain('Then ask your agent to do something it should not do');
     expect(r.status).toBe(1);
   });
+
+  it('does NOT claim "nothing is covered" when things ARE covered and only the example is missing', () => {
+    // Coverage > 0 (the hook leg denies clickup_delete_task) while C4 is
+    // INCOMPLETE (the stdio server never answers tools/list). suggestTrigger
+    // returns undefined here, and it is RIGHT to: a sentence drawn from a
+    // partial list can name a tool that is not there. But "no sentence could
+    // be chosen" is not "nothing is covered", and printing the second on the
+    // first told a protected user they were unprotected, directly underneath
+    // doctor's own list of the tools it had just denied.
+    const dir = tmpDir('protect-partial-');
+    const dataDir = join(dir, 'data');
+    writeMcpJson(dir, { wedged: { command: process.execPath, args: [HANG_SERVER] } });
+    const mcpConfig = join(dir, 'mcp-config.json');
+    writeFileSync(
+      mcpConfig,
+      JSON.stringify({
+        mcpServers: {
+          ClickUp: {
+            type: 'http',
+            url: 'https://api.anthropic.com/v2/ccr-sessions/s/mcp?mcp_url=https%3A%2F%2Fmcp.clickup.com%2Fmcp',
+            tools: [{ name: 'clickup_delete_task' }],
+          },
+        },
+      }),
+    );
+    const r = cli(['protect', '--client', 'claude-code', '--data-dir', dataDir], { cwd: dir, env: { MCP_RECORDER_MCP_CONFIG: mcpConfig } });
+    // The precondition this test exists for: genuinely covered, genuinely partial.
+    expect(r.stdout, r.stdout).toContain('could not be enumerated');
+    expect(r.stdout, r.stdout).toMatch(/[1-9]\d* denied/);
+    // The false sentence must not appear.
+    expect(r.stdout).not.toContain('NOTHING YOU HAVE IS COVERED');
+    expect(r.stdout).not.toContain('matches none of the tools your servers expose');
+    // And what it says instead is true, and says why there is no example.
+    expect(r.stdout).toContain('ARE covered by a deny or hold rule');
+    expect(r.stdout).toContain('tool list is INCOMPLETE');
+  }, 30_000);
 
   it('--dry-run writes NOTHING, including the starter files', () => {
     const { dir, dataDir } = project();
