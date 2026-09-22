@@ -263,7 +263,8 @@ identity join, not from anything this package counts. `sessions`
 (**shipped**) lists one row per recorded session with tool calls, errors,
 servers and decisions; it is a census of MCP traffic, not an attribution
 report, and the per-server, per-tool form (`sessions --tools`) is
-**needs-build**.
+**shipped**: one row per (server, tool) with calls, errors, denied, held,
+sessions and last seen.
 
 **What the control plane must supply.** The identity gate and the per-user
 token in OpenBao —
@@ -352,9 +353,11 @@ engine evaluates the rule:
 2. **Smoke-test every rule with the real binary, in the exact observed
    spelling**, by piping a PreToolUse event into `mcp-recorder hook`. The
    thirty seconds where a rule someone wrote from memory prints *nothing* is
-   the most useful moment in the meeting. A `policy test --tool <name>`
-   command that does this is **needs-build**; today it is a `printf` someone
-   has to remember.
+   the most useful moment in the meeting. `mcp-recorder policy test
+   <file> --tool <name> --expect deny` does this (**shipped**): the same
+   engine the hook or the gateway uses, and on the hook leg every other
+   server segment a client could choose, so a rule anchored to one
+   session's spelling fails `--expect deny` instead of passing.
 
 The manager view is
 [Phase 4's views ticket](https://app.clickup.com/t/z8n6b5z50n) and belongs to
@@ -488,7 +491,7 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | `policy validate` + Rego compiler (OPA parity test) | 3 | [Policy engine](https://app.clickup.com/t/z8n6b5z50k) | shipped; egress rules compile and nothing enforces them | recorder |
 | Policy per (user × tool version); read / draft / send / write classes; draft-only default — **control-plane half** | 3 | [Policy engine](https://app.clickup.com/t/z8n6b5z50k) | shipped at L1 in nhi: `apps/api/src/policy/decide.ts` (those four classes; read and draft need no grant, send and write need an unrevoked one), grants in `policy/store.ts` behind `routes/grants.ts`, registry in `registry.ts`, bundle `packages/policies/default/cresec/gateway/decision.rego`; tests `decide.test.ts`, `apps/api/tests/system/{policy-decide,grants-crud}.test.ts`, S9. L2 needs a real tenant | control plane |
 | Policy per (user × tool version); read / draft / send / write classes; draft-only default — **recorder half** | 3 | [Policy engine](https://app.clickup.com/t/z8n6b5z50k) | needs-build: rules here key on (server, tool, args), not on a person or a tool version | recorder |
-| Deny-rule smoke test as a command (`policy test`) | 3 | — | needs-build | recorder |
+| Deny-rule smoke test as a command (`policy test`) | 3 | [z8n6b5zbqb](https://app.clickup.com/t/z8n6b5zbqb) | shipped: `policy test FILE --tool NAME`, both legs, with the spelling check; `test/cli.test.ts` | recorder |
 | `http` recording proxy for remote MCP servers | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | shipped | recorder |
 | `http --policy`: gateway for remote MCP servers, per-user token injection from the control plane | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | in-flight (this branch): `http --policy` and `credentials[].broker: { kind: remote }` → `POST /v1/broker/user-token`, tested against a journaling fake vendor MCP and a fake control plane (S17a); no live vendor remote MCP yet (S17b). Touches invariants 1 and 3 (per-user token fetched per call, decision id on the record); invariant 1 is met only with the control plane's injection | recorder |
 | Broker core + 7 credential sources; `credentials` policy section + Rego emitter; gateway synthetic→real swap + result scrub; 4-test e2e suite; live in dogfood 7 | 3 | — | shipped (local broker) | recorder |
@@ -508,7 +511,7 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | `decision_id` on `policy_decision` events | 4 | — | in-flight (this branch): additive optional field, the local engine's uuid or the control plane's own id; invariant 3 (the decision joins the record) | recorder |
 | Actor claims (user, tool, tool-version, host) on every record | 0, 4 | [Actor-claim schema](https://app.clickup.com/t/z8n6b5z507) | in-flight (this branch): ADR 012's shape as `identity.actor`, from `--identity-jwt`; `identity.actor_verified` true only with `--identity-jwks`; invariant 3 | both |
 | `DECISIONS` counting both deny shapes; one deny event shape | 4 | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | in-flight (this branch) for the counting and the replay badges; the two shapes remain (invariant 3's exactly-one-record clause still does not hold: a gateway deny is a `policy_decision` plus a synthetic `tool_call`, a hook call is `pre` + `post`) | recorder |
-| `sessions --tools` census | 4 | — | needs-build | recorder |
+| `sessions --tools` census | 4 | [z8n6b5zbqf](https://app.clickup.com/t/z8n6b5zbqf) | shipped: `src/query/census.ts`; `test/cli.test.ts` | recorder |
 | `receiver/` in package `files`; HTTP export route for signed replica bundles | 4 | — | in-flight (this branch): `receiver/` (and `src/`, which it imports) ship in the package, `receiver/Dockerfile` builds it, `GET /v1/chains/{chain_id}/export` serves the attested replica bundle to the operator; S18's pinned-enrolment arm is in `test/e2e/ship.e2e.test.ts` | recorder |
 | Evidence stream on NATS JetStream | 4 | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m) | shipped at L1: nhi's `apps/api/src/evidence/publish.ts` fans each appended record out to `tenant.<slug>.evidence` on the `cresec-tenant` stream, off the append's critical path with a 2 s timeout; S8 dumps that subject with the run's `record_id` as a positive control | control plane |
 | Regulator-mapped export pack (Art. 12, SOC 2 CC6/CC7) | 4 | [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff) | needs-build in both repositories | both |
@@ -697,9 +700,9 @@ against vendor fakes, deployed nowhere.
   retention, no pruning, no external anchoring.
 - *"`setup` will rewrite your configs safely."* — rated **Tested, not Verified**:
   no real client has ever launched what it wrote. Use `--dry-run` in the room.
-- *"The binary says so too."* — not yet. `mcp-recorder --help` still prints
-  the old tagline (`src/cli.ts`); `src/` is out of scope for this revision,
-  so the installed binary lags this page until the next `src/` change.
+- *"The binary says so too."* — yes. `mcp-recorder --help` opens with
+  "a gate in front of every tool call your agent makes, and a signed record
+  of every one of them" (`src/cli.ts`); the old tagline is gone.
 
 ---
 

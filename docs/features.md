@@ -108,6 +108,8 @@ points at them.
 | Gateway: boundary filter, injection flagging | `mcp.boundary.injection` | **Verified** (dogfood 5) — flags, does not block |
 | Gateway: boundary filter, secret redaction | `mcp.boundary.secrets` | **Tested**, with a false-positive rate worth reading |
 | Policy validation | `policy validate FILE` | **Tested** |
+| Deny-rule smoke test, both legs, with the spelling check | `policy test FILE --tool NAME` | **Tested** (`test/cli.test.ts`) |
+| Per-server, per-tool census | `sessions --tools` | **Tested** (`test/cli.test.ts`) |
 | Rego compiler and OPA parity | `policy compile FILE` | **Tested** (parity runs in CI only) |
 | Typechecking for `test`/`bench`/`demo` | `npm run typecheck` | **Verified** (build-time control; run here and in CI) |
 | `sessions` DECISIONS counts hook denies too | `sessions` | **Tested** (`test/store.test.ts`, both backends) — closed after this transcript |

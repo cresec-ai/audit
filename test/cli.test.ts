@@ -10,6 +10,7 @@ import { spawnTsx } from './helpers/tsx.js';
 import { GENESIS_HASH, makeRecord, sha256Ref } from '../src/chain/hash.js';
 import { Signer, publicKeyPem } from '../src/chain/keys.js';
 import { openStore } from '../src/store/index.js';
+import { materialiseStarterPolicy, starterHookPolicyPath, starterPolicyPath } from '../src/policy/starter.js';
 import { SCHEMA } from '../src/schema/events.js';
 import type {
   AnyEvent,
@@ -814,6 +815,156 @@ describe('mcp-recorder CLI', () => {
       last_event_at: '2026-01-01T12:41:08.000Z',
       event_count: 5,
     });
+  }, 60_000);
+
+  it('sessions --tools: one row per (server, tool), a hook call counted once across its pre and post', async () => {
+    const dataDir = tmpDir('mcp-rec-census-hook-');
+    const sessionId = 'cccccccc-1111-4000-8000-000000000000';
+    seedHookSession(dataDir, sessionId);
+
+    const json = await runCli(['sessions', '--tools', '--data-dir', dataDir, '--json']);
+    expect(json.code).toBe(0);
+    const rows = JSON.parse(json.stdout) as Array<Record<string, unknown>>;
+    // Sorted by server, then tool; the client's own session events are not a tool.
+    expect(rows.map((r) => `${String(r.server)}/${String(r.tool)}`)).toEqual([
+      'ClickUp/clickup_get_list',
+      'ClickUp/clickup_get_task',
+      'github/pull_request_read',
+    ]);
+    expect(rows[1]).toMatchObject({ calls: 1, errors: 0, denied: 0, held: 0, sessions: 1 });
+    // The post half is the same call, but it is the last time the tool was seen.
+    expect(rows[1]).toMatchObject({ first_seen: '2026-01-01T00:00:01.000Z', last_seen: '2026-01-01T00:00:02.000Z' });
+    expect(rows[0]).toMatchObject({ calls: 1 }); // a lone pre still counts once
+
+    const human = await runCli(['sessions', '--tools', '--data-dir', dataDir]);
+    expect(human.code).toBe(0);
+    const [headerLine, ...rowLines] = human.stdout.trim().split('\n');
+    expect(headerLine!.trim().split(/\s+/)).toEqual([
+      'SERVER',
+      'TOOL',
+      'CALLS',
+      'ERRORS',
+      'DENIED',
+      'HELD',
+      'SESSIONS',
+      'LAST_SEEN',
+    ]);
+    expect(rowLines).toHaveLength(3);
+  }, 60_000);
+
+  it('sessions --tools: a gateway deny and a resolved hold land on their own tools, counted once each', async () => {
+    const dataDir = tmpDir('mcp-rec-census-gateway-');
+    const sessionId = 'dddddddd-1111-4000-8000-000000000000';
+    seedGatewaySession(dataDir, sessionId);
+
+    const res = await runCli(['sessions', '--tools', '--data-dir', dataDir, '--json']);
+    expect(res.code).toBe(0);
+    const rows = JSON.parse(res.stdout) as Array<{ tool: string } & Record<string, unknown>>;
+    const byTool = (tool: string): Record<string, unknown> | undefined => rows.find((r) => r.tool === tool);
+    expect(rows).toHaveLength(3);
+    expect(byTool('read_note')).toMatchObject({ calls: 1, errors: 0, denied: 0, held: 0 });
+    // The deny is a policy_decision AND the synthetic tool_call: one refusal, counted once.
+    expect(byTool('http_post')).toMatchObject({ calls: 1, errors: 1, denied: 1, held: 0 });
+    expect(byTool('send_mail')).toMatchObject({ calls: 1, errors: 0, denied: 0, held: 1 });
+  }, 60_000);
+
+  it('sessions --tools --session: a prefix selects the session, an unknown one is a usage error', async () => {
+    const dataDir = tmpDir('mcp-rec-census-session-');
+    seedGatewaySession(dataDir, 'eeeeeeee-1111-4000-8000-000000000000');
+
+    const hit = await runCli(['sessions', '--tools', '--data-dir', dataDir, '--session', 'eeeeeeee', '--json']);
+    expect(hit.code).toBe(0);
+    expect(JSON.parse(hit.stdout)).toHaveLength(3);
+
+    const miss = await runCli(['sessions', '--tools', '--data-dir', dataDir, '--session', 'ffffffff']);
+    expect(miss.code).toBe(2);
+    expect(miss.stderr).toContain('matches no recorded session');
+  }, 60_000);
+
+  it('policy test: the starter hook policy denies a destructive tool under every spelling, and --expect gates the exit code', async () => {
+    const dir = tmpDir('mcp-rec-policy-test-hook-');
+    materialiseStarterPolicy(dir);
+    const hookPolicy = starterHookPolicyPath(dir);
+
+    const deny = await runCli(['policy', 'test', hookPolicy, '--tool', 'mcp__ClickUp__clickup_delete_task', '--expect', 'deny']);
+    expect(deny.code).toBe(0);
+    expect(deny.stdout).toMatch(/^DENY {2}mcp__ClickUp__clickup_delete_task/);
+    expect(deny.stdout).toContain('(hook leg,');
+    expect(deny.stdout).toContain('same verdict under all');
+
+    const allow = await runCli(['policy', 'test', hookPolicy, '--tool', 'mcp__ClickUp__clickup_get_task', '--expect', 'deny']);
+    expect(allow.code).toBe(1);
+    expect(allow.stdout).toContain('expected deny, got allow');
+  }, 60_000);
+
+  it('policy test: a hook deny anchored to one server segment is reported, and fails --expect deny', async () => {
+    const dir = tmpDir('mcp-rec-policy-test-anchored-');
+    const path = join(dir, 'anchored.json');
+    // Cloud dogfood 4's shape: a rule that names the segment one session used.
+    writeFileSync(path, JSON.stringify({ deny: [{ tool: '^mcp__ClickUp__clickup_delete_task$' }] }));
+
+    const human = await runCli(['policy', 'test', path, '--tool', 'mcp__ClickUp__clickup_delete_task', '--expect', 'deny']);
+    expect(human.code).toBe(1);
+    expect(human.stdout).toMatch(/^DENY /);
+    expect(human.stdout).toContain('WARNING:');
+    expect(human.stdout).toContain('mcp__zz-unknown-segment-0__clickup_delete_task');
+    expect(human.stdout).toContain('expected deny under every spelling');
+
+    const json = await runCli(['policy', 'test', path, '--tool', 'mcp__ClickUp__clickup_delete_task', '--json']);
+    expect(json.code).toBe(0); // no --expect: evaluated, reported, not judged
+    const parsed = JSON.parse(json.stdout) as { leg: string; action: string; anchored: Array<{ action: string }> };
+    expect(parsed.leg).toBe('hook');
+    expect(parsed.action).toBe('deny');
+    expect(parsed.anchored.length).toBeGreaterThan(0);
+    expect(parsed.anchored.every((s) => s.action === 'allow')).toBe(true);
+  }, 60_000);
+
+  it('policy test: the gateway leg evaluates server, tool and arguments through the same engine as record --policy', async () => {
+    const dir = tmpDir('mcp-rec-policy-test-gateway-');
+    materialiseStarterPolicy(dir);
+    const policy = starterPolicyPath(dir);
+
+    const cred = await runCli([
+      'policy', 'test', policy, '--tool', 'read_file', '--server', 'filesystem',
+      '--args', JSON.stringify({ path: '/home/me/.env' }), '--json',
+    ]);
+    expect(cred.code).toBe(0);
+    expect(JSON.parse(cred.stdout)).toMatchObject({ leg: 'gateway', server: 'filesystem', tool: 'read_file', action: 'deny' });
+
+    // The same call with harmless arguments is not denied: the arguments are really evaluated.
+    const plain = await runCli([
+      'policy', 'test', policy, '--tool', 'read_file', '--server', 'filesystem',
+      '--args', JSON.stringify({ path: '/home/me/notes.txt' }), '--expect', 'allow',
+    ]);
+    expect(plain.code).toBe(0);
+    expect(plain.stdout).toMatch(/^ALLOW {2}server=filesystem tool=read_file/);
+
+    // An mcp__<server>__<tool> spelling supplies the server.
+    const spelled = await runCli(['policy', 'test', policy, '--tool', 'mcp__filesystem__read_file', '--json']);
+    expect(spelled.code).toBe(0);
+    expect(JSON.parse(spelled.stdout)).toMatchObject({ server: 'filesystem', tool: 'read_file' });
+  }, 60_000);
+
+  it('policy test: usage errors exit 2, an invalid policy exits 1', async () => {
+    const dir = tmpDir('mcp-rec-policy-test-errors-');
+    materialiseStarterPolicy(dir);
+
+    const noServer = await runCli(['policy', 'test', starterPolicyPath(dir), '--tool', 'read_file']);
+    expect(noServer.code).toBe(2);
+    expect(noServer.stderr).toContain('needs --server');
+
+    const noTool = await runCli(['policy', 'test', starterPolicyPath(dir)]);
+    expect(noTool.code).toBe(2);
+    expect(noTool.stderr).toContain('missing --tool');
+
+    const badExpect = await runCli(['policy', 'test', starterPolicyPath(dir), '--tool', 'x', '--server', 's', '--expect', 'maybe']);
+    expect(badExpect.code).toBe(2);
+
+    const badHook = join(dir, 'bad.json');
+    writeFileSync(badHook, JSON.stringify({ deny: [{ tool: '([' }] }));
+    const invalid = await runCli(['policy', 'test', badHook, '--tool', 'mcp__a__b']);
+    expect(invalid.code).toBe(1);
+    expect(invalid.stdout).toContain('would deny every call it governs');
   }, 60_000);
 
   it('export on an empty store exits 1', async () => {
