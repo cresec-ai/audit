@@ -328,8 +328,8 @@ credentials:
     provider: gmail                       # the control plane's connector name — REQUIRED here
     broker:
       kind: remote
-      url: https://api.staging.cresec.ai  # https://; http:// on loopback only
-      token_env: CRESEC_INTERNAL_TOKEN    # the internal bearer, named, never its value
+      url: https://cresec-api.corp.example  # a control plane you run yourself; https://, http:// on loopback only
+      token_env: CRESEC_INTERNAL_TOKEN    # its internal bearer, named, never its value — never for the hosted control plane
       tenant: e2e                         # slug or uuid; optional with an identity JWT
       identity_jwt_env: CRESEC_IDENTITY_JWT   # or start the recorder with --identity-jwt PATH
       # user_env: CRESEC_USER_ID            # the user id when no identity JWT is given
@@ -344,13 +344,41 @@ credentials:
         method: POST
 ```
 
+**This example is for a self-hosted control plane** — a deployment of
+cresec-ai/nhi that the operator runs, whose internal bearer the operator
+already holds. Today that bearer acts for every tenant of that control plane
+(nhi `docs/platform-plan.md` §3–4), so put it only where the operator would
+keep it anyway. It is **never** for Cresec's hosted control plane
+(`platform.cresec.ai`, planned and not deployed): the recorder has no hosted
+remote-broker path, built or planned.
+
+- The hosted deployment will run with `CRESEC_PREPIVOT_SURFACE=0` (A8 in
+  cresec-ai/nhi `docs/decisions.md`, recorded in
+  [nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged;
+  implemented by M1.13 of nhi's `docs/platform-plan.md`, not built), which
+  removes the pre-pivot `/broker/exchange` route. That is the route
+  `RemoteBroker` speaks in its default mode, when it is constructed without
+  `userToken` (`src/broker/remote.ts`); no policy selects that mode, since
+  `broker: { kind: remote }` always speaks the user-token endpoint below.
+- `POST /v1/broker/user-token` is an internal-class route. Today it accepts
+  the control plane's single internal token. After M1.12 splits that token
+  (planned, not built), it will accept only the operator credential or the
+  gateway credential, and at the hosted edge it will answer 404 (M1.3; a
+  Gate A exit criterion). The recorder must hold neither credential:
+  "`RemoteBroker` must never receive the internal token" (nhi
+  `docs/platform-plan.md`, "Deliberately not in this plan").
+
+A user-class route that authenticates the person by their identity JWT
+instead of a service credential is future work. The same row of the nhi plan
+lists it, with `mcp-recorder login` and metering the MCP leg, as
+deliberately not planned until a decision makes the MCP leg part of the
+platform offer (B10's MCP half).
+
 A credential with `broker: { kind: remote }` has no local `source`: the
 gateway resolves it by calling the control plane's per-user token endpoint,
 `POST <url>/v1/broker/user-token`, exactly as
-[`docs/internal/contracts/user-token.md`](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/contracts/user-token.md)
-in cresec-ai/nhi specifies (that file, and all of
-`docs/internal/contracts/`, exists on the branch linked above and not on that
-repository's `main`) (the contract page spells the block
+[`docs/internal/contracts/user-token.md`](https://github.com/cresec-ai/nhi/blob/main/docs/internal/contracts/user-token.md)
+in cresec-ai/nhi specifies (the contract page spells the block
 `credentials.broker`; here `credentials` is a list, so the block sits on the
 credential it brokers). One call per mediated call, at the declared site and
 only there:
@@ -384,10 +412,13 @@ body says `vault_unavailable` or `connector_unavailable` is a deny with that
 reason. Any other `5xx`, a timeout (`timeout_ms`, default 5 000 ms) or a
 connection failure is a deny with reason **`control_plane_unavailable`** —
 never a crash, never a hang, never a forward: the credential is absent
-([ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md),
-now on that repository's `main`: invariant 1 wins over invariant 8; there
-is no read-only fallback in this leg). An outage is not paid for on every
-call: the first `control_plane_unavailable` opens a 5 s window in which
+(invariant 8 as cresec-ai/nhi `docs/decisions.md` C1 words it: nothing falls
+back to a stored credential or a cached decision, reads included). There is
+no read-only fallback in this leg; the cached-read forward of
+[ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md),
+which nhi's M1.18 removes from its HTTPS gateway, was never built here. An
+outage is not paid for on every call: the first `control_plane_unavailable`
+opens a 5 s window in which
 further calls that need the control plane are refused with the same reason
 without a request, one call per window probes, and any answer (an allow, a
 deny, a 4xx, a 503 naming the vault or a connector) closes it. The refusal
@@ -416,7 +447,9 @@ and the chain hold the synthetic. It is still a context and audit control on
 the agent's own machine — the process that fetches the token can read it —
 so credential *absence* is the control plane's per-user injection, and this
 leg is its client. Invariant 3: the control plane's `decision_id` is on the
-record, and the record verifies offline as before.
+record, and the record verifies offline as before (the integrity half;
+`AGENTS.md` says what of the coverage half and the lifecycle clause does
+not hold yet).
 
 ### What the gateway does with all this
 

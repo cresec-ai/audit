@@ -166,8 +166,11 @@ export const SWAP_DENY = {
  */
 const RESOLUTION_FAILURE_CODES: ReadonlySet<string> = new Set([
   // The control plane could not be asked, or could not produce the token
-  // it decided to give (ADR 013; user-token.md, 503). Nobody decided "no":
-  // the refusal must read as retryable, not as the operator's policy.
+  // it decided to give (user-token.md, 503). C1 (cresec-ai/nhi
+  // docs/decisions.md, invariant 8; recorded in
+  // https://github.com/cresec-ai/nhi/pull/10, not yet merged) makes that a
+  // fail-closed refusal with no cached fallback. Nobody decided "no": the refusal must read as
+  // retryable, not as the operator's policy.
   'control_plane_unavailable',
   'vault_unavailable',
   'connector_unavailable',

@@ -144,10 +144,9 @@ Identity context stamped on **every** event ("identity-stamp everything").
 ### Actor claim (optional, additive)
 
 `identity.actor` carries the actor claim of
-[ADR 012](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/012-actor-claim.md)
-in the Cresec control plane — on that repository's branch
-`claude/routine-production-enterprise-mfrojx`, not yet on its `main`, whose
-`docs/internal/adrs/` holds 001–011 only — copied field for field from the **identity JWT**
+[ADR 012](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/012-actor-claim.md)
+in the Cresec control plane — on that repository's `main` since PR #4
+(`5b99fe3`) — copied field for field from the **identity JWT**
 the control plane mints for a signed-in person (`docs/internal/contracts/identity-jwt.md`
 there). It is a pure function of the token's claims: `user` from `sub`,
 `email`, `idp`, `idp_sub`; `tool` and `host` from the claims of the same
@@ -480,10 +479,15 @@ That event is one decision here and one call/error in `TOOL_CALLS`/`ERRORS`
 — the same arithmetic a gateway deny has — so `DECISIONS` reads alike
 whichever surface refused the call, and the replay page badges both with the
 same red `gw-deny` badge (`hook deny` / `gateway deny`). This closes the
-"one deny event shape" ticket for **invariant 3's** counting; what still
-does not hold is its exactly-one-record clause: a gateway deny is still a
-`policy_decision` plus a synthetic `tool_call`, and a hook call is still a
-`pre` + `post` pair.
+"one deny event shape" ticket's counting half; the two shapes themselves
+stay two. That is not by itself an **invariant 3** gap: separate intent,
+decision and outcome records are the shape its lifecycle clause asks for.
+What that clause still lacks here is a stable action ID and attempt IDs (no
+event carries either; records correlate only by `request_id`), a separate
+decision record for an allowed call (its `tool_call` carries
+`gateway.decision: 'allow'` instead), and an explicit `unknown` outcome (a
+call pending at close is sealed as `error.type: 'unanswered'`). See
+`AGENTS.md`.
 
 It also counts the decisions that cannot BE a `policy_decision` event,
 because `request_id` is `string | number` and these messages have no usable

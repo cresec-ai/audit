@@ -113,7 +113,7 @@ points at them.
 | Rego compiler and OPA parity | `policy compile FILE` | **Tested** (parity runs in CI only) |
 | Typechecking for `test`/`bench`/`demo` | `npm run typecheck` | **Verified** (build-time control; run here and in CI) |
 | `sessions` DECISIONS counts hook denies too | `sessions` | **Tested** (`test/store.test.ts`, both backends) — closed after this transcript |
-| Two different event shapes for "this call was denied" | — | **Known gap**, narrowed: both shapes count once and badge alike; the shapes themselves stay two (invariant 3's exactly-one-record clause) |
+| Two different event shapes for "this call was denied" | — | **Known gap**, narrowed: both shapes count once and badge alike; the shapes themselves stay two. Separate records are the shape invariant 3 asks for; its lifecycle clause lacks here a stable action ID across them (see `AGENTS.md`) |
 | Replay page badges the two deny paths alike | `ui` | **Tested** (`test/replay.test.ts`: `hook deny` / `gateway deny`, same `gw-deny` badge) — closed after this transcript |
 | Gateway mode over HTTP (`http --policy`), control-plane token injection (`credentials[].broker`), actor claim (`--identity-jwt`) | `http --policy`, `record --policy` | **Tested** against fakes (`test/http-gateway.test.ts`, `test/e2e/http-gateway.e2e.test.ts`); not yet a live vendor remote MCP |
 | `boundary.injection: flag` flags but does not block | — | **Known gap** |
@@ -1479,8 +1479,10 @@ below reads `DECISIONS 1` and `--json`'s `policy_decision_count` agrees
 event the same red `gw-deny` badge a gateway deny gets, labelled `hook deny`.
 What stays true: the two SHAPES remain two (a gateway deny is a
 `policy_decision` plus a synthetic `tool_call`; a hook deny is the call's own
-`pre` event), which is invariant 3's exactly-one-record clause still not
-holding. The transcript that found the gap is kept as it was:
+`pre` event). Two records per call is not itself an invariant 3 gap — its
+lifecycle clause asks for separate intent, decision and outcome records —
+but neither shape carries the stable action ID that clause joins them by
+(see `AGENTS.md`). The transcript that found the gap is kept as it was:
 
 `DECISIONS` counted `policy_decision` events. A hook deny is not one: it is
 recorded as a `tool_call` with `error.type: "policy_denied"`. So a session in
