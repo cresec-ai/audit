@@ -32,8 +32,10 @@
  * pass-through. The Go client returns an error there and leaves the choice to
  * its caller; we do not have that luxury on a forwarding path, so the choice
  * is made here and it is "no". On the per-user path the code for "the
- * control plane could not decide" is `control_plane_unavailable` (ADR 013),
- * and the credential is absent — invariant 1 wins over invariant 8.
+ * control plane could not decide" is `control_plane_unavailable`, and the
+ * credential is absent: invariant 8 as C1 (cresec-ai/nhi docs/decisions.md,
+ * 2026-09-23; recorded in https://github.com/cresec-ai/nhi/pull/10, not yet
+ * merged) words it, fail closed and retryable, reads included.
  *
  * What is never logged, recorded or quoted: the access token, the internal
  * token, a response body. The token is registered as a brokered secret
@@ -111,8 +113,9 @@ export interface RemoteBrokerOptions {
 export declare const REMOTE_TIMEOUT_MS = 5000;
 /**
  * How long an observed control-plane outage refuses per-user token requests
- * without asking, before one probe is let through (ADR 013; the corrected
- * outage contract of ClickUp z8n6b5z9fd, 2026-09-21). See {@link RemoteBroker}.
+ * without asking, before one probe is let through (the corrected outage
+ * contract of ClickUp z8n6b5z9fd, 2026-09-21; invariant 8 as C1 words it).
+ * See {@link RemoteBroker}.
  */
 export declare const OUTAGE_COOLDOWN_MS = 5000;
 /** The endpoint path of user-token.md, relative to the control plane base. */
@@ -135,9 +138,10 @@ export declare function templatePath(pathTemplate: string): string;
  *
  * The per-user path has no fallback. The agent holds only a synthetic, and
  * nothing here keeps a stored credential or a cached token to serve a read
- * with (invariant 1 wins over invariant 8, ADR 013; the corrected contract
- * says so for reads too), so a control plane that cannot be reached means
- * the call is refused with `control_plane_unavailable` — never forwarded,
+ * with (invariant 8 as C1 words it: nothing falls back to a stored
+ * credential or a cached decision, reads included; ADR 013's cached-read
+ * forward was never built here), so a control plane that cannot be reached
+ * means the call is refused with `control_plane_unavailable` — never forwarded,
  * never forwarded with the synthetic.
  *
  * What an outage must not do is cost every call the full round-trip budget.

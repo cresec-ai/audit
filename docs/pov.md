@@ -16,7 +16,7 @@ Every capability named here carries a status, and the statuses are load-bearing:
 | **retiring** | exists in the control plane and is being removed under [Retire v1 components](https://app.clickup.com/t/z8n6b5z509) |
 | **needs-build** | does not exist; a Roadmap v2 ticket says where it lands |
 | **needs-nhi** | exists as code in the control plane (`cresec-ai/nhi`) but is not runnable from a clean checkout today. Much of what this page once tagged **needs-nhi** is now **shipped at L1** there instead |
-| **shipped at L1** | on a branch of `cresec-ai/nhi` (`claude/routine-production-enterprise-mfrojx`, `d1346a7`), green in its S0–S16 stack suite against the vendor fakes in its `tests/e2e/mocks/` — in **one local run on 2026-09-21**; the `e2e-stack` CI job that would run it (`.github/workflows/ci.yaml:253`) was added on the same unmerged branch and has never executed, and no CI run exists for `d1346a7` at all. It is **not** on that repository's `main`, it is deployed nowhere, and no real Okta, Salesforce, Gmail or Workspace tenant has been touched. L2 — the staging tenants of its `docs/e2e-accounts.md` — has never run |
+| **shipped at L1** | on `main` of `cresec-ai/nhi` since PR #4 (merge commit `5b99fe3`, which merged `claude/routine-production-enterprise-mfrojx` at `53ad540`), green in its S0–S16 stack suite against the vendor fakes in its `tests/e2e/mocks/`: first in one local run of `d1346a7` on 2026-09-21, and since then in the `e2e-stack` CI job (`.github/workflows/ci.yaml:262` on nhi's `main`), green on `5b99fe3` ([run 35654937905](https://github.com/cresec-ai/nhi/actions/runs/35654937905)). It is deployed nowhere — `infra/terraform` has never been applied, so every staging workflow has failed for want of a staging to reach — and no real Okta, Salesforce, Gmail or Workspace tenant has been touched. L2 — the staging tenants of its `docs/e2e-accounts.md` — has never run |
 | **aspirational** | nobody has built it and it is not scheduled |
 
 A narrative that quietly assumes a **needs-build** capability is worse than
@@ -47,8 +47,8 @@ issuing the identity JWT, with Okta Cross App Access and Entra OBO on top of
 the existing RFC 8693 `/v1/tokens/exchange`), the per-user credential vault
 (OpenBao, tokens keyed by (user, connector)), the HTTPS egress gateway, the policy engine, the
 NATS JetStream record stream, and the manager and security views. All six are
-now **shipped at L1** on nhi's branch `claude/routine-production-enterprise-mfrojx`
-(`d1346a7`), each with a stack spec: `apps/api/src/identity/` (S4),
+now **shipped at L1** on nhi's `main` (merged from `53ad540` in PR #4,
+`5b99fe3`), each with a stack spec: `apps/api/src/identity/` (S4),
 `apps/api/src/connectors/` writing `tenant/<slug>/user/<user id>/connector/<connector>`
 in OpenBao (S4), `apps/gateway/` (S7), `apps/api/src/policy/` (S9),
 `apps/api/src/evidence/publish.ts` on `tenant.<slug>.evidence` (S6, S8), and
@@ -63,9 +63,9 @@ It is a pnpm + Turborepo + Go monorepo: a Fastify API over Postgres with
 Drizzle schemas, OpenBao, OPA, a Next.js console. Its `/broker/exchange`
 decision path (OPA → OpenBao → audit, returning a `decision_id`) — minus its
 synthetic keying, which nhi leaves undecided — its OpenBao client and its Rego
-bundle are plumbing that Roadmap v2 reuses; they are not the product. Its `origin/main` is `5a8dca5`, dated 2026-09-21, and carries documentation
-only; the Governed Tools runtime above is on the branch named there and has not
-merged. "NHI" stays as the
+bundle are plumbing that Roadmap v2 reuses; they are not the product. The
+Governed Tools runtime above has been on its `main` since PR #4 merged
+(`5b99fe3`). "NHI" stays as the
 repository's name and as a technical term for non-human identities; it is no
 longer the product's name. One term to read carefully: nhi's older docs and
 its stack section use "control plane" for `apps/api` alone (the May 2026
@@ -104,7 +104,7 @@ founder review". Both sides implement it — `ActorClaim` in nhi's
 `packages/contracts/src/actor.ts`, and `identity.actor` on every event here
 when the recorder is started with `--identity-jwt` (`docs/event-schema.md:141`,
 `test/identity.test.ts`), with `identity.actor_verified` beside it recording
-whether the signature was checked. The ADR is on nhi's branch, not its `main`.
+whether the signature was checked. The ADR is on nhi's `main` since PR #4.
 `decision_id` rides the broker protocol (`src/broker/protocol.ts`) and lands as
 the attribute `cresec.broker.decision_id` on swapped `tool_call` events
 (`src/gateway/credentials.ts`), and it is now also an additive optional field on
@@ -153,10 +153,19 @@ tool has 28 users and no owner" — and reassigns it. Nothing breaks.
 
 No lock-in: the tool runs on Lendaro's Vercel or Lambda, built in Cursor,
 Lovable, v0 or Retool. Cresec's pieces are a sign-in gate, ten lines of
-middleware and a gateway URL; the exit is replacing two environment variables
-with real credentials. The eight invariants that hold this together are in the
+middleware and a gateway URL. The exit is documented and measured rather than
+promised (invariant 6): for the reference tool it is replacing two environment
+variables with real credentials, which nhi's S5 demonstrates at L1, and nhi
+is to record the exit surface by surface rather than promise a universal
+two-variable exit (provisional decision 8 in cresec-ai/nhi
+`docs/decisions.md`, recorded in
+[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged; the
+same holds for the other nhi decisions of 2026-09-23 this page cites: A7,
+B12 and C1 as decided). The eight invariants that hold this together are
+in the
 [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638);
-the four that bind this repository are quoted in [`AGENTS.md`](../AGENTS.md).
+the four that bind this repository are quoted in [`AGENTS.md`](../AGENTS.md):
+1, 3 and 4 in the brief's wording, 8 in C1's.
 
 ---
 
@@ -176,7 +185,7 @@ So the HTTPS egress gateway in the control plane
 conversion, and this package carries two things: the MCP route — a tool, or a
 rep's Claude, that reaches a vendor through MCP goes through this gateway
 ([z8n6b5z50j](https://app.clickup.com/t/z8n6b5z50j)) — and the evidence
-discipline — one signed, chained record per mediated call, exported as a
+discipline — signed, chained records of the mediated calls, exported as a
 bundle a stranger verifies offline
 ([z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m)). Where the ClickUp plan
 does not put this package on the POV's critical path, this page does not
@@ -189,6 +198,12 @@ Workspace admin to allowlist one OAuth app; one rep with a working Claude
 routine and two hours; a named tool owner. Nothing from this package is
 installed in week 0. Signing the partner is
 [Phase 6's 30-day clock](https://app.clickup.com/t/z8n6b5z50r).
+
+Where and when, as decided on 2026-09-23 (nhi `docs/decisions.md` A7): the POV
+partners run on nhi's production deployment, as contract tenants, after its
+Gate A — about week 18, 25 January 2027, roughly ten weeks later than the
+14 November end of Sprint C that earlier plans assumed. They do not run on
+staging, which holds only Cresec's own test identities.
 
 ### Week 1 — the before-number
 
@@ -253,7 +268,7 @@ evidence behind it:
 | `http` recording proxy for a remote MCP server | shipped | byte-for-byte without `--policy`; one live public server is the whole of the live evidence for the transport |
 | `http --policy`: the gateway over the streamable-HTTP transport | in-flight (this branch; tested, not verified live) | the same evaluation, holds, boundary filter, `credentials` swap and events as `record --policy`, over the HTTP exchange (`src/proxy/http.ts`). The one difference: a `tools/call` body and its result are buffered long enough to evaluate and filter them (a JSON body whole, an SSE stream one event at a time) — the gateway-mode exception AGENTS.md allows. Proven against a journaling fake vendor MCP and a fake control plane (S17a, `test/e2e/http-gateway.e2e.test.ts`); S17b, a live vendor remote MCP, has not run. Touches invariants 1 and 3 as the rows below say |
 | Gateway mode `record --policy`: allow / hold / deny, tool-result boundary filter | shipped (stdio, verified live); in-flight over HTTP | rules key on (server, tool, args), not (user × tool version); the read / draft / send / write action class is a per-site declaration a remote credential sends to the control plane, not something this engine applies; draft-only is a policy the operator writes today, not a default the engine applies |
-| Per-user token injection from the control plane | in-flight (this branch; tested against a fake control plane, never against nhi's real endpoint) | `credentials[].broker: { kind: remote }` wires `RemoteBroker` (`src/broker/wire.ts`) to `POST /v1/broker/user-token` exactly as nhi's `docs/internal/contracts/user-token.md` specifies, keyed by (user, connector, tool, action class, target) from the identity JWT or the policy; the returned access token is swapped at the declared site as a local source's would be, never logged, never recorded; the control plane's `decision_id` lands on the `tool_call` and the `policy_decision`; a 403 is a deny with the control plane's reason, a 5xx / timeout / connection failure is a deny with `control_plane_unavailable` (fail closed, bounded at 5 s). **Invariant 1** is touched, not met by this leg alone: the token is fetched per call and absent from the agent's context, transcript and chain, but the fetching process can read it, so this is the client of credential absence, not credential absence. **Invariant 3**: the decision id is on the record. An unreachable control plane denies (ADR 013), fast and retryable, with no read-only fallback — see the degrade row below |
+| Per-user token injection from the control plane | in-flight (this branch; tested against a fake control plane, never against nhi's real endpoint) | `credentials[].broker: { kind: remote }` wires `RemoteBroker` (`src/broker/wire.ts`) to `POST /v1/broker/user-token` exactly as nhi's `docs/internal/contracts/user-token.md` specifies, keyed by (user, connector, tool, action class, target) from the identity JWT or the policy; the returned access token is swapped at the declared site as a local source's would be, never logged, never recorded; the control plane's `decision_id` lands on the `tool_call` and the `policy_decision`; a 403 is a deny with the control plane's reason, a 5xx / timeout / connection failure is a deny with `control_plane_unavailable` (fail closed, bounded at 5 s). **Invariant 1** is touched, not met by this leg alone: the token is fetched per call and absent from the agent's context, transcript and chain, but the fetching process can read it, so this is the client of credential absence, not credential absence. **Invariant 3**: the decision id is on the record. An unreachable control plane denies (invariant 8; nhi `docs/decisions.md` A1), fast and retryable, with no read-only fallback — see the degrade row below |
 | Local credential broker + `credentials` policy section + synthetic-for-real swap at declared sites, with result scrub | shipped | the ancestor of Phase 3 token injection, proven live in dogfood 7 ([below](#the-credential-swap-what-dogfood-7-proved-and-what-it-did-not)). On one machine a context and audit control, not a confidentiality one |
 | Added latency | shipped, measured 2026-09-17 | 0.792 ms p50 added, stdio, against a local echo fixture, gate < 5 ms (`npm run bench`). Nothing here measures the HTTP transport or a remote hop, which is what the week's p95 < 50 ms criterion is about |
 | Actor claim (user, tool, tool-version, host) on every record | in-flight (this branch) | ADR 012's shape, as an additive optional `identity.actor` on every event (`docs/event-schema.md`), decoded from the identity JWT given with `--identity-jwt` (or a policy's `identity_jwt_env`); verified against a JWKS only with `--identity-jwks`, and every event says which (`identity.actor_verified`, beside the claim so `actor` stays the control plane's shape byte for byte; `exp`/`iat` are checked in both modes). **Invariant 3**: the record now carries who acted; the chain and `verify.cjs` are unchanged (they hash whatever is there). What still does not hold: the claim is stamped from a token the operator supplies at start, so one proxy process is one actor and a session with no token is unattributed; nothing here checks the person is still active (that is the control plane's status check) |
@@ -392,9 +407,15 @@ plane's audit tables.
 
 ### Week 4 — readout
 
-**In the room.** The before/after number, the bundle, the orphan list, and a
-pricing conversation anchored on whichever unit the partner reached for
-first: governed tool, governed connector, or governed action.
+**In the room.** The before/after number, the bundle, the orphan list, and the
+pricing conversation, which now starts from a chosen unit rather than from
+whichever one the partner reached for first (the founder's decision of
+2026-09-23, nhi `docs/decisions.md` B12). It is **$5 per person per tool
+per month** on the hosted control plane (`platform.cresec.ai`), with one
+tool free for up to 15 people; single sign-on and SCIM are a
+separate line at **+$1 per person per tool per month**, charged on every
+seat, the free 15 included. It is decided, not yet enforced or billed. The
+recorder in this repository stays free, local and without an account.
 
 **What this package contributes.** The bundle format again, now over three
 weeks of traffic — the HTTPS actions from the control plane's stream once
@@ -496,8 +517,8 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | `http --policy`: gateway for remote MCP servers, per-user token injection from the control plane | 3 | [MCP gateway](https://app.clickup.com/t/z8n6b5z50j) | in-flight (this branch): `http --policy` and `credentials[].broker: { kind: remote }` → `POST /v1/broker/user-token`, tested against a journaling fake vendor MCP and a fake control plane (S17a); no live vendor remote MCP yet (S17b). Touches invariants 1 and 3 (per-user token fetched per call, decision id on the record); invariant 1 is met only with the control plane's injection | recorder |
 | Broker core + 7 credential sources; `credentials` policy section + Rego emitter; gateway synthetic→real swap + result scrub; 4-test e2e suite; live in dogfood 7 | 3 | — | shipped (local broker) | recorder |
 | Added-latency bench, stdio (`npm run bench`, gate p50 < 5 ms) | 3 | — | shipped; not the HTTPS p95 < 50 ms measurement | recorder |
-| Degrade mode, MCP leg: fail closed when the control plane is unreachable (invariant 8 as the corrected outage contract reads it) | 3 | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | shipped (this branch): fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). No read-only fallback by design: nothing here holds a credential or a cached token to serve a read with. Tested in `test/broker.test.ts` and the S17a outage arm of `test/e2e/http-gateway.e2e.test.ts` (three calls, one request to the control plane). `MCP_RECORDER_DISABLE=1` is unchanged: a kill switch, not the degrade path. Live validation against the real control plane: not done | recorder, MCP leg only |
-| Degrade mode, HTTPS leg: the customer's tool falls back to read-only when the egress gateway is unreachable (the middleware and gateway half of invariant 8) | 3 | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g), [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h), [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | shipped at L1 in nhi: ADR 013 decided it and `packages/governed-middleware/src/gateway-fetch.ts` implements it ("a vendor the tool cannot reach is the same read-only degrade", `withMeta(res, { degraded: true })`), with `apps/gateway/src/degrade.ts` and `degrade.test.ts` on the gateway side; S12 asserts the draft is refused with a documented read-only response and that the degraded log line is written. The MCP-leg row above stays needs-build | control plane |
+| Degrade mode, MCP leg: fail closed when the control plane is unreachable (invariant 8 as the corrected outage contract reads it) | 3 | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | shipped on `main` (PR #25, `89184f8`): fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). No read-only fallback by design: nothing here holds a credential or a cached token to serve a read with. Tested in `test/broker.test.ts` and the S17a outage arm of `test/e2e/http-gateway.e2e.test.ts` (three calls, one request to the control plane). `MCP_RECORDER_DISABLE=1` is unchanged: a kill switch, not the degrade path. Live validation against the real control plane: not done | recorder, MCP leg only |
+| Degrade mode, HTTPS leg: the egress gateway and the middleware when the gateway or the control plane is unreachable (their half of invariant 8) | 3 | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g), [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h), [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | decided 2026-09-23, needs-build in nhi: C1 (nhi `docs/decisions.md`) makes the HTTPS gateway fail closed like the MCP leg — during an outage every governed call, reads included, gets an explicit, retryable `503` — and nhi's M1.18 removes ADR 013's cached-read forward (`apps/gateway/src/degrade.ts` and the cached read-allow in `apps/gateway/src/routes/gateway.ts`) together with the middleware's read-only degrade body. Until M1.18 lands, nhi's `main` still has the forward, shipped at L1: ADR 013 decided it and `packages/governed-middleware/src/gateway-fetch.ts` implements it ("a vendor the tool cannot reach is the same read-only degrade", `withMeta(res, { degraded: true })`), with `degrade.test.ts` on the gateway side; S12 asserts the draft is refused with a documented read-only response and that the degraded log line is written | control plane |
 | HTTPS egress gateway; [A3] walking skeleton | 3 | [HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h), [[A3]](https://app.clickup.com/t/z8n6b5z8ch) | shipped at L1 as nhi's `apps/gateway/`, a **new** Fastify service — not the Go proxy re-targeted (ADR 014; `apps/data-plane-proxy` is retiring untouched). JWT validation in `src/auth/`, the per-user fetch in `control-plane.ts`, redacted recording in `record.ts` with `record.test.ts`, the response-side header policy in `@cresec/contracts/gateway`; S7 measures added latency **on loopback**, S8 checks the stream for plaintext. Nothing is deployed | control plane |
 | Identity gate (hosted OIDC, XAA/OBO), middleware packages | 2 | [z8n6b5z50f](https://app.clickup.com/t/z8n6b5z50f), [z8n6b5z9fc](https://app.clickup.com/t/z8n6b5z9fc), [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) | shipped at L1 as a **generic** OIDC relying party (nhi `apps/api/src/identity/`, contract `docs/internal/contracts/oidc-front.md`) plus `packages/governed-middleware/`; tests `identity-oidc.test.ts`, `identity-deactivation.test.ts`, `index.test.ts`, `mode.test.ts`, S4 and S11 against the Okta-shaped fake. Okta Cross App Access and Entra OBO specifically are still needs-build | control plane |
 | [A2] reference tool, both states | 2 | [[A2]](https://app.clickup.com/t/z8n6b5z8cg) | shipped at L1 as nhi's `apps/outreach-tool/`, run as six instances by `tests/e2e/scripts/stack-local.mjs`, including `outreach-tool-nocred` (governed, no Cresec variables, no credentials) whose run S5 asserts is refused and reaches neither vendor | control plane (nhi; no longer undecided) |
@@ -510,12 +531,12 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | `decision_id` as `cresec.broker.decision_id` on swapped `tool_call` events | 4 | — | shipped | recorder |
 | `decision_id` on `policy_decision` events | 4 | — | in-flight (this branch): additive optional field, the local engine's uuid or the control plane's own id; invariant 3 (the decision joins the record) | recorder |
 | Actor claims (user, tool, tool-version, host) on every record | 0, 4 | [Actor-claim schema](https://app.clickup.com/t/z8n6b5z507) | in-flight (this branch): ADR 012's shape as `identity.actor`, from `--identity-jwt`; `identity.actor_verified` true only with `--identity-jwks`; invariant 3 | both |
-| `DECISIONS` counting both deny shapes; one deny event shape | 4 | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | in-flight (this branch) for the counting and the replay badges; the two shapes remain (invariant 3's exactly-one-record clause still does not hold: a gateway deny is a `policy_decision` plus a synthetic `tool_call`, a hook call is `pre` + `post`) | recorder |
+| `DECISIONS` counting both deny shapes; one deny event shape | 4 | [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr) | in-flight (this branch) for the counting and the replay badges; the two shapes remain (a gateway deny is a `policy_decision` plus a synthetic `tool_call`, a hook deny the call's own `pre` event). Separate records are the shape invariant 3 asks for; what its lifecycle clause still lacks here is a stable action ID and attempt IDs, a separate decision record for an allowed call, and an explicit `unknown` outcome (`AGENTS.md`) | recorder |
 | `sessions --tools` census | 4 | [z8n6b5zbqf](https://app.clickup.com/t/z8n6b5zbqf) | shipped: `src/query/census.ts`; `test/cli.test.ts` | recorder |
 | `receiver/` in package `files`; HTTP export route for signed replica bundles | 4 | — | in-flight (this branch): `receiver/` (and `src/`, which it imports) ship in the package, `receiver/Dockerfile` builds it, `GET /v1/chains/{chain_id}/export` serves the attested replica bundle to the operator; S18's pinned-enrolment arm is in `test/e2e/ship.e2e.test.ts` | recorder |
 | Evidence stream on NATS JetStream | 4 | [z8n6b5z50m](https://app.clickup.com/t/z8n6b5z50m) | shipped at L1: nhi's `apps/api/src/evidence/publish.ts` fans each appended record out to `tenant.<slug>.evidence` on the `cresec-tenant` stream, off the append's critical path with a 2 s timeout; S8 dumps that subject with the run's `record_id` as a positive control | control plane |
 | Regulator-mapped export pack (Art. 12, SOC 2 CC6/CC7) | 4 | [z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff) | needs-build in both repositories | both |
-| Payload PII/redaction policy decided before the first bundle leaves (invariant 4) — control-plane half | 4 | [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | shipped at L1: decided by nhi's [ADR 015](https://github.com/cresec-ai/nhi/blob/claude/routine-production-enterprise-mfrojx/docs/internal/adrs/015-payload-redaction.md) (accepted 2026-09-21) and encoded by S8, which asserts nothing plaintext reaches the evidence stream | control plane |
+| Payload PII/redaction policy decided before the first bundle leaves (invariant 4) — control-plane half | 4 | [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | shipped at L1: decided by nhi's [ADR 015](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/015-payload-redaction.md) (accepted 2026-09-21) and encoded by S8, which asserts nothing plaintext reaches the evidence stream | control plane |
 | Payload PII/redaction policy — this package's half | 4 | [z8n6b5z9fg](https://app.clickup.com/t/z8n6b5z9fg) | shipped: tool arguments are hashed unconditionally and no readable payload string reaches the store, the replay page or a bundle; ADR 015 leaves the MCP leg's rule unchanged. What is still owed is the *plaintext hostname and OS-username* decision, which ADR 015 does not cover — **needs-build** here | recorder |
 | Manager view, security view | 4 | [z8n6b5z50n](https://app.clickup.com/t/z8n6b5z50n) | shipped at L1: nhi's `apps/web/src/app/(dashboard)/{manager,security}/page.tsx` with `components/{AttributionTable,RecordsTable}.tsx`; S13 and S14 drive them against the live API | control plane |
 | Ownership-decay alerts | 4 | [z8n6b5z50n](https://app.clickup.com/t/z8n6b5z50n) | written, with unit coverage only — nhi's `apps/api/src/policy/decay.ts` plus `components/DecayNudge.tsx`, covered by `apps/api/src/cron/wire.test.ts` (registration, against a stub) and `apps/web/src/components/components.test.tsx:64-72` (the nudge render). **No stack spec exercises decay** (`grep -rn decay tests/e2e/specs/stack/*.spec.ts` is empty), so by this page's own definition it is not "shipped at L1" | control plane |
@@ -541,8 +562,8 @@ recorder and broker lines were re-checked on 2026-09-20 at `74dce0e`. The
 control-plane lines below were first written by reading `cresec-ai/nhi` at
 `1864a59`, a tree three months and nine work packages old; they have been
 re-read against `cresec-ai/nhi` at `d1346a7` on branch
-`claude/routine-production-enterprise-mfrojx`. That runtime is on a **branch**,
-not on `main` (`origin/main` is `5a8dca5`), and it has been run only at L1 —
+`claude/routine-production-enterprise-mfrojx`. That runtime has since merged
+to nhi's `main` (PR #4, `5b99fe3`), and it has been run only at L1 —
 against vendor fakes, deployed nowhere.
 
 **Install and packaging**
@@ -614,7 +635,9 @@ against vendor fakes, deployed nowhere.
   refusal, and logs when the outage began and ended as it observed them; it
   never falls back to a stored credential or a cached token, reads included.
   `MCP_RECORDER_DISABLE=1` is a kill switch that turns off recording **and**
-  enforcement together, not a degrade mode.
+  enforcement together, not a degrade mode. The HTTPS leg is decided the same
+  way (C1, 2026-09-23), but until nhi's M1.18 lands its gateway on `main`
+  still forwards a read on a cached token and a cached read-allow (ADR 013).
 
 **Credentials**
 - *"The agent never has access to your credentials."* — it does. It can read the
@@ -672,11 +695,14 @@ against vendor fakes, deployed nowhere.
   because preseed stores a literal `fakeHash` where the HMAC belongs, then an
   unhandled `VaultNotFound` — a 500, not a deny — because preseed writes no
   vault paths). What "not ready" rests on **now**: nothing is deployed
-  (`infra/terraform/` has never been applied, `deploy-staging.yaml` has never
-  run), no real Okta, Salesforce, Gmail or Workspace tenant exists, and the
-  runtime is on branch `claude/routine-production-enterprise-mfrojx`, not on
-  `main`. `docs/governed-tools.md` in `cresec-ai/nhi` carries the same claims
-  with a verdict each and records the same supersessions; this page adopts its
+  (`infra/terraform/` has never been applied, so `deploy-staging.yaml` has
+  failed on every push to nhi's `main` for want of a staging to reach), and
+  no real Okta, Salesforce, Gmail or Workspace tenant exists. The runtime
+  itself has been on nhi's `main` since PR #4 (`5b99fe3`), and the POV
+  partners are planned on its production deployment only after Gate A,
+  about 25 January 2027 (nhi `docs/decisions.md` A7).
+  `docs/governed-tools.md` in `cresec-ai/nhi` carries the same claims with a
+  verdict each and records the same supersessions; this page adopts its
   corrections.
 - *"We will swap the credential on your ClickUp or Gmail connector too."* —
   architecturally impossible. Hosted connectors authenticate on Anthropic's
@@ -738,18 +764,22 @@ names. Every schema change is an additive optional field, because
    fallback, reads included: the corrected outage contract of
    [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) (2026-09-21), which
    replaced the earlier read-only promise
-   ([Phase 3](https://app.clickup.com/t/z8n6b5z4zr), invariant 8). The
-   other half — the customer's HTTPS tool when the egress gateway is
-   unreachable — is the control plane's, in its middleware
+   ([Phase 3](https://app.clickup.com/t/z8n6b5z4zr), invariant 8, whose
+   text as `AGENTS.md` quotes it, C1's, now says the same). **Shipped** on
+   `main` (PR #25), tested against the fake control plane. The other half — the customer's HTTPS tool when the
+   egress gateway or the control plane is unreachable — is the control
+   plane's, in its middleware
    ([z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g)) and gateway
-   ([z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h)). **Shipped** on
-   this branch, tested against the fake control plane.
+   ([z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h)); it was decided
+   fail closed on 2026-09-23 (C1), and nhi's M1.18 will build it.
 5. **One deny event shape** —
    [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr): `DECISIONS` counts
    both shapes and the replay page badges them alike — **in-flight** on this
    branch. The shapes themselves stay two: a hook deny has no usable JSON-RPC
-   request id, so it is not simply "emit a `policy_decision`", and invariant
-   3's exactly-one-record clause still does not hold for either surface.
+   request id, so it is not simply "emit a `policy_decision`". Two records
+   per call is not itself the invariant 3 gap; its lifecycle clause — one
+   stable action ID across a call's intent, decision and outcome records,
+   and an explicit `unknown` outcome — holds on neither surface yet.
 6. **Export-pack mapping** — the bundle mapped to EU AI Act Art. 12 and
    SOC 2 CC6/CC7 controls
    ([z8n6b5z9ff](https://app.clickup.com/t/z8n6b5z9ff)). Phase 4.

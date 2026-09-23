@@ -32,8 +32,10 @@
  * pass-through. The Go client returns an error there and leaves the choice to
  * its caller; we do not have that luxury on a forwarding path, so the choice
  * is made here and it is "no". On the per-user path the code for "the
- * control plane could not decide" is `control_plane_unavailable` (ADR 013),
- * and the credential is absent — invariant 1 wins over invariant 8.
+ * control plane could not decide" is `control_plane_unavailable`, and the
+ * credential is absent: invariant 8 as C1 (cresec-ai/nhi docs/decisions.md,
+ * 2026-09-23; recorded in https://github.com/cresec-ai/nhi/pull/10, not yet
+ * merged) words it, fail closed and retryable, reads included.
  *
  * What is never logged, recorded or quoted: the access token, the internal
  * token, a response body. The token is registered as a brokered secret
@@ -116,8 +118,9 @@ export const REMOTE_TIMEOUT_MS = 5_000;
 
 /**
  * How long an observed control-plane outage refuses per-user token requests
- * without asking, before one probe is let through (ADR 013; the corrected
- * outage contract of ClickUp z8n6b5z9fd, 2026-09-21). See {@link RemoteBroker}.
+ * without asking, before one probe is let through (the corrected outage
+ * contract of ClickUp z8n6b5z9fd, 2026-09-21; invariant 8 as C1 words it).
+ * See {@link RemoteBroker}.
  */
 export const OUTAGE_COOLDOWN_MS = 5_000;
 
@@ -180,9 +183,10 @@ interface Outage {
  *
  * The per-user path has no fallback. The agent holds only a synthetic, and
  * nothing here keeps a stored credential or a cached token to serve a read
- * with (invariant 1 wins over invariant 8, ADR 013; the corrected contract
- * says so for reads too), so a control plane that cannot be reached means
- * the call is refused with `control_plane_unavailable` — never forwarded,
+ * with (invariant 8 as C1 words it: nothing falls back to a stored
+ * credential or a cached decision, reads included; ADR 013's cached-read
+ * forward was never built here), so a control plane that cannot be reached
+ * means the call is refused with `control_plane_unavailable` — never forwarded,
  * never forwarded with the synthetic.
  *
  * What an outage must not do is cost every call the full round-trip budget.
@@ -348,8 +352,8 @@ export class RemoteBroker implements Broker {
     try {
       res = await this.#fetch({ method: 'POST', url, headers, body, timeoutMs: this.#opts.timeoutMs ?? REMOTE_TIMEOUT_MS });
     } catch (err) {
-      // ADR 013: a connect error or a timeout means the control plane could
-      // not decide; the credential is absent and the call is denied.
+      // Invariant 8 (C1): a connect error or a timeout means the control
+      // plane could not decide; the credential is absent and the call is denied.
       this.#warn(`broker: ${USER_TOKEN_PATH} unreachable: ${err instanceof Error ? err.message : String(err)}`);
       return denyResponse(newDecisionId(), 'control_plane_unavailable');
     }
@@ -406,12 +410,15 @@ export class RemoteBroker implements Broker {
       this.#warn('broker: brokered-secret exclusion set is full; denying rather than risk a fingerprint');
       return denyResponse(decisionId, 'exclusion_capacity');
     }
-    // `ttl_ms` is the degrade-cache bound (min(expires_at - now, 300000));
-    // the swap engine only uses it to size the reverse-scrub window. The
-    // contract's mapping is `ttl_seconds: floor(ttl_ms / 1000)`, and an
-    // allow whose ttl is missing, not a number, or under one second is a
-    // malformed allow — exactly as the /broker/exchange path treats a zero
-    // `ttl_seconds` — not a token to forward with a made-up lifetime.
+    // `ttl_ms` is min(expires_at - now, 300000). user-token.md introduced it
+    // as the bound of ADR 013's degrade cache, which nhi's M1.18 will drop
+    // (C1: fail closed, no cached decision); it stays on the wire because this
+    // broker needs it, and the swap engine only uses it to size the
+    // reverse-scrub window. The contract's mapping is
+    // `ttl_seconds: floor(ttl_ms / 1000)`, and an allow whose ttl is missing,
+    // not a number, or under one second is a malformed allow — exactly as
+    // the /broker/exchange path treats a zero `ttl_seconds` — not a token to
+    // forward with a made-up lifetime.
     const ttlMs = obj.ttl_ms;
     const ttl = typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0 ? Math.floor(ttlMs / 1000) : 0;
     if (ttl === 0) {

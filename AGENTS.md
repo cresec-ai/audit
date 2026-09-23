@@ -39,38 +39,90 @@ from the control plane's `POST /v1/broker/user-token` (`src/broker/wire.ts`,
 `src/broker/remote.ts`, S17a in `test/e2e/http-gateway.e2e.test.ts`) — tested
 against a **fake** control plane only, never against the real one.
 
-The build brief's invariants that bind this repository, numbered as in the
-brief ([ClickUp](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638)):
+The invariants that bind this repository, numbered as in the build brief
+([ClickUp](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638)):
 
-1. The tool holds no secret. Enforcement is credential absence, not policy
-   text.
-3. Every mediated call produces exactly one record, chained to the previous
-   one, signed, verifiable offline by the customer with no network access to
-   us.
-4. No payload warehousing. Hash the full request, store a redacted form.
-   Decide redaction before the first record exists.
-8. Degrade, don't die. Gateway unreachable means the tool falls back to
-   read-only, not to broken.
+1. **The tool holds no secret.** Enforcement is credential absence, not
+   policy text. If a design lets a tool authenticate to a third-party system
+   on its own, the design is wrong.
+3. **Evidence integrity and coverage are separate guarantees.** A governed
+   action has a stable action ID and attempt IDs; its intent, decision and
+   outcome are distinct lifecycle records. Recording never gates the call:
+   the record is appended after the upstream call, spooled durably if the
+   append fails and replayed, and a reconciliation sweep detects any allowed
+   decision that has no record. Deduplicate delivery by event ID. Crashes and
+   upstream timeouts may leave an explicit `unknown` outcome; never report
+   them as success or retry a write blindly. Sign and chain the records that
+   exist and verify them offline. Best-effort observation may drop events and
+   must expose gaps; it does not satisfy governed completeness. This is the
+   target contract, pending fault-injection proof.
+4. **No payload warehousing.** Hash the full request, store a redacted form.
+   Decide redaction before the first record exists, not after.
+8. **Degrade, don't die.** When the gateway or control plane cannot be
+   reached, every governed call, reads included, is refused with an
+   explicit, retryable error; nothing falls back to a stored credential or a
+   cached decision, and the tool itself stays up. The UI may show previously
+   authorized cached data only under an explicit tenant/user isolation,
+   expiry and invalidation policy, with a stale-data label. Cached display is
+   not live read-only access.
 
-Invariant 3's chain, signature and offline-verifier clauses hold for the MCP
-leg (the rules below are how); its exactly-one-record clause does not yet — a
-gateway refusal writes a `policy_decision` and a `tool_call`, a hook call is a
-`pre` + `post` pair, and fail-open recording can drop an event (see the
-one-deny-event-shape ticket in `docs/pov.md`). Invariant 4 holds for the
-stored form (redacted tree, hashed leaves, `result_hash` over the complete
-result); a hash of the complete raw request is not recorded on `tool_call`
-events. Invariant 1 is not met by this package alone: the local broker keeps
-the real credential out of the model's context, the transcript and the chain
-at declared swap sites, but the secret is resolvable on the agent's own
-machine, so it is a context and audit control, not credential absence.
+Items 1, 3 and 4 are the build brief's section 2 wording, verbatim as of
+2026-09-23; 3 is as the founder amended it that day (decision 21: C2 and C5
+in cresec-ai/nhi `docs/decisions.md`, recorded in
+[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged, like
+every nhi decision of that day this file cites). Item 8 is **not** the
+brief's wording. It is C1's, taken here ahead of nhi's M1.18 because the MCP
+leg already implements it (A1, PR #25). The brief's own item 8 still reads: "**Outages fail closed for
+live upstream access.** If the gateway is unreachable, no live upstream reads
+or writes can occur through it. If the control plane, policy or credential
+broker is unavailable, governed execution is denied. The UI may show
+previously authorized cached data only under an explicit tenant/user
+isolation, expiry and invalidation policy, with a stale-data label. Cached
+display is not live read-only access. Never fall back to tool-held upstream
+credentials." nhi's `AGENTS.md` keeps its old item 8 ("Gateway unreachable
+means the tool falls back to read-only, not to broken") until M1.18. The
+brief and nhi both switch to the C1 text when M1.18 lands.
+
+Invariant 3 has three parts here, and only the first holds for the MCP leg.
+The **integrity half** holds: the records that exist are signed and chained,
+and a bundle of them verifies offline with no network access to us (the
+rules below are how). The **coverage half** — wherever these docs use the
+term, it means the spool, the replay and the reconciliation sweep — does not
+hold yet. Recording stays fail-open in observation mode (`record`, `http` or
+`hook` with no policy) and in gateway mode alike, so it never gates the
+call, as the invariant asks; but an event the store cannot take is dropped,
+not spooled durably and replayed (the proxies retry a failed batch first,
+then count the drops and say so once on stderr), and nothing reconciles
+allowed decisions against records. The
+**lifecycle clause** (a stable action ID and attempt IDs; distinct intent,
+decision and outcome records; an explicit `unknown` outcome) does not hold
+either. An allowed gateway call is one `tool_call` recorded after the
+response, with the decision folded into its `gateway` field
+(`src/schema/events.ts`), so it has no separate intent or decision record.
+Records correlate only by `request_id`; no event carries an action or
+attempt ID. A call still pending when a proxy closes is sealed as
+an error with `error.type: 'unanswered'` (`src/proxy/stdio.ts`,
+`src/proxy/http.ts`), not as an explicit `unknown`. A refusal's
+`policy_decision` plus synthetic `tool_call`, and a hook's `pre` + `post`
+pair, are already separate records; that the two surfaces use different
+shapes is the one-deny-event-shape ticket in `docs/pov.md`.
+Invariant 4 holds for the stored form (redacted tree, hashed leaves,
+`result_hash` over the complete result); a hash of the complete raw request
+is not recorded on `tool_call` events. Invariant 1 is not met by this
+package alone: the local broker keeps the real credential out of the model's
+context, the transcript and the chain at declared swap sites, but the secret
+is resolvable on the agent's own machine, so it is a context and audit
+control, not credential absence.
 Credential absence is the control plane's per-user injection; `RemoteBroker`
 is its client, wired behind `credentials[].broker: { kind: remote }` against
 `POST /v1/broker/user-token`, tested against a fake control plane and not yet
-run against a real one. Invariant 8, as the corrected outage contract of
-[z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) (2026-09-21) reads it for
-the MCP leg, is fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). There is
+run against a real one. Invariant 8 holds for the MCP leg, where the
+corrected outage contract of
+[z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) (2026-09-21) implements
+it as fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). There is
 deliberately no read-only fallback: a tool that holds no secret has nothing
-to read with, and the contract forbids serving reads from a cached token.
+to read with, and the invariant forbids serving reads from a stored
+credential or a cached decision.
 Only admission is affected; a call already forwarded is not recalled.
 `MCP_RECORDER_DISABLE=1` is unchanged and is not the degrade path: it removes
 recording and enforcement together. A PR that
