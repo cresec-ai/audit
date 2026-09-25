@@ -1,0 +1,110 @@
+{
+  "display_contract": "cresec.public-evidence-display.v1",
+  "fixture_version": "1",
+  "scenario": "Synthetic summary read and draft creation",
+  "sample": true,
+  "mode": "synthetic-observation",
+  "actor_status": "unattributed",
+  "generated_at": "2026-09-25T16:10:24.565Z",
+  "generator": {
+    "command": "npm run demo:sample -- --out <new-directory>",
+    "package_version": "0.1.0",
+    "source_base_commit": "8a95b6b2bdd38c5d8527cb37833025248bc68e1e",
+    "source_state": "dirty",
+    "source_changes": [
+      {
+        "path": "demo/public-evidence.ts",
+        "kind": "file",
+        "sha256": "65a18bc9a0cf493f27927d6f221ac44540acd6cbc7092f256a80cc0f734bd92e",
+        "mode": 420
+      },
+      {
+        "path": "docs/public-evidence-sample.md",
+        "kind": "file",
+        "sha256": "6a25e32a1b284cba430932f2dbf1c6ab9ec9e680b3a5169086adf55aaa11aef4",
+        "mode": 420
+      },
+      {
+        "path": "test/public-evidence.test.ts",
+        "kind": "file",
+        "sha256": "c3fed9873a1504bf71a4570582cf2bfea1db8a8770f16db200acd475df0815ec",
+        "mode": 420
+      }
+    ],
+    "source_sha256": {
+      "demo/public-evidence.ts": "65a18bc9a0cf493f27927d6f221ac44540acd6cbc7092f256a80cc0f734bd92e",
+      "docs/public-evidence-sample.md": "6a25e32a1b284cba430932f2dbf1c6ab9ec9e680b3a5169086adf55aaa11aef4",
+      "test/public-evidence.test.ts": "c3fed9873a1504bf71a4570582cf2bfea1db8a8770f16db200acd475df0815ec"
+    },
+    "source_note": "Unsigned repository snapshot at generation start: base commit plus every tracked working-tree change and nonignored untracked file. Hashes cover working-tree bytes (or symlink targets); deleted paths are explicit. Ignored files, installed dependencies and the environment are not attested. Keep source unchanged during generation.",
+    "node_version": "v24.19.0"
+  },
+  "signer": {
+    "public_key_hex": "0c57cf9df24c6e5f938b61fbc25fbfd00c590dc8cf31d380440b568b255a957c",
+    "fingerprint_sha256_raw_key": "bb339cf6322fa1e0fecd11b69e6ca2d43028afaf9af9ff39c43cc695268de4a1",
+    "independently_trusted": false
+  },
+  "range": {
+    "from_seq": 1,
+    "to_seq": 2
+  },
+  "head_hash": "fbf41a55f44eeb6659359753d30f46f73c187af10b96281963358d2daa524ba1",
+  "event_count": 2,
+  "safe_records": [
+    {
+      "kind": "tool_call",
+      "tool": "read_summary",
+      "request_id": 1,
+      "timestamp": "2026-09-25T00:00:00.000Z"
+    },
+    {
+      "kind": "tool_call",
+      "tool": "create_draft",
+      "request_id": 2,
+      "timestamp": "2026-09-25T00:00:01.000Z"
+    }
+  ],
+  "verification": {
+    "kind": "precomputed",
+    "observed_at": "2026-09-25T16:10:24.565Z",
+    "verifier": "@edut/mcp-recorder exported verify.cjs",
+    "package_version": "0.1.0",
+    "intact": {
+      "artifact": "intact/",
+      "command": "node intact/verify.cjs",
+      "exit_code": 0,
+      "stdout": "PASS: evidence bundle verified\n  events     : 2 (seq 1..2)\n  base hash  : 707996e896e3e9a4b1e8d1e25fa74b8e0559541bb89243d2da7ae1f1f18cff27\n  head hash  : fbf41a55f44eeb6659359753d30f46f73c187af10b96281963358d2daa524ba1\n  signed by  : ed25519 0c57cf9df24c6e5f938b61fbc25fbfd00c590dc8cf31d380440b568b255a957c at 2026-09-25T16:10:24.018Z\nEvery event hash recomputes, the chain is contiguous, and the head\nsignature verifies against the bundled public key.\n  key check  : NOT independently verified - the key came from this bundle\n               itself (public_key.pem / manifest.json), which an attacker\n               who forged the whole bundle controls too. Re-run with\n               --public-key <hex|path> using a key you obtained out of band\n               (e.g. from the operator directly) for real assurance.\n\nUNSIGNED metadata (not covered by the signature - informational only):\n  created_at   : 2026-09-25T16:10:24.019Z\n  tool_version : 0.1.0\n",
+      "stderr": ""
+    },
+    "tampered": {
+      "artifact": "tampered/",
+      "command": "node tampered/verify.cjs",
+      "mutation": "event at seq 1: tool changed to altered_tool, without recomputing hashes or signatures",
+      "exit_code": 1,
+      "stdout": "FAIL: hash mismatch at seq 1: the event does not match its chain hash (event was altered)\nThis bundle does NOT verify. Treat its contents as unreliable.\n",
+      "stderr": ""
+    }
+  },
+  "artifact_sha256": {
+    "intact/events.jsonl": "1403723846deda1eeb9b13bb39093982e98f10edca7133891ecf95c32ac675dc",
+    "intact/manifest.json": "3cee2c468dcc69d45021493dfebed48e871dfdeef26ea123c03f18427b2951e0",
+    "intact/public_key.pem": "9851ab738e87f6c06f1c30f5532b101d3b32353f52398c433a28b2dac3e7d509",
+    "intact/verify.cjs": "2bc8e9384a2448e5d4fd66d50e936204a5d2c64d69b58ce1ffa3667a080d8a70",
+    "intact/README.txt": "c0e319e31fd7971f6e614fa53067aea9ef5a528f958cccdcf078e4e3dcd43df4",
+    "tampered/events.jsonl": "422bde1260ca2937d50b87a44f45b55e41ecf05004e0f3e4647c3eeaa4312be1",
+    "tampered/manifest.json": "3cee2c468dcc69d45021493dfebed48e871dfdeef26ea123c03f18427b2951e0",
+    "tampered/public_key.pem": "9851ab738e87f6c06f1c30f5532b101d3b32353f52398c433a28b2dac3e7d509",
+    "tampered/verify.cjs": "2bc8e9384a2448e5d4fd66d50e936204a5d2c64d69b58ce1ffa3667a080d8a70",
+    "tampered/README.txt": "c0e319e31fd7971f6e614fa53067aea9ef5a528f958cccdcf078e4e3dcd43df4"
+  },
+  "limitations": [
+    "Synthetic fixture, not production traffic or a real workflow execution.",
+    "Integrity: present records match the signed head under the bundled key; signer identity is not independently trusted.",
+    "Coverage: a valid chain does not prove every action was recorded. Failed appends can drop events; durable spool/replay/reconciliation is not complete.",
+    "Enforcement: these are simulated observation-mode MCP records. No policy, credential broker, remote call or enforcement is exercised.",
+    "Identity: unattributed synthetic actor; no enterprise login or verified identity JWT.",
+    "Trust: obtain a public key and expected head/range independently for stronger assurance. A never-recorded action or self-consistent earlier history need not be detected.",
+    "Provenance and verification timestamps are unsigned metadata, not a signed timestamp or third-party attestation.",
+    "A local credential broker hiding a secret from context does not prove credential absence from the agent machine."
+  ]
+}

@@ -1,5 +1,10 @@
 # Demo: catching a prompt-injection exfiltration
 
+For a smaller fixture focused on what a signature proves, see the
+[public evidence sample](../docs/public-evidence-sample.md). Its two synthetic
+observations are generated through the recorder/exporter without a tool server;
+both intact and intentionally altered artifacts are checked by the real verifier.
+
 This is a self-contained, deterministic demo of `@edut/mcp-recorder` acting as
 the MCP gateway and evidence-chain leg of Governed Tools. It tells one story
 end to end:

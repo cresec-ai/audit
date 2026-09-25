@@ -402,6 +402,11 @@ mcp-recorder [record] [options] -- <server command...>
 
 ## The demo
 
+For a small downloadable synthetic bundle with both intact and deliberately
+tampered examples, see the [public evidence sample](docs/public-evidence-sample.md).
+It uses the real offline verifier and explains integrity, coverage, enforcement
+and signer trust separately; its result is not a claim of production traffic.
+
 ```sh
 npm run demo
 ```
