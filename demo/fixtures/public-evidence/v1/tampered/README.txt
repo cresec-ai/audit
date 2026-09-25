@@ -4,4 +4,4 @@ PASS checks the present records against the declared range, hash chain and signe
 Obtain the signer public key and expected head/range independently for stronger assurance; use node verify.cjs --public-key <hex-or-path> to pin the key. A never-recorded action or a self-consistent earlier history need not be detected.
 Recording can drop events after failed appends; durable coverage/reconciliation is not complete. Enforcement applies only to mediated calls in explicitly selected gateway mode, never from a valid chain alone.
 The generation time and tool version below are unsigned informational metadata, not a trusted timestamp.
-Generated 2026-09-25T15:31:53.802Z by @edut/mcp-recorder v0.1.0; details in manifest.json.
+Generated 2026-09-25T16:10:24.019Z by @edut/mcp-recorder v0.1.0; details in manifest.json.

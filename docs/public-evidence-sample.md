@@ -54,12 +54,25 @@ bytes**. Fictional event timestamps are fixed and are not measured execution
 times.
 
 `display.json` records the fixture version, package version, source base commit,
-SHA-256 hashes of relevant generator/source files, generation time, raw-public-key
-fingerprint and every bundle artifact's SHA-256. The source hashes identify the
-actual working tree; the base commit by itself does not claim local changes were
-committed. These provenance fields and recorded verifier output are **unsigned
-informational metadata**, not an attestation. The bundle's signature covers the
-chain head, not the display JSON, generation date or package version.
+generation time, Node version, raw-public-key fingerprint and every bundle
+artifact's SHA-256. Source provenance is captured **before generation writes any
+output**. `source_state` says whether the checkout is clean or dirty;
+`source_changes` lists every tracked working-tree change relative to the base
+commit and every nonignored untracked file. It hashes current working-tree bytes
+even when an earlier version is staged, records deletions explicitly, and records
+symlink-target hashes and filesystem modes. The `source_sha256` map is a lookup
+over these changes, not a handpicked runtime-import list. For a clean checkout,
+the base commit identifies repository source and the change list is empty.
+
+This includes changes to store/schema modules and new local dependencies without
+requiring a maintainer to update a file list. Keep source unchanged during
+generation. Ignored files (including installed `node_modules`), dependency
+installation integrity and the execution environment are **not attested**;
+reproduce from the identified repository state with the committed lockfile.
+These provenance fields and recorded verifier output are **unsigned informational
+metadata**. The bundle's signature covers the chain head, not the display JSON,
+generation date or package version. Do not treat a source hash as the source
+contents or as proof that an installed dependency matches the lockfile.
 
 ## Four different questions
 

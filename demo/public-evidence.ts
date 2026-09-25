@@ -1,7 +1,7 @@
 /** Public synthetic fixture: real recording/export/verification, no live tool calls. */
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -58,8 +58,58 @@ function runVerifier(bundle: string) {
   return { exit_code: run.status, stdout: run.stdout, stderr: run.stderr };
 }
 
+export interface SourceChange {
+  path: string;
+  kind: 'file' | 'symlink' | 'deleted';
+  sha256: string | null;
+  /** Actual filesystem mode at capture time, not an assertion about other platforms. */
+  mode: number | null;
+}
+
+/**
+ * Identify repository source by its base commit plus ALL working-tree deltas,
+ * not a hand-maintained list of imports. Read working-tree bytes even for staged
+ * changes. Ignored installations/artifacts are outside this unsigned snapshot.
+ */
+export function sourceProvenance(root = ROOT) {
+  const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const base = git(['rev-parse', 'HEAD']).trim();
+  const changed = new Set([
+    ...git(['diff', '--name-only', '--no-renames', '-z', base, '--']).split('\0'),
+    ...git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0'),
+  ].filter(Boolean));
+  const changes: SourceChange[] = [...changed].sort().map((path) => {
+    const absolute = join(root, path);
+    let stat;
+    try {
+      stat = lstatSync(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return { path, kind: 'deleted', sha256: null, mode: null };
+    }
+    if (stat.isSymbolicLink()) {
+      return { path, kind: 'symlink', sha256: sha256Hex(readlinkSync(absolute)), mode: stat.mode & 0o777 };
+    }
+    if (!stat.isFile()) throw new Error(`Cannot capture source change at non-file path: ${path}`);
+    return { path, kind: 'file', sha256: sha256Hex(readFileSync(absolute)), mode: stat.mode & 0o777 };
+  });
+  return {
+    source_base_commit: base,
+    source_state: changes.length === 0 ? 'clean' as const : 'dirty' as const,
+    source_changes: changes,
+    // Retain a convenient hash lookup; deletions and symlink kinds are explicit above.
+    source_sha256: Object.fromEntries(changes.filter((change) => change.sha256 !== null)
+      .map((change) => [change.path, change.sha256!])),
+    source_note: 'Unsigned repository snapshot at generation start: base commit plus every tracked working-tree change and nonignored untracked file. Hashes cover working-tree bytes (or symlink targets); deleted paths are explicit. Ignored files, installed dependencies and the environment are not attested. Keep source unchanged during generation.',
+    node_version: process.version,
+  };
+}
+
 /** Regenerates the procedure, not identical bytes: every run creates and discards a fresh key. */
 export async function generatePublicEvidence(output: string) {
+  // Capture before writing output, so the output cannot hash itself. This also
+  // includes newly added/modified store or schema modules without changing a list.
+  const provenance = sourceProvenance();
   // Refuse overwrite rather than deleting a directory supplied by a caller.
   mkdirSync(output, { recursive: false });
   const temporary = mkdtempSync(join(tmpdir(), 'cresec-public-evidence-'));
@@ -91,9 +141,6 @@ export async function generatePublicEvidence(output: string) {
     assert.equal(tamperedResult.exit_code, 1, 'altered event must fail the unchanged verifier');
     assert.match(tamperedResult.stdout, /hash mismatch at seq 1/);
 
-    const sourceFiles = ['demo/public-evidence.ts', 'src/export/bundle.ts', 'src/capture/recorder.ts',
-      'src/chain/keys.ts', 'src/chain/hash.ts', 'src/redact/redactor.ts', 'package-lock.json'];
-    const sourceHashes = Object.fromEntries(sourceFiles.map((path) => [path, sha256Hex(readFileSync(join(ROOT, path)))]));
     const artifactHashes = Object.fromEntries(['intact', 'tampered'].flatMap((kind) =>
       Object.values(BUNDLE_FILES).map((name) => [`${kind}/${name}`, sha256Hex(readFileSync(join(output, kind, name)))])));
     const generatedAt = new Date().toISOString();
@@ -108,9 +155,7 @@ export async function generatePublicEvidence(output: string) {
       generator: {
         command: 'npm run demo:sample -- --out <new-directory>',
         package_version: packageInfo.version,
-        source_base_commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).trim(),
-        source_note: 'Source hashes identify the working-tree generator; base commit alone does not identify uncommitted changes.',
-        source_sha256: sourceHashes,
+        ...provenance,
       },
       signer: { public_key_hex: signer.publicKeyHex, fingerprint_sha256_raw_key: sha256Hex(Buffer.from(signer.publicKeyHex, 'hex')), independently_trusted: false },
       range: manifest.range,
