@@ -283,9 +283,13 @@ describe('exportBundle', () => {
     const onDisk = JSON.parse(readFileSync(join(bundleDir, BUNDLE_FILES.MANIFEST), 'utf8'));
     expect(onDisk).toEqual(manifest);
 
-    // README has the promised four lines.
+    // README includes the verification command and its trust/coverage limits.
     const readme = readFileSync(join(bundleDir, BUNDLE_FILES.README), 'utf8');
-    expect(readme.trimEnd().split('\n')).toHaveLength(4);
+    expect(readme.trimEnd().split('\n')).toHaveLength(7);
+    expect(readme).toContain('does not prove all real activity was recorded');
+    expect(readme).toContain('use node verify.cjs --public-key');
+    expect(readme).toContain('Enforcement applies only to mediated calls');
+    expect(readme).toContain('unsigned informational metadata');
     expect(readme).toContain('node verify.cjs');
 
     // Our own verifier accepts the exported segment + fresh signature.

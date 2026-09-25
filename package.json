@@ -65,6 +65,7 @@
     "bench:gateway": "tsx bench/latency.ts --gateway",
     "bench:boundary": "tsx bench/boundary.ts",
     "demo": "tsx demo/run.ts",
+    "demo:sample": "node --import tsx demo/public-evidence.ts",
     "receiver": "tsx receiver/main.ts",
     "prepublishOnly": "npm run compile && npm test"
   },
