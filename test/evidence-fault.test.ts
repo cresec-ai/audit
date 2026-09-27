@@ -12,6 +12,9 @@ import { openStore, isSqliteAvailable } from '../src/store/index.js';
 import { DurableDelivery } from '../src/capture/spool.js';
 import { reconcileStore } from '../src/capture/reconcile.js';
 import { verifyStore } from '../src/verify/verify.js';
+import { Signer } from '../src/chain/keys.js';
+import { SCHEMA } from '../src/schema/events.js';
+import { sha256Ref } from '../src/chain/hash.js';
 import { FILES } from '../src/types.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -58,7 +61,10 @@ for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : 
         // store's short-lived stale lock after termination inside append.
         let recovery = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
         await until(() => {
-          if (recovery.status === 3 && JSON.parse(recovery.stdout).delivery.pending_events === 0) return true;
+          if (recovery.status === 3) {
+            const state = JSON.parse(recovery.stdout).delivery;
+            if (!state.pending_events && !state.active_runs && !state.abandoned_runs && !state.errors.length) return true;
+          }
           recovery = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
           return false;
         }, () => recovery.stderr + recovery.stdout);
@@ -250,3 +256,21 @@ for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : 
     } finally { store.close(); }
   }, 30_000);
 }
+
+it('close removes its clean lease when recovery resolves a transient signing failure', async () => {
+  const dataDir = directory(); const signer = await Signer.load(dataDir); let attempts = 0;
+  const delivery = new DurableDelivery({ dataDir, openStore: () => openStore({ dataDir, backend: 'jsonl' }),
+    signer: { publicKeyHex: signer.publicKeyHex, sign: async (seq, hash) => {
+      if (++attempts <= 3) throw new Error('signer temporarily unavailable');
+      return signer.sign(seq, hash);
+    } } });
+  expect((await delivery.deliver([{ schema: SCHEMA, kind: 'notification', event_id: 'transient', session_id: 'transient',
+    timestamp: new Date().toISOString(), identity: { fingerprint: sha256Ref('fixture') },
+    server: { name: 'fixture', command: '', transport: 'stdio' }, attributes: {},
+    method: 'test', params: {}, direction: 'client_to_server' }])).pending).toBe(true);
+  await delivery.close();
+  const report = JSON.parse(cli(dataDir, 'jsonl', ['reconcile', '--json']).stdout);
+  expect(report.delivery.pending_events).toBe(0);
+  expect(report.delivery.active_runs).toBe(0);
+  expect(report.delivery.abandoned_runs).toBe(0);
+});

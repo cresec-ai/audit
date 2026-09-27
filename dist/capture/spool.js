@@ -455,8 +455,11 @@ export class DurableDelivery {
         }
     }
     async close() {
-        const final = await this.deliver([]);
+        await this.deliver([]);
         await this.recover(this.endedHook);
+        // Recovery may have resolved an earlier uncertain append. Confirm the
+        // current delivery state before retaining this otherwise clean lease.
+        const final = await this.deliver([]);
         const report = await this.sweep();
         if (report && (report.missing_outcomes.length || report.missing_companion_records.length || report.gaps.length)) {
             this.warn('coverage', `coverage incomplete: ${report.missing_outcomes.length} allowed decisions without outcomes; ${report.missing_companion_records.length} missing companion records; ${report.gaps.length} gap records`);

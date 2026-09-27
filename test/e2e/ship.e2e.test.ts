@@ -23,6 +23,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { once } from 'node:events';
+import { Signer } from '../../src/chain/keys.js';
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -287,4 +289,28 @@ describe.skipIf(!TSX_AVAILABLE)('e2e ship: live replication to a real receiver',
     });
     expect(mismatch.code).toBe(1);
   }, 180_000);
+});
+
+describe.skipIf(!TSX_AVAILABLE)('shipper before the first async evidence append', () => {
+  it('reopens its empty reader and follows the first chain without creating it', async () => {
+    const dir = tmpDir('e2e-ship-before-append-'); const dataDir = join(dir, 'data');
+    await Signer.load(dataDir);
+    const receiver = await startReceiver(join(dir, 'receiver'), TOKEN);
+    const daemon = spawn(process.execPath, [join(REPO_ROOT, 'dist/cli.js'), 'ship', '--data-dir', dataDir, '--store', 'jsonl'], {
+      cwd: REPO_ROOT, env: cleanEnv({ MCP_RECORDER_SINK: receiver.url, MCP_RECORDER_SINK_TOKEN: TOKEN }),
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = ''; daemon.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
+    try {
+      await waitFor(() => stderr.includes('waiting for first evidence append'), 'the shipper to observe the missing evidence file', 20_000);
+      expect(existsSync(join(dataDir, 'evidence.jsonl'))).toBe(false);
+      await recordOneSession(dataDir, join(dir, 'journal.jsonl'), 'first-delayed-append');
+      const local = readChain(dataDir);
+      await waitFor(() => receiver.chainIds().some((id) => receiver.records(id).length === local.length), 'the late-created chain to replicate', 20_000);
+      expect(JSON.stringify(receiver.records(receiver.chainIds()[0]!))).toBe(JSON.stringify(local));
+    } finally {
+      if (daemon.exitCode === null && daemon.signalCode === null) { const exited = once(daemon, 'exit'); daemon.kill('SIGKILL'); await exited; }
+      receiver.stop();
+    }
+  }, 60_000);
 });

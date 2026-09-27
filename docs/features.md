@@ -227,7 +227,8 @@ spool saturation and pending stdio/HTTP writes. Repeated recovery appends no
 duplicate IDs, pending calls/timeouts are unknown, and recovered bundles verify
 offline; lost in-memory events leave a dirty-exit gap. The live retry timer
 works without new traffic. This is process-fault proof, not a power-loss
-experiment. Whole-disk loss, a crash before lease
+experiment. Regression tests also pin clean lease removal after recovery
+and a shipper that starts before the first async append. Whole-disk loss, a crash before lease
 creation, host callbacks never delivered, PID reuse and decisions absent
 from all local evidence need independent reconciliation in the control plane.
 Details: [delivery and coverage](event-schema.md#delivery-and-coverage-additive-v1).

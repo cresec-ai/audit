@@ -839,6 +839,8 @@ allowed-decision feed are follow-ups for nhi, not a claim of this local sweep.
 | Stdio/HTTP gateway terminated with admitted pending write | Same action/attempt recovers as `unknown`; upstream receipt journal remains exactly one call |
 | Upstream JSON-RPC timeout | `unknown`, one upstream execution, never success |
 | Hook session ends without post callback | Its durable allow resolves to `unknown` with the same action ID |
+| Recovery resolves a transient signing failure during close | Recheck current journal state; remove the clean lease, avoiding a false later exit gap |
+| Shipper starts before any async append (`test/e2e/ship.e2e.test.ts`) | Reopen the empty read-only reader when the first evidence file appears; replicate without creating a chain |
 | Repeated recovery and bundle export | Stable event IDs, no duplicates; v1 `verify.cjs` accepts recovered signed evidence offline |
 
 The process is forcibly terminated only after a concrete checkpoint file or

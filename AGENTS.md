@@ -114,7 +114,10 @@ queue; pending stdio/HTTP writes recover as unknown and are never resent.
 A live recorder replays after recovery with no new traffic, upstream timeouts
 stay unknown, and missing hook post callbacks resolve at session end. Repeated
 recovery deduplicates evidence, reports gaps and exports bundles that verify
-offline. These are process-fault tests, not power-loss or real-control-plane
+offline. Close rechecks delivery after recovery before retaining a lease;
+`test/evidence-fault.test.ts` pins the transient-signing case. The shipper
+reopens an initially empty reader when the first async append arrives
+(`test/e2e/ship.e2e.test.ts`). These are process-fault tests, not power-loss or real-control-plane
 proof. A crash before any evidence is durable cannot reconstruct an action
 locally under fail-open admission; a surviving lease exposes a recorder-exit
 gap, not invented success. Total disk failure can prevent even a gap from
