@@ -286,6 +286,7 @@ export class SqliteStore implements EvidenceStore {
       // A replay acknowledgement must survive a process/OS restart.
       this.db.pragma('synchronous = FULL');
       retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_event_id ON records(json_extract(event, '$.event_id'))"), openDeadline);
+      retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_run_id ON records(json_extract(event, '$.recorder_run_id'))"), openDeadline);
     } catch (err) {
       // Don't leak the handle on a failed open: the caller falls back or
       // disables recording, and an open handle would keep the file locked
@@ -437,8 +438,10 @@ export class SqliteStore implements EvidenceStore {
     }
   }
 
-  count(): number {
-    const row = this.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM records').get();
+  count(recorderRunId?: string): number {
+    const row = recorderRunId === undefined
+      ? this.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM records').get()
+      : this.db.prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM records WHERE json_extract(event, '$.recorder_run_id') = ?").get(recorderRunId);
     return row?.n ?? 0;
   }
 

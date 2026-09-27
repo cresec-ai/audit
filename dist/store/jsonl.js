@@ -412,6 +412,7 @@ export class JsonlStore {
     sigs;
     eventIndex = new Map();
     indexedCount = 0;
+    runCounts = new Map();
     /** File size as of the last time `records`/`sigs` were loaded from disk. */
     recordsLoadedSize;
     sigsLoadedSize;
@@ -434,6 +435,7 @@ export class JsonlStore {
         const { items, loadedSize } = syncJsonlArray(this.path, this.records, this.recordsLoadedSize);
         if (this.indexedCount && items[this.indexedCount - 1] !== this.records[this.indexedCount - 1]) {
             this.eventIndex.clear();
+            this.runCounts.clear();
             this.indexedCount = 0;
         }
         this.records = items;
@@ -499,6 +501,7 @@ export class JsonlStore {
         const after = this.cachedHead();
         if (after.seq !== diskHead.seq || after.hash !== diskHead.hash) {
             this.eventIndex.clear();
+            this.runCounts.clear();
             this.indexedCount = 0;
             this.records = loadJsonlFile(this.path);
             this.recordsLoadedSize = sizeOf(this.path);
@@ -538,13 +541,7 @@ export class JsonlStore {
             repairTornTail(this.path);
             const diskHead = this.readHeadFromDisk();
             this.catchUpTo(diskHead);
-            if (this.indexedCount > this.records.length) {
-                this.eventIndex.clear();
-                this.indexedCount = 0;
-            }
-            for (const record of this.records.slice(this.indexedCount))
-                this.eventIndex.set(record.event.event_id, record.event);
-            this.indexedCount = this.records.length;
+            this.indexEvents();
             const seen = new Map();
             let head = diskHead;
             const sealed = [];
@@ -595,9 +592,26 @@ export class JsonlStore {
             yield record;
         }
     }
-    count() {
+    indexEvents() {
+        if (this.indexedCount > this.records.length) {
+            this.eventIndex.clear();
+            this.runCounts.clear();
+            this.indexedCount = 0;
+        }
+        for (const { event } of this.records.slice(this.indexedCount)) {
+            this.eventIndex.set(event.event_id, event);
+            if (event.recorder_run_id !== undefined) {
+                this.runCounts.set(event.recorder_run_id, (this.runCounts.get(event.recorder_run_id) ?? 0) + 1);
+            }
+        }
+        this.indexedCount = this.records.length;
+    }
+    count(recorderRunId) {
         this.syncRecords();
-        return this.records.length;
+        if (recorderRunId === undefined)
+            return this.records.length;
+        this.indexEvents();
+        return this.runCounts.get(recorderRunId) ?? 0;
     }
     /**
      * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL

@@ -776,7 +776,10 @@ append, including when the store was unavailable at startup. A journal is
 acknowledged only after the chain and head signature are synced. SQLite uses
 FULL synchronous transactions; JSONL files are fsynced explicitly. Replay is
 attempted during drains, every second while the recorder is alive, and at
-startup/close. Event-ID dedupe covers uncertain acknowledgements, including a
+startup/close. CLI startup schedules this work in the background; recovery
+checks for dead leases before scanning historical records. Acknowledgements
+are counted by originating recorder_run_id, even when another process replays
+the shared journal. Event-ID dedupe covers uncertain acknowledgements, including a
 commit followed by process death before journal removal. Replay never calls
 the upstream tool. Canonical JSON, genesis, signatures and bundle v1 remain
 unchanged; integrity verification is not coverage reconciliation.

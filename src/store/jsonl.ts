@@ -425,6 +425,7 @@ export class JsonlStore implements EvidenceStore {
   private sigs: HeadSignature[];
   private eventIndex = new Map<string, AnyEvent>();
   private indexedCount = 0;
+  private runCounts = new Map<string, number>();
   /** File size as of the last time `records`/`sigs` were loaded from disk. */
   private recordsLoadedSize: number;
   private sigsLoadedSize: number;
@@ -448,7 +449,7 @@ export class JsonlStore implements EvidenceStore {
   private syncRecords(): void {
     const { items, loadedSize } = syncJsonlArray(this.path, this.records, this.recordsLoadedSize);
     if (this.indexedCount && items[this.indexedCount - 1] !== this.records[this.indexedCount - 1]) {
-      this.eventIndex.clear(); this.indexedCount = 0;
+      this.eventIndex.clear(); this.runCounts.clear(); this.indexedCount = 0;
     }
     this.records = items;
     this.recordsLoadedSize = loadedSize;
@@ -513,7 +514,7 @@ export class JsonlStore implements EvidenceStore {
     this.syncRecords();
     const after = this.cachedHead();
     if (after.seq !== diskHead.seq || after.hash !== diskHead.hash) {
-      this.eventIndex.clear(); this.indexedCount = 0;
+      this.eventIndex.clear(); this.runCounts.clear(); this.indexedCount = 0;
       this.records = loadJsonlFile<ChainRecord>(this.path);
       this.recordsLoadedSize = sizeOf(this.path);
     }
@@ -553,9 +554,7 @@ export class JsonlStore implements EvidenceStore {
       repairTornTail(this.path);
       const diskHead = this.readHeadFromDisk();
       this.catchUpTo(diskHead);
-      if (this.indexedCount > this.records.length) { this.eventIndex.clear(); this.indexedCount = 0; }
-      for (const record of this.records.slice(this.indexedCount)) this.eventIndex.set(record.event.event_id, record.event);
-      this.indexedCount = this.records.length;
+      this.indexEvents();
       const seen = new Map<string, AnyEvent>();
       let head = diskHead;
       const sealed: ChainRecord[] = [];
@@ -606,9 +605,24 @@ export class JsonlStore implements EvidenceStore {
     }
   }
 
-  count(): number {
+  private indexEvents(): void {
+    if (this.indexedCount > this.records.length) {
+      this.eventIndex.clear(); this.runCounts.clear(); this.indexedCount = 0;
+    }
+    for (const { event } of this.records.slice(this.indexedCount)) {
+      this.eventIndex.set(event.event_id, event);
+      if (event.recorder_run_id !== undefined) {
+        this.runCounts.set(event.recorder_run_id, (this.runCounts.get(event.recorder_run_id) ?? 0) + 1);
+      }
+    }
+    this.indexedCount = this.records.length;
+  }
+
+  count(recorderRunId?: string): number {
     this.syncRecords();
-    return this.records.length;
+    if (recorderRunId === undefined) return this.records.length;
+    this.indexEvents();
+    return this.runCounts.get(recorderRunId) ?? 0;
   }
 
   /**

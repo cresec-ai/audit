@@ -19,6 +19,8 @@ export declare class DurableDelivery {
     private store;
     private signer;
     private ready;
+    private acknowledged;
+    private endedHook;
     private tail;
     private warned;
     private lostGap;
@@ -48,12 +50,13 @@ export declare class DurableDelivery {
     private repairTail;
     private replay;
     private fallbackBase;
+    private acknowledge;
     deliver(events: AnyEvent[]): Promise<DeliveryResult>;
-    start(): Promise<void>;
+    start(includeEndedHooks?: boolean): Promise<void>;
     /** Recover only known-dead process incarnations, or explicitly ended hook
      * sessions. PID reuse/permission errors are conservatively left unresolved.
      * Deterministic recovery IDs and timestamps make a kill during recovery safe. */
-    recover(): Promise<void>;
+    recover(includeEndedHooks?: boolean): Promise<void>;
     sweep(): Promise<Reconciliation | undefined>;
     close(): Promise<void>;
 }

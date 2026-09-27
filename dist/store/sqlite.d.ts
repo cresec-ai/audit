@@ -39,7 +39,7 @@ export declare class SqliteStore implements EvidenceStore {
     latestSignature(): HeadSignature | null;
     signatures(): HeadSignature[];
     iterate(opts?: IterateOpts): Iterable<ChainRecord>;
-    count(): number;
+    count(recorderRunId?: string): number;
     sessions(): SessionSummary[];
     close(): void;
 }

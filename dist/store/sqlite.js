@@ -225,6 +225,7 @@ export class SqliteStore {
             // A replay acknowledgement must survive a process/OS restart.
             this.db.pragma('synchronous = FULL');
             retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_event_id ON records(json_extract(event, '$.event_id'))"), openDeadline);
+            retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_run_id ON records(json_extract(event, '$.recorder_run_id'))"), openDeadline);
         }
         catch (err) {
             // Don't leak the handle on a failed open: the caller falls back or
@@ -334,8 +335,10 @@ export class SqliteStore {
             };
         }
     }
-    count() {
-        const row = this.db.prepare('SELECT COUNT(*) AS n FROM records').get();
+    count(recorderRunId) {
+        const row = recorderRunId === undefined
+            ? this.db.prepare('SELECT COUNT(*) AS n FROM records').get()
+            : this.db.prepare("SELECT COUNT(*) AS n FROM records WHERE json_extract(event, '$.recorder_run_id') = ?").get(recorderRunId);
         return row?.n ?? 0;
     }
     sessions() {

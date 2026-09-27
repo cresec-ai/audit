@@ -55,6 +55,8 @@ export class DurableDelivery {
     store;
     signer;
     ready = false;
+    acknowledged = 0;
+    endedHook = false;
     tail = Promise.resolve();
     warned = new Set();
     lostGap;
@@ -315,7 +317,26 @@ export class DurableDelivery {
             identity: { fingerprint: sha256Ref('unattributed-recovery') },
             server: { name: 'recorder', command: '', transport: 'stdio' }, attributes: {}, recorder_run_id: this.runId };
     }
+    acknowledge() {
+        // Another process may have replayed our frames. Query the indexed run
+        // count, not whichever process happened to append the shared journal.
+        try {
+            this.store ??= this.opts.openStore();
+            const total = this.store.count(this.runId);
+            const delta = Math.max(0, total - this.acknowledged);
+            this.acknowledged = Math.max(total, this.acknowledged);
+            return delta;
+        }
+        catch {
+            return 0;
+        }
+    }
     deliver(events) {
+        for (const event of events) {
+            event.recorder_run_id ??= this.runId;
+            if (event.kind === 'session_end' && event.source === 'hook')
+                this.endedHook = true;
+        }
         return this.serial(async () => {
             let dropped = 0;
             let persisted = false;
@@ -324,9 +345,8 @@ export class DurableDelivery {
                     await this.repairTail();
                     // Repair/replay an old torn tail before appending to it. A healthy
                     // journal is replayed first too, freeing its bounded capacity.
-                    let replayed = 0;
                     try {
-                        replayed = await this.replay();
+                        await this.replay();
                     }
                     catch { /* a down store retains the backlog */ }
                     if (this.lostGap) {
@@ -337,11 +357,12 @@ export class DurableDelivery {
                     dropped = await this.append(events);
                     persisted = true;
                     try {
-                        return { written: replayed + await this.replay(), dropped, pending: false };
+                        await this.replay();
+                        return { written: this.acknowledge(), dropped, pending: false };
                     }
                     catch {
                         this.warn('store', 'store unavailable; evidence retained in durable delivery spool');
-                        return { written: replayed, dropped, pending: true };
+                        return { written: this.acknowledge(), dropped, pending: true };
                     }
                 });
             }
@@ -351,25 +372,24 @@ export class DurableDelivery {
                     // Some frames may already have reached disk: the loss count is unknown.
                 }
                 this.warn('spool', 'coverage gap: delivery spool unavailable; traffic continues, evidence may be lost');
-                return { written: 0, dropped: persisted ? dropped : events.length, pending: true };
+                return { written: this.acknowledge(), dropped: persisted ? dropped : events.length, pending: true };
             }
         });
     }
-    async start() {
+    async start(includeEndedHooks = true) {
         await this.deliver([]);
-        await this.recover();
+        await this.recover(includeEndedHooks);
     }
     /** Recover only known-dead process incarnations, or explicitly ended hook
      * sessions. PID reuse/permission errors are conservatively left unresolved.
      * Deterministic recovery IDs and timestamps make a kill during recovery safe. */
-    async recover() {
+    async recover(includeEndedHooks = true) {
         await this.serial(async () => {
             try {
                 await this.withLock(async () => {
                     await this.repairTail();
                     await this.replay();
                     this.store ??= this.opts.openStore();
-                    const events = [...this.store.iterate()].map((r) => r.event);
                     const dead = [];
                     for (const name of await readdir(this.runs)) {
                         if (!name.endsWith('.json') || name === this.runId + '.json')
@@ -383,6 +403,9 @@ export class DurableDelivery {
                             this.warn('lease', 'coverage gap: unreadable recorder lease; recovery needs inspection');
                         }
                     }
+                    if (!dead.length && !includeEndedHooks)
+                        return;
+                    const events = [...this.store.iterate()].map((r) => r.event);
                     const deadRuns = new Set(dead.map((l) => l.run_id));
                     const ended = new Set(events.filter((e) => e.kind === 'session_end' && e.source === 'hook').map((e) => e.session_id));
                     const outcomes = new Set(events.filter((e) => e.kind === 'action_lifecycle' && e.phase === 'outcome').map((e) => JSON.stringify([e.action_id, e.attempt_id])));
@@ -433,7 +456,7 @@ export class DurableDelivery {
     }
     async close() {
         const final = await this.deliver([]);
-        await this.recover();
+        await this.recover(this.endedHook);
         const report = await this.sweep();
         if (report && (report.missing_outcomes.length || report.missing_companion_records.length || report.gaps.length)) {
             this.warn('coverage', `coverage incomplete: ${report.missing_outcomes.length} allowed decisions without outcomes; ${report.missing_companion_records.length} missing companion records; ${report.gaps.length} gap records`);

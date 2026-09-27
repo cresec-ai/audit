@@ -141,7 +141,8 @@ export async function setupProxyRecording(
   const delivery = config.disabled ? undefined : new DurableDelivery({
     dataDir: config.dataDir, store, signer, openStore: () => openConfiguredStore(config), warn: diag,
   });
-  await delivery?.start();
+  // Replay/recovery is background work, never a prerequisite for forwarding.
+  void delivery?.start(false);
   const inner = new Recorder({ store, signer, ...(delivery === undefined ? {} : { delivery }) });
   const { recorder, sessionId } = tapSessionId(inner);
   return {

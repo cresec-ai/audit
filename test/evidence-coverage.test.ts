@@ -144,3 +144,32 @@ it('inspection includes allowed decisions waiting in an unavailable-store spool'
   expect(snapshot.active_runs).toBe(1);
   await delivery.close();
 });
+
+it('startup without abandoned leases does not scan historical evidence', async () => {
+  const dataDir = dir(); const store = openStore({ dataDir, backend: 'jsonl' });
+  store.appendEvents([event()]);
+  const iterate = store.iterate.bind(store); let scans = 0;
+  store.iterate = (opts) => { scans++; return iterate(opts); };
+  const delivery = new DurableDelivery({ dataDir, store, openStore: () => store });
+  await delivery.start(false);
+  expect(scans).toBe(0);
+  await delivery.close();
+  expect(scans).toBe(1); // explicit close reconciliation
+});
+
+for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : [])] as const) {
+  it(`${backend}: shared replay credits the original run, including an acknowledgement by another process`, async () => {
+    const dataDir = dir(); let offline = true;
+    const a = new DurableDelivery({ dataDir, openStore: () => {
+      if (offline) throw new Error('offline'); return openStore({ dataDir, backend });
+    } });
+    const b = new DurableDelivery({ dataDir, openStore: () => openStore({ dataDir, backend }) });
+    const one = event(); const two = event();
+    expect((await a.deliver([one])).written).toBe(0);
+    expect((await b.deliver([two])).written).toBe(1);
+    offline = false;
+    expect((await a.deliver([])).written).toBe(1);
+    expect((await a.deliver([])).written).toBe(0);
+    await a.close(); await b.close();
+  });
+}

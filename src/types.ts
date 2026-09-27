@@ -178,7 +178,8 @@ export interface EvidenceStore {
   latestSignature(): HeadSignature | null;
   signatures(): HeadSignature[];
   iterate(opts?: IterateOpts): Iterable<ChainRecord>;
-  count(): number;
+  /** Optional process-incarnation filter for delivery acknowledgements. */
+  count(recorderRunId?: string): number;
   sessions(): SessionSummary[];
   close(): void;
 }
