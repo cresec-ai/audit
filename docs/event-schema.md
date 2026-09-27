@@ -843,6 +843,12 @@ allowed-decision feed are follow-ups for nhi, not a claim of this local sweep.
 | Shipper starts before any async append (`test/e2e/ship.e2e.test.ts`) | Reopen the empty read-only reader when the first evidence file appears; replicate without creating a chain |
 | Repeated recovery and bundle export | Stable event IDs, no duplicates; v1 `verify.cjs` accepts recovered signed evidence offline |
 
+Recovery assertions wait for pending frames and abandoned leases to clear.
+The JSONL store's existing stale-lock grace period can defer replay after a
+termination inside append; reconciliation reports that pending state until
+a subsequent recovery attempt completes. No missing outcome is counted as
+complete during that interval.
+
 The process is forcibly terminated only after a concrete checkpoint file or
 persisted allow is observed. POSIX uses SIGKILL; Node forces termination on
 Windows. Fault hooks live exclusively in test fixtures, with no production

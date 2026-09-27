@@ -47,6 +47,19 @@ function cli(dataDir: string, backend: string, args: string[]) {
   return spawnTsxSync(['src/cli.ts', ...args, '--data-dir', dataDir, '--store', backend], { cwd: root, encoding: 'utf8', timeout: 30_000 });
 }
 
+async function recover(dataDir: string, backend: string) {
+  let result = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
+  await until(() => {
+    if (result.status === 3 || result.status === 0) {
+      const state = JSON.parse(result.stdout).delivery;
+      if (!state.pending_events && !state.active_runs && !state.abandoned_runs && !state.errors.length) return true;
+    }
+    result = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
+    return false;
+  }, () => result.stderr + result.stdout);
+  return result;
+}
+
 for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : [])] as const) {
   describe(`${backend} actual process death`, () => {
     for (const mode of ['append', 'committed', 'offline', ...(backend === 'jsonl' ? ['signature', 'journal', 'full', 'queue'] : [])]) {
@@ -59,15 +72,7 @@ for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : 
         await kill(proc);
         // Recovery runs in a new OS process. JSONL may retain the existing
         // store's short-lived stale lock after termination inside append.
-        let recovery = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
-        await until(() => {
-          if (recovery.status === 3) {
-            const state = JSON.parse(recovery.stdout).delivery;
-            if (!state.pending_events && !state.active_runs && !state.abandoned_runs && !state.errors.length) return true;
-          }
-          recovery = cli(dataDir, backend, ['reconcile', '--recover', '--json']);
-          return false;
-        }, () => recovery.stderr + recovery.stdout);
+        const recovery = await recover(dataDir, backend);
         expect(recovery.status, recovery.stderr).toBe(3); // dirty exit is always a gap
         const store = openStore({ dataDir, backend });
         let count: number;
@@ -131,7 +136,7 @@ for (const transport of ['stdio', 'http'] as const) {
       catch { return false; }
     }, output);
     await kill(proc);
-    const report = cli(dataDir, 'jsonl', ['reconcile', '--recover', '--json']);
+    const report = await recover(dataDir, 'jsonl');
     expect(report.status, report.stderr).toBe(3);
     const parsed = JSON.parse(report.stdout);
     expect(parsed.allowed).toBe(1); expect(parsed.missing_outcomes).toHaveLength(0);
@@ -206,7 +211,7 @@ it('an upstream JSON-RPC timeout is unknown and the write is sent only once', as
   });
   expect(calls).toBe(1);
   await kill(proc);
-  const report = cli(dataDir, 'jsonl', ['reconcile', '--recover', '--json']);
+  const report = await recover(dataDir, 'jsonl');
   expect(JSON.parse(report.stdout).unknown_outcomes).toHaveLength(1);
   expect(calls).toBe(1);
 });
