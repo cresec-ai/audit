@@ -189,8 +189,8 @@ lifecycle tests in `gateway-proxy.test.ts`, `http-gateway.test.ts` and
 `hook.test.ts` assert allow/refusal joins without plaintext. Pending proxy
 close is `unknown`, not success; legacy tool_call and DECISIONS views retain
 their meanings. Hashes cover complete pre-injection requests. Local durable
-delivery and reconciliation are tested below; hard-kill proof is pending,
-so this is not a governed-completeness claim.
+delivery, reconciliation and real process termination are tested below.
+Completeness is scoped to durable local observations, with explicit gaps.
 
 ### What happens if the evidence store breaks mid-session?
 
@@ -221,7 +221,13 @@ governed completeness. Gateway mode records lifecycle decisions and uses the
 same delivery mechanism; a gap makes coverage incomplete without changing
 admission. A durable lease marks a hard exit even if the event queue was lost;
 a missing response is recovered as unknown from durable intent/decision.
-Real process-kill proof is pending. Whole-disk loss, a crash before lease
+`test/evidence-fault.test.ts` proves real process termination inside both
+store backends and the journal/signature append, uncertain acknowledgements,
+spool saturation and pending stdio/HTTP writes. Repeated recovery appends no
+duplicate IDs, pending calls/timeouts are unknown, and recovered bundles verify
+offline; lost in-memory events leave a dirty-exit gap. The live retry timer
+works without new traffic. This is process-fault proof, not a power-loss
+experiment. Whole-disk loss, a crash before lease
 creation, host callbacks never delivered, PID reuse and decisions absent
 from all local evidence need independent reconciliation in the control plane.
 Details: [delivery and coverage](event-schema.md#delivery-and-coverage-additive-v1).
