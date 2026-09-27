@@ -222,3 +222,31 @@ it('a hook session ending without its post callback resolves the durable allow a
   expect(report.unknown_outcomes).toHaveLength(1);
   expect(report.unknown_outcomes[0].action_id).toBe(pending.missing_outcomes[0].action_id);
 });
+
+for (const backend of ['jsonl', ...(isSqliteAvailable() ? ['sqlite' as const] : [])] as const) {
+  it(`${backend}: an outage persists across recovery-process startup, then live replay restores original IDs`, async () => {
+    const dataDir = directory();
+    const original = child(['test/fixtures/evidence-fault.ts', dataDir, backend, 'offline']);
+    await until(() => existsSync(join(dataDir, 'fault-ready')), original.output);
+    const expected = JSON.parse(readFileSync(join(dataDir, 'expected.json'), 'utf8')) as string[];
+    const journal = join(dataDir, 'delivery/pending.jsonl');
+    const spooled = readFileSync(journal, 'utf8');
+    await kill(original.proc);
+    const recovery = child(['test/fixtures/evidence-fault.ts', dataDir, backend, 'restart-offline']);
+    await until(() => existsSync(join(dataDir, 'restart-ready')), recovery.output);
+    expect(readFileSync(journal, 'utf8')).toBe(spooled);
+    expect(JSON.parse(cli(dataDir, backend, ['reconcile', '--json']).stdout).delivery.pending_events).toBe(2);
+    writeFileSync(join(dataDir, 'restore'), '');
+    await until(() => !existsSync(journal), recovery.output);
+    const exited = once(recovery.proc, 'exit'); recovery.proc.stdin.end();
+    expect((await exited)[0]).toBe(0);
+    const store = openStore({ dataDir, backend });
+    try {
+      const ids = [...store.iterate()].map((r) => r.event.event_id);
+      for (const id of expected) expect(ids.filter((value) => value === id)).toHaveLength(1);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(reconcileStore(store).gaps.some((e) => e.reason === 'recorder_exit')).toBe(true);
+      expect((await verifyStore(store)).ok).toBe(true);
+    } finally { store.close(); }
+  }, 30_000);
+}

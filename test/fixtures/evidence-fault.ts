@@ -15,6 +15,18 @@ import { FILES } from '../../src/types.js';
 const [dataDir, backend, mode] = process.argv.slice(2) as [string, 'jsonl' | 'sqlite', string];
 const signal = () => fs.writeFileSync(join(dataDir, 'fault-ready'), mode);
 const block = (): never => { signal(); for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); };
+if (mode === 'restart-offline') {
+  // A second OS process starts while the original outage still persists.
+  const delivery = new DurableDelivery({ dataDir, openStore: () => {
+    if (!fs.existsSync(join(dataDir, 'restore'))) throw new Error('store still unavailable at startup');
+    return openStore({ dataDir, backend });
+  } });
+  await delivery.start();
+  const recorder = new Recorder({ store: null, signer: null, delivery });
+  fs.writeFileSync(join(dataDir, 'restart-ready'), 'outage persists');
+  process.stdin.resume();
+  process.stdin.once('end', async () => { await recorder.close(); process.exit(0); });
+} else {
 const store = openStore({ dataDir, backend });
 const events: AnyEvent[] = Array.from({ length: mode === 'full' ? 20 : 2 }, () => ({
   schema: SCHEMA, kind: 'notification', event_id: randomUUID(), session_id: 'fault-session',
@@ -81,3 +93,5 @@ await delivery.deliver(events);
 if (mode === 'recovering') new Recorder({ store, signer: null, delivery });
 signal();
 setInterval(() => {}, 1000);
+
+}
