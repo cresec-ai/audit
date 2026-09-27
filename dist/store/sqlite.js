@@ -222,6 +222,9 @@ export class SqliteStore {
         try {
             retryWhileBusy(() => this.db.pragma('journal_mode = WAL'), openDeadline);
             retryWhileBusy(() => this.db.exec(DDL), openDeadline);
+            // A replay acknowledgement must survive a process/OS restart.
+            this.db.pragma('synchronous = FULL');
+            retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_event_id ON records(json_extract(event, '$.event_id'))"), openDeadline);
         }
         catch (err) {
             // Don't leak the handle on a failed open: the caller falls back or
@@ -253,10 +256,18 @@ export class SqliteStore {
         // until the first write, as a normal BEGIN would), so the head read
         // below is never followed by another connection sneaking in a write
         // before we insert — the read-then-write is atomic across processes.
+        const eventById = this.db.prepare("SELECT event FROM records WHERE json_extract(event, '$.event_id') = ? LIMIT 1");
         const sealAndInsert = this.db.transaction((events) => {
             let head = this.head();
             const sealed = [];
             for (const event of events) {
+                const existing = eventById.get(event.event_id);
+                if (existing !== undefined) {
+                    if (canonicalJson(JSON.parse(existing.event)) !== canonicalJson(event)) {
+                        throw new Error('event_id collision: delivery differs from stored evidence');
+                    }
+                    continue;
+                }
                 const record = makeRecord(head, event);
                 this.insertRecordStmt.run(record.seq, record.prev_hash, record.hash, record.event.session_id, record.event.kind, record.event.timestamp, canonicalJson(record.event));
                 sealed.push(record);

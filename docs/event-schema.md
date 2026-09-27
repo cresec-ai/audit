@@ -741,8 +741,8 @@ paths or a post callback containing results.
 Pending close, lost responses and admitted notifications are `unknown`,
 never success. The compatible unanswered tool_call stays is_error with its
 old error type. An upstream JSON-RPC timeout (-32001) and interrupted hook
-also give unknown. A hard process kill still needs recovery in the coverage
-follow-up; this PR does not prove crash completeness. Lifecycle construction
+also give unknown. Dead recorder leases now recover durable pending attempts
+as unknown; real process-kill proof is still pending. Lifecycle construction
 has no I/O. Its evidence is queued without awaiting append before execution;
 it is not an admission receipt or a durable-intent gate.
 
@@ -752,3 +752,64 @@ Old signed bundles and new records use the same hash recipe, genesis,
 signature payload and `@edut/mcp-recorder bundle v1`; no verifier or format
 version change is required. Unknown optional fields/new kinds must be kept
 verbatim by consumers when verifying.
+
+
+## Delivery and coverage (additive, v1)
+
+| Field / record | Contract | Proof / limit |
+| --- | --- | --- |
+| `recorder_run_id` | Optional process incarnation on CLI-captured events | Survives replay; never used as an action ID |
+| `coverage_gap` | New kind, `coverage: incomplete`, `reason`, `dropped_at_least` | Evidence of incomplete coverage, never an execution outcome |
+| Gap reason | `queue_full`, `spool_full`, `spool_unavailable`, `torn_spool`, `recorder_exit` | Count is a lower bound; zero means the number lost is unknown |
+| `event_id` | Stable delivery identifier; duplicates with identical canonical event content append once | Both stores reject same-ID different-content delivery; historical records are not rewritten |
+| Recovery IDs | Domain-separated SHA-256 refs derived from durable event/run IDs | Deterministic across recovery retries; IDs need not all be UUIDs |
+| `reconcile` | Every locally persisted allow with no outcome; unknowns and missing `record_event_id` companions listed separately | Chain plus pending spool snapshot; not a control-plane ledger census |
+
+`test/evidence-coverage.test.ts` proves spool/replay, both-store dedupe,
+concurrency, queue/spool bounds, torn-tail gaps and reconciliation with injected
+in-process failures. Real process-kill proof remains pending.
+
+The CLI's `record`, `http` and `hook` share `<data-dir>/delivery/pending.jsonl`.
+Its committed frames are append-only; a torn final frame is truncated with a
+gap, never treated as a successful append. Frames are fsynced before store
+append, including when the store was unavailable at startup. A journal is
+acknowledged only after the chain and head signature are synced. SQLite uses
+FULL synchronous transactions; JSONL files are fsynced explicitly. Replay is
+attempted during drains, every second while the recorder is alive, and at
+startup/close. Event-ID dedupe covers uncertain acknowledgements, including a
+commit followed by process death before journal removal. Replay never calls
+the upstream tool. Canonical JSON, genesis, signatures and bundle v1 remain
+unchanged; integrity verification is not coverage reconciliation.
+
+The shared journal cap is 64 MiB plus an 8 KiB reserve for a saturation gap;
+the memory queue holds at most 4096 events plus a gap counter and one draining
+batch. One oversized event may be dropped. A saturation episode's gap is a
+lower bound across this data directory, not an exact per-session loss count.
+Lease/ticket metadata is separate from the payload cap; dead-run metadata is
+cleaned after recovery. A filesystem bakery lock uses immutable unique
+process tickets, ignoring only known-dead PIDs; this avoids reclaiming a live
+writer because a clock timeout elapsed. Local POSIX/NTFS filesystems with
+coherent directory reads and hardlinks are required; network filesystems are
+not supported. Windows fsyncs files and closes handles before rename/unlink;
+Node cannot fsync Windows directories. Power-loss durability beyond the
+filesystem's guarantees is not claimed.
+
+Close and `reconcile --recover` sweep for missing outcomes. Known-dead run
+leases and ended hook sessions produce `unknown` for unresolved durable
+attempts (`denied` only when a deny decision is already known); a recorder
+exit also leaves a gap with an unknown loss count. A later observed response
+may refine unknown for the same attempt; reconciliation uses its latest
+outcome. PID reuse or permission-denied liveness checks remain unresolved,
+not guessed dead. Hook pre/post processes are intentionally distinct; a clean
+pre close does not declare its host action complete. An undelivered post
+callback needs the hook session-end record or independent reconciliation.
+
+Without a policy, observation is explicitly best effort: gaps expose losses,
+no lifecycle completeness is implied. Gateway mode has the same fail-open
+recording but persisted allow decisions can be reconciled. A gap or missing
+outcome makes coverage incomplete; unknown is an explicit uncertainty, never
+success. Disk failure may prevent persisting even a gap; stderr then reports
+it and a surviving lease can expose the dirty exit on recovery. A crash before
+lease/evidence persistence and control-plane decisions never observed here
+cannot be enumerated locally. Cross-leg action-ID propagation and an independent
+allowed-decision feed are follow-ups for nhi, not a claim of this local sweep.

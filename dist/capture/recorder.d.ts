@@ -10,6 +10,7 @@
  * drop mode, where traffic is never affected, drops are counted, and
  * exactly one diagnostic line goes to stderr.
  */
+import { type DurableDelivery } from './spool.js';
 import type { AnyEvent } from '../schema/events.js';
 import type { EvidenceStore, RecorderLike, RecorderStats, SignerLike } from '../types.js';
 export interface RecorderOpts {
@@ -19,16 +20,21 @@ export interface RecorderOpts {
     signEveryFlush?: boolean;
     /** Backoff (ms) before each retry of a failed batch; tests pass [] for none. */
     retryDelaysMs?: readonly number[];
+    delivery?: DurableDelivery;
 }
 export declare class Recorder implements RecorderLike {
     private readonly store;
     private readonly signer;
     private readonly signEveryFlush;
     private readonly retryDelaysMs;
+    private readonly delivery;
+    private readonly replayTimer;
+    private queueGap;
     private queue;
     private flushScheduled;
     /** In-flight flush, so flush()/close() can await the active drain. */
     private flushing;
+    private deliveryFlush;
     private enqueued;
     private written;
     private dropped;

@@ -188,27 +188,43 @@ intent, decision and outcome records joined by action and attempt IDs. The
 lifecycle tests in `gateway-proxy.test.ts`, `http-gateway.test.ts` and
 `hook.test.ts` assert allow/refusal joins without plaintext. Pending proxy
 close is `unknown`, not success; legacy tool_call and DECISIONS views retain
-their meanings. Hashes cover complete pre-injection requests. Hard-kill
-recovery, durable spooling and reconciliation are still pending, so this is
-not a governed-completeness claim.
+their meanings. Hashes cover complete pre-injection requests. Local durable
+delivery and reconciliation are tested below; hard-kill proof is pending,
+so this is not a governed-completeness claim.
 
 ### What happens if the evidence store breaks mid-session?
 
-Traffic keeps flowing. Recording is fail-open by design: a store failure is
-counted, never escalated. Dropped events appear as `events_dropped` on the
-`session_end` event and in the closing line the proxy prints.
+Traffic keeps flowing. CLI record/http/hook use a shared, bounded delivery
+journal (64 MiB plus an 8 KiB gap reserve), appended and fsynced in the async
+drain. Nothing awaits recording before forwarding or admitting a call.
+Evidence is journaled before a store append, retained until the chain and
+head signature are synced, and retried every second and on the next start.
+This retries evidence delivery, never the upstream operation. Both stores
+deduplicate the same event ID; conflicting content is an error, not a rewrite.
 
-**Maturity: Tested.** `test/recorder.test.ts` drives a store into failure and
-asserts the recorder keeps accepting events and counts them as dropped
-(`dropped: 100`, `written: 0`, `storeFailed: true`, then one more event still
-counted) rather than throwing. No live incident has exercised this path, so we
-describe it as tested, not verified.
+**Maturity: Tested.** `test/evidence-coverage.test.ts` covers an unavailable
+store, uncertain partial commit, replay with no duplicates, bounded overflow,
+a torn journal tail, concurrent writers and a non-blocking record() queue.
+Queue/spool exhaustion emits `coverage_gap` with a conservative loss count;
+if disk failure prevents persisting the gap too, stderr says coverage is
+incomplete. Counts are not a guarantee that every lost event was observed.
 
-The counter is visible in normal operation:
+`mcp-recorder reconcile --data-dir D` reports missing outcomes for persisted
+allow decisions, unknown outcomes, missing companion records and gaps,
+including pending spool frames. `--recover` first replays and resolves
+known-dead recorder runs; it never resends a tool call. Exit 3 means findings
+or pending/unreadable delivery state, 0 means none in the inspected snapshot,
+and 2 means the command failed. Close also performs a sweep.
 
-```
-[mcp-recorder] session 36cbd3a1 recorded 6 events (0 dropped) -> d1/evidence.db
-```
+Observation without a policy remains best effort and cannot establish
+governed completeness. Gateway mode records lifecycle decisions and uses the
+same delivery mechanism; a gap makes coverage incomplete without changing
+admission. A durable lease marks a hard exit even if the event queue was lost;
+a missing response is recovered as unknown from durable intent/decision.
+Real process-kill proof is pending. Whole-disk loss, a crash before lease
+creation, host callbacks never delivered, PID reuse and decisions absent
+from all local evidence need independent reconciliation in the control plane.
+Details: [delivery and coverage](event-schema.md#delivery-and-coverage-additive-v1).
 
 ### Can it record an HTTP MCP server?
 

@@ -283,6 +283,9 @@ export class SqliteStore implements EvidenceStore {
     try {
       retryWhileBusy(() => this.db.pragma('journal_mode = WAL'), openDeadline);
       retryWhileBusy(() => this.db.exec(DDL), openDeadline);
+      // A replay acknowledgement must survive a process/OS restart.
+      this.db.pragma('synchronous = FULL');
+      retryWhileBusy(() => this.db.exec("CREATE INDEX IF NOT EXISTS idx_record_event_id ON records(json_extract(event, '$.event_id'))"), openDeadline);
     } catch (err) {
       // Don't leak the handle on a failed open: the caller falls back or
       // disables recording, and an open handle would keep the file locked
@@ -328,10 +331,20 @@ export class SqliteStore implements EvidenceStore {
     // until the first write, as a normal BEGIN would), so the head read
     // below is never followed by another connection sneaking in a write
     // before we insert — the read-then-write is atomic across processes.
+    const eventById = this.db.prepare<[string], { event: string }>(
+      "SELECT event FROM records WHERE json_extract(event, '$.event_id') = ? LIMIT 1",
+    );
     const sealAndInsert = this.db.transaction((events: AnyEvent[]): ChainRecord[] => {
       let head = this.head();
       const sealed: ChainRecord[] = [];
       for (const event of events) {
+        const existing = eventById.get(event.event_id);
+        if (existing !== undefined) {
+          if (canonicalJson(JSON.parse(existing.event)) !== canonicalJson(event)) {
+            throw new Error('event_id collision: delivery differs from stored evidence');
+          }
+          continue;
+        }
         const record = makeRecord(head, event);
         this.insertRecordStmt.run(
           record.seq,

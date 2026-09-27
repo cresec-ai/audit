@@ -178,7 +178,8 @@ export type EventKind =
   | 'session_end'
   /** Additive (v1): an enforcement action taken by gateway mode. */
   | 'policy_decision'
-  | 'action_lifecycle';
+  | 'action_lifecycle'
+  | 'coverage_gap';
 
 /**
  * OTel-style flat attribute bag. Use semconv names where they exist:
@@ -212,6 +213,8 @@ export interface EventBase {
   attempt_id?: string;
   /** Hash of the complete pre-injection request, never a redacted tree. */
   request_hash?: Sha256Ref;
+  /** Delivery process incarnation; recovery never mistakes another live writer for a crash. */
+  recorder_run_id?: string;
 }
 
 /** Additive v1 records; legacy tool_call/policy_decision retain their meaning. */
@@ -230,6 +233,14 @@ export interface ActionLifecycleEvent extends EventBase {
   reason?: string;
   /** The compatible tool_call/notification this outcome describes. */
   record_event_id?: string;
+}
+
+/** A bounded lower-bound report, not a claim to enumerate lost actions. */
+export interface CoverageGapEvent extends EventBase {
+  kind: 'coverage_gap';
+  reason: 'spool_full' | 'queue_full' | 'spool_unavailable' | 'torn_spool' | 'recorder_exit';
+  dropped_at_least: number;
+  coverage: 'incomplete';
 }
 
 /** Proxy process started; carries the redaction policy in force. */
@@ -481,7 +492,8 @@ export type AnyEvent =
   | ProtocolErrorEvent
   | SessionEndEvent
   | PolicyDecisionEvent
-  | ActionLifecycleEvent;
+  | ActionLifecycleEvent
+  | CoverageGapEvent;
 
 /* ------------------------------------------------------------------ */
 /* Chain layer — how events are wrapped in the tamper-evident store.   */

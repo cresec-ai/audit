@@ -50,6 +50,8 @@ export declare class JsonlStore implements EvidenceStore {
     private readonly lockDir;
     private records;
     private sigs;
+    private eventIndex;
+    private indexedCount;
     /** File size as of the last time `records`/`sigs` were loaded from disk. */
     private recordsLoadedSize;
     private sigsLoadedSize;

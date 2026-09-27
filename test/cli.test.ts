@@ -1022,7 +1022,7 @@ describe('mcp-recorder CLI', () => {
     child.stdin!.end();
     const exitCode = await waitExit(child);
     expect(exitCode).toBe(5);
-    expect(stderrText()).toContain('recording disabled (init failed, traffic unaffected)');
+    expect(stderrText()).toContain('evidence store init failed; delivery spool will retry (traffic unaffected)');
   }, 30_000);
 
   it('a command that cannot be spawned (ENOENT) exits 127', async () => {

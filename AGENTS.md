@@ -98,12 +98,24 @@ notifications. Pending-ledger eviction and proxy close emit `unknown` outcomes
 (`test/http-gateway.test.ts`, HTTP lifecycle edge cases);
 legacy `tool_call.error.type: unanswered` remains for existing consumers.
 Recording never waits before forwarding; intent/decision capture is queued,
-not a durable admission gate. The **coverage half** does not hold yet:
-failed appends still exhaust retries and drop, with no durable spool, replay
-or reconciliation. A hard-killed recorder cannot yet recover pending calls
-as unknown; that needs the coverage and fault-injection follow-ups. A crash
-before any evidence is durable cannot be reconstructed locally under the
-fail-open contract. No completeness claim follows from an intact chain.
+not a durable admission gate. The **coverage machinery** now holds for local
+persisted evidence: a bounded, fsynced delivery journal retries on recovery
+and next start; both stores deduplicate event IDs and reject conflicting
+content. `test/evidence-coverage.test.ts` proves unavailable/partial-commit
+replay, bounds and gap records, concurrent delivery and reconciliation.
+`reconcile` reports every locally persisted allow without an outcome,
+unknown outcomes, absent legacy companion records and explicit gaps; close
+also sweeps. Dead recorder leases recover durable pending attempts as
+unknown without retrying an upstream call. The **fault-injection proof is
+still pending**: this change tests failures in process, not hard process
+kills. A crash before any evidence is durable cannot reconstruct an action
+locally under fail-open admission; a surviving lease exposes a recorder-exit
+gap, not invented success. Total disk failure can prevent even a gap from
+persisting and is reported on stderr. Observation mode is best effort;
+gateway mode uses the same delivery mechanism and any gap means coverage
+is incomplete. Reconciliation's domain is local persisted decisions, not an
+independent control-plane decision ledger. No completeness claim follows
+from an intact chain. See `docs/event-schema.md` for limits and recovery.
 Invariant 4 now also hashes the full pre-injection governed request
 (`request_hash`); hook requests use the normalized tools/call envelope.
 `test/lifecycle.test.ts` proves canonical equivalence and no depth truncation.
