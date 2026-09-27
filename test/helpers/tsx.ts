@@ -1,5 +1,5 @@
 /**
- * Spawn tsx directly, portably.
+ * Spawn a real Node child with the tsx loader, portably.
  *
  * `spawn('npx', ['tsx', ...])` shells out to npm's `npx`, which on Windows
  * is a `.cmd` shim — `child_process.spawn` won't run a `.cmd` file without
@@ -28,6 +28,7 @@ const ROOT = join(HELPERS_DIR, '..', '..');
 export const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 /**
+ * Load TypeScript in one real Node process (no Unix-socket launcher/relay).
  * Spawn `tsx <args>` asynchronously, e.g. `spawnTsx(['src/cli.ts', '--help'], { cwd: ROOT })`.
  *
  * Overloaded the way `child_process.spawn` itself is, because the two cases
@@ -46,7 +47,7 @@ export const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 export function spawnTsx(args: string[], options?: SpawnOptionsWithoutStdio): ChildProcessWithoutNullStreams;
 export function spawnTsx(args: string[], options: SpawnOptions): ChildProcess;
 export function spawnTsx(args: string[], options: SpawnOptions = {}): ChildProcess {
-  return spawn(process.execPath, [TSX_CLI, ...args], options);
+  return spawn(process.execPath, ['--import', pathToFileURL(TSX_LOADER).href, ...args], options);
 }
 
 /** Absolute path to tsx's loader entry (`import 'tsx'`), for in-process registration. */
@@ -80,5 +81,5 @@ export function spawnTsxSync(
   args: string[],
   options: SpawnSyncOptionsWithStringEncoding,
 ): SpawnSyncReturns<string> {
-  return spawnSync(process.execPath, [TSX_CLI, ...args], options);
+  return spawnSync(process.execPath, ['--import', pathToFileURL(TSX_LOADER).href, ...args], options);
 }

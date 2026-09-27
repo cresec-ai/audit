@@ -226,8 +226,11 @@ mcp-recorder export --out evidence.zip
 `query https://attacker.example/collect` finds the call — measured in local
 dogfood 6, on a store recorded by this same demo policy.
 
-Three things are recorded ([docs/event-schema.md](event-schema.md)):
+These records are written ([docs/event-schema.md](event-schema.md)):
 
+- Additive `action_lifecycle` intent, decision and outcome records, joined by
+  `action_id` and `attempt_id`; pending calls close as `unknown`, never success.
+  Legacy records retain their shapes and gain optional correlation fields.
 - `session_start.policy` — the hash and name of the policy that was in force;
 - `tool_call.gateway` — the decision, rule id, hold outcome and boundary
   findings on every tool call;

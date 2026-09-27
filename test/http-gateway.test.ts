@@ -536,3 +536,27 @@ describe('SseEventSplitter / rewriteSseEvent', () => {
     expect(rewriteSseEvent(Buffer.from('data: x\n\n'), 'y').toString()).toBe('data: y\n\n');
   });
 });
+
+describe('HTTP lifecycle evidence', () => {
+  it('joins allow and refusal without changing legacy decisions or payload privacy', async () => {
+    const target = await startJsonTarget();
+    const dir = tmpDataDir();
+    const { proxy } = await startGateway(target.url, dir);
+    await (await post(proxy.url, call(61, 'echo', { value: SECRET }))).text();
+    await (await post(proxy.url, call(62, 'http_post', { value: SECRET }))).text();
+    await proxy.close();
+    const events = loadEvents(dir);
+    const life = events.filter((e) => e.kind === 'action_lifecycle');
+    expect(life).toHaveLength(6);
+    for (const id of [61, 62]) {
+      const group = life.filter((e) => e.request_id === id);
+      expect(group.map((e) => e.phase)).toEqual(['intent', 'decision', 'outcome']);
+      expect(new Set(group.map((e) => e.action_id)).size).toBe(1);
+      expect(new Set(group.map((e) => e.attempt_id)).size).toBe(1);
+    }
+    expect(life.filter((e) => e.phase === 'outcome').map((e) => e.outcome)).toEqual(['success', 'denied']);
+    expect(events.filter((e) => e.kind === 'policy_decision')).toHaveLength(1);
+    expect(target.journal.bodies).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain(SECRET);
+  });
+});

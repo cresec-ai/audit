@@ -146,6 +146,7 @@
  * has always written for an id-less message, and the decision is on stderr.
  */
 
+import { beginAction, correlate, decideAction, endAction, toolOutcome, type Lifecycle } from '../capture/lifecycle.js';
 import { constants as osConstants, hostname as osHostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -229,6 +230,7 @@ export interface StdioProxyOpts {
 }
 
 interface PendingEntry {
+  lifecycle?: Lifecycle;
   method: string;
   params: unknown;
   t0: number;
@@ -251,6 +253,7 @@ interface PendingEntry {
 
 /** A parsed `tools/call` request the gateway evaluated. */
 interface GatewayCall {
+  lifecycle: Lifecycle;
   id: string | number;
   params: Record<string, unknown>;
   /** The tool name exactly as the client sent it (used in the text the model sees). */
@@ -1668,6 +1671,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         error: { type: errorType },
       };
       if (entry.gateway !== undefined) ev.gateway = { ...entry.gateway };
+      endAction(entry.lifecycle, ev, 'unknown', record, 'response_missing');
       record(ev);
       return;
     }
@@ -1854,6 +1858,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       if (rawError !== undefined) ev.error = errorInfo(rawError);
       else if (hashFailed) ev.error = { type: RESULT_HASH_FAILED_ERROR_TYPE };
       if (gatewayOutcome !== undefined) ev.gateway = gatewayOutcome;
+      endAction(entry.lifecycle, ev, toolOutcome(ev), record);
       record(ev);
       return;
     }
@@ -1939,6 +1944,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         // `policy_decision` event instead.
         ...(gateway === undefined ? {} : { gateway }),
       };
+      if (opts.gateway !== undefined && direction === 'client_to_server' && method === 'tools/call') {
+        const params = isPlainObject(msg.params) ? msg.params : {};
+        const tool = typeof params.name === 'string' ? structuralString(params.name, 'identifier') : '';
+        const lifecycle = beginAction(base('action_lifecycle', {}), tool, msg, record);
+        const denied = gateway?.decision === 'deny';
+        decideAction(lifecycle, denied ? 'deny' : 'allow', record, opts.gateway.policy.hash);
+        endAction(lifecycle, ev, denied ? 'denied' : 'unknown', record, 'no_response_expected');
+      }
       record(ev);
       return;
     }
@@ -2187,6 +2200,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
       name: string,
       args: unknown,
       argsHash: string,
+      request: unknown,
     ): GatewayCall => {
       // '' stays '': structuralString would hash the empty string, and ''
       // is what a nameless call's tool_call event has always carried.
@@ -2203,6 +2217,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         tool,
         args,
         argsHash,
+        lifecycle: beginAction(base('action_lifecycle', {}), tool, request, record, undefined, id),
       };
     };
 
@@ -2215,14 +2230,14 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
     const unevaluatedCall = (msg: ToolsCallRequest): GatewayCall => {
       const { params, name } = toolsCallParts(msg);
       const args: unknown = params.arguments ?? {};
-      return newCall(msg.id, params, name, args, argsCanonical(args).argsHash);
+      return newCall(msg.id, params, name, args, argsCanonical(args).argsHash, msg);
     };
 
     const buildCall = (msg: ToolsCallRequest): { call: GatewayCall; action: McpDecision['action'] } => {
       const { params, name } = toolsCallParts(msg);
       const args: unknown = params.arguments ?? {};
       const { decision, argsHash } = evaluate(name, args);
-      const call = newCall(msg.id, params, name, args, argsHash);
+      const call = newCall(msg.id, params, name, args, argsHash, msg);
       if (decision.ruleId !== undefined) {
         call.rawRuleId = decision.ruleId;
         call.ruleId = cappedRuleId(decision.ruleId);
@@ -2275,6 +2290,7 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         ev.waited_ms = hold.waitedMs;
         if (hold.approver !== undefined) ev.approver = hold.approver;
       }
+      correlate(ev, call.lifecycle);
       record(ev);
     };
 
@@ -2322,6 +2338,8 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
         error: { type: errorType },
         gateway: gatewayOutcome,
       };
+      decideAction(call.lifecycle, 'deny', record, loaded.hash, call.decisionId);
+      endAction(call.lifecycle, ev, 'denied', record);
       record(ev);
     };
 
@@ -2554,8 +2572,10 @@ export async function runStdioProxy(opts: StdioProxyOpts): Promise<number> {
 
     /** Register a forwarded tools/call in `pending` so its response becomes the tool_call event. */
     const registerCall = (call: GatewayCall, gatewayOutcome: GatewayOutcome, attributes?: Attributes): void => {
+      decideAction(call.lifecycle, 'allow', record, loaded.hash, call.decisionId ?? (attributes?.['cresec.broker.decision_id'] as string | undefined));
       const entry: PendingEntry = {
         method: 'tools/call',
+        lifecycle: call.lifecycle,
         // The PRE-swap params: this is what the `tool_call` event's `args`
         // are scrubbed from, so the chain records the synthetic and never the
         // brokered value. The swap builds a separate tree (see `beginSwap`).

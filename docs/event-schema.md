@@ -482,12 +482,9 @@ same red `gw-deny` badge (`hook deny` / `gateway deny`). This closes the
 "one deny event shape" ticket's counting half; the two shapes themselves
 stay two. That is not by itself an **invariant 3** gap: separate intent,
 decision and outcome records are the shape its lifecycle clause asks for.
-What that clause still lacks here is a stable action ID and attempt IDs (no
-event carries either; records correlate only by `request_id`), a separate
-decision record for an allowed call (its `tool_call` carries
-`gateway.decision: 'allow'` instead), and an explicit `unknown` outcome (a
-call pending at close is sealed as `error.type: 'unanswered'`). See
-`AGENTS.md`.
+Governed calls now also emit the additive `action_lifecycle` records below.
+They do not increment `DECISIONS`: that column keeps its established
+refusal/hold counting semantics, including the hook's denied pre record.
 
 It also counts the decisions that cannot BE a `policy_decision` event,
 because `request_id` is `string | number` and these messages have no usable
@@ -706,3 +703,52 @@ with `seq` rendered in decimal and `chain_hash` as 64 lowercase hex characters.
 Any independent implementation following these rules over the same event object yields
 byte-identical output, and therefore the same chain hashes — this is what makes the
 standalone `verify.cjs` in an exported bundle possible.
+
+## Governed lifecycle (additive, v1)
+
+`action_lifecycle` is a new event kind with three distinct records per
+completed governed attempt: `phase: intent`, `phase: decision`, and
+`phase: outcome`. It is emitted only when a policy was selected, on stdio,
+HTTP and hooks. Existing `tool_call`, `policy_decision`, hook pre/post and
+notification records remain; their optional correlation fields point to
+this lifecycle. `DECISIONS` still counts legacy refusals/holds, not allows.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `action_id` | `string` | Stable for this action; also optional on legacy records |
+| `attempt_id` | `string` | Stable for this dispatch attempt; also optional on legacy records |
+| `request_hash` | `Sha256Ref?` | Full canonical pre-injection request hash, without depth truncation; also optional on legacy records |
+| `phase` | `intent`, `decision`, `outcome` | One lifecycle stage per record |
+| `tool` | `string` | Capped structural tool name |
+| `request_id` | `string or number?` | Absent for notifications and invalid IDs |
+| `decision` | `allow or deny?` | Final admission, after approval and credential checks; not a success claim |
+| `decision_id` | `string?` | Local/broker decision ID; present on decisions |
+| `policy_hash` | `Sha256Ref?` | Proxy policy fingerprint on decisions |
+| `outcome` | `success, error, denied, unknown?` | Observed response, known refusal, or absence of a known result |
+| `reason` | `string?` | Structural reason, never upstream error text |
+| `record_event_id` | `string?` | Compatible outcome record's event ID |
+
+Proxy actions and attempts use independent UUIDs. Reusing a JSON-RPC ID,
+including a refused duplicate, is a new action; IDs are not an upstream
+idempotency key. No write is retried by the recorder. Hooks derive domain-
+separated hashes from session ID and tool_use_id, joining pre/post across
+processes. Each host dispatch is one attempt. Without tool_use_id the host's
+existing argument-based fallback cannot distinguish identical invocations;
+that surface cannot claim complete correlation. Hook request_hash covers a
+normalized `{method,id,params:{name,arguments}}` envelope, not transcript
+paths or a post callback containing results.
+
+Pending close, lost responses and admitted notifications are `unknown`,
+never success. The compatible unanswered tool_call stays is_error with its
+old error type. An upstream JSON-RPC timeout (-32001) and interrupted hook
+also give unknown. A hard process kill still needs recovery in the coverage
+follow-up; this PR does not prove crash completeness. Lifecycle construction
+has no I/O. Its evidence is queued without awaiting append before execution;
+it is not an admission receipt or a durable-intent gate.
+
+Proof: `test/lifecycle.test.ts`, the lifecycle cases in
+`test/gateway-proxy.test.ts`, `test/http-gateway.test.ts`, `test/hook.test.ts`.
+Old signed bundles and new records use the same hash recipe, genesis,
+signature payload and `@edut/mcp-recorder bundle v1`; no verifier or format
+version change is required. Unknown optional fields/new kinds must be kept
+verbatim by consumers when verifying.

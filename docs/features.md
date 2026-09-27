@@ -113,7 +113,7 @@ points at them.
 | Rego compiler and OPA parity | `policy compile FILE` | **Tested** (parity runs in CI only) |
 | Typechecking for `test`/`bench`/`demo` | `npm run typecheck` | **Verified** (build-time control; run here and in CI) |
 | `sessions` DECISIONS counts hook denies too | `sessions` | **Tested** (`test/store.test.ts`, both backends) — closed after this transcript |
-| Two different event shapes for "this call was denied" | — | **Known gap**, narrowed: both shapes count once and badge alike; the shapes themselves stay two. Separate records are the shape invariant 3 asks for; its lifecycle clause lacks here a stable action ID across them (see `AGENTS.md`) |
+| Two different event shapes for "this call was denied" | — | **Known gap**, narrowed: both shapes count once and badge alike; the shapes themselves stay two. Separate records are the shape invariant 3 asks for; additive lifecycle records now join them by action/attempt IDs (see `AGENTS.md`) |
 | Replay page badges the two deny paths alike | `ui` | **Tested** (`test/replay.test.ts`: `hook deny` / `gateway deny`, same `gw-deny` badge) — closed after this transcript |
 | Gateway mode over HTTP (`http --policy`), control-plane token injection (`credentials[].broker`), actor claim (`--identity-jwt`) | `http --policy`, `record --policy` | **Tested** against fakes (`test/http-gateway.test.ts`, `test/e2e/http-gateway.e2e.test.ts`); not yet a live vendor remote MCP |
 | `boundary.injection: flag` flags but does not block | — | **Known gap** |
@@ -180,6 +180,17 @@ $ npm run bench
 Gateway mode (`--policy`) deliberately gives it up for one case — a line it
 cannot parse is refused rather than forwarded. See
 [Enforcement](#enforcement-gateway-mode).
+
+### Can I distinguish admission from execution?
+
+**Tested:** governed proxy and hook calls carry distinct `action_lifecycle`
+intent, decision and outcome records joined by action and attempt IDs. The
+lifecycle tests in `gateway-proxy.test.ts`, `http-gateway.test.ts` and
+`hook.test.ts` assert allow/refusal joins without plaintext. Pending proxy
+close is `unknown`, not success; legacy tool_call and DECISIONS views retain
+their meanings. Hashes cover complete pre-injection requests. Hard-kill
+recovery, durable spooling and reconciliation are still pending, so this is
+not a governed-completeness claim.
 
 ### What happens if the evidence store breaks mid-session?
 
@@ -1481,7 +1492,7 @@ What stays true: the two SHAPES remain two (a gateway deny is a
 `policy_decision` plus a synthetic `tool_call`; a hook deny is the call's own
 `pre` event). Two records per call is not itself an invariant 3 gap — its
 lifecycle clause asks for separate intent, decision and outcome records —
-but neither shape carries the stable action ID that clause joins them by
+and both shapes now carry the action/attempt IDs that join the additive lifecycle
 (see `AGENTS.md`). The transcript that found the gap is kept as it was:
 
 `DECISIONS` counted `policy_decision` events. A hook deny is not one: it is
@@ -1521,10 +1532,9 @@ dg1-bundle   {"session_start":1,"policy_decision":1,"tool_call":1,"initialize":1
 dhk-bundle   {"session_start":1,"tool_call":1}                                                                       lines containing policy_denied: 1
 ```
 
-This is by design rather than by bug — a hook has no proxy session to attach a
-separate decision event to — but it makes every "how much was enforced?" query
-path-dependent, and it is what makes the `DECISIONS` column above misleading.
-Anything analysing a bundle for enforcement must handle both shapes.
+The transcript predates lifecycle records. Both paths now also emit the same
+`action_lifecycle` intent/decision/outcome shape with action/attempt IDs.
+Legacy deny shapes and `DECISIONS` counting are preserved for old consumers.
 
 ### The replay page badges the two deny paths differently
 

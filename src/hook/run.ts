@@ -38,6 +38,7 @@
  * rule is a deliberate, operator-configured decision, not a failure.
  */
 
+import { beginAction, correlate, decideAction, endAction, requestHash, toolOutcome, type Lifecycle } from '../capture/lifecycle.js';
 import { hostname as osHostname, userInfo } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
@@ -331,6 +332,19 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
             ? input.tool_use_id
             : computeFallbackRequestId(sessionId, toolName!, input.tool_input);
 
+        // tool_use_id identifies one host dispatch across separate hook processes.
+        // No raw identity or tool input is put into an identifier.
+        const actionId = requestHash([sessionId, requestId, 'action']);
+        const attemptId = requestHash([sessionId, requestId, 'attempt', 1]);
+        const request = { method: 'tools/call', id: requestId,
+          params: { name: toolName, arguments: input.tool_input ?? {} } };
+        const lifecycle: Lifecycle | undefined = opts.policyPath === undefined ? undefined : {
+          intent: { ...base('action_lifecycle', {}, server), kind: 'action_lifecycle',
+            phase: 'intent', action_id: actionId, attempt_id: attemptId,
+            request_hash: requestHash(request), tool: parsed!.tool, request_id: requestId },
+          decided: false,
+        };
+
         if (eventName === 'PreToolUse') {
           const { policy, warning, unusable } = loadPolicy(opts.policyPath);
           if (warning !== undefined) diagStderr(warning);
@@ -377,6 +391,13 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
                   (cause instanceof Error ? cause.message : String(cause)),
               );
             }
+          }
+          if (lifecycle) {
+            beginAction(lifecycle.intent, parsed!.tool, request, (ev) => setup.recorder.record(ev),
+              { action_id: actionId, attempt_id: attemptId }, requestId);
+            decideAction(lifecycle, isDenied ? 'deny' : 'allow', (ev) => setup.recorder.record(ev));
+            correlate(toolCall, lifecycle);
+            if (isDenied) endAction(lifecycle, toolCall, 'denied', (ev) => setup.recorder.record(ev));
           }
           setup.recorder.record(toolCall);
 
@@ -460,6 +481,8 @@ export async function runHook(stdinText: string, opts: HookOpts): Promise<HookRe
             if (messageRef !== undefined) error.message_ref = messageRef;
             toolCall.error = error;
           }
+          endAction(lifecycle, toolCall, input.is_interrupt === true ? 'unknown' : toolOutcome(toolCall),
+            (ev) => setup.recorder.record(ev));
           setup.recorder.record(toolCall);
         }
       }

@@ -3171,3 +3171,40 @@ describe('G8: one request id gets at most one gateway answer inside a batch', ()
     assertChainIntact(s.store);
   });
 });
+
+describe('governed lifecycle correlation', () => {
+  it('joins distinct intent, decision and outcome; reused request IDs start new actions', async () => {
+    const s = startProxy(standardPolicy());
+    for (const name of ['echo', 'delete_file', 'echo']) {
+      const count = s.out.lines().length;
+      s.send(toolsCall(301, name, { secret: SECRET }));
+      await waitFor(() => s.out.lines().length > count, 'lifecycle response');
+    }
+    s.stdin.end();
+    await s.done;
+    const lifecycle = s.events().filter((e) => e.kind === 'action_lifecycle');
+    expect(lifecycle).toHaveLength(9);
+    const intents = lifecycle.filter((e) => e.phase === 'intent');
+    expect(new Set(intents.map((e) => e.action_id)).size).toBe(3);
+    for (const intent of intents) {
+      const chain = lifecycle.filter((e) => e.action_id === intent.action_id);
+      expect(chain.map((e) => e.phase)).toEqual(['intent', 'decision', 'outcome']);
+      expect(new Set(chain.map((e) => e.attempt_id)).size).toBe(1);
+      expect(s.events().filter((e) => e.kind === 'tool_call' && e.action_id === intent.action_id)).toHaveLength(1);
+      expect(intent.request_hash).toBe(sha256Ref(canonicalJson(toolsCall(301, intent.tool, { secret: SECRET }))));
+    }
+    expect(lifecycle.filter((e) => e.phase === 'outcome').map((e) => e.outcome)).toEqual(['success', 'denied', 'success']);
+    expect(s.events().filter((e) => e.kind === 'policy_decision')).toHaveLength(1);
+    expect(JSON.stringify(s.events())).not.toContain(SECRET);
+  });
+
+  it('an admitted call without an upstream response is unknown, never success', async () => {
+    const s = startProxy(ALLOW_ALL, { command: [process.execPath, '-e', "process.stdin.once('data', () => process.exit(0))"] });
+    s.send(toolsCall(8, 'write', { secret: SECRET }));
+    await s.done;
+    const lifecycle = s.events().filter((e) => e.kind === 'action_lifecycle');
+    expect(lifecycle.map((e) => e.phase)).toEqual(['intent', 'decision', 'outcome']);
+    expect(lifecycle[2]).toMatchObject({ outcome: 'unknown', reason: 'response_missing' });
+    expect(s.events().find((e) => e.kind === 'tool_call')).toMatchObject({ is_error: true, error: { type: 'unanswered' } });
+  });
+});
