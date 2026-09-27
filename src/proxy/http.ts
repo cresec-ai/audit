@@ -468,7 +468,12 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
   const evictOldest = (map: Map<string, PendingEntry>): void => {
     if (map.size < MAX_PENDING) return;
     const oldest = map.keys().next().value as string | undefined;
-    if (oldest !== undefined) map.delete(oldest);
+    if (oldest !== undefined) {
+      // Losing the close-time ledger must leave an explicit unknown. A late
+      // response may subsequently refine this outcome for the same attempt.
+      if (map === allPending) emitUnanswered(map.get(oldest)!);
+      map.delete(oldest);
+    }
     if (!pendingEvictWarned) {
       pendingEvictWarned = true;
       diag(`pending request map exceeded ${MAX_PENDING} entries; evicting oldest`);
@@ -1941,6 +1946,25 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
    * evaluated; when each tools/call is allowed and needs no credential the
    * batch crosses as written, otherwise it is answered here.
    */
+  const recordRefusedNotification = (msg: Record<string, unknown>, refusal: string): void => {
+      const { params, name } = toolsCallParts(msg);
+      const tool = name === '' ? '' : structuralString(name, 'identifier');
+      guarded(() => {
+        const ev: NotificationEvent = {
+          ...base('notification', { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' }),
+          kind: 'notification',
+          method: 'tools/call',
+          direction: 'client_to_server',
+          params: redactor.scrub(params),
+          gateway: { decision: 'deny', refusal },
+        };
+        const lifecycle = beginAction(base('action_lifecycle', {}), tool, msg, record);
+        decideAction(lifecycle, 'deny', record, opts.gateway!.policy.hash);
+        endAction(lifecycle, ev, 'denied', record);
+        record(ev);
+      });
+  };
+
   const gatewayBatch = (
     g: NonNullable<typeof gw>,
     req: IncomingMessage,
@@ -1990,6 +2014,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
         return;
       }
       if (isInvalidIdToolsCall(el)) {
+        recordRefusedNotification(el, 'invalid_request_id');
         responses.push(invalidRequestResponse(null, el['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
         return;
       }
@@ -2022,7 +2047,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           invalidRequestResponse(el['id'], 'mcp-recorder gateway: this request was batched with a tools/call the policy refused and was not forwarded; send it on its own'),
         );
       }
-      // A notification in a refused batch gets no response, like any notification.
+      // Refused notifications have evidence even though they have no response.
+      if (isToolsCallNotification(el)) recordRefusedNotification(el, 'batch_refused');
     });
     diag(`gateway: refused a JSON-RPC batch of ${batch.length} (a tools/call in it was denied, held or needed a credential)`);
     respondJson(res, 200, responses);
@@ -2069,22 +2095,9 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
     if (isInvalidIdToolsCall(msg)) {
       // Refused whatever the policy says (a response could not be
       // correlated); recorded on a notification event, like the stdio gateway.
-      const { params, name } = toolsCallParts(msg);
+      const { name } = toolsCallParts(msg);
       const tool = name === '' ? '' : structuralString(name, 'identifier');
-      guarded(() => {
-        const ev: NotificationEvent = {
-          ...base('notification', { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' }),
-          kind: 'notification',
-          method: 'tools/call',
-          direction: 'client_to_server',
-          params: redactor.scrub(params),
-          gateway: { decision: 'deny', refusal: 'invalid_request_id' },
-        };
-        const lifecycle = beginAction(base('action_lifecycle', {}), tool, msg, record);
-        decideAction(lifecycle, 'deny', record, opts.gateway!.policy.hash);
-        endAction(lifecycle, ev, 'denied', record);
-        record(ev);
-      });
+      recordRefusedNotification(msg, 'invalid_request_id');
       diag(`gateway: refused tools/call "${tool}" with an unusable id`);
       respondJson(res, 400, invalidRequestResponse(null, msg['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
       return;

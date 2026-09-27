@@ -93,7 +93,9 @@ A reused proxy request id starts a new action; a hook's session/tool_use_id
 joins its separate processes. `test/gateway-proxy.test.ts` (governed lifecycle
 correlation), `test/http-gateway.test.ts` (HTTP lifecycle evidence) and
 `test/hook.test.ts` (hook lifecycle IDs) cover the join and refusals.
-A proxy closing with pending calls emits an explicit `unknown` outcome;
+HTTP refused batches retain lifecycle evidence, including unusable IDs and
+notifications. Pending-ledger eviction and proxy close emit `unknown` outcomes
+(`test/http-gateway.test.ts`, HTTP lifecycle edge cases);
 legacy `tool_call.error.type: unanswered` remains for existing consumers.
 Recording never waits before forwarding; intent/decision capture is queued,
 not a durable admission gate. The **coverage half** does not hold yet:
