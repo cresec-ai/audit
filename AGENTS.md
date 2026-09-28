@@ -66,22 +66,17 @@ The invariants that bind this repository, numbered as in the build brief
    expiry and invalidation policy, with a stale-data label. Cached display is
    not live read-only access.
 
-Items 1, 3 and 4 are the build brief's section 2 wording, verbatim as of
-2026-09-23; 3 is as the founder amended it that day (decision 21: C2 and C5
-in cresec-ai/nhi `docs/decisions.md`, recorded in
-[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged, like
-every nhi decision of that day this file cites). Item 8 is **not** the
-brief's wording. It is C1's, taken here ahead of nhi's M1.18 because the MCP
-leg already implements it (A1, PR #25). The brief's own item 8 still reads: "**Outages fail closed for
-live upstream access.** If the gateway is unreachable, no live upstream reads
-or writes can occur through it. If the control plane, policy or credential
-broker is unavailable, governed execution is denied. The UI may show
-previously authorized cached data only under an explicit tenant/user
-isolation, expiry and invalidation policy, with a stale-data label. Cached
-display is not live read-only access. Never fall back to tool-held upstream
-credentials." nhi's `AGENTS.md` keeps its old item 8 ("Gateway unreachable
-means the tool falls back to read-only, not to broken") until M1.18. The
-brief and nhi both switch to the C1 text when M1.18 lands.
+Items 1, 3, 4 and 8 are the build brief's section 2 wording, verbatim as of
+2026-09-28. Item 3 is as the founder amended it on 2026-09-23 (decision 21:
+C2 and C5 in cresec-ai/nhi `docs/decisions.md`, recorded by
+[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), merged). Item 8 is
+C1's fail-closed text. It was taken here first, because the MCP leg already
+implemented it (A1, PR #25), and the brief and nhi's `AGENTS.md` took the
+same text on 2026-09-28, when nhi's M1.18 landed
+([nhi PR #28](https://github.com/cresec-ai/nhi/pull/28), ADR 016). Until
+then the brief's item 8 read "Outages fail closed for live upstream access
+…", and nhi's "Gateway unreachable means the tool falls back to read-only,
+not to broken".
 
 Invariant 3 has three parts here. The **integrity half** holds: existing
 records are signed and chained and verify offline; the genesis, canonical

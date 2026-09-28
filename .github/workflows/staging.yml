@@ -11,8 +11,12 @@
 # skipped would read as green in the nightly summary.
 #
 # These jobs block nothing and follow the `staging-red` rule through the nhi
-# issue tracker. They are not runnable until staging exists (the Terraform
-# and deploy workflows in cresec-ai/nhi are written, not applied).
+# issue tracker. Every job runs only while this repository's own
+# STAGING_STATE variable is `active` (cresec-ai/nhi `docs/decisions.md` A10,
+# parked staging, decided 2026-09-28): the receiver runs on the `stateful-1`
+# VM, which staging no longer creates by default, so the variable stays
+# unset here until the receiver returns. A skipped job uses no runner. When
+# the variable is `active`, the variable checks below still fail loudly.
 name: staging
 
 on:
@@ -39,6 +43,7 @@ env:
 jobs:
   ship-staging:
     name: ship-staging (S18)
+    if: vars.STAGING_STATE == 'active'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -166,6 +171,7 @@ jobs:
 
   demo-injection:
     name: demo-injection (the scripted incident, gateway mode)
+    if: vars.STAGING_STATE == 'active'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

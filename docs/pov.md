@@ -158,10 +158,10 @@ promised (invariant 6): for the reference tool it is replacing two environment
 variables with real credentials, which nhi's S5 demonstrates at L1, and nhi
 is to record the exit surface by surface rather than promise a universal
 two-variable exit (provisional decision 8 in cresec-ai/nhi
-`docs/decisions.md`, recorded in
-[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged; the
-same holds for the other nhi decisions of 2026-09-23 this page cites: A7,
-B12 and C1 as decided). The eight invariants that hold this together are
+`docs/decisions.md`, recorded by
+[nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), merged, like the
+other nhi decisions of 2026-09-23 this page cites: A7, B12 and C1 as
+decided). The eight invariants that hold this together are
 in the
 [build brief](https://app.clickup.com/90182720801/docs/2kzmy791-558/2kzmy791-638);
 the four that bind this repository are quoted in [`AGENTS.md`](../AGENTS.md):
@@ -518,7 +518,7 @@ Keyed to the Roadmap v2 phase each capability serves. Owner is `recorder`
 | Broker core + 7 credential sources; `credentials` policy section + Rego emitter; gateway synthetic→real swap + result scrub; 4-test e2e suite; live in dogfood 7 | 3 | — | shipped (local broker) | recorder |
 | Added-latency bench, stdio (`npm run bench`, gate p50 < 5 ms) | 3 | — | shipped; not the HTTPS p95 < 50 ms measurement | recorder |
 | Degrade mode, MCP leg: fail closed when the control plane is unreachable (invariant 8 as the corrected outage contract reads it) | 3 | [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | shipped on `main` (PR #25, `89184f8`): fail closed, fast: a control plane that cannot be reached refuses every call that needs it with `control_plane_unavailable`, the first failure opens a 5 s window in which further calls are refused without a request and one probe per window tests recovery, the model is told the refusal is retryable rather than the operator's policy, and the outage's start and end are logged as this process's own observation (`src/broker/remote.ts`). No read-only fallback by design: nothing here holds a credential or a cached token to serve a read with. Tested in `test/broker.test.ts` and the S17a outage arm of `test/e2e/http-gateway.e2e.test.ts` (three calls, one request to the control plane). `MCP_RECORDER_DISABLE=1` is unchanged: a kill switch, not the degrade path. Live validation against the real control plane: not done | recorder, MCP leg only |
-| Degrade mode, HTTPS leg: the egress gateway and the middleware when the gateway or the control plane is unreachable (their half of invariant 8) | 3 | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g), [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h), [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | decided 2026-09-23, needs-build in nhi: C1 (nhi `docs/decisions.md`) makes the HTTPS gateway fail closed like the MCP leg — during an outage every governed call, reads included, gets an explicit, retryable `503` — and nhi's M1.18 removes ADR 013's cached-read forward (`apps/gateway/src/degrade.ts` and the cached read-allow in `apps/gateway/src/routes/gateway.ts`) together with the middleware's read-only degrade body. Until M1.18 lands, nhi's `main` still has the forward, shipped at L1: ADR 013 decided it and `packages/governed-middleware/src/gateway-fetch.ts` implements it ("a vendor the tool cannot reach is the same read-only degrade", `withMeta(res, { degraded: true })`), with `degrade.test.ts` on the gateway side; S12 asserts the draft is refused with a documented read-only response and that the degraded log line is written | control plane |
+| Degrade mode, HTTPS leg: the egress gateway and the middleware when the gateway or the control plane is unreachable (their half of invariant 8) | 3 | [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g), [z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h), [z8n6b5z9fd](https://app.clickup.com/t/z8n6b5z9fd) | shipped at L1 in nhi on 2026-09-28 (M1.18, [nhi PR #28](https://github.com/cresec-ai/nhi/pull/28), ADR 016, which supersedes ADR 013): C1 made the HTTPS gateway fail closed like the MCP leg. An unreachable control plane gets every governed call, reads included, `503 control_plane_unavailable` with `retryable: true` and `Retry-After: 5`, and a deny record; a call that gets no answer opens a 5 s window per endpoint with one probe. The middleware's synthetic `503 gateway_unreachable` is retryable for a read or a request that provably never left the tool, and `retryable: false, outcome: "unknown"` for a write that may have been sent. ADR 013's cached-read forward and `apps/gateway/src/degrade.ts` are gone. Proved by nhi's gateway integration window suite, `outage.test.ts` and S12; no L1 scenario takes the control plane away yet | control plane |
 | HTTPS egress gateway; [A3] walking skeleton | 3 | [HTTPS egress gateway](https://app.clickup.com/t/z8n6b5z50h), [[A3]](https://app.clickup.com/t/z8n6b5z8ch) | shipped at L1 as nhi's `apps/gateway/`, a **new** Fastify service — not the Go proxy re-targeted (ADR 014; `apps/data-plane-proxy` is retiring untouched). JWT validation in `src/auth/`, the per-user fetch in `control-plane.ts`, redacted recording in `record.ts` with `record.test.ts`, the response-side header policy in `@cresec/contracts/gateway`; S7 measures added latency **on loopback**, S8 checks the stream for plaintext. Nothing is deployed | control plane |
 | Identity gate (hosted OIDC, XAA/OBO), middleware packages | 2 | [z8n6b5z50f](https://app.clickup.com/t/z8n6b5z50f), [z8n6b5z9fc](https://app.clickup.com/t/z8n6b5z9fc), [z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g) | shipped at L1 as a **generic** OIDC relying party (nhi `apps/api/src/identity/`, contract `docs/internal/contracts/oidc-front.md`) plus `packages/governed-middleware/`; tests `identity-oidc.test.ts`, `identity-deactivation.test.ts`, `index.test.ts`, `mode.test.ts`, S4 and S11 against the Okta-shaped fake. Okta Cross App Access and Entra OBO specifically are still needs-build | control plane |
 | [A2] reference tool, both states | 2 | [[A2]](https://app.clickup.com/t/z8n6b5z8cg) | shipped at L1 as nhi's `apps/outreach-tool/`, run as six instances by `tests/e2e/scripts/stack-local.mjs`, including `outreach-tool-nocred` (governed, no Cresec variables, no credentials) whose run S5 asserts is refused and reaches neither vendor | control plane (nhi; no longer undecided) |
@@ -636,8 +636,8 @@ against vendor fakes, deployed nowhere.
   never falls back to a stored credential or a cached token, reads included.
   `MCP_RECORDER_DISABLE=1` is a kill switch that turns off recording **and**
   enforcement together, not a degrade mode. The HTTPS leg is decided the same
-  way (C1, 2026-09-23), but until nhi's M1.18 lands its gateway on `main`
-  still forwards a read on a cached token and a cached read-allow (ADR 013).
+  way (C1, 2026-09-23), and since nhi's M1.18 (PR #28, 2026-09-28) its
+  gateway refuses reads too; ADR 013's cached-read forward is gone.
 
 **Credentials**
 - *"The agent never has access to your credentials."* — it does. It can read the
@@ -771,7 +771,8 @@ names. Every schema change is an additive optional field, because
    plane's, in its middleware
    ([z8n6b5z50g](https://app.clickup.com/t/z8n6b5z50g)) and gateway
    ([z8n6b5z50h](https://app.clickup.com/t/z8n6b5z50h)); it was decided
-   fail closed on 2026-09-23 (C1), and nhi's M1.18 will build it.
+   fail closed on 2026-09-23 (C1), and nhi's M1.18 built it (PR #28,
+   2026-09-28).
 5. **One deny event shape** —
    [z8n6b5z1zr](https://app.clickup.com/t/z8n6b5z1zr): `DECISIONS` counts
    both shapes and the replay page badges them alike — **in-flight** on this
