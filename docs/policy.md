@@ -353,9 +353,10 @@ keep it anyway. It is **never** for Cresec's hosted control plane
 remote-broker path, built or planned.
 
 - The hosted deployment will run with `CRESEC_PREPIVOT_SURFACE=0` (A8 in
-  cresec-ai/nhi `docs/decisions.md`, recorded in
-  [nhi PR #10](https://github.com/cresec-ai/nhi/pull/10), not yet merged;
-  implemented by M1.13 of nhi's `docs/platform-plan.md`, not built), which
+  cresec-ai/nhi `docs/decisions.md`, recorded by
+  [nhi PR #10](https://github.com/cresec-ai/nhi/pull/10); M1.13 of nhi's
+  `docs/platform-plan.md` built the flag in
+  [nhi PR #27](https://github.com/cresec-ai/nhi/pull/27)), which
   removes the pre-pivot `/broker/exchange` route. That is the route
   `RemoteBroker` speaks in its default mode, when it is constructed without
   `userToken` (`src/broker/remote.ts`); no policy selects that mode, since
@@ -416,7 +417,7 @@ never a crash, never a hang, never a forward: the credential is absent
 back to a stored credential or a cached decision, reads included). There is
 no read-only fallback in this leg; the cached-read forward of
 [ADR 013](https://github.com/cresec-ai/nhi/blob/main/docs/internal/adrs/013-degrade-mode.md),
-which nhi's M1.18 removes from its HTTPS gateway, was never built here. An
+which nhi's M1.18 removed from its HTTPS gateway (PR #28), was never built here. An
 outage is not paid for on every call: the first `control_plane_unavailable`
 opens a 5 s window in which
 further calls that need the control plane are refused with the same reason
