@@ -11,6 +11,7 @@
  * exactly one diagnostic line goes to stderr.
  */
 
+import { coverageGap, type DurableDelivery } from './spool.js';
 import type { AnyEvent, ChainRecord } from '../schema/events.js';
 import type {
   EvidenceStore,
@@ -26,6 +27,7 @@ export interface RecorderOpts {
   signEveryFlush?: boolean;
   /** Backoff (ms) before each retry of a failed batch; tests pass [] for none. */
   retryDelaysMs?: readonly number[];
+  delivery?: DurableDelivery;
 }
 
 /**
@@ -62,10 +64,14 @@ export class Recorder implements RecorderLike {
   private readonly signEveryFlush: boolean;
   private readonly retryDelaysMs: readonly number[];
 
+  private readonly delivery: DurableDelivery | undefined;
+  private readonly replayTimer: NodeJS.Timeout | undefined;
+  private queueGap: AnyEvent | undefined;
   private queue: AnyEvent[] = [];
   private flushScheduled = false;
   /** In-flight flush, so flush()/close() can await the active drain. */
   private flushing: Promise<void> = Promise.resolve();
+  private deliveryFlush: Promise<void> | undefined;
 
   private enqueued = 0;
   private written = 0;
@@ -78,6 +84,11 @@ export class Recorder implements RecorderLike {
   private readonly signerErrorLogged = { v: false };
 
   constructor(opts: RecorderOpts) {
+    this.delivery = opts.delivery;
+    if (this.delivery) {
+      this.replayTimer = setInterval(() => { if (!this.flushScheduled) void this.flush(); }, 1000);
+      this.replayTimer.unref();
+    }
     this.store = opts.store;
     this.signer = opts.signer;
     this.signEveryFlush = opts.signEveryFlush ?? true;
@@ -88,9 +99,18 @@ export class Recorder implements RecorderLike {
   record(event: AnyEvent): void {
     try {
       this.enqueued++;
-      if (this.store === null || this.storeFailed || this.closed) {
+      if ((!this.delivery && (this.store === null || this.storeFailed)) || this.closed) {
         this.dropped++;
         return;
+      }
+      if (this.delivery) {
+        event.recorder_run_id ??= this.delivery.runId;
+        if (this.queue.length >= 4096) {
+          this.dropped++;
+          this.queueGap ??= coverageGap(event, 'queue_full', 0);
+          if (this.queueGap.kind === 'coverage_gap') this.queueGap.dropped_at_least++;
+          return;
+        }
       }
       this.queue.push(event);
       if (!this.flushScheduled) {
@@ -109,6 +129,13 @@ export class Recorder implements RecorderLike {
 
   /** Drain the queue in one batch. Never rejects. */
   flush(): Promise<void> {
+    if (this.delivery) {
+      if (this.deliveryFlush) return this.deliveryFlush;
+      this.deliveryFlush = (async () => {
+        do { await this.drainOnce(); } while (this.queue.length > 0 || this.queueGap !== undefined);
+      })().catch(() => undefined).finally(() => { this.deliveryFlush = undefined; });
+      return this.deliveryFlush;
+    }
     const run = this.flushing.then(() => this.drainOnce());
     // Keep the chain alive even though drainOnce never rejects.
     this.flushing = run.catch(() => undefined);
@@ -116,6 +143,16 @@ export class Recorder implements RecorderLike {
   }
 
   private async drainOnce(): Promise<void> {
+    if (this.delivery) {
+      const events = this.queue;
+      this.queue = [];
+      if (this.queueGap) { events.push(this.queueGap); this.queueGap = undefined; }
+      const result = await this.delivery.deliver(events);
+      this.written += result.written;
+      this.dropped += result.dropped;
+      this.storeFailed = result.pending;
+      return;
+    }
     if (this.queue.length === 0) return;
     const events = this.queue;
     this.queue = [];
@@ -167,8 +204,11 @@ export class Recorder implements RecorderLike {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closePromise = (async () => {
-      await this.flush();
+      // Stop accepting before draining: no event can land after the final batch.
       this.closed = true;
+      if (this.replayTimer) clearInterval(this.replayTimer);
+      await this.flush();
+      if (this.delivery) { await this.delivery.close(); return; }
       if (this.store && !this.storeFailed) {
         try {
           this.store.close();

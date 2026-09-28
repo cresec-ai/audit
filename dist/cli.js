@@ -9,6 +9,8 @@
  * Exit codes: 0 ok (record/http: the wrapped server's code), 1 verification
  * failed / nothing to export, 2 usage or unexpected error.
  */
+import { reconcileEvents } from './capture/reconcile.js';
+import { DurableDelivery, inspectDelivery } from './capture/spool.js';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -56,6 +58,7 @@ const SUBCOMMANDS = [
     'why',
     'record',
     'verify',
+    'reconcile',
     'query',
     'sessions',
     'ui',
@@ -142,6 +145,10 @@ Everything else:
       <data-dir>/identity.pub (store mode) or the bundle's own manifest key
       (bundle mode); --public-key overrides either with a key obtained out
       of band (64-hex, or a path to a hex or PEM file)
+  mcp-recorder reconcile [--data-dir D] [--json] [--recover]
+      report every locally recorded allow without an outcome, unknown outcomes
+      and coverage gaps; exit 3 for incomplete/unknown coverage. --recover
+      replays the durable spool and seals abandoned attempts as unknown
   mcp-recorder query    <needle> [--data-dir D] [--session ID] [--json]
       blast radius: trace a value through the evidence chain
   mcp-recorder sessions [--data-dir D] [--json]
@@ -335,6 +342,7 @@ const FLAG_DEFS = {
     'public-key': { type: 'string' },
     'allow-unsigned': { type: 'boolean' },
     json: { type: 'boolean' },
+    recover: { type: 'boolean' },
     'no-open': { type: 'boolean' },
     client: { type: 'string' },
     config: { type: 'string' },
@@ -1214,6 +1222,32 @@ function printToolCensus(store, flags) {
         String(r.sessions),
         r.last_seen,
     ])));
+}
+async function cmdReconcile(flags) {
+    const config = resolveConfig({ flags, env: process.env });
+    if (flags.recover === true) {
+        const delivery = new DurableDelivery({ dataDir: config.dataDir,
+            openStore: () => openConfiguredStore(config), warn: diag });
+        await delivery.start();
+        await delivery.close();
+    }
+    const store = openConfiguredStore(config, { readOnly: true });
+    try {
+        const { events: pending, ...delivery } = await inspectDelivery(config.dataDir);
+        const events = new Map([...store.iterate()].map((r) => [r.event.event_id, r.event]));
+        for (const event of pending)
+            if (!events.has(event.event_id))
+                events.set(event.event_id, event);
+        const report = { ...reconcileEvents(events.values()), delivery };
+        out(JSON.stringify(report, null, 2));
+        if (report.missing_outcomes.length || report.unknown_outcomes.length || report.gaps.length ||
+            report.missing_companion_records.length || report.legacy_decisions_without_ids ||
+            delivery.pending_events || delivery.abandoned_runs || delivery.errors.length)
+            process.exitCode = 3;
+    }
+    finally {
+        store.close();
+    }
 }
 async function cmdSessions(flags) {
     guardStdoutEpipe();
@@ -3035,6 +3069,8 @@ async function main() {
             return cmdWhy(flags);
         case 'record':
             return cmdRecord(flags, serverCommand);
+        case 'reconcile':
+            return cmdReconcile(flags);
         case 'verify':
             return cmdVerify(flags);
         case 'query':

@@ -25,7 +25,7 @@
 import { appendFileSync, closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync, } from 'node:fs';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
-import { GENESIS_HASH, makeRecord } from '../chain/hash.js';
+import { GENESIS_HASH, makeRecord, canonicalJson } from '../chain/hash.js';
 import { validateExtendsHead } from './sqlite.js';
 import { FILES } from '../types.js';
 import { sleepSync } from '../util/sleep-sync.js';
@@ -410,6 +410,9 @@ export class JsonlStore {
     lockDir;
     records;
     sigs;
+    eventIndex = new Map();
+    indexedCount = 0;
+    runCounts = new Map();
     /** File size as of the last time `records`/`sigs` were loaded from disk. */
     recordsLoadedSize;
     sigsLoadedSize;
@@ -430,6 +433,11 @@ export class JsonlStore {
      */
     syncRecords() {
         const { items, loadedSize } = syncJsonlArray(this.path, this.records, this.recordsLoadedSize);
+        if (this.indexedCount && items[this.indexedCount - 1] !== this.records[this.indexedCount - 1]) {
+            this.eventIndex.clear();
+            this.runCounts.clear();
+            this.indexedCount = 0;
+        }
         this.records = items;
         this.recordsLoadedSize = loadedSize;
     }
@@ -492,6 +500,9 @@ export class JsonlStore {
         this.syncRecords();
         const after = this.cachedHead();
         if (after.seq !== diskHead.seq || after.hash !== diskHead.hash) {
+            this.eventIndex.clear();
+            this.runCounts.clear();
+            this.indexedCount = 0;
             this.records = loadJsonlFile(this.path);
             this.recordsLoadedSize = sizeOf(this.path);
         }
@@ -530,13 +541,24 @@ export class JsonlStore {
             repairTornTail(this.path);
             const diskHead = this.readHeadFromDisk();
             this.catchUpTo(diskHead);
+            this.indexEvents();
+            const seen = new Map();
             let head = diskHead;
             const sealed = [];
             for (const event of events) {
+                const existing = seen.get(event.event_id) ?? this.eventIndex.get(event.event_id);
+                if (existing !== undefined) {
+                    if (canonicalJson(existing) !== canonicalJson(event))
+                        throw new Error('event_id collision: delivery differs from stored evidence');
+                    continue;
+                }
+                seen.set(event.event_id, event);
                 const record = makeRecord(head, event);
                 sealed.push(record);
                 head = { seq: record.seq, hash: record.hash };
             }
+            if (sealed.length === 0)
+                return [];
             const chunk = sealed.map((record) => JSON.stringify(record)).join('\n') + '\n';
             appendFileSync(this.path, chunk);
             this.records.push(...sealed);
@@ -546,6 +568,7 @@ export class JsonlStore {
     }
     addSignature(sig) {
         this.withLock(() => {
+            repairTornTail(this.sigsPath);
             appendFileSync(this.sigsPath, JSON.stringify(sig) + '\n');
         });
     }
@@ -569,9 +592,26 @@ export class JsonlStore {
             yield record;
         }
     }
-    count() {
+    indexEvents() {
+        if (this.indexedCount > this.records.length) {
+            this.eventIndex.clear();
+            this.runCounts.clear();
+            this.indexedCount = 0;
+        }
+        for (const { event } of this.records.slice(this.indexedCount)) {
+            this.eventIndex.set(event.event_id, event);
+            if (event.recorder_run_id !== undefined) {
+                this.runCounts.set(event.recorder_run_id, (this.runCounts.get(event.recorder_run_id) ?? 0) + 1);
+            }
+        }
+        this.indexedCount = this.records.length;
+    }
+    count(recorderRunId) {
         this.syncRecords();
-        return this.records.length;
+        if (recorderRunId === undefined)
+            return this.records.length;
+        this.indexEvents();
+        return this.runCounts.get(recorderRunId) ?? 0;
     }
     /**
      * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL

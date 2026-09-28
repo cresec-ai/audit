@@ -5,14 +5,13 @@
  * (cli.ts -> src/hook/run.ts -> cli.ts).
  *
  * ANY init failure is fail-open: warn (via the caller-supplied `diag`) and
- * degrade — a store that can't be opened means nothing can be recorded (the
- * returned recorder just drops everything); a signer that can't be loaded
- * still leaves the store usable (recording continues, without head
- * signatures). This is also where the data directory gets created, so a bad
+ * degrade — store/signing failures retain the delivery journal for retry.
+ * If the journal itself is unavailable, stderr exposes the coverage gap. This is also where the data directory gets created, so a bad
  * --data-dir/MCP_RECORDER_DATA_DIR degrades gracefully here rather than
  * throwing before the caller can do its own work (forward traffic for
  * record/http; still answer the hook's stdin for `hook`).
  */
+import { DurableDelivery } from './spool.js';
 import { Recorder } from './recorder.js';
 import { Signer } from '../chain/keys.js';
 import { ensureDataDir } from '../config.js';
@@ -73,7 +72,7 @@ export async function setupProxyRecording(config, diag, opts = {}) {
         }
         catch (cause) {
             const msg = cause instanceof Error ? cause.message : String(cause);
-            diag(`recording disabled (init failed, traffic unaffected): ${msg}`);
+            diag(`evidence store init failed; delivery spool will retry (traffic unaffected): ${msg}`);
             try {
                 store?.close();
             }
@@ -112,7 +111,12 @@ export async function setupProxyRecording(config, diag, opts = {}) {
             ensureShipper({ config, sink, surface: opts.surface ?? 'record' });
         }
     }
-    const inner = new Recorder({ store, signer });
+    const delivery = config.disabled ? undefined : new DurableDelivery({
+        dataDir: config.dataDir, store, signer, openStore: () => openConfiguredStore(config), warn: diag,
+    });
+    // Replay/recovery is background work, never a prerequisite for forwarding.
+    void delivery?.start(false);
+    const inner = new Recorder({ store, signer, ...(delivery === undefined ? {} : { delivery }) });
     const { recorder, sessionId } = tapSessionId(inner);
     return {
         recorder,

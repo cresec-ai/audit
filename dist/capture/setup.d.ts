@@ -5,10 +5,8 @@
  * (cli.ts -> src/hook/run.ts -> cli.ts).
  *
  * ANY init failure is fail-open: warn (via the caller-supplied `diag`) and
- * degrade — a store that can't be opened means nothing can be recorded (the
- * returned recorder just drops everything); a signer that can't be loaded
- * still leaves the store usable (recording continues, without head
- * signatures). This is also where the data directory gets created, so a bad
+ * degrade — store/signing failures retain the delivery journal for retry.
+ * If the journal itself is unavailable, stderr exposes the coverage gap. This is also where the data directory gets created, so a bad
  * --data-dir/MCP_RECORDER_DATA_DIR degrades gracefully here rather than
  * throwing before the caller can do its own work (forward traffic for
  * record/http; still answer the hook's stdin for `hook`).

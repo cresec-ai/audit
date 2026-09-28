@@ -50,6 +50,9 @@ export declare class JsonlStore implements EvidenceStore {
     private readonly lockDir;
     private records;
     private sigs;
+    private eventIndex;
+    private indexedCount;
+    private runCounts;
     /** File size as of the last time `records`/`sigs` were loaded from disk. */
     private recordsLoadedSize;
     private sigsLoadedSize;
@@ -94,7 +97,8 @@ export declare class JsonlStore implements EvidenceStore {
     latestSignature(): HeadSignature | null;
     signatures(): HeadSignature[];
     iterate(opts?: IterateOpts): Iterable<ChainRecord>;
-    count(): number;
+    private indexEvents;
+    count(recorderRunId?: string): number;
     /**
      * Per-session aggregate. Must stay in step with SqliteStore's SESSIONS_SQL
      * — test/store.test.ts runs the same fixtures through both backends; the
