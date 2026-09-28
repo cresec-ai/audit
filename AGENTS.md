@@ -98,7 +98,7 @@ notifications. Pending-ledger eviction and proxy close emit `unknown` outcomes
 (`test/http-gateway.test.ts`, HTTP lifecycle edge cases);
 legacy `tool_call.error.type: unanswered` remains for existing consumers.
 Recording never waits before forwarding; intent/decision capture is queued,
-not a durable admission gate. The **coverage machinery** now holds for local
+not a durable admission gate. The CLI's **coverage machinery** now holds for local
 persisted evidence: a bounded, fsynced delivery journal retries on recovery
 and next start; both stores deduplicate event IDs and reject conflicting
 content. `test/evidence-coverage.test.ts` proves unavailable/partial-commit
@@ -106,9 +106,19 @@ replay, bounds and gap records, concurrent delivery and reconciliation.
 `reconcile` reports every locally persisted allow without an outcome,
 unknown outcomes, absent legacy companion records and explicit gaps; close
 also sweeps. Dead recorder leases recover durable pending attempts as
-unknown without retrying an upstream call. The **fault-injection proof is
-still pending**: this change tests failures in process, not hard process
-kills. A crash before any evidence is durable cannot reconstruct an action
+unknown without retrying an upstream call. The **local process-fault proof now holds** for the checkpoints in
+`test/evidence-fault.test.ts`: actual termination inside a SQLite transaction,
+JSONL append, head-signature append and journal append; termination after
+commit but before acknowledgement; unavailable/full spool and lost in-memory
+queue; pending stdio/HTTP writes recover as unknown and are never resent.
+A live recorder replays after recovery with no new traffic, upstream timeouts
+stay unknown, and missing hook post callbacks resolve at session end. Repeated
+recovery deduplicates evidence, reports gaps and exports bundles that verify
+offline. Close rechecks delivery after recovery before retaining a lease;
+`test/evidence-fault.test.ts` pins the transient-signing case. The shipper
+reopens an initially empty reader when the first async append arrives
+(`test/e2e/ship.e2e.test.ts`). These are process-fault tests, not power-loss or real-control-plane
+proof. A crash before any evidence is durable cannot reconstruct an action
 locally under fail-open admission; a surviving lease exposes a recorder-exit
 gap, not invented success. Total disk failure can prevent even a gap from
 persisting and is reported on stderr. Observation mode is best effort;

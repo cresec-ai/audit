@@ -742,7 +742,8 @@ Pending close, lost responses and admitted notifications are `unknown`,
 never success. The compatible unanswered tool_call stays is_error with its
 old error type. An upstream JSON-RPC timeout (-32001) and interrupted hook
 also give unknown. Dead recorder leases now recover durable pending attempts
-as unknown; real process-kill proof is still pending. Lifecycle construction
+as unknown; `test/evidence-fault.test.ts` proves recovery after real process
+termination on both MCP proxy transports. Lifecycle construction
 has no I/O. Its evidence is queued without awaiting append before execution;
 it is not an admission receipt or a durable-intent gate.
 
@@ -767,8 +768,12 @@ verbatim by consumers when verifying.
 
 `test/evidence-coverage.test.ts` proves spool/replay, both-store dedupe,
 concurrency, queue/spool bounds, torn-tail gaps and reconciliation with injected
-in-process failures. Real process-kill proof remains pending.
+in-process failures. `test/evidence-fault.test.ts` adds actual process
+termination and next-process recovery at the checkpoints below.
 
+The CLI wires `DurableDelivery` into `Recorder`. Low-level embedding that
+constructs `Recorder` without its optional delivery adapter retains the
+legacy best-effort behavior and does not satisfy these coverage guarantees.
 The CLI's `record`, `http` and `hook` share `<data-dir>/delivery/pending.jsonl`.
 Its committed frames are append-only; a torn final frame is truncated with a
 gap, never treated as a successful append. Frames are fsynced before store
@@ -816,3 +821,44 @@ it and a surviving lease can expose the dirty exit on recovery. A crash before
 lease/evidence persistence and control-plane decisions never observed here
 cannot be enumerated locally. Cross-leg action-ID propagation and an independent
 allowed-decision feed are follow-ups for nhi, not a claim of this local sweep.
+
+
+### Process-fault proof and its limits
+
+| Fault checkpoint (`test/evidence-fault.test.ts`) | Asserted outcome |
+| --- | --- |
+| SQLite transaction after first insert | Rollback plus durable journal replay; each original event ID appears once |
+| JSONL append after one frame and part of the next | Intact prefix retained, torn tail repaired, journal replay restores both IDs exactly once |
+| Commit before journal acknowledgement | Replaying the retained journal adds no duplicate record |
+| Signature append interrupted | Torn signature repaired; journal retained until a new signed head is durable |
+| Journal append interrupted | Intact frames replay; partial frame produces `torn_spool`, not fictitious success |
+| Store unavailable, including next-process startup | Fsynced journal survives termination and replays on recovery |
+| Store recovers while recorder stays alive | Timer drains the journal without new tool traffic |
+| Full bounded journal | Original IDs may be absent; `spool_full` explicitly exposes the loss |
+| Termination before queue drain | Surviving lease produces `recorder_exit` with unknown loss count; no invented action history |
+| Stdio/HTTP gateway terminated with admitted pending write | Same action/attempt recovers as `unknown`; upstream receipt journal remains exactly one call |
+| Upstream JSON-RPC timeout | `unknown`, one upstream execution, never success |
+| Hook session ends without post callback | Its durable allow resolves to `unknown` with the same action ID |
+| Recovery resolves a transient signing failure during close | Recheck current journal state; remove the clean lease, avoiding a false later exit gap |
+| Shipper starts before any async append (`test/e2e/ship.e2e.test.ts`) | Reopen the empty read-only reader when the first evidence file appears; replicate without creating a chain |
+| Repeated recovery and bundle export | Stable event IDs, no duplicates; v1 `verify.cjs` accepts recovered signed evidence offline |
+
+Recovery assertions wait for pending frames and abandoned leases to clear.
+The JSONL store's existing stale-lock grace period can defer replay after a
+termination inside append; reconciliation reports that pending state until
+a subsequent recovery attempt completes. No missing outcome is counted as
+complete during that interval.
+
+The process is forcibly terminated only after a concrete checkpoint file or
+persisted allow is observed. POSIX uses SIGKILL; Node forces termination on
+Windows. Fault hooks live exclusively in test fixtures, with no production
+backdoor or runtime failure flag. SQLite's fixture blocks inside a real
+transaction; JSONL fixtures stop after actual partial writes and fsync. The
+upstream receipt journal is independent of recorder evidence.
+
+This closes the local process-fault proof, not an assertion of lossless
+fail-open execution. Hardware power loss, network filesystems, a lost disk,
+a crash before lease persistence, unobserved control-plane decisions and
+host callbacks that never arrive remain outside that proof. The exact gap
+and independent-reconciliation limits above still apply. Integrity verification
+continues to prove only the records present in the bundle.

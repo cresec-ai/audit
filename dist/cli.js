@@ -1898,7 +1898,7 @@ async function cmdShip(flags) {
         diag(`ship: ${cause instanceof Error ? cause.message : String(cause)}`);
         return;
     }
-    const store = openConfiguredStore(config, { readOnly: true });
+    let store = openConfiguredStore(config, { readOnly: true });
     const release = () => {
         try {
             store.close();
@@ -1915,6 +1915,20 @@ async function cmdShip(flags) {
         });
     }
     try {
+        // A daemon can beat the first async delivery append to disk. The inert
+        // empty reader returned in that window cannot observe a future chain.
+        // Reopen read-only until it exists; never create evidence from the sink.
+        const waitStarted = Date.now();
+        if (!drain && !existsSync(store.path))
+            diag('ship: waiting for first evidence append');
+        while (!drain && !existsSync(store.path)) {
+            if (idleExitMs !== undefined && Date.now() - waitStarted >= idleExitMs)
+                return;
+            lock.touch();
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            store.close();
+            store = openConfiguredStore(config, { readOnly: true });
+        }
         const result = await runShipper({
             dataDir: config.dataDir,
             sink,
