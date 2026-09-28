@@ -83,32 +83,32 @@ credentials." nhi's `AGENTS.md` keeps its old item 8 ("Gateway unreachable
 means the tool falls back to read-only, not to broken") until M1.18. The
 brief and nhi both switch to the C1 text when M1.18 lands.
 
-Invariant 3 has three parts here, and only the first holds for the MCP leg.
-The **integrity half** holds: the records that exist are signed and chained,
-and a bundle of them verifies offline with no network access to us (the
-rules below are how). The **coverage half** — wherever these docs use the
-term, it means the spool, the replay and the reconciliation sweep — does not
-hold yet. Recording stays fail-open in observation mode (`record`, `http` or
-`hook` with no policy) and in gateway mode alike, so it never gates the
-call, as the invariant asks; but an event the store cannot take is dropped,
-not spooled durably and replayed (the proxies retry a failed batch first,
-then count the drops and say so once on stderr), and nothing reconciles
-allowed decisions against records. The
-**lifecycle clause** (a stable action ID and attempt IDs; distinct intent,
-decision and outcome records; an explicit `unknown` outcome) does not hold
-either. An allowed gateway call is one `tool_call` recorded after the
-response, with the decision folded into its `gateway` field
-(`src/schema/events.ts`), so it has no separate intent or decision record.
-Records correlate only by `request_id`; no event carries an action or
-attempt ID. A call still pending when a proxy closes is sealed as
-an error with `error.type: 'unanswered'` (`src/proxy/stdio.ts`,
-`src/proxy/http.ts`), not as an explicit `unknown`. A refusal's
-`policy_decision` plus synthetic `tool_call`, and a hook's `pre` + `post`
-pair, are already separate records; that the two surfaces use different
-shapes is the one-deny-event-shape ticket in `docs/pov.md`.
-Invariant 4 holds for the stored form (redacted tree, hashed leaves,
-`result_hash` over the complete result); a hash of the complete raw request
-is not recorded on `tool_call` events. Invariant 1 is not met by this
+Invariant 3 has three parts here. The **integrity half** holds: existing
+records are signed and chained and verify offline; the genesis, canonical
+JSON and bundle v1 format are unchanged (`test/export.test.ts`,
+`test/public-evidence.test.ts`). The **lifecycle clause** now has additive
+`action_lifecycle` intent, decision and outcome records on governed proxy
+and hook calls, joined to the legacy records by `action_id` / `attempt_id`.
+A reused proxy request id starts a new action; a hook's session/tool_use_id
+joins its separate processes. `test/gateway-proxy.test.ts` (governed lifecycle
+correlation), `test/http-gateway.test.ts` (HTTP lifecycle evidence) and
+`test/hook.test.ts` (hook lifecycle IDs) cover the join and refusals.
+HTTP refused batches retain lifecycle evidence, including unusable IDs and
+notifications. Pending-ledger eviction and proxy close emit `unknown` outcomes
+(`test/http-gateway.test.ts`, HTTP lifecycle edge cases);
+legacy `tool_call.error.type: unanswered` remains for existing consumers.
+Recording never waits before forwarding; intent/decision capture is queued,
+not a durable admission gate. The **coverage half** does not hold yet:
+failed appends still exhaust retries and drop, with no durable spool, replay
+or reconciliation. A hard-killed recorder cannot yet recover pending calls
+as unknown; that needs the coverage and fault-injection follow-ups. A crash
+before any evidence is durable cannot be reconstructed locally under the
+fail-open contract. No completeness claim follows from an intact chain.
+Invariant 4 now also hashes the full pre-injection governed request
+(`request_hash`); hook requests use the normalized tools/call envelope.
+`test/lifecycle.test.ts` proves canonical equivalence and no depth truncation.
+The stored payload remains redacted, including in the new lifecycle records.
+Invariant 1 is not met by this
 package alone: the local broker keeps the real credential out of the model's
 context, the transcript and the chain at declared swap sites, but the secret
 is resolvable on the agent's own machine, so it is a context and audit

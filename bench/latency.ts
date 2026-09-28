@@ -194,8 +194,8 @@ function spawnWrapped(
   extraArgs: readonly string[] = [],
 ): { child: ChildProcessWithoutNullStreams; stderr: () => string } {
   const child = spawn(
-    'npx',
-    ['tsx', 'src/cli.ts', '--data-dir', dataDir, ...extraArgs, '--', 'node', ECHO_SERVER],
+    process.execPath,
+    ['--import', 'tsx', 'src/cli.ts', '--data-dir', dataDir, ...extraArgs, '--', process.execPath, ECHO_SERVER],
     { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] },
   );
   let stderr = '';

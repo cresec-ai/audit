@@ -50,6 +50,7 @@
  * unwritable hold is a deny).
  */
 
+import { beginAction, correlate, decideAction, endAction, toolOutcome, type Lifecycle } from '../capture/lifecycle.js';
 import { createServer, request as httpRequest } from 'node:http';
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -162,6 +163,7 @@ export interface HttpProxyHandle {
 }
 
 interface PendingEntry {
+  lifecycle?: Lifecycle;
   method: string;
   params: unknown;
   t0: number;
@@ -466,7 +468,12 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
   const evictOldest = (map: Map<string, PendingEntry>): void => {
     if (map.size < MAX_PENDING) return;
     const oldest = map.keys().next().value as string | undefined;
-    if (oldest !== undefined) map.delete(oldest);
+    if (oldest !== undefined) {
+      // Losing the close-time ledger must leave an explicit unknown. A late
+      // response may subsequently refine this outcome for the same attempt.
+      if (map === allPending) emitUnanswered(map.get(oldest)!);
+      map.delete(oldest);
+    }
     if (!pendingEvictWarned) {
       pendingEvictWarned = true;
       diag(`pending request map exceeded ${MAX_PENDING} entries; evicting oldest`);
@@ -604,6 +611,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
       };
       if (rawError !== undefined) ev.error = errorInfo(rawError);
       if (entry.gateway !== undefined) ev.gateway = { ...entry.gateway };
+      endAction(entry.lifecycle, ev, toolOutcome(ev), record);
       record(ev);
       return;
     }
@@ -670,6 +678,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
     direction: Direction,
     raw: string,
     scope: ExchangeScope,
+    lifecycle?: Lifecycle,
   ): void => {
     if (Array.isArray(msg)) {
       for (const el of msg) handleMessage(el, direction, raw, scope);
@@ -730,6 +739,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
         direction,
         params: redactor.scrub(msg.params ?? null),
       };
+      endAction(lifecycle, ev, 'unknown', record, 'no_response_expected');
       record(ev);
       return;
     }
@@ -782,6 +792,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           duration_ms: durationMs,
           error: { type: 'unanswered' },
         };
+        if (entry.gateway !== undefined) ev.gateway = { ...entry.gateway };
+        endAction(entry.lifecycle, ev, 'unknown', record, 'response_missing');
         record(ev);
         return;
       }
@@ -839,6 +851,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
 
   /** A parsed `tools/call` request the gateway evaluated (the stdio gateway's GatewayCall). */
   interface GatewayCall {
+    lifecycle: Lifecycle;
     id: string | number;
     params: Record<string, unknown>;
     rawTool: string;
@@ -960,12 +973,12 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
             }
           };
 
-          const buildCall = (msg: Record<string, unknown> & { id: string | number }): { call: GatewayCall; action: McpDecision['action'] } => {
+          const buildCall = (msg: Record<string, unknown> & { id: string | number }, original: unknown = msg): { call: GatewayCall; action: McpDecision['action'] } => {
             const { params, name } = toolsCallParts(msg);
             const args: unknown = params['arguments'] ?? {};
             const { decision, argsHash } = evaluate(name, args);
             const tool = name === '' ? '' : structuralString(name, 'identifier');
-            const call: GatewayCall = { id: msg.id, params, rawTool: name.length > 128 ? tool : name, tool, args, argsHash };
+            const call: GatewayCall = { id: msg.id, params, rawTool: name.length > 128 ? tool : name, tool, args, argsHash, lifecycle: beginAction(base('action_lifecycle', {}), tool, original, record, undefined, original === msg ? msg.id : undefined) };
             if (decision.ruleId !== undefined) {
               call.rawRuleId = decision.ruleId;
               call.ruleId = cappedRuleId(decision.ruleId);
@@ -1013,6 +1026,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
               ev.waited_ms = hold.waitedMs;
               if (hold.approver !== undefined) ev.approver = hold.approver;
             }
+            correlate(ev, call.lifecycle);
             record(ev);
           };
 
@@ -1049,6 +1063,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
               error: { type: errorType },
               gateway: gatewayOutcome,
             };
+            decideAction(call.lifecycle, 'deny', record, loaded.hash, call.decisionId);
+            endAction(call.lifecycle, ev, 'denied', record);
             record(ev);
           };
 
@@ -1081,8 +1097,10 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           /** Register a forwarded tools/call so its response becomes the tool_call event. */
           const registerCall = (scope: ExchangeScope, call: GatewayCall, gatewayOutcome: GatewayOutcome, attributes?: Attributes): void => {
             const key = idKeyOf(call.id);
+            decideAction(call.lifecycle, 'allow', record, loaded.hash, call.decisionId ?? (attributes?.['cresec.broker.decision_id'] as string | undefined));
             const entry: PendingEntry = {
               method: 'tools/call',
+              lifecycle: call.lifecycle,
               // PRE-swap params: the event's `args` are scrubbed from these,
               // so the chain records the synthetic, never the brokered value.
               params: call.params,
@@ -1928,6 +1946,25 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
    * evaluated; when each tools/call is allowed and needs no credential the
    * batch crosses as written, otherwise it is answered here.
    */
+  const recordRefusedNotification = (msg: Record<string, unknown>, refusal: string): void => {
+      const { params, name } = toolsCallParts(msg);
+      const tool = name === '' ? '' : structuralString(name, 'identifier');
+      guarded(() => {
+        const ev: NotificationEvent = {
+          ...base('notification', { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' }),
+          kind: 'notification',
+          method: 'tools/call',
+          direction: 'client_to_server',
+          params: redactor.scrub(params),
+          gateway: { decision: 'deny', refusal },
+        };
+        const lifecycle = beginAction(base('action_lifecycle', {}), tool, msg, record);
+        decideAction(lifecycle, 'deny', record, opts.gateway!.policy.hash);
+        endAction(lifecycle, ev, 'denied', record);
+        record(ev);
+      });
+  };
+
   const gatewayBatch = (
     g: NonNullable<typeof gw>,
     req: IncomingMessage,
@@ -1977,6 +2014,7 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
         return;
       }
       if (isInvalidIdToolsCall(el)) {
+        recordRefusedNotification(el, 'invalid_request_id');
         responses.push(invalidRequestResponse(null, el['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
         return;
       }
@@ -2009,7 +2047,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           invalidRequestResponse(el['id'], 'mcp-recorder gateway: this request was batched with a tools/call the policy refused and was not forwarded; send it on its own'),
         );
       }
-      // A notification in a refused batch gets no response, like any notification.
+      // Refused notifications have evidence even though they have no response.
+      if (isToolsCallNotification(el)) recordRefusedNotification(el, 'batch_refused');
     });
     diag(`gateway: refused a JSON-RPC batch of ${batch.length} (a tools/call in it was denied, held or needed a credential)`);
     respondJson(res, 200, responses);
@@ -2056,19 +2095,9 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
     if (isInvalidIdToolsCall(msg)) {
       // Refused whatever the policy says (a response could not be
       // correlated); recorded on a notification event, like the stdio gateway.
-      const { params, name } = toolsCallParts(msg);
+      const { name } = toolsCallParts(msg);
       const tool = name === '' ? '' : structuralString(name, 'identifier');
-      guarded(() => {
-        const ev: NotificationEvent = {
-          ...base('notification', { 'mcp.method.name': 'tools/call', 'rpc.system': 'jsonrpc', 'gen_ai.tool.name': tool, 'cresec.policy.decision': 'deny' }),
-          kind: 'notification',
-          method: 'tools/call',
-          direction: 'client_to_server',
-          params: redactor.scrub(params),
-          gateway: { decision: 'deny', refusal: 'invalid_request_id' },
-        };
-        record(ev);
-      });
+      recordRefusedNotification(msg, 'invalid_request_id');
       diag(`gateway: refused tools/call "${tool}" with an unusable id`);
       respondJson(res, 400, invalidRequestResponse(null, msg['id'] === null ? NULL_ID_TOOLS_CALL_MESSAGE : INVALID_ID_TOOLS_CALL_MESSAGE));
       return;
@@ -2079,10 +2108,13 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
       // notification event's `gateway` field.
       const { params, name } = toolsCallParts(msg);
       const args: unknown = params['arguments'] ?? {};
-      const { call, action } = g.buildCall({ ...msg, id: '' });
+      const { call, action } = g.buildCall({ ...msg, id: '' }, msg);
       const tool = name === '' ? '' : structuralString(name, 'identifier');
       if (action === 'allow' && g.planSwap(call.rawTool, args).length === 0) {
-        guarded(() => handleMessage(msg, 'client_to_server', text, scope));
+        guarded(() => {
+          decideAction(call.lifecycle, 'allow', record, opts.gateway!.policy.hash);
+          handleMessage(msg, 'client_to_server', text, scope, call.lifecycle);
+        });
         forwardExchange(req, res, upstreamUrl, scope, { body, filterResponse: true });
         return;
       }
@@ -2099,6 +2131,8 @@ export async function runHttpProxy(opts: HttpProxyOpts): Promise<HttpProxyHandle
           params: redactor.scrub(params),
           gateway: outcome,
         };
+        decideAction(call.lifecycle, 'deny', record, opts.gateway!.policy.hash);
+        endAction(call.lifecycle, ev, 'denied', record);
         record(ev);
       });
       diag(`gateway: refused tools/call notification "${tool}" (rule ${call.ruleId ?? 'default'}; a notification cannot be held or answered)`);

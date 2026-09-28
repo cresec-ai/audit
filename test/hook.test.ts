@@ -1410,3 +1410,28 @@ describe('mcp-recorder hook (cloud sessions: UUID server names, server.url, poli
     expectNoConfigLeak(readFileSync(join(dataDir, 'evidence.jsonl'), 'utf8'));
   });
 });
+
+describe('hook lifecycle IDs', () => {
+  it('joins pre/post across processes and uses the same refusal lifecycle', async () => {
+    const dataDir = tmpDir('mcp-hook-lifecycle-');
+    const policyPath = join(dataDir, 'policy.json');
+    writeFileSync(policyPath, JSON.stringify({ deny: [{ tool: '^mcp__test__delete$' }], default: 'allow' }));
+    const args = ['--data-dir', dataDir, '--store', 'jsonl', '--policy', policyPath];
+    const input = { sessionId: freshSessionId(), toolName: 'mcp__test__echo', toolInput: { secret: 'private-lifecycle-value' }, toolUseId: 'toolu_1' };
+    expect((await runHook(args, preToolUseInput(input))).code).toBe(0);
+    expect((await runHook(args, postToolUseInput({ ...input, toolResponse: { ok: true } }))).code).toBe(0);
+    expect((await runHook(args, preToolUseInput({ ...input, toolName: 'mcp__test__delete', toolUseId: 'toolu_2' }))).code).toBe(0);
+    const events = readEvents(dataDir);
+    const life = events.filter((e) => e.kind === 'action_lifecycle');
+    expect(life).toHaveLength(6);
+    for (const id of ['toolu_1', 'toolu_2']) {
+      const group = life.filter((e) => e.request_id === id);
+      expect(group.map((e) => e.phase)).toEqual(['intent', 'decision', 'outcome']);
+      expect(new Set(group.map((e) => e.action_id)).size).toBe(1);
+      expect(new Set(group.map((e) => e.attempt_id)).size).toBe(1);
+      expect(events.filter((e) => e.kind === 'tool_call' && e.request_id === id).every((e) => e.action_id === group[0]!.action_id)).toBe(true);
+    }
+    expect(life.filter((e) => e.phase === 'outcome').map((e) => e.outcome)).toEqual(['success', 'denied']);
+    expect(JSON.stringify(events)).not.toContain('private-lifecycle-value');
+  });
+});

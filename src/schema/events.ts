@@ -177,7 +177,8 @@ export type EventKind =
   | 'protocol_error'
   | 'session_end'
   /** Additive (v1): an enforcement action taken by gateway mode. */
-  | 'policy_decision';
+  | 'policy_decision'
+  | 'action_lifecycle';
 
 /**
  * OTel-style flat attribute bag. Use semconv names where they exist:
@@ -206,6 +207,29 @@ export interface EventBase {
    * the stdio/http proxy tap. Undefined on every proxy-captured event.
    */
   source?: 'hook';
+  /** Additive correlation; absent on legacy and observation events. */
+  action_id?: string;
+  attempt_id?: string;
+  /** Hash of the complete pre-injection request, never a redacted tree. */
+  request_hash?: Sha256Ref;
+}
+
+/** Additive v1 records; legacy tool_call/policy_decision retain their meaning. */
+export interface ActionLifecycleEvent extends EventBase {
+  kind: 'action_lifecycle';
+  action_id: string;
+  attempt_id: string;
+  phase: 'intent' | 'decision' | 'outcome';
+  tool: string;
+  request_id?: string | number;
+  decision?: 'allow' | 'deny';
+  decision_id?: string;
+  policy_hash?: Sha256Ref;
+  outcome?: 'success' | 'error' | 'denied' | 'unknown';
+  /** Structural reason, never upstream error text. */
+  reason?: string;
+  /** The compatible tool_call/notification this outcome describes. */
+  record_event_id?: string;
 }
 
 /** Proxy process started; carries the redaction policy in force. */
@@ -456,7 +480,8 @@ export type AnyEvent =
   | NotificationEvent
   | ProtocolErrorEvent
   | SessionEndEvent
-  | PolicyDecisionEvent;
+  | PolicyDecisionEvent
+  | ActionLifecycleEvent;
 
 /* ------------------------------------------------------------------ */
 /* Chain layer — how events are wrapped in the tamper-evident store.   */

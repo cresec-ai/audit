@@ -363,6 +363,8 @@ function renderSessionEnd(seq, e) {
 function renderEvent(record) {
     const e = record.event;
     switch (e.kind) {
+        case 'action_lifecycle':
+            return `<article class="card"><div class="card-head"><span class="kind">ACTION ${escapeHtml(e.phase)}</span>${timeTag(e.timestamp)}</div><div class="body">${escapeHtml(e.tool)} · ${escapeHtml(e.outcome ?? e.decision ?? 'intent')}<br>action <code>${escapeHtml(e.action_id)}</code> · attempt <code>${escapeHtml(e.attempt_id)}</code></div></article>`;
         case 'session_start':
             return renderSessionStart(record.seq, e);
         case 'initialize':

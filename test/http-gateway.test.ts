@@ -536,3 +536,62 @@ describe('SseEventSplitter / rewriteSseEvent', () => {
     expect(rewriteSseEvent(Buffer.from('data: x\n\n'), 'y').toString()).toBe('data: y\n\n');
   });
 });
+
+describe('HTTP lifecycle evidence', () => {
+  it('joins allow and refusal without changing legacy decisions or payload privacy', async () => {
+    const target = await startJsonTarget();
+    const dir = tmpDataDir();
+    const { proxy } = await startGateway(target.url, dir);
+    await (await post(proxy.url, call(61, 'echo', { value: SECRET }))).text();
+    await (await post(proxy.url, call(62, 'http_post', { value: SECRET }))).text();
+    await proxy.close();
+    const events = loadEvents(dir);
+    const life = events.filter((e) => e.kind === 'action_lifecycle');
+    expect(life).toHaveLength(6);
+    for (const id of [61, 62]) {
+      const group = life.filter((e) => e.request_id === id);
+      expect(group.map((e) => e.phase)).toEqual(['intent', 'decision', 'outcome']);
+      expect(new Set(group.map((e) => e.action_id)).size).toBe(1);
+      expect(new Set(group.map((e) => e.attempt_id)).size).toBe(1);
+    }
+    expect(life.filter((e) => e.phase === 'outcome').map((e) => e.outcome)).toEqual(['success', 'denied']);
+    expect(events.filter((e) => e.kind === 'policy_decision')).toHaveLength(1);
+    expect(target.journal.bodies).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain(SECRET);
+  });
+});
+
+// A refused batch bypasses gatewayPost's standalone refusal branch.
+describe('HTTP lifecycle edge cases', () => {
+  it('records invalid IDs and notifications in refused batches', async () => {
+    const target = await startJsonTarget();
+    const dir = tmpDataDir();
+    const { proxy } = await startGateway(target.url, dir);
+    const request = call(1, 'echo', {});
+    const notification = { jsonrpc: request.jsonrpc, method: request.method, params: request.params };
+    await (await post(proxy.url, [{ ...request, id: null }, notification])).text();
+    await proxy.close();
+    const events = loadEvents(dir);
+    const life = events.filter((e) => e.kind === 'action_lifecycle');
+    expect(life).toHaveLength(6);
+    expect(life.filter((e) => e.phase === 'outcome').map((e) => e.outcome)).toEqual(['denied', 'denied']);
+    expect(new Set(life.map((e) => e.action_id)).size).toBe(2);
+    expect(target.journal.bodies).toHaveLength(0);
+  });
+
+  it('seals evicted pending calls unknown, including before close', async () => {
+    const target = createServer(async (req, res) => { await readBody(req); res.writeHead(202); res.end(); });
+    const url = await listen(target);
+    cleanups.push(() => new Promise<void>((resolve) => target.close(() => resolve())));
+    const dir = tmpDataDir();
+    const { proxy } = await startGateway(url, dir);
+    // One accepted batch fills the pending ledger without 10,001 sockets.
+    const batch = Array.from({ length: 10_001 }, (_, i) => call(i, 'echo', {}));
+    expect((await post(proxy.url, batch)).status).toBe(202);
+    await proxy.close();
+    const outcomes = loadEvents(dir).filter((e) => e.kind === 'action_lifecycle' && e.phase === 'outcome');
+    expect(outcomes).toHaveLength(10_001);
+    expect(outcomes.every((e) => e.kind === 'action_lifecycle' && e.outcome === 'unknown')).toBe(true);
+    expect(new Set(outcomes.map((e) => e.action_id)).size).toBe(10_001);
+  }, 30_000);
+});

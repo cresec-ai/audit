@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # The evidence series is reviewed as a stack; test each PR against its base.
+    branches: [main, "codex/mcp-evidence-*"]
 
 jobs:
   test:

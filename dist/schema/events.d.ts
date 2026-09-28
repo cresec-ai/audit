@@ -149,7 +149,7 @@ export interface ServerContext {
 }
 export type EventKind = 'session_start' | 'initialize' | 'tool_call' | 'rpc' | 'notification' | 'protocol_error' | 'session_end'
 /** Additive (v1): an enforcement action taken by gateway mode. */
- | 'policy_decision';
+ | 'policy_decision' | 'action_lifecycle';
 /**
  * OTel-style flat attribute bag. Use semconv names where they exist:
  * `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`,
@@ -176,6 +176,28 @@ export interface EventBase {
      * the stdio/http proxy tap. Undefined on every proxy-captured event.
      */
     source?: 'hook';
+    /** Additive correlation; absent on legacy and observation events. */
+    action_id?: string;
+    attempt_id?: string;
+    /** Hash of the complete pre-injection request, never a redacted tree. */
+    request_hash?: Sha256Ref;
+}
+/** Additive v1 records; legacy tool_call/policy_decision retain their meaning. */
+export interface ActionLifecycleEvent extends EventBase {
+    kind: 'action_lifecycle';
+    action_id: string;
+    attempt_id: string;
+    phase: 'intent' | 'decision' | 'outcome';
+    tool: string;
+    request_id?: string | number;
+    decision?: 'allow' | 'deny';
+    decision_id?: string;
+    policy_hash?: Sha256Ref;
+    outcome?: 'success' | 'error' | 'denied' | 'unknown';
+    /** Structural reason, never upstream error text. */
+    reason?: string;
+    /** The compatible tool_call/notification this outcome describes. */
+    record_event_id?: string;
 }
 /** Proxy process started; carries the redaction policy in force. */
 export interface SessionStartEvent extends EventBase {
@@ -412,7 +434,7 @@ export interface SessionEndEvent extends EventBase {
     /** Signal name (e.g. 'SIGKILL') when the wrapped process was killed by a signal. */
     child_signal?: string;
 }
-export type AnyEvent = SessionStartEvent | InitializeEvent | ToolCallEvent | RpcEvent | NotificationEvent | ProtocolErrorEvent | SessionEndEvent | PolicyDecisionEvent;
+export type AnyEvent = SessionStartEvent | InitializeEvent | ToolCallEvent | RpcEvent | NotificationEvent | ProtocolErrorEvent | SessionEndEvent | PolicyDecisionEvent | ActionLifecycleEvent;
 /** An event sealed into the hash chain. */
 export interface ChainRecord {
     /** 1-based, strictly contiguous. */

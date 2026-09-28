@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { TSX_CLI } from './helpers/tsx.js';
+import { spawnTsxSync } from './helpers/tsx.js';
 import { collectStringLeaves, evaluateMcp } from '../src/policy/engine.js';
 import { loadPolicyFile } from '../src/policy/load.js';
 import { validatePolicyObject } from '../src/policy/validate.js';
@@ -85,7 +85,7 @@ interface RunResult {
 
 /** Run the real CLI through tsx, with the ambient recorder env cleared. */
 function cli(args: string[], opts: { cwd?: string; env?: Record<string, string | undefined>; input?: string } = {}): RunResult {
-  const r = spawnSync(process.execPath, [TSX_CLI, join(ROOT, 'src', 'cli.ts'), ...args], {
+  const r = spawnTsxSync([join(ROOT, 'src', 'cli.ts'), ...args], {
     cwd: opts.cwd ?? ROOT,
     encoding: 'utf8',
     input: opts.input ?? '',

@@ -10,4 +10,4 @@
 set -e
 cd "$(dirname "$0")/.."
 sh scripts/bootstrap.sh
-exec node_modules/.bin/tsx src/cli.ts record --data-dir "${MCP_RECORDER_DATA_DIR:-.mcp-recorder}" "$@"
+exec node --import tsx src/cli.ts record --data-dir "${MCP_RECORDER_DATA_DIR:-.mcp-recorder}" "$@"
